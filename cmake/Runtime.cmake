@@ -31,7 +31,9 @@ function(dal_runtime_add_core)
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_memory.cpp
     runtime/src/core/log.cpp
+    runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
+    runtime/src/hle/cell_game.cpp
     runtime/src/hle/cell_gcm_sys.cpp
     runtime/src/hle/cell_spurs.cpp
     runtime/src/hle/cell_sysmodule.cpp

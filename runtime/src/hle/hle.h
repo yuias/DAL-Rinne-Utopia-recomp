@@ -27,6 +27,12 @@ std::span<const HleEntry> cellSysmoduleHandlers();
 // Handlers of the cellSpurs module.
 std::span<const HleEntry> cellSpursHandlers();
 
+// Handlers of the cellGame module.
+std::span<const HleEntry> cellGameHandlers();
+
+// Forgets the outstanding cellGameDataCheck state. Intended for tests.
+void resetCellGame();
+
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();
 

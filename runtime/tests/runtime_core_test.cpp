@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -26,6 +27,7 @@
 #include "core/guest_memory.h"
 #include "core/host_functions.h"
 #include "core/log.h"
+#include "core/param_sfo.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
@@ -1688,6 +1690,157 @@ class FakeSink : public dal::RsxSink {
 
 using Writes = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
+void testParamSfo() {
+  dal::ParamSfo sfo;
+  sfo.ints["PARENTAL_LEVEL"] = 5;
+  sfo.ints["RESOLUTION"] = 0x1d;
+  sfo.strings["CATEGORY"] = "DG";
+  sfo.strings["TITLE_ID"] = "BLJM61048";
+  sfo.strings["TITLE"] = "Sample title";
+  const std::vector<std::uint8_t> bytes = dal::serializeParamSfo(sfo);
+  CHECK(bytes.size() > 20 && bytes[0] == 0 && bytes[1] == 'P' && bytes[2] == 'S' && bytes[3] == 'F');
+  const auto parsed = dal::parseParamSfo(bytes);
+  CHECK(parsed && parsed->ints == sfo.ints && parsed->strings == sfo.strings);
+  CHECK(parsed && parsed->ints.find("SOUND_FORMAT") == parsed->ints.end());  // missing key
+
+  std::vector<std::uint8_t> bad = bytes;
+  bad[1] = 'X';
+  CHECK(!dal::parseParamSfo(bad));
+  CHECK(!dal::parseParamSfo(std::span<const std::uint8_t>(bytes.data(), 10)));
+  CHECK(!dal::parseParamSfo(std::span<const std::uint8_t>(bytes.data(), bytes.size() - 8)));
+
+  // A raw-format (0x0004) string that fills its length without a terminator.
+  const std::vector<std::uint8_t> raw = {0, 'P', 'S', 'F', 1, 1, 0, 0, 36, 0, 0, 0, 40, 0, 0, 0, 1, 0, 0, 0,
+                                         0, 0, 4, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
+                                         'K', 0, 0, 0, 'a', 'b', 'c', 'd'};
+  const auto raw_parsed = dal::parseParamSfo(raw);
+  CHECK(raw_parsed && raw_parsed->strings.at("K") == "abcd");
+}
+
+void testCellGame() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetCellGame();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t name = scratch, size = scratch + 0x100, info = scratch + 0x200,
+                      usrdir = scratch + 0x300, init = scratch + 0x400;
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_game_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  const stdfs::path game = root / "game";
+  stdfs::create_directories(game / "PS3_GAME" / "USRDIR");
+  dal::ParamSfo disc;
+  disc.strings["CATEGORY"] = "DG";
+  disc.strings["TITLE_ID"] = "BLJM61048";
+  {
+    const auto bytes = dal::serializeParamSfo(disc);
+    std::ofstream(game / "PS3_GAME" / "PARAM.SFO", std::ios::binary)
+        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+  dal::configureVfs(game, root / "hdd");
+
+  enum Import : std::uint32_t { Create, Permit, ErrorDialog, DataCheck, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x42a2e133, "cellGame", "cellGameCreateGameData"},
+      {0x00800010, 0x70acec67, "cellGame", "cellGameContentPermit"},
+      {0x00800020, 0xb0a1f8c6, "cellGame", "cellGameContentErrorDialog"},
+      {0x00800030, 0xdb9819f3, "cellGame", "cellGameDataCheck"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a, std::uint64_t b, std::uint64_t c) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  auto put = [&](std::uint32_t addr, std::string_view text) {
+    std::memcpy(base + addr, text.data(), text.size());
+    base[addr + text.size()] = 0;
+  };
+  auto get = [&](std::uint32_t addr) { return std::string(reinterpret_cast<const char*>(base + addr)); };
+  constexpr std::uint32_t kParam = 0x8002cb07, kFailure = 0x8002cb22, kBusy = 0x8002cb23,
+                          kBroken = 0x8002cb05, kExist = 0x8002cb26;
+
+  // Disc: the content directory is the disc itself.
+  CHECK(call(DataCheck, 1, 0, size) == 0);
+  CHECK(dalRead32(base, size) == 40 * 1024 * 1024 - 256);
+  CHECK(static_cast<std::int32_t>(dalRead32(base, size + 4)) == -1 && dalRead32(base, size + 8) == 0);
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+  CHECK(get(info) == "/dev_bdvd/PS3_GAME" && get(usrdir) == "/dev_bdvd/PS3_GAME/USRDIR");
+  CHECK(call(Permit, info, usrdir, 0) == kFailure);  // no outstanding check
+
+  // Argument validation and the busy state.
+  CHECK(call(DataCheck, 0, name, 0) == kParam);
+  CHECK(call(DataCheck, 4, name, 0) == kParam);
+  CHECK(call(DataCheck, 3, 0, 0) == kParam);
+  CHECK(call(DataCheck, 1, 0, 0) == 0);
+  CHECK(call(DataCheck, 1, 0, 0) == kBusy);
+  CHECK(call(Permit, 0, usrdir, 0) == kParam);
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+
+  // Game data that does not exist yet: check, create, permit moves it into place.
+  put(name, "TESTDATA");
+  CHECK(call(DataCheck, 3, name, size) == 2);
+  CHECK(dalRead32(base, size + 4) == 0);
+  put(init + 0, "My title");
+  put(init + 128, "TESTID001");
+  put(init + 140, "01.00");
+  CHECK(call(Create, init, info, usrdir) == 0);
+  const std::string temp_dir = get(info);
+  CHECK(temp_dir.starts_with("/dev_hdd0/game/_GDATA_") && get(usrdir) == temp_dir + "/USRDIR");
+  const stdfs::path hdd_game = root / "hdd" / "dev_hdd0" / "game";
+  CHECK(stdfs::is_directory(hdd_game / temp_dir.substr(15) / "USRDIR"));
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+  CHECK(get(info) == "/dev_hdd0/game/TESTDATA" && get(usrdir) == "/dev_hdd0/game/TESTDATA/USRDIR");
+  CHECK(stdfs::is_directory(hdd_game / "TESTDATA" / "USRDIR"));
+  CHECK(!stdfs::exists(hdd_game / temp_dir.substr(15)));
+  const auto written = dal::readParamSfoFile(hdd_game / "TESTDATA" / "PARAM.SFO");
+  CHECK(written && written->strings.at("CATEGORY") == "GD" && written->strings.at("TITLE") == "My title" &&
+        written->strings.at("TITLE_ID") == "TESTID001" && written->strings.at("VERSION") == "01.00");
+
+  // The data now exists: no creation, a category mismatch is reported as broken.
+  CHECK(call(DataCheck, 3, name, size) == 0);
+  CHECK(static_cast<std::int32_t>(dalRead32(base, size + 4)) == -1);
+  CHECK(call(Create, init, info, usrdir) == kExist);
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+  CHECK(get(usrdir) == "/dev_hdd0/game/TESTDATA/USRDIR");
+  CHECK(call(DataCheck, 2, name, 0) == kBroken);
+  CHECK(call(DataCheck, 3, name, 0) == 0);  // the broken check left no outstanding state
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+
+  // CreateGameData needs an outstanding game data check.
+  CHECK(call(Create, init, info, usrdir) == kFailure);
+  CHECK(call(Create, 0, info, usrdir) == kParam);
+
+  // Permit for a missing directory returns empty paths.
+  put(name, "NOSUCHDIR");
+  CHECK(call(DataCheck, 2, name, 0) == 2);
+  CHECK(call(Permit, info, usrdir, 0) == 0);
+  CHECK(get(info).empty() && get(usrdir).empty());
+
+  // Error dialog: only the continuing types return.
+  CHECK(call(ErrorDialog, 0, 0, 0) == 0);
+  CHECK(call(ErrorDialog, 2, 1024, name) == 0);
+  CHECK(call(ErrorDialog, 7, 0, 0) == kParam);
+
+  dal::resetCellGame();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  stdfs::remove_all(root, ec);
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -3288,6 +3441,8 @@ int main(int argc, char** argv) {
   testSpuAndSysmodule();
   testSpurs();
   testCellGcmSys();
+  testParamSfo();
+  testCellGame();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();
