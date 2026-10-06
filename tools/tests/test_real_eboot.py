@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import disasm, ghidra_diff, info, probe
+from ps3recomp import disasm, ghidra_diff, info, nids, probe
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
 
@@ -222,6 +222,39 @@ class RealGhidraDiffTest(unittest.TestCase):
                          % strict["pairs"]["ghidra_code_we_unknown"][:5])
         for key in ("mnemonic_mismatch", "operand_mismatch"):
             self.assertEqual(strict["categories"][key], lax["categories"][key])
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealEbootNidTest(unittest.TestCase):
+    _VERIFIED = [
+        ("cellSpurs", "cellSpursInitializeWithAttribute2"),
+        ("cellSpurs", "cellSpursGetSpuThreadGroupId"),
+        ("cellSpurs", "_cellSpursAttributeInitialize"),
+        ("cellSpurs", "cellSpursFinalize"),
+        ("cellSail", "cellSailPlayerBoot"),
+        ("cellAtrac", "cellAtracDecode"),
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "info.json"
+            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
+                info.main([_ELF_PATH, "-o", str(out_path)])
+            doc = json.loads(out_path.read_text(encoding="utf-8"))
+        cls.fnids = {m["name"]: {int(f["fnid"], 16) for f in m["functions"]}
+                     for m in doc["imports"]}
+
+    def test_verified_names_are_imported(self):
+        for module, name in self._VERIFIED:
+            with self.subTest(module=module, name=name):
+                self.assertIn(nids.compute_nid(name), self.fnids[module])
+
+    def test_known_answer(self):
+        self.assertEqual(nids.compute_nid("cellSpursInitializeWithAttribute2"), 0x30AA96C4)
+        self.assertEqual(nids.compute_nid("cellSailPlayerBoot"), 0xBDF21B0F)
+        self.assertEqual(nids.compute_nid("cellAtracDecode"), 0x8EB0E65F)
 
 
 if __name__ == "__main__":

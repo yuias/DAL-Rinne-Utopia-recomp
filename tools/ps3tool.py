@@ -10,6 +10,7 @@ COMMANDS = {
     "disasm": "disasm",
     "ghidra-export": "ghidra",
     "ghidra-diff": "ghidra_diff",
+    "nidgen": "nidgen",
 }
 
 
