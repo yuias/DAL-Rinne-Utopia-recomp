@@ -34,6 +34,14 @@ struct VfsResolution {
 // to resolve. Intended to be called before guest code runs; tests may call it again.
 void configureVfs(std::filesystem::path game_dir, std::optional<std::filesystem::path> hdd_dir);
 
+// Directory holding decrypted copies of the game's sdata files, each at its path relative to the
+// game directory. nullopt (the default) means sdata files cannot be opened.
+void configureSdataCache(std::optional<std::filesystem::path> cache_dir);
+
+// The cache file standing in for the sdata file `res` names; nullopt when no cache is configured
+// or `res` is not under the game directory (/dev_bdvd, /app_home).
+std::optional<std::filesystem::path> sdataCacheHostPath(const VfsResolution& res);
+
 // `guest` must be an absolute guest path. "." components and empty components are dropped and
 // ".." pops one component; a ".." that would pop the device itself fails with NotFound.
 // Host names are matched by the host file system, so on Windows they are case-insensitive: a

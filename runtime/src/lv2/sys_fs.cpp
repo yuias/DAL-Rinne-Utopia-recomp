@@ -427,9 +427,10 @@ enum class FileKind { Plain, Sdata, Edata };
 constexpr std::uint64_t kArgSdata = 0x18000000010;
 constexpr std::uint64_t kArgEdata = 2;
 
-// Opens an sdata container file. Decryption is not available, so the file is reported missing; a
-// lookup of a decrypted copy belongs here.
-std::uint32_t openSdata(std::string_view path, std::uint32_t& /*fd*/) {
+// Opens an sdata container file. The runtime does not decrypt: it serves a copy decrypted ahead
+// of time (tools/dal_sdat) from the --sdata-cache directory, which holds each file at its path
+// relative to the game directory. Without such a copy the file is reported missing.
+std::uint32_t openSdata(std::string_view path, std::uint32_t& fd) {
   const VfsResolution res = resolveVfs(path);
   if (res.device == VfsDevice::Root) {
     return kCellEisdir;
@@ -437,8 +438,25 @@ std::uint32_t openSdata(std::string_view path, std::uint32_t& /*fd*/) {
   if (res.status != VfsStatus::Ok) {
     return vfsError(res.status);
   }
-  logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path), "dal: fs: sdata open not supported: {}", path);
-  return kCellEnoent;
+  const std::optional<stdfs::path> cached = sdataCacheHostPath(res);
+  if (!cached) {
+    logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path), "dal: fs: sdata open not supported: {}", path);
+    return kCellEnoent;
+  }
+  const HANDLE handle = CreateFileW(cached->c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path),
+            "dal: fs: no decrypted copy of sdata file {} in the sdata cache", path);
+    return kCellEnoent;
+  }
+  auto object = std::make_shared<FsObject>();
+  object->file = handle;
+  object->device = res.device;
+  object->read_only = true;
+  fd = addObject(std::move(object));
+  return fd != 0 ? kCellOk : kCellEmfile;
 }
 
 std::uint32_t openGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
@@ -451,6 +469,9 @@ std::uint32_t openGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_
   std::uint32_t fd = 0;
   if (kind == FileKind::Sdata) {
     code = openSdata(path, fd);
+    if (code == kCellOk) {
+      logPathOp("sdata-open", path, code);
+    }
   } else {
     if (kind == FileKind::Edata) {
       logOnce("fs-open-edata", "dal: fs: edata open is not decrypted, \"{}\" opens as a plain file", path);

@@ -24,6 +24,8 @@ endfunction()
 set(DAL_PPU_GENERATED_DIR "" CACHE PATH "Output directory of 'ps3tool emit' (empty: no generated code)")
 set(DAL_GAME_DIR "" CACHE PATH "Game directory for the game_boot test (empty: test not registered)")
 
+set(DAL_RPCS3_CRYPTO_DIR "" CACHE PATH "RPCS3 Crypto source directory (key_vault.h) for decrypting .sdat files at build time (empty: skipped)")
+
 function(dal_ppu_add_generated_tree)
   if(DAL_PPU_GENERATED_DIR STREQUAL "")
     message(STATUS "DAL: generated PPU code not configured (DAL_PPU_GENERATED_DIR is empty)")
@@ -65,6 +67,22 @@ function(dal_ppu_add_generated_tree)
     message(STATUS "DAL: game_boot test not registered (DAL_EBOOT_ELF or DAL_GAME_DIR is empty)")
   else()
     separate_arguments(boot_args UNIX_COMMAND "${DAL_GAME_BOOT_ARGS}")
+
+    # Optional: decrypt the game's .sdat files during the build and hand them to the game. The keys
+    # come from a local RPCS3 checkout at build time and never enter the repository.
+    if(NOT DAL_RPCS3_CRYPTO_DIR STREQUAL "")
+      set(sdata_cache "${CMAKE_BINARY_DIR}/sdata_cache")
+      set(sdata_stamp "${sdata_cache}/.stamp")
+      add_custom_command(OUTPUT "${sdata_stamp}"
+        COMMAND dal_sdat --keys "${DAL_RPCS3_CRYPTO_DIR}" --game-dir "${DAL_GAME_DIR}" --out "${sdata_cache}"
+        COMMAND ${CMAKE_COMMAND} -E touch "${sdata_stamp}"
+        DEPENDS dal_sdat
+        COMMENT "Decrypting sdat files into ${sdata_cache}"
+        VERBATIM)
+      add_custom_target(sdata_cache ALL DEPENDS "${sdata_stamp}")
+      list(APPEND boot_args --sdata-cache "${sdata_cache}")
+    endif()
+
     add_test(NAME game_boot
       COMMAND dal_game --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}" ${boot_args})
     set_tests_properties(game_boot PROPERTIES

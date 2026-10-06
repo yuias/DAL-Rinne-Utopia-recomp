@@ -23,6 +23,7 @@ struct VfsState {
 
 std::mutex g_mutex;
 VfsState g_state;
+std::optional<std::filesystem::path> g_sdata_cache;
 
 // Components the host would interpret instead of treating them as plain names.
 bool isHostSafeName(std::string_view name) {
@@ -89,6 +90,33 @@ void configureVfs(std::filesystem::path game_dir, std::optional<std::filesystem:
   }
   const std::lock_guard lock(g_mutex);
   g_state = std::move(state);
+}
+
+void configureSdataCache(std::optional<std::filesystem::path> cache_dir) {
+  const std::lock_guard lock(g_mutex);
+  g_sdata_cache = std::move(cache_dir);
+}
+
+std::optional<std::filesystem::path> sdataCacheHostPath(const VfsResolution& res) {
+  if (res.status != VfsStatus::Ok || (res.device != VfsDevice::Bdvd && res.device != VfsDevice::AppHome)) {
+    return std::nullopt;
+  }
+  std::filesystem::path game_dir;
+  std::filesystem::path cache_dir;
+  {
+    const std::lock_guard lock(g_mutex);
+    if (!g_sdata_cache) {
+      return std::nullopt;
+    }
+    game_dir = g_state.game_dir;
+    cache_dir = *g_sdata_cache;
+  }
+  // res.host is built from game_dir by plain appends, so the relative path is exact.
+  const std::filesystem::path relative = res.host.lexically_relative(game_dir);
+  if (relative.empty() || relative == "." || *relative.begin() == "..") {
+    return std::nullopt;
+  }
+  return cache_dir / relative;
 }
 
 VfsResolution resolveVfs(std::string_view guest) {

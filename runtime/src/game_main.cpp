@@ -26,6 +26,7 @@ struct Options {
   std::string game_dir;
   std::string elf;
   std::string hdd_dir;
+  std::string sdata_cache;
   std::string log_file;
   unsigned seconds = 0;
   bool strict = false;
@@ -36,7 +37,7 @@ struct Options {
 void printUsage() {
   std::fputs(
       "usage: dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE]\n"
-      "                [--quiet-hle] [--load-only]\n",
+      "                [--hdd-dir DIR] [--sdata-cache DIR] [--quiet-hle] [--load-only]\n",
       stderr);
 }
 
@@ -57,6 +58,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.elf)) return false;
     } else if (arg == "--hdd-dir") {
       if (!value(opt.hdd_dir)) return false;
+    } else if (arg == "--sdata-cache") {
+      if (!value(opt.sdata_cache)) return false;
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
     } else if (arg == "--seconds") {
@@ -115,6 +118,9 @@ int main(int argc, char** argv) {
   dal::configureVfs(game_dir, opt.hdd_dir.empty()
                                   ? std::nullopt
                                   : std::optional<std::filesystem::path>(opt.hdd_dir));
+  if (!opt.sdata_cache.empty()) {
+    dal::configureSdataCache(std::filesystem::path(opt.sdata_cache));
+  }
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();

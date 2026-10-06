@@ -1974,6 +1974,26 @@ void testCellFs() {
   CHECK(call(Open, path_a, 0, out, arg, 8) == err(dal::kCellEnoent));
   CHECK(dalRead32(base, out) == 0xDEADBEEF);
 
+  // With a cache directory the decrypted copy at the same relative path is served read-only.
+  stdfs::create_directories(root / "cache");
+  std::ofstream(root / "cache" / "b.txt", std::ios::binary) << "decrypted!";
+  dal::configureSdataCache(root / "cache");
+  CHECK(call(SdataOpen, path_a, 0, out) == 0);
+  const std::uint32_t sfd = dalRead32(base, out);
+  CHECK(sfd != 0xDEADBEEF);
+  CHECK(call(Fstat, sfd, sb) == 0 && dalRead64(base, sb + 36) == 10 && dalRead32(base, sb) == 0100444);
+  CHECK(call(Read, sfd, 2, buf, 4, out) == 0 && dalRead64(base, out) == 4 && std::memcmp(base + buf, "cryp", 4) == 0);
+  CHECK(call(Write, sfd, 0, buf, 1, out) == err(dal::kCellEbadf));
+  CHECK(call(Close, sfd) == 0);
+  CHECK(call(Open, path_a, 0, out, arg, 8) == 0);  // the sdata marker takes the same route
+  CHECK(call(Close, dalRead32(base, out)) == 0);
+  put(path_a, "/dev_bdvd/sub/nothing.sdat");
+  dalWrite32(base, out, 0xDEADBEEF);
+  CHECK(call(SdataOpen, path_a, 0, out) == err(dal::kCellEnoent) && dalRead32(base, out) == 0xDEADBEEF);
+  put(path_a, "/dev_hdd0/tmp/x.sdat");  // only the game directory is mapped
+  CHECK(call(SdataOpen, path_a, 0, out) == err(dal::kCellEnoent));
+  dal::configureSdataCache(std::nullopt);
+
   p.main.free(scratch);
   dal::setLogSink({});
   dal::resetCensus();
