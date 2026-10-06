@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(cmake/CompilerChecks.cmake)
+include(cmake/PpuCodegen.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -17,8 +18,16 @@ enable_testing()
 
 add_executable(dal_runtime runtime/src/main.cpp)
 target_compile_definitions(dal_runtime PRIVATE DAL_VERSION="${PROJECT_VERSION}")
-target_compile_options(dal_runtime PRIVATE -Wall -Wextra)
+target_compile_options(dal_runtime PRIVATE -march=x86-64-v3 -Wall -Wextra)
 target_include_directories(dal_runtime PRIVATE runtime/include)
+
+add_library(dal_ppu_stub STATIC runtime/src/ppu_stub_runtime.cpp)
+target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
+target_include_directories(dal_ppu_stub PUBLIC runtime/include)
+
+add_executable(dal_ppu_header_check runtime/tests/ppu_header_check.c)
+dal_ppu_codegen_options(dal_ppu_header_check)
+target_link_libraries(dal_ppu_header_check PRIVATE dal_ppu_stub)
 
 add_test(NAME runtime_version COMMAND dal_runtime --version)
 set_tests_properties(runtime_version PROPERTIES
@@ -27,6 +36,10 @@ set_tests_properties(runtime_version PROPERTIES
 add_test(NAME runtime_musttail COMMAND dal_runtime --selftest-musttail)
 set_tests_properties(runtime_musttail PROPERTIES
   PASS_REGULAR_EXPRESSION "musttail ok")
+
+add_test(NAME ppu_header_check COMMAND dal_ppu_header_check)
+set_tests_properties(ppu_header_check PROPERTIES
+  PASS_REGULAR_EXPRESSION "ppu header ok")
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")

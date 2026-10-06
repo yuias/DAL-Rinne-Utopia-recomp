@@ -30,7 +30,19 @@ static int g(int x) { return x; }
 int f(int x) { [[clang::musttail]] return g(x); }
 int main() { return f(0); }
 " DAL_HAVE_MUSTTAIL_CXX)
+
+# Generated code reserves 8 bytes of padding at every function entry for later hooking.
+set(CMAKE_REQUIRED_FLAGS "-Werror -fpatchable-function-entry=8")
+check_c_source_compiles("
+int f(int x) { return x; }
+int main(void) { return f(0); }
+" DAL_HAVE_PATCHABLE_ENTRY)
 cmake_pop_check_state()
+
+if(NOT DAL_HAVE_PATCHABLE_ENTRY)
+  message(FATAL_ERROR "DAL: -fpatchable-function-entry=8 is not supported by this compiler/target")
+endif()
+message(STATUS "DAL: -fpatchable-function-entry=8 supported")
 
 if(NOT DAL_HAVE_MUSTTAIL_C OR NOT DAL_HAVE_MUSTTAIL_CXX)
   message(FATAL_ERROR
