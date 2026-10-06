@@ -271,6 +271,11 @@ void gcmSetDisplayBuffer(DalPpuContext* ctx, std::uint8_t*) {
   if (id > kMaxDisplayId) return setResultCode(ctx, kGcmErrorFailure);
   RsxState& state = rsxState();
   state.display[id] = {argU32(ctx, 1), argU32(ctx, 2), argU32(ctx, 3), argU32(ctx, 4)};
+  const RsxDisplayBuffer& buffer = state.display[id];
+  logOnce(std::format("gcm-display-{}-{}-{}-{}-{}", id, buffer.offset, buffer.pitch, buffer.width,
+                      buffer.height),
+          "dal: gcm: display buffer {}: offset {:#x} pitch {:#x} {}x{}", id, buffer.offset,
+          buffer.pitch, buffer.width, buffer.height);
   state.display_count = std::max(state.display_count, id + 1);
   setResultCode(ctx, kCellOk);
 }

@@ -34,4 +34,9 @@ std::expected<ParamSfo, std::string> readParamSfoFile(const std::filesystem::pat
 // CATEGORY 4), rounded up to a multiple of 4.
 std::vector<std::uint8_t> serializeParamSfo(const ParamSfo& sfo);
 
+// The running game's PARAM.SFO. Set once before boot and read-only afterwards. Until it is set (or
+// when the game has none) it holds RESOLUTION 0x1 (480 only) and SOUND_FORMAT 0x1 (LPCM 2 ch).
+const ParamSfo& gameParamSfo();
+void setGameParamSfo(ParamSfo sfo);
+
 }  // namespace dal

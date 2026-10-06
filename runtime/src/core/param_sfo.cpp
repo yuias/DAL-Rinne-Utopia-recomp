@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <string_view>
+#include <utility>
 
 namespace dal {
 namespace {
@@ -157,5 +158,23 @@ std::vector<std::uint8_t> serializeParamSfo(const ParamSfo& sfo) {
   }
   return out;
 }
+
+namespace {
+
+ParamSfo& gameSfoStorage() {
+  static ParamSfo sfo = [] {
+    ParamSfo defaults;
+    defaults.ints["RESOLUTION"] = 0x1;
+    defaults.ints["SOUND_FORMAT"] = 0x1;
+    return defaults;
+  }();
+  return sfo;
+}
+
+}  // namespace
+
+const ParamSfo& gameParamSfo() { return gameSfoStorage(); }
+
+void setGameParamSfo(ParamSfo sfo) { gameSfoStorage() = std::move(sfo); }
 
 }  // namespace dal

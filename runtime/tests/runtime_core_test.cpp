@@ -2362,6 +2362,120 @@ void testCellSysutil() {
   dal::resetLogOnce();
 }
 
+void testVideoAndAudioOut() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetCellSysutil();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+
+  enum Import : std::uint32_t { GetState, Availability, Configure, AudioState, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x887572d5, "cellSysutil", "cellVideoOutGetState"},
+      {0x00800010, 0xa322db75, "cellSysutil", "cellVideoOutGetResolutionAvailability"},
+      {0x00800020, 0x0bae8772, "cellSysutil", "cellVideoOutConfigure"},
+      {0x00800030, 0xf4e3caa0, "cellSysutil", "cellAudioOutGetState"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                  std::uint64_t d = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    ctx->gpr[6] = d;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kIllegalParameter = 0x8002b222, kOutOfRange = 0x8002b223,
+                          kDeviceNotFound = 0x8002b224, kUnsupportedMode = 0x8002b226,
+                          kIllegalConfiguration = 0x8002b221, kAudioIllegal = 0x8002b242,
+                          kAudioRange = 0x8002b243;
+
+  // RESOLUTION 0x1d: 480, 720, 1080 and 480 16:9.
+  dal::ParamSfo sfo;
+  sfo.ints["RESOLUTION"] = 0x1d;
+  sfo.ints["SOUND_FORMAT"] = 0x1;
+  dal::setGameParamSfo(sfo);
+  CHECK(call(Availability, 0, 2, 0, 0) == 1);   // 720
+  CHECK(call(Availability, 0, 1, 0, 0) == 1);   // 1080
+  CHECK(call(Availability, 0, 4, 0, 0) == 1);   // 480
+  CHECK(call(Availability, 0, 5, 0, 0) == 0);   // 576
+  CHECK(call(Availability, 0, 2, 1, 0) == 0);   // 720 is 16:9 only
+  CHECK(call(Availability, 0, 4, 2, 0) == 1);   // 480 16:9
+  CHECK(call(Availability, 0, 5, 2, 0) == 0);
+  CHECK(call(Availability, 1, 2, 0, 0) == 0);   // secondary output
+  CHECK(call(Availability, 2, 2, 0, 0) == 0x8002b225);
+
+  // Default state: 1280x720 progressive 16:9 RGB, 59.94 Hz.
+  const std::uint32_t state = scratch;
+  std::memset(base + state, 0xaa, 24);
+  CHECK(call(GetState, 0, 0, 0) == kIllegalParameter);
+  CHECK(call(GetState, 0, 1, state) == kDeviceNotFound);
+  CHECK(call(GetState, 1, 0, state) == kDeviceNotFound);
+  CHECK(call(GetState, 0, 0, state) == 0);
+  const std::uint8_t expected_default[16] = {0, 1, 0, 0, 0, 0, 0, 0, 2, 1, 0, 2, 0, 0, 0, 1};
+  CHECK(std::memcmp(base + state, expected_default, 16) == 0 && base[state + 16] == 0xaa);
+
+  // Without 720p the default falls back to 480.
+  dal::ParamSfo sd;
+  sd.ints["RESOLUTION"] = 0x1;
+  dal::setGameParamSfo(sd);
+  CHECK(call(GetState, 0, 0, state) == 0 && base[state + 8] == 4 && base[state + 11] == 1);
+  CHECK(call(Availability, 0, 2, 0, 0) == 0 && call(Availability, 0, 4, 0, 0) == 1);
+  dal::setGameParamSfo(sfo);
+
+  // Configure validates, then GetState reports the stored mode.
+  const std::uint32_t config = scratch + 0x100;
+  auto setConfig = [&](std::uint8_t res, std::uint8_t format, std::uint8_t aspect,
+                       std::uint32_t pitch) {
+    std::memset(base + config, 0, 16);
+    base[config] = res;
+    base[config + 1] = format;
+    base[config + 2] = aspect;
+    dalWrite32(base, config + 12, pitch);
+  };
+  CHECK(call(Configure, 0, 0, 0, 0) == kIllegalParameter);
+  setConfig(2, 0, 0, 0);
+  CHECK(call(Configure, 0, config, 0, 0) == kOutOfRange);
+  setConfig(0x92, 0, 0, 0x1400);
+  CHECK(call(Configure, 0, config, 0, 0) == kIllegalConfiguration);
+  setConfig(0x3, 0, 0, 0x1400);
+  CHECK(call(Configure, 0, config, 0, 0) == kUnsupportedMode);
+  setConfig(0x81, 0, 0, 0x1400);
+  CHECK(call(Configure, 0, config, 0, 0) == kUnsupportedMode);
+  CHECK(call(GetState, 0, 0, state) == 0 && base[state + 8] == 2);  // nothing was stored
+  setConfig(1, 0, 0, 0x1e00);
+  CHECK(call(Configure, 0, config, 0, 0) == 0);
+  CHECK(call(GetState, 0, 0, state) == 0 && base[state + 8] == 1 && base[state + 9] == 1 &&
+        base[state + 11] == 2);
+  setConfig(4, 0, 1, 0xb40);
+  CHECK(call(Configure, 0, config, 0, 0) == 0);
+  CHECK(call(GetState, 0, 0, state) == 0 && base[state + 8] == 4 && base[state + 11] == 1);
+
+  // Audio out: LPCM 2 ch 48 kHz, layout 2CH.
+  std::memset(base + state, 0xaa, 24);
+  CHECK(call(AudioState, 0, 0, 0) == kAudioIllegal);
+  CHECK(call(AudioState, 2, 0, state) == kAudioIllegal);
+  CHECK(call(AudioState, 0, 1, state) == kAudioRange);
+  CHECK(call(AudioState, 0, 0, state) == 0);
+  const std::uint8_t expected_audio[20] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 0, 0, 1};
+  CHECK(std::memcmp(base + state, expected_audio, 20) == 0 && base[state + 20] == 0xaa);
+  CHECK(call(AudioState, 1, 0, state) == 0 && base[state] == 0x10 &&
+        dalRead32(base, state + 16) == 0xd00c1680);
+
+  dal::setGameParamSfo({});
+  dal::resetCellSysutil();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 std::vector<std::pair<std::int64_t, std::uint32_t>> g_dialog_results;
 std::vector<std::uint64_t> g_dialog_sysutil_events;
 
@@ -4481,6 +4595,7 @@ int main(int argc, char** argv) {
   testCellFs();
   testSceNpAndTrophy();
   testCellSysutil();
+  testVideoAndAudioOut();
   testCellMsgDialog();
   testCellSaveData();
   testFifoParser();

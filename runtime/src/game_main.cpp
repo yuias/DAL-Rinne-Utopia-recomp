@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <string_view>
 
 #include "core/boot.h"
@@ -15,6 +16,7 @@
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/param_sfo.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
@@ -96,6 +98,24 @@ bool parseArgs(int argc, char** argv, Options& opt) {
   return true;
 }
 
+// Video and audio out report what the game's PARAM.SFO allows. A missing or broken file keeps the
+// defaults of gameParamSfo().
+void loadGameParamSfo(const std::filesystem::path& game_dir) {
+  auto sfo = dal::readParamSfoFile(game_dir / "PS3_GAME" / "PARAM.SFO");
+  if (!sfo) {
+    dal::logWarn("dal: sfo: {}; using the defaults", sfo.error());
+    return;
+  }
+  const auto title_id = sfo->strings.find("TITLE_ID");
+  const auto resolution = sfo->ints.find("RESOLUTION");
+  const auto sound_format = sfo->ints.find("SOUND_FORMAT");
+  dal::logInfo("dal: sfo: TITLE_ID {} RESOLUTION {:#x} SOUND_FORMAT {:#x}",
+               title_id == sfo->strings.end() ? "?" : title_id->second,
+               resolution == sfo->ints.end() ? 0x1u : resolution->second,
+               sound_format == sfo->ints.end() ? 0x1u : sound_format->second);
+  dal::setGameParamSfo(std::move(*sfo));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -129,6 +149,8 @@ int main(int argc, char** argv) {
   if (!opt.sdata_cache.empty()) {
     dal::configureSdataCache(std::filesystem::path(opt.sdata_cache));
   }
+
+  loadGameParamSfo(game_dir);
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();
