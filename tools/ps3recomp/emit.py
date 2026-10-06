@@ -6,11 +6,15 @@ import argparse
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import cell
 from .elf import ElfError
+from .emit_core import EmitEnv, EmitStats, emit_function
 from .emit_db import census_doc, census_lines, check_db_matches, load_function_db, take_census
+from .emit_output import (FunctionRecord, build_report, func_name, import_name,
+                          read_thunk_words, render_trampoline, report_lines, write_output)
 from .ghidra import _load_default_config
 from .info import (EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliError, parse_ppu_elf, read_input,
                    reject_encrypted)
@@ -36,9 +40,7 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _run(args: argparse.Namespace) -> int:
-    if not args.census:
-        raise CliError(2, "only --census is available")
-
+    started = time.perf_counter()
     data = read_input(args.elf)
     sha256 = hashlib.sha256(data).hexdigest()
     reject_encrypted(data, sha256, _load_default_config())
@@ -56,10 +58,46 @@ def _run(args: argparse.Namespace) -> int:
         raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
     census = take_census(image, db)
-    out_path = Path(args.census_out) if args.census_out else DEFAULT_CENSUS
-    _write_text(out_path, json.dumps(census_doc(census), indent=2, ensure_ascii=False) + "\n")
-    for line in census_lines(census):
+    census_path = Path(args.census_out) if args.census_out else DEFAULT_CENSUS
+    _write_text(census_path, json.dumps(census_doc(census), indent=2, ensure_ascii=False) + "\n")
+    if args.census:
+        for line in census_lines(census):
+            print(line)
+        return 0
+
+    env = EmitEnv(
+        names={fn.entry: func_name(fn.entry) for fn in db.functions},
+        thunks={t.addr: import_name(t.addr) for t in db.thunks},
+        switch_targets={branch: tuple(sorted(set(table.targets)))
+                        for branch, table in db.jump_tables.items()},
+        comments=args.comments)
+    stats = EmitStats()
+    functions = []
+    for fn in db.functions:
+        addrs = fn.addrs()
+        text = emit_function(image, fn.entry, addrs, env, stats, name=func_name(fn.entry),
+                             title=fn.name)
+        functions.append(FunctionRecord(fn.entry, len(addrs), text))
+
+    thunk_texts = []
+    without_toc_save = []
+    for index, thunk in enumerate(db.thunks):
+        text, saves = render_trampoline(thunk, index, read_thunk_words(elf, thunk.addr))
+        thunk_texts.append(text)
+        if not saves:
+            without_toc_save.append(thunk.addr)
+
+    out_dir = Path(args.out) if args.out else DEFAULT_OUT
+    summary = write_output(out_dir, sha256, functions, db.thunks, thunk_texts, args.chunks)
+    report = build_report(sha256=sha256, db_sha256=db.file_sha256, stats=stats,
+                          functions=functions, thunks=db.thunks, without_toc_save=without_toc_save,
+                          summary=summary, elapsed=time.perf_counter() - started)
+    report_path = Path(args.report) if args.report else DEFAULT_REPORT
+    _write_text(report_path, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    for line in report_lines(report, str(out_dir)):
         print(line)
+    if args.max_unhandled is not None and report["unhandled"]["total"] > args.max_unhandled:
+        return EXIT_UNHANDLED
     return 0
 
 

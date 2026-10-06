@@ -239,9 +239,9 @@ class EmitCensusCliTest(TempDirTestCase):
         doc = json.loads((self.tmp / "c.json").read_text(encoding="utf-8"))
         self.assertEqual(doc["invalid_owned"], [hexs(TEXT + 0x1C)])
 
-    def test_without_census_is_a_usage_error(self):
-        code, _, err = self.run_cli([str(self.tmp / "x.elf")])
-        self.assertEqual((code, err), (2, "error: only --census is available\n"))
+    def test_missing_elf_argument_is_a_usage_error(self):
+        code, _, _ = self.run_cli(["--census"])
+        self.assertEqual(code, 2)
 
     def test_bad_option_is_a_usage_error(self):
         code, _, _ = self.run_cli(["x.elf", "--chunks", "0"])

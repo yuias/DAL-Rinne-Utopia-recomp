@@ -537,6 +537,55 @@ class RealEmitCensusTest(unittest.TestCase):
                          "census: 206045 words, 168 distinct mnemonics, 0 invalid owned")
 
 
+_EMIT_CACHE = []
+
+
+def _emit_result():
+    """One full `emit` run per process into a temporary directory."""
+    if not _EMIT_CACHE:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                code = emit.main([_ELF_PATH, "--out", str(tmp_path / "ppu"),
+                                  "--report", str(tmp_path / "report.json"),
+                                  "--census-out", str(tmp_path / "census.json")])
+            report = census = None
+            if (tmp_path / "report.json").is_file():
+                report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+                census = json.loads((tmp_path / "census.json").read_text(encoding="utf-8"))
+        _EMIT_CACHE.append((code, stdout.getvalue(), report, census))
+    return _EMIT_CACHE[0]
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealEmitTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.code, cls.stdout, cls.report, cls.census = _emit_result()
+
+    def test_counts(self):
+        self.assertEqual(self.code, 0)
+        self.assertEqual((self.report["functions"], self.report["import_trampolines"],
+                          self.report["edges"]["switches"]), (2529, 166, 14))
+
+    def test_every_non_control_word_is_unhandled_without_group_modules(self):
+        control = self.census["by_group"]["control"]["words"]
+        self.assertEqual(self.report["unhandled"]["total"], self.census["words"] - control)
+
+    def test_every_thunk_saves_the_toc(self):
+        self.assertEqual(self.report["thunks_without_toc_save"], [])
+
+    def test_measurements(self):
+        # Printed only: the 1411 `bctrl` anchor and the tail edges are reported, not asserted.
+        edges = self.report["edges"]
+        print("emit: calls_indirect %d (bctrl anchor 1411), fallthrough_tails %d, "
+              "dynamic_targets %d, elapsed %.1f s"
+              % (edges["calls_indirect"], edges["fallthrough_tails"],
+                 len(self.report["dynamic_targets"]), self.report["elapsed_s"]))
+
+
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
                      "DAL_EBOOT_ELF is not set or does not name an existing file")
 class RealEbootNidTest(unittest.TestCase):
