@@ -561,7 +561,8 @@ def _emit_result():
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
                 code = emit.main([_ELF_PATH, "--out", str(tmp_path / "ppu"),
                                   "--report", str(tmp_path / "report.json"),
-                                  "--census-out", str(tmp_path / "census.json")])
+                                  "--census-out", str(tmp_path / "census.json"),
+                                  "--max-unhandled", "0"])
             report = census = None
             if (tmp_path / "report.json").is_file():
                 report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
@@ -581,6 +582,11 @@ class RealEmitTest(unittest.TestCase):
         self.assertEqual(self.code, 0)
         self.assertEqual((self.report["functions"], self.report["import_trampolines"],
                           self.report["edges"]["switches"]), (2531, 166, 14))
+
+    def test_no_unhandled_words(self):
+        # `--max-unhandled 0` makes a non-zero count exit 9, which test_counts also catches.
+        self.assertEqual(self.report["unhandled"]["total"], 0)
+        self.assertIn("unhandled: 0 words", self.stdout)
 
     def test_unhandled_words_are_those_without_a_handler(self):
         handled = set(emit_core.load_handlers())
