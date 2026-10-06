@@ -1,7 +1,7 @@
 {
 "schema": 1,
 "generator": "ps3tool recover",
-"input": {"executable_sha256": "8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348", "ghidra_summary_sha256": "9741ee1debba3c982f22c7ade27ae8e2d918748b479dbe7412ef5ee21274e2aa", "extra_seeds": 0},
+"input": {"executable_sha256": "8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348", "ghidra_summary_sha256": "9741ee1debba3c982f22c7ade27ae8e2d918748b479dbe7412ef5ee21274e2aa", "extra_seeds": 2},
 "text": {"start": "0x00010230", "end": "0x000dcf2c"},
 "toc": "0x00109f80",
 "functions": [
@@ -2316,8 +2316,10 @@
 {"entry": "0x000cbb34", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x000cbb34", "0x000cbb40"]]},
 {"entry": "0x000cbb40", "name": null, "sources": ["bl"], "ranges": [["0x000cbb40", "0x000cbd64"]]},
 {"entry": "0x000cbd64", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x000cbd64", "0x000cc194"]]},
-{"entry": "0x000cc52c", "name": null, "sources": ["bl"], "ranges": [["0x000cc194", "0x000cc534"]]},
-{"entry": "0x000cc724", "name": null, "sources": ["bl"], "ranges": [["0x000cc534", "0x000cc72c"]]},
+{"entry": "0x000cc194", "name": null, "sources": ["manual"], "ranges": [["0x000cc194", "0x000cc52c"]]},
+{"entry": "0x000cc52c", "name": null, "sources": ["bl"], "ranges": [["0x000cc52c", "0x000cc534"]]},
+{"entry": "0x000cc534", "name": null, "sources": ["manual"], "ranges": [["0x000cc534", "0x000cc724"]]},
+{"entry": "0x000cc724", "name": null, "sources": ["bl"], "ranges": [["0x000cc724", "0x000cc72c"]]},
 {"entry": "0x000cc72c", "name": null, "sources": ["bl"], "ranges": [["0x000cc72c", "0x000cc9bc"]]},
 {"entry": "0x000cc9bc", "name": null, "sources": ["bl"], "ranges": [["0x000cc9bc", "0x000ccd10"]]},
 {"entry": "0x000ccd10", "name": null, "sources": ["bl"], "ranges": [["0x000ccd10", "0x000ccd18"]]},

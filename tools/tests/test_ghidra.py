@@ -139,13 +139,13 @@ class DirResolutionTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def _command(self, toc, seeds):
+    def _command(self, toc, seeds, seeds_file=None):
         return ghidra.build_headless_command(
             launcher=Path("/g/support/analyzeHeadless"), project_dir=Path("/p"),
             elf_path=Path("/e/EBOOT.elf"), out_path=Path("/o/out.json"),
             language="PowerPC:BE:64:A2ALT-32addr", cspec="default", script_dir=Path("/s"),
             log_dir=Path("/l"), toc=toc, seeds=seeds, text_range=(0x10230, 0xDCF2C),
-            timeout=3600)
+            timeout=3600, seeds_file=seeds_file)
 
     def test_exact_command(self):
         self.assertEqual(self._command(TOC, [0x10000, 0x20000]), [
@@ -160,6 +160,14 @@ class CommandTest(unittest.TestCase):
             "-log", str(Path("/l/application.log")),
             "-scriptlog", str(Path("/l/script.log")),
         ])
+
+    def test_exact_command_with_seeds_file(self):
+        seeds_file = Path("/s/seeds.txt")
+        base = self._command(TOC, [0x10000, 0x20000])
+        cmd = self._command(TOC, [0x10000, 0x20000], seeds_file)
+        i = base.index("0x00020000") + 1
+        self.assertEqual(cmd, base[:i] + ["@%s" % seeds_file] + base[i:])
+        self.assertEqual(cmd[i + 1], "-postScript")
 
     def test_toc_none(self):
         cmd = self._command(None, [0x10000])
@@ -184,6 +192,12 @@ class ExitOrderTest(GhidraTestBase):
         code, _, err = self.run_main(str(self.tmp / "missing.elf"),
                                      "--ghidra-dir", str(self.tmp))
         self.assertEqual(code, 6)
+        self.assertTrue(err.startswith("error: "))
+
+    def test_missing_seeds_file_is_exit_1(self):
+        code, _, err = self.run_main(str(self.elf_path), "--seeds-file",
+                                     str(self.tmp / "missing.txt"))
+        self.assertEqual(code, 1)
         self.assertTrue(err.startswith("error: "))
 
     def test_usage_errors(self):

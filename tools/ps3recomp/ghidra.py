@@ -71,7 +71,10 @@ def headless_launcher(ghidra_dir: Path, os_name: str = os.name) -> Path:
 def build_headless_command(*, launcher: Path, project_dir: Path, elf_path: Path,
                            out_path: Path, language: str, cspec: str, script_dir: Path,
                            log_dir: Path, toc: int | None, seeds: list[int],
-                           text_range: tuple[int, int], timeout: int) -> list[str]:
+                           text_range: tuple[int, int], timeout: int,
+                           seeds_file: Path | None = None) -> list[str]:
+    # A file keeps the command line short: cmd.exe rejects lines over ~8191 characters.
+    seeds_args = [] if seeds_file is None else ["@%s" % seeds_file]
     toc_arg = "none" if toc is None else "0x%08x" % toc
     return [
         str(launcher), str(project_dir), PROJECT_NAME,
@@ -79,6 +82,7 @@ def build_headless_command(*, launcher: Path, project_dir: Path, elf_path: Path,
         "-processor", language, "-cspec", cspec,
         "-scriptPath", str(script_dir),
         "-preScript", "Ps3Prepare.java", toc_arg, *["0x%08x" % s for s in seeds],
+        *seeds_args,
         "-postScript", "ExportAnalysis.java", str(out_path),
         "0x%08x" % text_range[0], "0x%08x" % text_range[1],
         "-analysisTimeoutPerFile", str(timeout),
@@ -323,6 +327,8 @@ def _load_export(path: Path) -> dict:
 
 def _run(args: argparse.Namespace) -> int:
     out_path = Path(args.output) if args.output else DEFAULT_OUTPUT
+    if args.seeds_file and not Path(args.seeds_file).is_file():
+        raise CliError(EXIT_IO, "seeds file not found: %s" % args.seeds_file)
     launcher = None
     if not args.check_only:
         ghidra_dir = resolve_ghidra_dir(args.ghidra_dir, os.environ)
@@ -345,6 +351,7 @@ def _run(args: argparse.Namespace) -> int:
     elapsed = None
     if launcher is not None:
         toc, seeds = collect_seeds(elf)
+        seeds_file = Path(args.seeds_file).resolve() if args.seeds_file else None
         project_dir = Path(args.project_dir).resolve()
         out_path = out_path.resolve()
         try:
@@ -357,7 +364,8 @@ def _run(args: argparse.Namespace) -> int:
             launcher=launcher.resolve(), project_dir=project_dir,
             elf_path=Path(args.elf).resolve(), out_path=out_path, language=args.language,
             cspec=args.cspec, script_dir=SCRIPT_DIR, log_dir=DEFAULT_LOG_DIR,
-            toc=toc, seeds=seeds, text_range=text_range, timeout=args.timeout)
+            toc=toc, seeds=seeds, text_range=text_range, timeout=args.timeout,
+            seeds_file=seeds_file)
         elapsed = _run_headless(cmd, DEFAULT_LOG_DIR, args.timeout)
         if not out_path.is_file():
             raise CliError(EXIT_TOOL, "Ghidra finished without writing %s; see logs in %s"
@@ -407,6 +415,9 @@ def _parser() -> argparse.ArgumentParser:
                         help="end address of the exported code range, exclusive")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, metavar="SEC",
                         help="Ghidra analysis timeout in seconds (default: %(default)s)")
+    parser.add_argument("--seeds-file", metavar="PATH",
+                        help="file of extra function starts, one hex address per line, "
+                             "seeded in addition to the entry and exports")
     parser.add_argument("--check-only", action="store_true",
                         help="do not run Ghidra; validate and language-check an existing export")
     return parser

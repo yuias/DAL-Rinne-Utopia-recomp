@@ -1,0 +1,4 @@
+{"schema": 1, "seeds": [
+{"addr": "0x000cc194", "reason": "full prologue, tail-called by the default-argument wrapper at 0x000cc52c (li r6,0; b 0x000cc194), which would otherwise absorb the body"},
+{"addr": "0x000cc534", "reason": "ghidra-feedback"}
+]}
