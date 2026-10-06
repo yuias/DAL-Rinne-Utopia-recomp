@@ -54,10 +54,10 @@ function(dal_ppu_add_generated_tree)
   set_tests_properties(ppu_link PROPERTIES PASS_REGULAR_EXPRESSION "ppu link ok")
 
   # Only game_main.cpp references the generated tables, so the runtime core builds without them.
-  # The stub supplies the CPU hooks until the runtime core provides its own.
+  # The runtime core supplies every hook; the stub must not be linked here (duplicate symbols).
   add_executable(dal_game runtime/src/game_main.cpp)
   target_compile_options(dal_game PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core dal_ppu_stub)
+  target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core)
 
   # Pins how far the game gets; updated by whoever moves the milestone.
   include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")

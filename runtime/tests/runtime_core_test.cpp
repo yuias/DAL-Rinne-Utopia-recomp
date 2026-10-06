@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
@@ -341,6 +342,211 @@ void testElfLoader() {
   CHECK(p.main.allocate(0x10000, 0x10000) == 0x40000);
 }
 
+DAL_PPU_FUNC(testFuncA) {
+  (void)base;
+  ctx->gpr[3] = 1;
+}
+
+DAL_PPU_FUNC(testFuncB) {
+  (void)base;
+  ctx->gpr[3] = 2;
+}
+
+std::size_t countContaining(const std::vector<std::string>& lines, std::string_view needle) {
+  std::size_t n = 0;
+  for (const std::string& line : lines) {
+    n += line.find(needle) != std::string::npos ? 1 : 0;
+  }
+  return n;
+}
+
+void testDispatch() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+
+  const DalFuncMapping mappings[] = {
+      {0x10200, testFuncA}, {0x10210, testFuncB}, {0x10400, testFuncA}};
+  dalRegisterFuncs(mappings, 3);
+  CHECK(countContaining(lines, "dal: dispatch: 3 entries, span 0x00010200..0x00010404") == 1);
+
+  CHECK(dalLookup(0x10200) == testFuncA);
+  CHECK(dalLookup(0x10210) == testFuncB);
+  CHECK(dalLookup(0x10400) == testFuncA);
+  CHECK(dalLookup(0x10204) == nullptr);  // inside the span, no function
+  CHECK(dalLookup(0x10201) == nullptr);  // misaligned
+  CHECK(dalLookup(0x10211) == nullptr);
+  CHECK(dalLookup(0x101fc) == nullptr);  // below the span
+  CHECK(dalLookup(0x10404) == nullptr);  // above the span
+  CHECK(dalLookup(0) == nullptr);
+  CHECK(dalLookup(0xFFFFFFFCu) == nullptr);
+
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->jump_target = 0x10210;
+  dalDispatch(ctx.get(), nullptr);
+  CHECK(ctx->gpr[3] == 2);
+  ctx->jump_target = 0x10200;
+  dalDispatch(ctx.get(), nullptr);
+  CHECK(ctx->gpr[3] == 1);
+
+  // Not strict: the unknown transfer returns, leaves the registers alone, and logs once per pair.
+  ctx->gpr[3] = 77;
+  ctx->trace_pos = 2;
+  ctx->trace[0] = 0x10200;
+  ctx->trace[1] = 0x10210;
+  lines.clear();
+  for (int i = 0; i < 3; i++) {
+    ctx->jump_target = 0x10204;
+    ctx->jump_site = 0x10300;
+    dalDispatch(ctx.get(), nullptr);
+  }
+  CHECK(ctx->gpr[3] == 77);
+  CHECK(countContaining(lines, "unknown target 0x00010204 from 0x00010300: inside the code span") ==
+        1);
+  CHECK(countContaining(lines, "trace (oldest -> newest): 00010200 00010210") == 1);
+
+  ctx->jump_target = 0x20000;
+  dalDispatch(ctx.get(), nullptr);
+  CHECK(countContaining(lines, "unknown target 0x00020000 from 0x00010300: outside the code span") ==
+        1);
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("census: unknown targets 2 distinct\n  0x00010204 from 0x00010300: 3\n"
+                    "  0x00020000 from 0x00010300: 1") != std::string::npos);
+
+  dalRegisterFuncs(nullptr, 0);
+  CHECK(dalLookup(0x10200) == nullptr);
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+std::vector<dal::ThreadCensusEntry> fakeThreads() {
+  using State = dal::ThreadCensusEntry::State;
+  return {{0x01000000, "main_thread", State::Blocked, "sys_event_queue_receive"},
+          {0x01000001, "worker", State::Exited, ""},
+          {0x01000002, "idle", State::Running, ""}};
+}
+
+void testCensus() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+
+  dal::censusSyscall(141, "sys_timer_usleep", true);
+  dal::censusSyscall(988, nullptr, false);
+  for (int i = 0; i < 119; i++) dal::censusSyscall(141, "sys_timer_usleep", true);
+  dal::censusSyscall(988, nullptr, false);
+  dal::censusSyscall(988, nullptr, false);
+  dal::censusHle("sysPrxForUser", "sys_lwmutex_lock", true);
+  dal::censusHle("cellSysutil", "cellSysutilRegisterCallback", false);
+  dal::censusHle("sysPrxForUser", "sys_lwmutex_lock", true);
+  dal::setThreadCensusProvider(&fakeThreads);
+
+  CHECK(lines.size() == 4);
+  CHECK(countContaining(lines, "dal: first sc 141 sys_timer_usleep") == 1);
+  CHECK(countContaining(lines, "dal: first sc 988 ?") == 1);
+  CHECK(countContaining(lines, "dal: first hle sysPrxForUser::sys_lwmutex_lock") == 1);
+  CHECK(countContaining(lines, "dal: first hle cellSysutil::cellSysutilRegisterCallback") == 1);
+
+  const std::string expected =
+      "census: syscalls 123 calls, 2 distinct, 1 default-handled\n"
+      "  sc 141 sys_timer_usleep: 120 [impl]\n"
+      "  sc 988 ?: 3 [default]\n"
+      "census: hle 3 calls, 2 distinct, 1 default-handled\n"
+      "  sysPrxForUser::sys_lwmutex_lock: 2 [impl]\n"
+      "  cellSysutil::cellSysutilRegisterCallback: 1 [default]\n"
+      "census: unknown targets 0 distinct\n"
+      "census: threads 3 created, 2 live\n"
+      "  0x01000000 main_thread: blocked in sys_event_queue_receive\n"
+      "  0x01000001 worker: exited\n"
+      "  0x01000002 idle: running";
+  const std::string actual = dal::formatCensus();
+  CHECK(actual == expected);
+  if (actual != expected) std::fprintf(stderr, "census was:\n%s\n", actual.c_str());
+
+  lines.clear();
+  dal::printCensus();
+  CHECK(lines.size() == 11);
+  CHECK(!lines.empty() && lines[0].find("census: syscalls 123 calls") != std::string::npos);
+
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+void testTimebase() {
+  auto ctx = std::make_unique<DalPpuContext>();
+  LARGE_INTEGER frequency, t0, t1;
+  QueryPerformanceFrequency(&frequency);
+
+  const std::uint64_t first = dalMftb(ctx.get());
+  QueryPerformanceCounter(&t0);
+  const std::uint64_t tb0 = dalMftb(ctx.get());
+  Sleep(100);
+  const std::uint64_t tb1 = dalMftb(ctx.get());
+  QueryPerformanceCounter(&t1);
+
+  CHECK(tb0 >= first);
+  CHECK(tb1 > tb0);
+  // The rate is measured against the host clock over the same interval, so Sleep jitter cancels.
+  const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / frequency.QuadPart;
+  const double rate = static_cast<double>(tb1 - tb0) / seconds;
+  const bool rate_ok = rate > 79800000.0 * 0.95 && rate < 79800000.0 * 1.05;
+  CHECK(rate_ok);
+  if (!rate_ok) std::fprintf(stderr, "timebase rate %.0f Hz\n", rate);
+  CHECK(dal::kTimebaseFrequency == 79800000);
+
+  const std::uint64_t us0 = dal::systemTimeUs();
+  Sleep(20);
+  CHECK(dal::systemTimeUs() >= us0 + 15000);
+}
+
+void testReservationAndDcbz() {
+  std::unique_ptr<dal::GuestMemory> memory(newMemory());
+  std::uint8_t* base = memory->base();
+  CHECK(memory->commit(0x20000, 0x1000));
+  auto ctx = std::make_unique<DalPpuContext>();
+
+  dalWrite32(base, 0x20010, 5);
+  CHECK(dalLwarx(ctx.get(), base, 0x20010) == 5);
+  CHECK(dalStwcx(ctx.get(), base, 0x20010, 6));
+  CHECK(dalRead32(base, 0x20010) == 6);
+  CHECK(!dalStwcx(ctx.get(), base, 0x20010, 7));  // the reservation is gone
+  CHECK(dalRead32(base, 0x20010) == 6);
+
+  dalLwarx(ctx.get(), base, 0x20010);
+  dalWrite32(base, 0x20010, 9);  // another thread changed the value
+  CHECK(!dalStwcx(ctx.get(), base, 0x20010, 7));
+  CHECK(dalRead32(base, 0x20010) == 9);
+
+  dalLwarx(ctx.get(), base, 0x20010);
+  CHECK(!dalStwcx(ctx.get(), base, 0x20014, 7));  // different address
+  CHECK(!dalStwcx(ctx.get(), base, 0x20010, 7));  // the failure also cleared it
+
+  dalWrite64(base, 0x20020, 0x1122334455667788ull);
+  CHECK(dalLdarx(ctx.get(), base, 0x20020) == 0x1122334455667788ull);
+  CHECK(dalStdcx(ctx.get(), base, 0x20020, 3));
+  CHECK(dalRead64(base, 0x20020) == 3);
+  CHECK(!dalStdcx(ctx.get(), base, 0x20020, 4));
+
+  std::memset(base + 0x20000, 0xAB, 0x300);
+  dalDcbz(ctx.get(), base, 0x20085);  // any address inside the line
+  CHECK(base[0x2007f] == 0xAB);
+  CHECK(base[0x20100] == 0xAB);
+  bool line_zero = true;
+  for (int i = 0x80; i < 0x100; i++) line_zero = line_zero && base[0x20000 + i] == 0;
+  CHECK(line_zero);
+
+  dalSync(ctx.get(), kDalSyncHeavy);
+  ctx->fpscr = 0;
+  dalMtfsf(ctx.get(), 0x80, 0xF0000000u);
+  CHECK(dalMffs(ctx.get()) == 0xF0000000u);
+  dalMtfsb(ctx.get(), 31, 1);
+  CHECK(dalMffs(ctx.get()) == 0xF0000001u);
+  dalMtfsb(ctx.get(), 0, 0);
+  CHECK(dalMffs(ctx.get()) == 0x70000001u);
+}
+
 struct ChildResult {
   DWORD exit_code = 0xFFFFFFFF;
   std::string output;
@@ -425,7 +631,43 @@ void testStopChild() {
   CHECK(contains(r, "census: test printer ran"));
 }
 
+void testStrictDispatchChild() {
+  const ChildResult r = runChild(L"--strict-dispatch-child");
+  echoChild("strict dispatch child", r);
+  CHECK(r.exit_code == 3);
+  CHECK(contains(r, "dal: stop: fatal unknown target: target 0x00010204 from 0x00010300"));
+  CHECK(contains(r, "census: unknown targets 1 distinct"));
+}
+
+void testUnsortedTableChild() {
+  const ChildResult r = runChild(L"--unsorted-table-child");
+  echoChild("unsorted table child", r);
+  CHECK(r.exit_code == 3);
+  CHECK(contains(r, "dal: stop: fatal internal error: function table: 0x00010200 follows "
+                    "0x00010210 (unsorted or duplicate)"));
+}
+
 // Children: each ends the process through the stop path under test.
+
+int strictDispatchChild() {
+  dal::installProcessSettings();
+  dal::installCensus();
+  dal::process().strict = true;
+  const DalFuncMapping mappings[] = {{0x10200, testFuncA}};
+  dalRegisterFuncs(mappings, 1);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->jump_target = 0x10204;
+  ctx->jump_site = 0x10300;
+  dalDispatch(ctx.get(), nullptr);
+  return 99;
+}
+
+int unsortedTableChild() {
+  dal::installProcessSettings();
+  const DalFuncMapping mappings[] = {{0x10210, testFuncA}, {0x10200, testFuncB}};
+  dalRegisterFuncs(mappings, 2);
+  return 99;
+}
 
 void childCensus() { std::fprintf(stderr, "census: test printer ran\n"); }
 
@@ -478,6 +720,8 @@ int main(int argc, char** argv) {
     if (mode == "--fault-child") return faultChild();
     if (mode == "--overflow-child") return overflowChild();
     if (mode == "--stop-child") return stopChild();
+    if (mode == "--strict-dispatch-child") return strictDispatchChild();
+    if (mode == "--unsorted-table-child") return unsortedTableChild();
   }
 
   dal::installProcessSettings();
@@ -490,9 +734,15 @@ int main(int argc, char** argv) {
   testStackGuards();
   testProcessSingleton();
   testElfLoader();
+  testDispatch();
+  testCensus();
+  testTimebase();
+  testReservationAndDcbz();
   testFaultChild();
   testOverflowChild();
   testStopChild();
+  testStrictDispatchChild();
+  testUnsortedTableChild();
   std::printf("runtime core tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed != 0 ? 1 : 0;
 }

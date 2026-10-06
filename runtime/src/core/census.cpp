@@ -1,0 +1,209 @@
+#include "core/census.h"
+
+#include <algorithm>
+#include <format>
+#include <map>
+#include <mutex>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+
+#include "core/fatal.h"
+#include "core/log.h"
+
+namespace dal {
+namespace {
+
+struct CallStat {
+  std::string name;
+  std::uint64_t count = 0;
+  bool implemented = false;
+};
+
+struct CensusState {
+  std::mutex mutex;
+  std::unordered_map<std::uint32_t, CallStat> syscalls;
+  std::unordered_map<std::string, CallStat> hle;
+  std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> unknown_targets;
+  ThreadCensusFn thread_fn = nullptr;
+};
+
+// Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
+// during static destruction.
+CensusState& state() {
+  static CensusState* s = new CensusState;
+  return *s;
+}
+
+struct Line {
+  std::uint64_t count;
+  std::string name;  // sort key and display name
+  std::uint32_t number;
+  bool implemented;
+};
+
+void sortLines(std::vector<Line>& lines) {
+  std::ranges::sort(lines, [](const Line& a, const Line& b) {
+    return std::tie(b.count, a.name, a.number) < std::tie(a.count, b.name, b.number);
+  });
+}
+
+std::string_view stateText(ThreadCensusEntry::State s) {
+  switch (s) {
+    case ThreadCensusEntry::State::Running:
+      return "running";
+    case ThreadCensusEntry::State::Blocked:
+      return "blocked";
+    case ThreadCensusEntry::State::Exited:
+      break;
+  }
+  return "exited";
+}
+
+template <typename Lines>
+std::string section(std::string_view title, std::uint64_t calls, const Lines& lines) {
+  std::uint64_t defaulted = 0;
+  for (const Line& line : lines) {
+    defaulted += line.implemented ? 0 : 1;
+  }
+  return std::format("census: {} {} calls, {} distinct, {} default-handled", title, calls,
+                     lines.size(), defaulted);
+}
+
+}  // namespace
+
+void censusSyscall(std::uint32_t number, const char* name, bool implemented) {
+  CensusState& s = state();
+  bool first = false;
+  std::string shown;
+  {
+    std::lock_guard lock(s.mutex);
+    CallStat& stat = s.syscalls[number];
+    if (stat.count == 0) {
+      stat.name = name != nullptr ? name : "?";
+      stat.implemented = implemented;
+      first = true;
+      shown = stat.name;
+    }
+    stat.count++;
+  }
+  if (first) {
+    logInfo("dal: first sc {} {}", number, shown);
+  }
+}
+
+void censusHle(const char* module, const char* name, bool implemented) {
+  CensusState& s = state();
+  std::string key = std::format("{}::{}", module != nullptr ? module : "?", name != nullptr ? name : "?");
+  bool first = false;
+  {
+    std::lock_guard lock(s.mutex);
+    CallStat& stat = s.hle[key];
+    if (stat.count == 0) {
+      stat.name = key;
+      stat.implemented = implemented;
+      first = true;
+    }
+    stat.count++;
+  }
+  if (first) {
+    logInfo("dal: first hle {}", key);
+  }
+}
+
+bool censusUnknownTarget(std::uint32_t target, std::uint32_t site) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  return s.unknown_targets[{target, site}]++ == 0;
+}
+
+void setThreadCensusProvider(ThreadCensusFn fn) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.thread_fn = fn;
+}
+
+std::string formatCensus() {
+  CensusState& s = state();
+  std::string out;
+  ThreadCensusFn thread_fn = nullptr;
+  {
+    std::lock_guard lock(s.mutex);
+
+    std::vector<Line> lines;
+    std::uint64_t calls = 0;
+    for (const auto& [number, stat] : s.syscalls) {
+      lines.push_back({stat.count, stat.name, number, stat.implemented});
+      calls += stat.count;
+    }
+    sortLines(lines);
+    out += section("syscalls", calls, lines);
+    for (const Line& line : lines) {
+      out += std::format("\n  sc {} {}: {} [{}]", line.number, line.name, line.count,
+                         line.implemented ? "impl" : "default");
+    }
+
+    lines.clear();
+    calls = 0;
+    for (const auto& [key, stat] : s.hle) {
+      lines.push_back({stat.count, stat.name, 0, stat.implemented});
+      calls += stat.count;
+    }
+    sortLines(lines);
+    out += "\n" + section("hle", calls, lines);
+    for (const Line& line : lines) {
+      out += std::format("\n  {}: {} [{}]", line.name, line.count,
+                         line.implemented ? "impl" : "default");
+    }
+
+    std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t>> targets(
+        s.unknown_targets.begin(), s.unknown_targets.end());
+    std::ranges::stable_sort(targets,
+                             [](const auto& a, const auto& b) { return a.second > b.second; });
+    out += std::format("\ncensus: unknown targets {} distinct", targets.size());
+    for (const auto& [key, count] : targets) {
+      out += std::format("\n  {:#010x} from {:#010x}: {}", key.first, key.second, count);
+    }
+    thread_fn = s.thread_fn;
+  }
+
+  // The provider takes its own locks, so it runs outside ours.
+  std::vector<ThreadCensusEntry> threads;
+  if (thread_fn != nullptr) {
+    threads = thread_fn();
+  }
+  const auto live = std::ranges::count_if(
+      threads, [](const ThreadCensusEntry& t) { return t.state != ThreadCensusEntry::State::Exited; });
+  out += std::format("\ncensus: threads {} created, {} live", threads.size(), live);
+  for (const ThreadCensusEntry& t : threads) {
+    out += std::format("\n  {:#010x} {}: {}", t.id, t.name, stateText(t.state));
+    if (t.state == ThreadCensusEntry::State::Blocked) {
+      out += " in " + t.blocked_in;
+    }
+  }
+  return out;
+}
+
+void printCensus() {
+  const std::string text = formatCensus();
+  std::string_view rest = text;
+  while (!rest.empty()) {
+    const std::size_t end = rest.find('\n');
+    logInfo("{}", rest.substr(0, end));
+    rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+  }
+}
+
+void installCensus() { setCensusPrinter(&printCensus); }
+
+void resetCensus() {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.syscalls.clear();
+  s.hle.clear();
+  s.unknown_targets.clear();
+  s.thread_fn = nullptr;
+}
+
+}  // namespace dal

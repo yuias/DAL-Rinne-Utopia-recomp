@@ -23,6 +23,9 @@ function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
 
   add_library(dal_runtime_core STATIC
+    runtime/src/core/census.cpp
+    runtime/src/core/cpu_hooks.cpp
+    runtime/src/core/dispatch.cpp
     runtime/src/core/elf_loader.cpp
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_memory.cpp

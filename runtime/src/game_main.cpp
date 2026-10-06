@@ -8,6 +8,7 @@
 #include <system_error>
 #include <string_view>
 
+#include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
@@ -80,6 +81,7 @@ bool parseArgs(int argc, char** argv, Options& opt) {
 
 int main(int argc, char** argv) {
   dal::installProcessSettings();
+  dal::installCensus();
 
   Options opt;
   if (!parseArgs(argc, argv, opt)) {
@@ -123,6 +125,8 @@ int main(int argc, char** argv) {
                   expected_sha256);
     return static_cast<int>(dal::ExitCode::LoadError);
   }
+
+  dalRegisterFuncs(kDalPpuFuncMappings, kDalPpuFuncMappingCount);
 
   dal::logInfo(
       "dal: loaded {}: entry {:#010x} toc {:#010x} opd {:#010x} tls {:#010x}/{}/{:#x} sdk {:#010x} "
