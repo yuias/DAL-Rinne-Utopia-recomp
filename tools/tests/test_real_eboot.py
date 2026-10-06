@@ -7,7 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import cell, disasm, ghidra_diff, ghidra_summary, info, nids, probe, seeds
+from ps3recomp import (cell, disasm, ghidra_diff, ghidra_summary, info, jumptab, nids,
+                       probe, seeds)
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
 from ps3recomp.ppu_flow import CodeImage
@@ -321,6 +322,51 @@ class RealSeedsTest(unittest.TestCase):
     def test_every_seed_starts_on_a_decodable_word_in_text(self):
         for seed in self.census.seeds:
             self.assertTrue(self.image.valid(seed.addr), hex(seed.addr))
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealJumpTableTest(unittest.TestCase):
+    # bctr site -> entry count (all rel32 tables placed right after the branch).
+    EXPECTED_COUNTS = {
+        0x966E4: 90, 0x96E74: 47, 0xC5EAC: 84, 0xC68D4: 25, 0xC8968: 84, 0xC8BBC: 25,
+        0xCA058: 25, 0xCF948: 84, 0xCFDCC: 25, 0xD030C: 13, 0xD07F4: 48, 0xD1300: 148,
+        0xD1804: 21, 0xD33A4: 13,
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        elf = ElfFile.from_path(_ELF_PATH)
+        cls.image = CodeImage.from_elf(elf, cell.find_text_range(elf))
+        cls.tables, cls.unresolved = jumptab.recover_jump_tables(
+            cls.image, jumptab.make_reader(elf), cell.parse_entry(elf).toc)
+
+    def test_every_site_is_accounted_for(self):
+        sites = {insn.addr for insn in self.image.insns
+                 if insn.spec is not None and insn.spec.name == "bcctr"
+                 and not insn.field("LK")}
+        self.assertEqual(len(sites), 14)
+        self.assertEqual(set(self.tables) | set(self.unresolved), sites)
+        self.assertEqual(set(self.tables) & set(self.unresolved), set())
+
+    def test_all_sites_resolve_with_expected_counts(self):
+        self.assertEqual(self.unresolved, {})
+        self.assertEqual({a: t.count for a, t in self.tables.items()}, self.EXPECTED_COUNTS)
+
+    def test_tables_follow_the_branch(self):
+        for addr, table in self.tables.items():
+            with self.subTest(site=hex(addr)):
+                self.assertEqual((table.kind, table.table, table.table_in_text),
+                                 ("rel32", addr + 4, True))
+
+    def test_entry_totals(self):
+        targets = [t for table in self.tables.values() for t in table.targets]
+        self.assertEqual((len(targets), len(set(targets))), (732, 143))
+
+    def test_targets_are_decodable_code_in_text(self):
+        for table in self.tables.values():
+            for target in table.targets:
+                self.assertTrue(self.image.valid(target), hex(target))
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),

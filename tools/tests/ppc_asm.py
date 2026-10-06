@@ -46,6 +46,18 @@ def bcctr(bo: int, bi: int, lk: bool = False) -> int:
     return 19 << 26 | bo << 21 | bi << 16 | 528 << 1 | int(lk)
 
 
+def bgt(crf: int, addr: int, target: int) -> int:
+    return bc(12, 4 * crf + 1, addr, target)
+
+
+def ble(crf: int, addr: int, target: int) -> int:
+    return bc(4, 4 * crf + 1, addr, target)
+
+
+def bge(crf: int, addr: int, target: int) -> int:
+    return bc(4, 4 * crf, addr, target)
+
+
 def blr() -> int:
     return bclr(20, 0)
 
@@ -135,6 +147,23 @@ def sldi(ra: int, rs: int, n: int) -> int:
 def clrldi(ra: int, rs: int, n: int) -> int:
     # rldicl ra,rs,0,n
     return _md_form(0, ra, rs, 0, n)
+
+
+def rlwinm(ra: int, rs: int, sh: int, mb: int, me: int) -> int:
+    return 21 << 26 | rs << 21 | ra << 16 | sh << 11 | mb << 6 | me << 1
+
+
+def clrlwi(ra: int, rs: int, n: int) -> int:
+    # rlwinm ra,rs,0,n,31
+    return rlwinm(ra, rs, 0, n, 31)
+
+
+def rldic(ra: int, rs: int, sh: int, mb: int) -> int:
+    return _md_form(2, ra, rs, sh, mb)
+
+
+def extsw(ra: int, rs: int) -> int:
+    return _x_form(986, rs, ra, 0)
 
 
 def cmplwi(crf: int, ra: int, uimm: int) -> int:
