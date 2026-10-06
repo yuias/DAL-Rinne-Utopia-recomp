@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,6 +33,7 @@
 #include "lv2/sys_spu.h"
 #include "lv2/syscalls.h"
 #include "lv2/sys_sync.h"
+#include "rsx/fifo_parser.h"
 #include "rsx/rsx_state.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -1398,6 +1401,237 @@ void testSpuAndSysmodule() {
   dal::resetLogOnce();
 }
 
+// In-memory command buffer: words are keyed by IO offset, unlisted offsets are unmapped.
+class FakeSink : public dal::RsxSink {
+ public:
+  bool readIo(std::uint32_t io, std::uint32_t& word) override {
+    const auto it = words.find(io);
+    if (it == words.end()) return false;
+    word = it->second;
+    return true;
+  }
+  bool write(std::uint32_t method, std::uint32_t value) override {
+    ++attempts;
+    if (refuse > 0) {
+      --refuse;
+      return false;
+    }
+    writes.emplace_back(method, value);
+    return true;
+  }
+  void put(std::uint32_t at, std::initializer_list<std::uint32_t> list) {
+    for (const std::uint32_t word : list) {
+      words[at] = word;
+      at += 4;
+    }
+  }
+
+  std::map<std::uint32_t, std::uint32_t> words;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> writes;
+  int refuse = 0;  // the next writes return false
+  int attempts = 0;
+};
+
+using Writes = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+void testFifoParser() {
+  using dal::FifoParser;
+  using dal::FifoStatus;
+  constexpr std::uint32_t kBase = 0x1000;
+
+  // Increment method: registers advance by 4 per argument. 0x4feac and 0x80064 are the headers
+  // the cellGcmSys flip functions write.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x1d6c | (3u << 18), 10, 11, 12, 0x4feac, 2, 0x80064, 0x50, 0x77});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 36, 100, sink) == FifoStatus::Idle);
+    CHECK(get == kBase + 36);
+    CHECK((sink.writes == Writes{{0x1d6c, 10}, {0x1d70, 11}, {0x1d74, 12}, {0xfeac, 2}, {0x64, 0x50}, {0x68, 0x77}}));
+    CHECK(parser.headersParsed() == 3);
+    CHECK(parser.run(get, kBase + 36, 100, sink) == FifoStatus::Idle && sink.writes.size() == 6);
+  }
+
+  // Non-increment method: every argument goes to the same register. The low bits of put are ignored.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x40000000u | 0x1800 | (3u << 18), 1, 2, 3, 0x1800 | (1u << 18), 9});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 24 + 3, 100, sink) == FifoStatus::Idle && get == kBase + 24);
+    CHECK((sink.writes == Writes{{0x1800, 1}, {0x1800, 2}, {0x1800, 3}, {0x1800, 9}}));
+  }
+
+  // The method register wraps at 16 bits.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0xfffcu | (2u << 18), 5, 6});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 12, 100, sink) == FifoStatus::Idle);
+    CHECK((sink.writes == Writes{{0xfffc, 5}, {0x0000, 6}}));
+  }
+
+  // NOPs: an all-zero word and a zero-count header of either kind write nothing.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0, 0x40000000u | 0x100, 0x100, 0x1800 | (1u << 18), 4});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 20, 100, sink) == FifoStatus::Idle);
+    CHECK((sink.writes == Writes{{0x1800, 4}}) && parser.headersParsed() == 1);
+  }
+
+  // Old and new jumps move get; put is only compared against get.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x20000000u | 0x2000});
+    sink.put(0x2000, {0x00003000u | 1});
+    sink.put(0x3000, {0x1800 | (1u << 18), 7});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, 0x3008, 100, sink) == FifoStatus::Idle && get == 0x3008);
+    CHECK((sink.writes == Writes{{0x1800, 7}}));
+  }
+
+  // A jump target is only validated when its word is read.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x20000000u | 0x1ffffffc});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, 0x40, 100, sink) == FifoStatus::Fault);  // 0x1ffffffc is unmapped
+    CHECK(get == 0x1ffffffc);
+  }
+
+  // Call and return: the return lands after the call word; the same call word can be reused.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x2000u | 2, 0x1800 | (1u << 18), 100, 0x2000u | 2});
+    sink.put(0x2000, {0x1800 | (1u << 18), 200, 0x00020000});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 16, 100, sink) == FifoStatus::Idle && get == kBase + 16);
+    CHECK((sink.writes == Writes{{0x1800, 200}, {0x1800, 100}, {0x1800, 200}}));
+  }
+
+  // A call inside a subroutine and a return without a call are faults that leave get on the word.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x2000u | 2});
+    sink.put(0x2000, {0x3000u | 2});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, 0x4000, 100, sink) == FifoStatus::Fault);
+    CHECK(get == 0x2000 && parser.lastFault().find("inside a subroutine") != std::string_view::npos);
+    CHECK(parser.run(get, 0x4000, 100, sink) == FifoStatus::Fault && get == 0x2000);  // sticky
+    parser.reset();
+    CHECK(parser.lastFault().empty());
+    get = kBase;
+    CHECK(parser.run(get, 0x4000, 100, sink) == FifoStatus::Fault && get == 0x2000);  // the nested call again
+
+    FakeSink sink2;
+    FifoParser parser2;
+    sink2.put(kBase, {0x00020000});
+    get = kBase;
+    CHECK(parser2.run(get, kBase + 4, 100, sink2) == FifoStatus::Fault && get == kBase);
+    CHECK(parser2.lastFault().find("without a call") != std::string_view::npos);
+  }
+
+  // Headers that are neither a method nor flow control: no write, get stays on the header.
+  for (const std::uint32_t bad : {0x80000000u, 0xa0001800u | (1u << 18), 0x00010000u, 0x00030000u, 0x00060000u,
+                                  0x60000000u | 0x1800}) {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x1800 | (1u << 18), 1, bad});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 12, 100, sink) == FifoStatus::Fault);
+    CHECK(get == kBase + 8 && sink.writes.size() == 1);
+    CHECK(parser.lastFault().find("invalid header") != std::string_view::npos);
+  }
+
+  // Unaligned get.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    std::uint32_t get = kBase + 2;
+    CHECK(parser.run(get, kBase + 16, 100, sink) == FifoStatus::Fault && get == kBase + 2);
+  }
+
+  // A refused write stops with Waiting and the next run retries the same write before reading on.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x68 | (2u << 18), 0x11, 0x22, 0x1800 | (1u << 18), 3});
+    sink.refuse = 2;
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 20, 100, sink) == FifoStatus::Waiting);
+    CHECK(get == kBase + 8 && sink.writes.empty());  // the argument is consumed, the write is kept
+    CHECK(parser.run(get, kBase + 20, 100, sink) == FifoStatus::Waiting && sink.attempts == 2);
+    CHECK(parser.run(get, kBase + 20, 100, sink) == FifoStatus::Idle && get == kBase + 20);
+    CHECK((sink.writes == Writes{{0x68, 0x11}, {0x6c, 0x22}, {0x1800, 3}}));
+    CHECK(sink.attempts == 5);
+  }
+
+  // Budget counts words read; the method register keeps advancing across runs.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x1d6c | (5u << 18), 1, 2, 3, 4, 5, 0x1800 | (1u << 18), 6});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 32, 3, sink) == FifoStatus::Budget && get == kBase + 12);
+    CHECK((sink.writes == Writes{{0x1d6c, 1}, {0x1d70, 2}}));
+    CHECK(parser.run(get, kBase + 32, 100, sink) == FifoStatus::Idle && get == kBase + 32);
+    CHECK((sink.writes == Writes{{0x1d6c, 1}, {0x1d70, 2}, {0x1d74, 3}, {0x1d78, 4}, {0x1d7c, 5}, {0x1800, 6}}));
+    CHECK(parser.run(get, kBase + 32, 0, sink) == FifoStatus::Idle);  // nothing left: Idle wins over Budget
+    sink.put(kBase + 32, {0x1800 | (1u << 18), 8});
+    CHECK(parser.run(get, kBase + 40, 0, sink) == FifoStatus::Budget && get == kBase + 32);
+  }
+
+  // put in the middle of a method: Idle with the arguments still owed, then it resumes.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0x1d6c | (3u << 18), 1, 2, 3});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 8, 100, sink) == FifoStatus::Idle && get == kBase + 8);
+    CHECK((sink.writes == Writes{{0x1d6c, 1}}));
+    CHECK(parser.run(get, kBase + 16, 100, sink) == FifoStatus::Idle && get == kBase + 16);
+    CHECK((sink.writes == Writes{{0x1d6c, 1}, {0x1d70, 2}, {0x1d74, 3}}));
+  }
+
+  // Unmapped reads: get stays on the unreadable word, the fault is sticky.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    std::uint32_t get = 0x5000;
+    CHECK(parser.run(get, 0x5010, 100, sink) == FifoStatus::Fault && get == 0x5000);
+    CHECK(parser.lastFault().find("unmapped") != std::string_view::npos);
+
+    FakeSink sink2;
+    FifoParser parser2;
+    sink2.put(kBase, {0x1800 | (2u << 18), 1});  // the second argument is unmapped
+    get = kBase;
+    CHECK(parser2.run(get, kBase + 12, 100, sink2) == FifoStatus::Fault && get == kBase + 8);
+    CHECK((sink2.writes == Writes{{0x1800, 1}}));
+  }
+
+  // Jumping to itself parks the puller as Idle without moving get; rewriting the word resumes.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.put(kBase, {0, 0x20000000u | (kBase + 4)});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, 0x9000, 100, sink) == FifoStatus::Idle && get == kBase + 4);
+    CHECK(parser.run(get, 0x9000, 100, sink) == FifoStatus::Idle && get == kBase + 4);
+    sink.put(kBase + 4, {0x1800 | (1u << 18), 5, 0x00000001u | 0x4000});
+    sink.put(0x4000, {0x1800 | (1u << 18), 6});
+    CHECK(parser.run(get, 0x4008, 100, sink) == FifoStatus::Idle && get == 0x4008);
+    CHECK((sink.writes == Writes{{0x1800, 5}, {0x1800, 6}}));
+  }
+}
+
 void testCellGcmSys() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -2488,6 +2722,7 @@ int main(int argc, char** argv) {
   testSpuAndSysmodule();
   testSpurs();
   testCellGcmSys();
+  testFifoParser();
   testLwmutex();
   testPpuThreads();
   testTimebase();
