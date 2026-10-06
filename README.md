@@ -9,7 +9,7 @@ output is written to ignored directories.
 
 Current state: build scaffold, a small runtime stub, and analysis tools for the PPU
 executable (ELF summary, SPU probe, disassembler, Ghidra cross-check, NID and syscall name
-tables). Recompilation itself is not implemented yet.
+tables, function recovery). Recompilation itself is not implemented yet.
 
 ## Prerequisites
 
@@ -19,7 +19,8 @@ tables). Recompilation itself is not implemented yet.
 - CMake 3.29 or newer
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
-- Optional, for `ghidra-export` only: Ghidra 12.x and a JDK 21 (see below)
+- Optional, for `ghidra-export` only: Ghidra 12.x and a JDK 21 (see below). `recover` does
+  not need Ghidra, because the Ghidra results it uses are committed.
 - Optional, for `nidgen` only: git and a sparse checkout of the RPCS3 sources (see below)
 
 ## Obtaining `EBOOT.elf`
@@ -62,15 +63,17 @@ pwsh -NoProfile -File tools/build.ps1 -Preset release -Test -EbootElf game/EBOOT
 
 ## Analysis tools
 
-`tools/ps3tool.py` has six subcommands. Each takes the path to the decrypted ELF, except
+`tools/ps3tool.py` has eight subcommands. Each takes the path to the decrypted ELF, except
 `nidgen`, which reads an RPCS3 checkout.
 
 ```sh
 python tools/ps3tool.py info   <elf> [-o OUTPUT] [--target-config FILE] [--nids FILE] [--no-verify]
 python tools/ps3tool.py probe  <elf> [-o OUTPUT] [--syscalls FILE]
 python tools/ps3tool.py disasm <elf> (--start ADDR (--count N | --end ADDR) | --entry [--count N] | --stats [--start ADDR --end ADDR] [--json OUT]) [--raw] [--strict]
-python tools/ps3tool.py ghidra-export <elf> [--ghidra-dir DIR] [--language ID] [--cspec ID] [--project-dir DIR] [-o OUT] [--start ADDR] [--end ADDR] [--timeout SEC] [--check-only]
+python tools/ps3tool.py ghidra-export <elf> [--ghidra-dir DIR] [--language ID] [--cspec ID] [--project-dir DIR] [-o OUT] [--start ADDR] [--end ADDR] [--timeout SEC] [--seeds-file PATH] [--check-only]
 python tools/ps3tool.py ghidra-diff   <elf> --ghidra JSON [--start ADDR] [--end ADDR] [--strict] [-o OUT] [--top N] [--examples K]
+python tools/ps3tool.py ghidra-summary <elf> --ghidra JSON [-o OUT]
+python tools/ps3tool.py recover <elf> [--ghidra-summary PATH | --no-ghidra] [--extra-seeds PATH] [--nids FILE] [--syscalls FILE] [-o OUT] [--report PATH] [--seeds-out PATH] [--prologue-seeds] [--max-rounds N]
 python tools/ps3tool.py nidgen --rpcs3 DIR [--source-commit COMMIT] [--nids-out FILE] [--syscalls-out FILE]
 ```
 
@@ -95,6 +98,7 @@ python tools/ps3tool.py nidgen --rpcs3 DIR [--source-commit COMMIT] [--nids-out 
   checking and which mnemonics are rejected most often. `--json OUT` also writes the
   statistics as JSON.
 - `ghidra-export` and `ghidra-diff` cross-check the decoder against Ghidra; see below.
+- `ghidra-summary` and `recover` find and delimit functions; see "Function recovery".
 - `nidgen` builds the name tables from RPCS3 sources; see below.
 
 Run `python tools/ps3tool.py <command> --help` for the full option list.
@@ -119,7 +123,9 @@ python tools/ps3tool.py ghidra-diff   <elf> --ghidra generated/ghidra/eboot_ghid
 
 - `ghidra-export` imports the ELF with language `PowerPC:BE:64:A2ALT-32addr` (override with
   `--language` and `--cspec`), runs auto-analysis, and exports the range given by
-  `--start`/`--end` (default: the largest executable section). Analysis of the real
+  `--start`/`--end` (default: the largest executable section). Ghidra is seeded with the
+  entry point and the exported functions; `--seeds-file` adds more starts (see "Feeding
+  recovered starts back to Ghidra"). Analysis of the real
   executable takes under a minute and is cut off after `--timeout` seconds (default 3600).
   The tool then checks that Ghidra decodes a few probe instructions (including AltiVec
   ones) as expected, so a wrong language setting is reported. `--check-only` skips Ghidra
@@ -145,6 +151,141 @@ python tools/ps3tool.py ghidra-diff   <elf> --ghidra generated/ghidra/eboot_ghid
 - `--strict` makes `ghidra-diff` decode with reserved-bit checking, as `disasm --strict`
   does. Words that have reserved bits set then count as unknown to this decoder, so the
   category counts change accordingly.
+
+## Function recovery
+
+Function recovery uses Ghidra for function starts and data references, and this
+repository's own decoder for function extents. Ghidra truncates some functions at the
+Cell-only vector load/store instructions (`lvlx`, `lvrx`, `stvlx`, `stvrx` and their `l`
+variants) that it cannot decode, so `recover` re-derives every function body itself from the
+seeds. It also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
+numbers over the recovered control-flow graph and reports coverage.
+
+### Commands
+
+```sh
+python tools/ps3tool.py ghidra-export  <elf>
+python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra.json -o config/ghidra_summary.json
+python tools/ps3tool.py recover        <elf> -o config/functions.json
+```
+
+- `ghidra-summary` reduces the large `ghidra-export` JSON to a small file: function starts,
+  names (only non-default ones), bodies, references from data into `.text`, Ghidra's code and
+  data ranges, and the `bctr` sites. It records the SHA-256 of the ELF, the `.text` range and
+  the Ghidra version and language, and prints a count for each kind of entry. The summary
+  contains addresses and names only, never instruction words.
+- `recover` needs no Ghidra installation. It reads the committed summary
+  (`--ghidra-summary`, default `config/ghidra_summary.json`) and combines it with its own
+  seeds: `bl` targets, function-descriptor (OPD) entries, the entry point, exports and
+  extra seeds. It then partitions `.text` into functions until the set of functions no
+  longer changes. It writes the function database (`-o`, default
+  `generated/analysis/functions.json`), a report (`--report`, default
+  `generated/analysis/recovery_report.json`) and the list of recovered starts that Ghidra
+  lacks (`--seeds-out`, default `generated/analysis/ghidra_seeds.txt`).
+- `--no-ghidra` runs `recover` without a summary, from the ELF's own seeds only. Without
+  it, a missing default summary is an error that points at `ghidra-summary` and
+  `--no-ghidra`.
+- `--prologue-seeds` additionally seeds code that looks like a function prologue after a
+  flow boundary. It is off by default; the report counts such candidates either way.
+- `--max-rounds N` limits the partition rounds (default 64).
+- `--nids` and `--syscalls` select the name tables (default: the committed ones).
+
+`recover` exits with 4 if the summary does not match the ELF's hash or `.text` range, and
+with 8 if the partition does not converge within `--max-rounds`. In the second case the
+function database is not written.
+
+### Extra seeds
+
+`config/extra_seeds.json` lists function starts that neither Ghidra nor the `bl` scan
+provides:
+
+```json
+{"schema": 1, "seeds": [{"addr": "0x000cc194", "reason": "..."}]}
+```
+
+`reason` is a free-text justification. `recover` reads the file by default when it exists
+(`--extra-seeds PATH` selects another one, which must exist). The entries are counted as
+`manual` seeds. Two kinds of reason occur in the committed file:
+
+- a hand-written explanation, for a start that Ghidra missed and that would otherwise be
+  absorbed into the body of a neighbouring function;
+- `ghidra-feedback`, for starts that Ghidra reported only after being given the recovered
+  starts (see below).
+
+### Feeding recovered starts back to Ghidra
+
+`recover` writes the starts it found that Ghidra's summary lacks to `--seeds-out`. Passing
+that file to `ghidra-export --seeds-file` seeds a second Ghidra run with them. The file
+holds one hex address per line; blank lines and `#` comments are ignored. The seeded run
+needs its own project directory and output file so that the base export is left alone:
+
+```sh
+python tools/ps3tool.py ghidra-export  <elf> --seeds-file generated/analysis/ghidra_seeds.txt --project-dir generated/ghidra/project_seeded -o generated/ghidra/eboot_ghidra_seeded.json
+python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra_seeded.json -o generated/ghidra/summary_seeded.json
+python tools/ps3tool.py recover        <elf> --ghidra-summary generated/ghidra/summary_seeded.json -o generated/analysis/functions_seeded.json --report generated/analysis/recovery_report_seeded.json
+```
+
+Function entries in the seeded summary that are missing from `config/functions.json` are
+candidates for `config/extra_seeds.json` with the reason `ghidra-feedback`. The committed
+`config/ghidra_summary.json` always comes from the base export (entry point and exports as
+the only seeds), so it does not depend on an earlier recovery run.
+
+### Committed files and regeneration
+
+| File | Produced by | Notes |
+| --- | --- | --- |
+| `config/ghidra_summary.json` | `ghidra-summary` on the base `ghidra-export` | Needs Ghidra and the ELF; regenerate when the Ghidra version, language setting or base seeding changes |
+| `config/extra_seeds.json` | by hand, or from the feedback run | Small and reviewable; edit it directly |
+| `config/functions.json` | `recover -o config/functions.json` | Input for later stages; needs only the ELF and the files above |
+
+None of them contains instruction words or other code bytes. `generated/` is not committed:
+the exports, the seeded export and the report stay local.
+
+Run `recover -o config/functions.json` again whenever the recovery code, the summary, the
+extra seeds or the name tables change. Two runs on the same inputs write byte-identical
+files, so `git diff config/` shows exactly what the change affected. To rebuild all three
+from scratch:
+
+```sh
+python tools/ps3tool.py ghidra-export  <elf>
+python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra.json -o config/ghidra_summary.json
+python tools/ps3tool.py recover        <elf> -o config/functions.json
+```
+
+### Function database
+
+`config/functions.json` contains:
+
+- `input`: the ELF SHA-256, the summary SHA-256 (`null` with `--no-ghidra`) and the number
+  of extra seeds;
+- `text` and `toc`: the `.text` range and the TOC base;
+- `functions`: for each function its entry, a name (Ghidra's non-default name, otherwise
+  `null`), the sources that found it (`bl`, `ghidra`, `ghidra_data_ref`, `opd`, `entry`,
+  `manual`, and `prologue` with `--prologue-seeds`) and its address ranges;
+- `import_thunks`: the import stubs, with module, FNID, resolved name and the slot they
+  load from;
+- `jump_tables`: resolved `bctr` tables with their branch site, table address, entry kind
+  and targets;
+- `unresolved_indirect`: indirect branches that were not resolved, each with a reason.
+
+### Report
+
+The report is JSON; the same information is summarised on stdout, one line per topic. Its
+top-level sections:
+
+| Section | Contents |
+| --- | --- |
+| `seeds` | Seed counts per source and the rejected candidates with reasons |
+| `thunks` | Import thunk count, slot mismatches, thunks that no `bl` reaches |
+| `jump_tables` | `bctr` sites, resolved tables and targets, unresolved sites by reason |
+| `partition` | Rounds, convergence, functions by source, promoted shared code, tail-edge kinds, invalid flow, rejected calls, external targets, functions seeded only by an unowned `bl` |
+| `coverage` | Words owned and not owned in `.text`; uncovered runs classified as `zero`, `padding`, `jump_table`, `data` or `code`; prologue candidates by position |
+| `ghidra` | Function extents compared with Ghidra's (`equal`, `ours_larger`, `ours_smaller`, `different`, `missing`), Ghidra functions cut at Cell-only vector instructions and whether ours extend past them, Ghidra code not owned by any function, data references by target class, Ghidra starts reached only by branches |
+| `syscalls` | `sc` sites and the lv2 number resolved at each by walking the CFG back to the `r11` load, unresolved sites with reasons, and disagreements with `probe` |
+
+Lists in the report are capped unless the field is documented as complete. `coverage`,
+`ghidra` and `syscalls` are only present when the partition converged, and `ghidra` is
+absent with `--no-ghidra`.
 
 ## NID and syscall name tables
 
@@ -176,7 +317,8 @@ status if the syscall table disagrees with its own comments.
 Python unit tests use synthetic ELF files built in memory. Tests that need the real
 executable are skipped unless `DAL_EBOOT_ELF` points at it. The Ghidra comparison tests
 additionally need `DAL_GHIDRA_JSON`, the path of an export written by `ghidra-export`, and
-are skipped without it. The tests never run Ghidra themselves.
+are skipped without it. The tests never run Ghidra themselves. The tests of `recover` that
+use the real executable also need `DAL_EBOOT_ELF`.
 
 ```sh
 python -m unittest discover -s tools/tests -t tools -v
@@ -199,11 +341,12 @@ results are only trusted for the expected build.
 | `runtime/` | Runtime library and executable stub (`dal_runtime`) |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
-| `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export and diff, name table generator |
+| `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |
 | `tools/ghidra/` | Java `GhidraScript`s run by `ghidra-export` |
 | `tools/tests/` | Unit tests |
 | `config/target.json` | Pinned size and hashes of the target executable |
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |
+| `config/ghidra_summary.json`, `config/extra_seeds.json`, `config/functions.json` | Ghidra summary, extra function starts and the recovered function database; see "Function recovery" |
 | `generated/` | Tool output (git-ignored) |
 | `build/` | Build output (git-ignored) |
 | `game/` | Suggested place for your own `EBOOT.elf` (git-ignored) |
