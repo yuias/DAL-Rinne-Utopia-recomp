@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "dal/ppu_context.h"
 
@@ -50,6 +51,9 @@ struct GuestThreadParams {
   std::uint32_t stack_size = 0;
   std::uint32_t tls_r13 = 0;
   bool joinable = false;
+  // A runtime-internal thread (for example the GCM interrupt thread): it does not count toward
+  // stall detection or toward "guest threads left".
+  bool service = false;
   std::string name;
 };
 
@@ -72,6 +76,7 @@ class GuestThread {
   std::uint32_t tlsR13() const { return tls_r13_; }
   std::uint32_t entryOpd() const { return entry_opd_; }
   bool joinable() const { return joinable_; }
+  bool service() const { return service_; }
   std::uint64_t exitValue() const { return exit_value_; }
   void setExitValue(std::uint64_t value) { exit_value_ = value; }
 
@@ -95,6 +100,7 @@ class GuestThread {
   std::int32_t priority_;
   std::uint32_t stack_addr_, stack_size_, tls_r13_, entry_opd_;
   bool joinable_;
+  bool service_;
   std::uint64_t exit_value_ = 0;
   std::atomic<ThreadState> state_{ThreadState::Created};
   std::atomic<const char*> blocked_in_{nullptr};
@@ -148,6 +154,22 @@ bool blockingWait(std::condition_variable_any& cv, Pred done, const char* what,
   blockLeave(thread);
   return satisfied;
 }
+
+// What the supervisor needs to know about one thread.
+struct ThreadHealth {
+  ThreadState state = ThreadState::Running;
+  bool indefinite_wait = false;
+  std::int64_t blocked_since_ms = 0;
+  bool service = false;
+};
+
+enum class ThreadVerdict { Ok, NoThreads, Stall };
+
+// The supervisor's decision: no live non-service thread, or every live non-service thread in an
+// indefinite wait for at least two seconds at `now_ms`. `stalled`, when given, receives the count of
+// stalled threads.
+ThreadVerdict judgeThreads(const std::vector<ThreadHealth>& threads, std::int64_t now_ms,
+                           std::size_t* stalled = nullptr);
 
 // Runs on the host main thread after boot and never returns: every 100 ms it checks the watchdog
 // (`seconds`, 0 = off), a stall (every live thread in an indefinite wait for 2 s) and the absence

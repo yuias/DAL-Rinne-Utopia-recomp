@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +35,7 @@
 #include "lv2/syscalls.h"
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
+#include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
 
@@ -1640,6 +1642,13 @@ dal::RsxCensus fakeRsxCensus() {
   return {120, 3, {{0x1d6c, 5, "NV4097_SET_SEMAPHORE_OFFSET"}, {0x1808, 9, ""}, {0x1800, 5, ""}}};
 }
 
+dal::RsxCensus fakeRsxCensusWithHandlerCalls() {
+  dal::RsxCensus census = fakeRsxCensus();
+  census.vblank_handler_runs = 600;
+  census.user_handler_runs = 2;
+  return census;
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -1783,6 +1792,11 @@ void testRsxConsumer() {
                   "  method 0x1808: 9\n"
                   "  method 0x1800: 5\n"
                   "  method 0x1d6c NV4097_SET_SEMAPHORE_OFFSET: 5\n") != std::string::npos);
+  CHECK(text.find("interrupt handler calls") == std::string::npos);
+  dal::setRsxCensusProvider(&fakeRsxCensusWithHandlerCalls);
+  CHECK(dal::formatCensus().find("census: rsx 120 headers, 3 distinct methods, 3 flips\n"
+                                 "  interrupt handler calls: vblank 600, flip 0, user 2\n"
+                                 "  method 0x1808: 9\n") != std::string::npos);
 
   dal::setRsxInterruptHook(nullptr);
   dal::resetRsxState();
@@ -2527,6 +2541,145 @@ void testPpuThreads() {
   dal::resetCensus();
 }
 
+struct HandlerCall {
+  char tag;
+  std::uint64_t r3;
+  bool on_service_thread;
+};
+std::vector<HandlerCall> g_handler_calls;  // written under the guest lock
+std::condition_variable_any g_handler_cv;
+
+void recordHandlerCall(char tag, DalPpuContext* ctx) {
+  const dal::GuestThread* thread = dal::currentThread();
+  g_handler_calls.push_back({tag, ctx->gpr[3],
+                             thread != nullptr && thread->service() && thread->name() == "_gcm_intr_thread" &&
+                                 ctx->gpr[13] == thread->tlsR13() && ctx->gpr[13] != 0});
+  g_handler_cv.notify_all();
+}
+
+DAL_PPU_FUNC(gcmVblankHandler) {
+  (void)base;
+  recordHandlerCall('v', ctx);
+}
+
+DAL_PPU_FUNC(gcmUserHandler) {
+  (void)base;
+  recordHandlerCall('u', ctx);
+}
+
+// Waits with the guest lock released until `done` holds; false after five seconds.
+template <class Pred>
+bool waitUntil(Pred done) {
+  return dal::blockingWait(g_handler_cv, done, "test wait", std::chrono::seconds(5));
+}
+
+// Lets other guest threads run for a moment.
+void pauseUnlocked() {
+  std::condition_variable_any cv;
+  dal::blockingWait(cv, [] { return false; }, "test pause", std::chrono::milliseconds(2));
+}
+
+void testGcmInterruptThread() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::resetRsxState();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t opd_vblank = scratch, opd_user = scratch + 0x10, tls_image = scratch + 0x100;
+  const DalFuncMapping mappings[] = {{0x10400, gcmVblankHandler}, {0x10410, gcmUserHandler}};
+  dalRegisterFuncs(mappings, 2);
+  dalWrite32(base, opd_vblank, 0x10400);
+  dalWrite32(base, opd_vblank + 4, 0x5555);
+  dalWrite32(base, opd_user, 0x10410);
+  dalWrite32(base, opd_user + 4, 0x6666);
+  g_handler_calls.clear();
+
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+
+  dal::RsxState& state = dal::rsxState();
+  state.vblank_handler = opd_vblank;
+  state.user_handler = opd_user;  // the flip handler stays unset, like the game's
+
+  const std::uint32_t id = dal::startGcmInterruptThread();
+  CHECK(id != 0 && dal::startGcmInterruptThread() == id);
+  const dal::GuestThread* thread = dal::findThread(id);
+  CHECK(thread != nullptr && thread->service() && thread->name() == "_gcm_intr_thread");
+  CHECK(thread != nullptr && thread->priority() == 1 && thread->stackSize() == 0x4000);
+
+  // The thread cannot run while this test holds the guest lock, so everything below queues up:
+  // user commands and flips are all delivered in order, vblanks coalesce, a missing handler drops.
+  dal::postGcmInterrupt(dal::RsxInterrupt::User, 7);
+  dal::postGcmInterrupt(dal::RsxInterrupt::VBlank, 1);
+  dal::postGcmInterrupt(dal::RsxInterrupt::VBlank, 1);
+  dal::postGcmInterrupt(dal::RsxInterrupt::Flip, 1);  // no flip handler
+  dal::postGcmInterrupt(dal::RsxInterrupt::User, 8);
+  dal::postGcmInterrupt(dal::RsxInterrupt::VBlank, 1);
+  CHECK(waitUntil([] { return g_handler_calls.size() >= 3; }));
+  CHECK(g_handler_calls.size() == 3);
+  if (g_handler_calls.size() == 3) {
+    CHECK(g_handler_calls[0].tag == 'u' && g_handler_calls[0].r3 == 7);
+    CHECK(g_handler_calls[1].tag == 'v' && g_handler_calls[1].r3 == 1);
+    CHECK(g_handler_calls[2].tag == 'u' && g_handler_calls[2].r3 == 8);
+    CHECK(g_handler_calls[0].on_service_thread && g_handler_calls[1].on_service_thread);
+  }
+
+  // Once the queue is empty a new tick is accepted again, and the thread idles as a service thread.
+  dal::postGcmInterrupt(dal::RsxInterrupt::VBlank, 1);
+  CHECK(waitUntil([] { return g_handler_calls.size() >= 4; }));
+  for (int i = 0; i < 2500 && thread->state() != dal::ThreadState::Blocked; i++) pauseUnlocked();
+  CHECK(thread->state() == dal::ThreadState::Blocked);
+  const dal::GcmInterruptCounts counts = dal::gcmInterruptCounts();
+  CHECK(counts.vblank == 2 && counts.flip == 0 && counts.user == 2);
+  CHECK(dal::formatCensus().find("_gcm_intr_thread: blocked in gcm interrupt wait [service]") !=
+        std::string::npos);
+
+  dal::stopGcmInterruptThread();
+  CHECK(thread->state() == dal::ThreadState::Exited);
+  CHECK(dal::gcmInterruptCounts().vblank == 0);
+
+  dalRegisterFuncs(nullptr, 0);
+  dal::resetHostFunctions();
+  dal::resetRsxState();
+  dal::resetSyncObjects();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+void testJudgeThreads() {
+  using dal::ThreadHealth;
+  using dal::ThreadState;
+  using dal::ThreadVerdict;
+  const auto stalled = [](bool service) {
+    return ThreadHealth{ThreadState::Blocked, true, 0, service};
+  };
+  const ThreadHealth running{ThreadState::Running, false, 0, false};
+  const ThreadHealth exited{ThreadState::Exited, false, 0, false};
+  std::size_t count = 0;
+
+  // Blocked for under two seconds is not a stall.
+  CHECK(dal::judgeThreads({ThreadHealth{ThreadState::Blocked, true, 9000, false}}, 10000) == ThreadVerdict::Ok);
+  CHECK(dal::judgeThreads({stalled(false)}, 10000, &count) == ThreadVerdict::Stall && count == 1);
+  // A timed wait never counts.
+  CHECK(dal::judgeThreads({ThreadHealth{ThreadState::Blocked, false, 0, false}}, 10000) == ThreadVerdict::Ok);
+  // A service thread, however it waits, neither keeps the process alive nor hides a stall.
+  const ThreadHealth running_service{ThreadState::Running, false, 0, true};
+  CHECK(dal::judgeThreads({stalled(false), running_service}, 10000) == ThreadVerdict::Stall);
+  CHECK(dal::judgeThreads({stalled(false), stalled(true)}, 10000, &count) == ThreadVerdict::Stall && count == 1);
+  CHECK(dal::judgeThreads({stalled(false), running}, 10000) == ThreadVerdict::Ok);
+  CHECK(dal::judgeThreads({exited, stalled(true)}, 10000) == ThreadVerdict::NoThreads);
+  CHECK(dal::judgeThreads({}, 10000) == ThreadVerdict::NoThreads);
+}
+
 // Waiters get the lock in the order they queued, whatever the host scheduler does.
 void testGuestLockFifo() {
   dal::GuestLock lock;
@@ -2887,6 +3040,8 @@ int main(int argc, char** argv) {
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();
+  testGcmInterruptThread();
+  testJudgeThreads();
   testTimebase();
   testGuestLockFifo();
   testReservationAndDcbz();

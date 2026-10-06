@@ -22,6 +22,7 @@
 #include "lv2/cell_error.h"
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
+#include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
 
@@ -174,8 +175,12 @@ void gcmCallback(DalPpuContext* ctx, std::uint8_t* base) {
 void gcmInitBodyHandler(DalPpuContext* ctx, std::uint8_t* base) {
   const std::uint32_t result =
       gcmInitBody(base, argU32(ctx, 0), argU32(ctx, 1), argU32(ctx, 2), argU32(ctx, 3), kRsxLocalSize);
-  // Only the import starts the consumer: tests call gcmInitBody and drive the control register by hand.
-  if (result == kCellOk) startRsxThread(base);
+  // Only the import starts the interrupt thread and the consumer: tests call gcmInitBody and drive
+  // the control register by hand. The hook must exist before the consumer can raise an interrupt.
+  if (result == kCellOk) {
+    startGcmInterruptThread();
+    startRsxThread(base);
+  }
   setResultCode(ctx, result);
 }
 

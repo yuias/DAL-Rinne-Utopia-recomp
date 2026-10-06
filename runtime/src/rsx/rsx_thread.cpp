@@ -17,6 +17,7 @@
 #include "core/log.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
+#include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_state.h"
 
 namespace dal {
@@ -346,7 +347,14 @@ namespace {
 
 RsxConsumer* g_consumer = nullptr;
 
-RsxCensus consumerCensus() { return g_consumer != nullptr ? g_consumer->census() : RsxCensus{}; }
+RsxCensus consumerCensus() {
+  RsxCensus result = g_consumer != nullptr ? g_consumer->census() : RsxCensus{};
+  const GcmInterruptCounts calls = gcmInterruptCounts();
+  result.vblank_handler_runs = calls.vblank;
+  result.flip_handler_runs = calls.flip;
+  result.user_handler_runs = calls.user;
+  return result;
+}
 
 // A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
 // system tick and make the VBlank rate irregular.

@@ -200,6 +200,10 @@ std::string formatCensus() {
     });
     out += std::format("\ncensus: rsx {} headers, {} distinct methods, {} flips", rsx.headers,
                        rsx.methods.size(), rsx.flips);
+    if (rsx.vblank_handler_runs + rsx.flip_handler_runs + rsx.user_handler_runs != 0) {
+      out += std::format("\n  interrupt handler calls: vblank {}, flip {}, user {}", rsx.vblank_handler_runs,
+                         rsx.flip_handler_runs, rsx.user_handler_runs);
+    }
     for (const RsxMethodCount& m : rsx.methods) {
       out += std::format("\n  method {:#x}{}{}: {}", m.method, m.name.empty() ? "" : " ", m.name, m.count);
     }

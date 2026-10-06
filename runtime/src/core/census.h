@@ -54,6 +54,8 @@ struct RsxCensus {
   std::uint64_t headers = 0;
   std::uint64_t flips = 0;
   std::vector<RsxMethodCount> methods;
+  // Guest interrupt handler calls made by the interrupt thread; the line is printed once any ran.
+  std::uint64_t vblank_handler_runs = 0, flip_handler_runs = 0, user_handler_runs = 0;
 };
 
 // Registered by the RSX consumer; the section is printed only while a provider is set. The provider

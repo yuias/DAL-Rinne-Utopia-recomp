@@ -79,6 +79,7 @@ std::vector<ThreadCensusEntry> threadCensus() {
         entry.state = ThreadCensusEntry::State::Blocked;
         const char* what = t->blockedIn();
         entry.blocked_in = what != nullptr ? what : "?";
+        if (t->service()) entry.blocked_in += " [service]";
         break;
       }
       case ThreadState::Exited:
@@ -90,13 +91,10 @@ std::vector<ThreadCensusEntry> threadCensus() {
   return out;
 }
 
+// Cheap and idempotent: repeating it re-registers the census provider after a resetCensus.
 void installThreadHooks() {
-  static const bool installed = [] {
-    setGuestThreadIdProvider(&currentThreadId);
-    setThreadCensusProvider(&threadCensus);
-    return true;
-  }();
-  (void)installed;
+  setGuestThreadIdProvider(&currentThreadId);
+  setThreadCensusProvider(&threadCensus);
 }
 
 // RPCS3 fills the lowest and the highest page of every stack allocation with these strings (`vm.cpp`
@@ -176,7 +174,8 @@ GuestThread::GuestThread(std::uint32_t id, const GuestThreadParams& params,
       stack_size_(stack_size),
       tls_r13_(params.tls_r13),
       entry_opd_(params.entry_opd),
-      joinable_(params.joinable) {
+      joinable_(params.joinable),
+      service_(params.service) {
   context_.vscr_nj = 1;
   context_.preempt_budget = kDalPreemptBudget;
   context_.runtime = this;
@@ -287,24 +286,37 @@ void runSupervisor(std::uint32_t seconds) {
       stopProcess(ExitCode::Watchdog, std::format("dal: stop: watchdog {} s", seconds));
     }
 
-    std::size_t live = 0, stalled = 0;
-    const std::int64_t now = steadyMs();
+    std::vector<ThreadHealth> health;
     for (GuestThread* t : snapshotThreads()) {
-      const ThreadState state = t->state();
-      if (state == ThreadState::Exited) continue;
-      live++;
-      if (state == ThreadState::Blocked && t->indefiniteWait() &&
-          now - t->blockedSinceMs() >= kStallMs) {
-        stalled++;
-      }
+      health.push_back({t->state(), t->indefiniteWait(), t->blockedSinceMs(), t->service()});
     }
-    if (live == 0) {
-      stopProcess(ExitCode::NoThreads, "dal: stop: no guest threads left");
-    }
-    if (stalled == live) {
-      stopProcess(ExitCode::Stall, std::format("dal: stop: stall ({} threads blocked)", stalled));
+    std::size_t stalled = 0;
+    switch (judgeThreads(health, steadyMs(), &stalled)) {
+      case ThreadVerdict::NoThreads:
+        stopProcess(ExitCode::NoThreads, "dal: stop: no guest threads left");
+        break;
+      case ThreadVerdict::Stall:
+        stopProcess(ExitCode::Stall, std::format("dal: stop: stall ({} threads blocked)", stalled));
+        break;
+      case ThreadVerdict::Ok:
+        break;
     }
   }
+}
+
+ThreadVerdict judgeThreads(const std::vector<ThreadHealth>& threads, std::int64_t now_ms,
+                           std::size_t* stalled_out) {
+  std::size_t live = 0, stalled = 0;
+  for (const ThreadHealth& t : threads) {
+    if (t.state == ThreadState::Exited || t.service) continue;
+    live++;
+    if (t.state == ThreadState::Blocked && t.indefinite_wait && now_ms - t.blocked_since_ms >= kStallMs) {
+      stalled++;
+    }
+  }
+  if (stalled_out != nullptr) *stalled_out = stalled;
+  if (live == 0) return ThreadVerdict::NoThreads;
+  return stalled == live ? ThreadVerdict::Stall : ThreadVerdict::Ok;
 }
 
 }  // namespace dal
