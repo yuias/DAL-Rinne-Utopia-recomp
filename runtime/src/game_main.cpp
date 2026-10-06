@@ -29,6 +29,7 @@ struct Options {
   std::string elf;
   std::string hdd_dir;
   std::string sdata_cache;
+  std::string png_dump;
   std::string log_file;
   std::string dialog_answer;
   unsigned seconds = 0;
@@ -64,6 +65,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.hdd_dir)) return false;
     } else if (arg == "--sdata-cache") {
       if (!value(opt.sdata_cache)) return false;
+    } else if (arg == "--png-dump") {
+      if (!value(opt.png_dump)) return false;
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
     } else if (arg == "--dialog-answer") {
@@ -155,6 +158,11 @@ int main(int argc, char** argv) {
                                   : std::optional<std::filesystem::path>(opt.hdd_dir));
   if (!opt.sdata_cache.empty()) {
     dal::configureSdataCache(std::filesystem::path(opt.sdata_cache));
+  }
+
+  if (!opt.png_dump.empty()) {
+    std::filesystem::create_directories(opt.png_dump, ec);
+    dal::setPngDumpDirectory(std::filesystem::path(opt.png_dump));
   }
 
   loadGameParamSfo(game_dir);

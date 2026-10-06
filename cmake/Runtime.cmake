@@ -17,10 +17,22 @@ function(dal_runtime_add_spdlog)
     ${CMAKE_BINARY_DIR}/externals/spdlog EXCLUDE_FROM_ALL)
 endfunction()
 
+# lodepng is a two-file C++ library (lodepng.cpp/.h) that decodes and encodes PNG without zlib.
+# It compiles without the project's warning flags, like spdlog.
+function(dal_runtime_add_lodepng)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/lodepng/lodepng.cpp)
+    message(FATAL_ERROR
+      "DAL: externals/lodepng is missing or empty. Run: git submodule update --init")
+  endif()
+  add_library(lodepng STATIC ${CMAKE_SOURCE_DIR}/externals/lodepng/lodepng.cpp)
+  target_include_directories(lodepng PUBLIC ${CMAKE_SOURCE_DIR}/externals/lodepng)
+endfunction()
+
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
+  dal_runtime_add_lodepng()
 
   add_library(dal_runtime_core STATIC
     runtime/src/core/boot.cpp
@@ -38,6 +50,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/cell_gcm_sys.cpp
     runtime/src/hle/cell_msg_dialog.cpp
     runtime/src/hle/cell_pad.cpp
+    runtime/src/hle/cell_png_dec.cpp
     runtime/src/hle/cell_save_data.cpp
     runtime/src/hle/cell_spurs.cpp
     runtime/src/hle/cell_sysmodule.cpp
@@ -65,10 +78,13 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PUBLIC bcrypt)
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
+  # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
+  target_link_libraries(dal_runtime_core PRIVATE lodepng)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
   target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core)
+  # The tests build their PNG inputs with lodepng's encoder.
+  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core lodepng)
 
   add_test(NAME runtime_core COMMAND dal_runtime_tests)
   set_tests_properties(runtime_core PROPERTIES

@@ -5,8 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <filesystem>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -162,6 +164,17 @@ bool setPadBackend(std::string_view name);
 
 // Forgets the init state and restores the default provider. Intended for tests.
 void resetCellPad();
+
+// Handlers of the cellPngDec imports: Create, Destroy, ExtOpen, ExtReadHeader, ExtSetParameter,
+// ExtDecodeData and Close.
+std::span<const HleEntry> cellPngDecHandlers();
+
+// Writes every image cellPngDec decodes to `<dir>/png_<n>.png` (re-encoded as 8-bit RGBA), for
+// inspecting what the guest was given. nullopt (the default) writes nothing.
+void setPngDumpDirectory(std::optional<std::filesystem::path> dir);
+
+// Forgets the open handles and streams and the dump counter. Intended for tests.
+void resetCellPngDec();
 
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();

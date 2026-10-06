@@ -1,5 +1,6 @@
 // Self-checking unit tests for the runtime core library. No generated code is involved.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -32,6 +33,7 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "lodepng.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_ppu_thread.h"
 #include "lv2/sys_spu.h"
@@ -3163,6 +3165,615 @@ void testCellSaveData() {
   dal::resetLogOnce();
 }
 
+// Guest allocation callbacks of the cellPngDec test: a bump allocator over a guest block.
+struct PngTestHeap {
+  std::uint32_t next = 0;
+  std::uint32_t end = 0;
+  std::vector<std::uint32_t> freed;
+  std::uint32_t malloc_calls = 0;
+};
+PngTestHeap g_png_heap;
+
+DAL_PPU_FUNC(pngTestMalloc) {
+  (void)base;
+  const auto size = static_cast<std::uint32_t>(ctx->gpr[3]);
+  g_png_heap.malloc_calls++;
+  const std::uint32_t addr = g_png_heap.next;
+  if (addr + size > g_png_heap.end) {
+    ctx->gpr[3] = 0;
+    return;
+  }
+  g_png_heap.next = (addr + size + 15) & ~15u;
+  ctx->gpr[3] = addr;
+}
+
+DAL_PPU_FUNC(pngTestFree) {
+  (void)base;
+  g_png_heap.freed.push_back(static_cast<std::uint32_t>(ctx->gpr[3]));
+  ctx->gpr[3] = 0;
+}
+
+// cbCtrlStrm: hands out the rest of a source in pieces of `piece` bytes through a staging buffer.
+struct PngTestFeed {
+  std::vector<std::uint8_t> rest;
+  std::size_t pos = 0;
+  std::size_t piece = 16;
+  std::uint32_t staging = 0;
+  std::uint32_t calls = 0;
+  std::uint32_t last_decoded = 0;
+  std::uint32_t arg_seen = 0;
+};
+PngTestFeed g_png_feed;
+
+DAL_PPU_FUNC(pngTestStream) {
+  const auto info = static_cast<std::uint32_t>(ctx->gpr[3]);
+  const auto param = static_cast<std::uint32_t>(ctx->gpr[4]);
+  g_png_feed.arg_seen = static_cast<std::uint32_t>(ctx->gpr[5]);
+  g_png_feed.last_decoded = dalRead32(base, info);
+  g_png_feed.calls++;
+  const std::size_t count = std::min(g_png_feed.piece, g_png_feed.rest.size() - g_png_feed.pos);
+  std::memcpy(base + g_png_feed.staging, g_png_feed.rest.data() + g_png_feed.pos, count);
+  g_png_feed.pos += count;
+  dalWrite32(base, param, g_png_feed.staging);
+  dalWrite32(base, param + 4, static_cast<std::uint32_t>(count));
+  ctx->gpr[3] = 0;
+}
+
+struct PngTestImage {
+  unsigned width = 0;
+  unsigned height = 0;
+  std::vector<std::uint8_t> file;
+};
+
+LodePNGColorMode colorMode(LodePNGColorType type, unsigned depth) {
+  LodePNGColorMode mode;
+  lodepng_color_mode_init(&mode);
+  mode.colortype = type;
+  mode.bitdepth = depth;
+  return mode;
+}
+
+// Encodes `raw` (laid out per `raw_mode`) into a PNG of `png_mode`.
+PngTestImage encodePng(unsigned width, unsigned height, const std::vector<std::uint8_t>& raw,
+                       const LodePNGColorMode& raw_mode, const LodePNGColorMode& png_mode,
+                       unsigned interlace = 0) {
+  lodepng::State state;
+  lodepng_color_mode_copy(&state.info_raw, &raw_mode);
+  lodepng_color_mode_copy(&state.info_png.color, &png_mode);
+  state.info_png.interlace_method = interlace;
+  state.encoder.auto_convert = 0;
+  unsigned char* out = nullptr;
+  std::size_t size = 0;
+  const unsigned error = lodepng_encode(&out, &size, raw.data(), width, height, &state);
+  CHECK(error == 0);
+  PngTestImage image{width, height, {}};
+  if (error == 0) image.file.assign(out, out + size);
+  std::free(out);
+  return image;
+}
+
+// Inserts a chunk so that it starts at byte `at` (33 is the first position after IHDR; the last
+// 12 bytes of a file are IEND).
+void insertChunk(std::vector<std::uint8_t>& png, std::size_t at, const char* type,
+                 const std::vector<std::uint8_t>& payload) {
+  unsigned char* chunk = nullptr;
+  std::size_t chunk_size = 0;
+  CHECK(lodepng_chunk_create(&chunk, &chunk_size, static_cast<unsigned>(payload.size()), type,
+                             payload.data()) == 0);
+  png.insert(png.begin() + static_cast<std::ptrdiff_t>(at), chunk, chunk + chunk_size);
+  std::free(chunk);
+}
+
+void testCellPngDec() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetHostFunctions();
+  dal::resetCellPngDec();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x100000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t heap = scratch, params = scratch + 0x10000, src_buf = scratch + 0x20000,
+                      out_buf = scratch + 0x40000, staging = scratch + 0x80000;
+  g_png_heap = {heap, heap + 0x10000, {}, 0};
+  g_png_feed = {};
+  g_png_feed.staging = staging;
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_pngdec_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  stdfs::create_directories(root / "game", ec);
+  stdfs::create_directories(root / "dump", ec);
+  dal::configureVfs(root / "game", std::nullopt);
+  dal::setPngDumpDirectory(root / "dump");
+
+  enum Import : std::uint32_t {
+    Create, ExtOpen, ExtReadHeader, ExtSetParameter, ExtDecodeData, Close, Destroy, ImportCount
+  };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x157d30c5, "cellPngDec", "cellPngDecCreate"},
+      {0x00800010, 0x0c515302, "cellPngDec", "cellPngDecExtOpen"},
+      {0x00800020, 0x8b33f863, "cellPngDec", "cellPngDecExtReadHeader"},
+      {0x00800030, 0x9e9d7d42, "cellPngDec", "cellPngDecExtSetParameter"},
+      {0x00800040, 0x726fc1d0, "cellPngDec", "cellPngDecExtDecodeData"},
+      {0x00800050, 0x5b3d1ff1, "cellPngDec", "cellPngDecClose"},
+      {0x00800060, 0x820dae1a, "cellPngDec", "cellPngDecDestroy"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  CHECK(p.memory.commit(0x4f0000, 0x10000));
+  auto call = [&](Import which, std::initializer_list<std::uint64_t> args) {
+    int reg = 3;
+    for (const std::uint64_t arg : args) ctx->gpr[reg++] = arg;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+
+  constexpr std::uint32_t kOk = 0, kErrHeader = 0x80611201, kErrFormat = 0x80611202,
+                          kErrArg = 0x80611203, kErrSeq = 0x80611204, kErrOpenFile = 0x80611207;
+  constexpr std::uint32_t kSpaceRgb = 2, kSpacePal = 4, kSpaceGa = 9, kSpaceRgba = 10,
+                          kSpaceArgb = 20;
+
+  // Guest scratch addresses inside the params block.
+  const std::uint32_t handle_pp = params, thread_in = params + 0x10, thread_out = params + 0x40,
+                      stream_pp = params + 0x50, src = params + 0x60, open_info = params + 0x90,
+                      cb_strm = params + 0xa0, info = params + 0xb0, ext_info = params + 0xd0,
+                      in_param = params + 0xe0, out_param = params + 0x110,
+                      ext_in = params + 0x140, ext_out = params + 0x150,
+                      ctrl_param = params + 0x160, out_info = params + 0x170,
+                      file_name = params + 0x200;
+  const std::uint32_t malloc_opd = dal::registerHostFunction("pngTestMalloc", pngTestMalloc);
+  const std::uint32_t free_opd = dal::registerHostFunction("pngTestFree", pngTestFree);
+  const std::uint32_t stream_opd = dal::registerHostFunction("pngTestStream", pngTestStream);
+
+  // Create: the handle block comes from the guest allocator; the codec version is reported.
+  dalWrite32(base, thread_in + 12, malloc_opd);
+  dalWrite32(base, thread_in + 16, 0x1111);
+  dalWrite32(base, thread_in + 20, free_opd);
+  dalWrite32(base, thread_in + 24, 0x2222);
+  CHECK(call(Create, {0, thread_in, thread_out}) == kErrArg);
+  CHECK(call(Create, {handle_pp, thread_in, thread_out}) == kOk);
+  const std::uint32_t handle = dalRead32(base, handle_pp);
+  CHECK(handle >= heap && handle < heap + 0x10000);
+  CHECK(dalRead32(base, thread_out) == 0x00420000);
+  CHECK(g_png_heap.malloc_calls == 1);
+  dalWrite32(base, thread_in + 12, 0);
+  CHECK(call(Create, {handle_pp, thread_in, thread_out}) == kErrArg);
+  dalWrite32(base, thread_in + 12, malloc_opd);
+
+  auto putSource = [&](const std::vector<std::uint8_t>& bytes) {
+    std::memcpy(base + src_buf, bytes.data(), bytes.size());
+    dalWrite32(base, src, 1);  // CELL_PNGDEC_BUFFER
+    dalWrite32(base, src + 20, src_buf);
+    dalWrite32(base, src + 24, static_cast<std::uint32_t>(bytes.size()));
+  };
+  auto setParam = [&](std::uint32_t mode, std::uint32_t space, std::uint32_t depth,
+                      std::uint32_t alpha_select = 0, std::uint32_t alpha = 0) {
+    dalWrite32(base, in_param, 0);
+    dalWrite32(base, in_param + 4, mode);
+    dalWrite32(base, in_param + 8, space);
+    dalWrite32(base, in_param + 12, depth);
+    dalWrite32(base, in_param + 16, 1);
+    dalWrite32(base, in_param + 20, alpha_select);
+    dalWrite32(base, in_param + 24, alpha);
+  };
+  auto bytesAt = [&](std::uint32_t addr, std::size_t count) {
+    return std::vector<std::uint8_t>(base + addr, base + addr + count);
+  };
+
+  // Opens `bytes` as a buffer source and reads its header; returns the stream, 0 on failure.
+  auto openAndRead = [&](const std::vector<std::uint8_t>& bytes) -> std::uint32_t {
+    putSource(bytes);
+    dalWrite32(base, stream_pp, 0);
+    if (call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) != kOk) return 0;
+    const std::uint32_t stream = dalRead32(base, stream_pp);
+    if (call(ExtReadHeader, {handle, stream, info, 0}) != kOk) return 0;
+    return stream;
+  };
+  struct Decoded {
+    std::uint32_t result;
+    std::vector<std::uint8_t> out;
+  };
+  // DecodeData into a 0xEE-filled buffer.
+  auto decode = [&](std::uint32_t stream, std::uint64_t bytes_per_line, std::size_t out_size) {
+    std::memset(base + out_buf, 0xEE, out_size);
+    dalWrite64(base, ctrl_param, bytes_per_line);
+    Decoded decoded{call(ExtDecodeData, {handle, stream, out_buf, ctrl_param, out_info, 0, 0}), {}};
+    decoded.out = bytesAt(out_buf, out_size);
+    return decoded;
+  };
+  // SetParameter (extIn null), then DecodeData.
+  auto setAndDecode = [&](std::uint32_t stream, std::uint32_t mode, std::uint32_t space,
+                          std::uint32_t depth, std::uint32_t alpha_select, std::uint32_t alpha,
+                          std::uint64_t bytes_per_line, std::size_t out_size) {
+    setParam(mode, space, depth, alpha_select, alpha);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kOk);
+    return decode(stream, bytes_per_line, out_size);
+  };
+  auto closeStream = [&](std::uint32_t stream) { CHECK(call(Close, {handle, stream}) == kOk); };
+
+  // 3x2 RGBA8, every sample distinct.
+  const std::vector<std::uint8_t> rgba = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
+                                          13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+  const PngTestImage rgba_png =
+      encodePng(3, 2, rgba, colorMode(LCT_RGBA, 8), colorMode(LCT_RGBA, 8));
+
+  // Header values; SetParameter and DecodeData before ReadHeader are sequence errors.
+  {
+    putSource(rgba_png.file);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kOk);
+    const std::uint32_t stream = dalRead32(base, stream_pp);
+    CHECK(dalRead32(base, open_info) != 0);
+    CHECK(stream != 0 && stream != handle);
+    setParam(0, kSpaceRgba, 8);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kErrSeq);
+    dalWrite64(base, ctrl_param, 12);
+    CHECK(call(ExtDecodeData, {handle, stream, out_buf, ctrl_param, out_info, 0, 0}) == kErrSeq);
+    CHECK(call(ExtReadHeader, {handle, stream, info, ext_info}) == kOk);
+    CHECK(dalRead32(base, info) == 3 && dalRead32(base, info + 4) == 2);
+    CHECK(dalRead32(base, info + 8) == 4 && dalRead32(base, info + 12) == kSpaceRgba);
+    CHECK(dalRead32(base, info + 16) == 8 && dalRead32(base, info + 20) == 0);
+    CHECK(dalRead32(base, info + 24) == 0);
+    CHECK(dalRead64(base, ext_info) == 0);
+    CHECK(call(ExtReadHeader, {0, stream, info, 0}) == kErrArg);
+    CHECK(call(ExtReadHeader, {handle, stream + 1, info, 0}) == kErrArg);
+    CHECK(call(ExtReadHeader, {handle, stream, 0, 0}) == kErrArg);
+    closeStream(stream);
+    CHECK(call(ExtReadHeader, {handle, stream, info, 0}) == kErrArg);  // closed
+  }
+
+  // RGBA8 -> RGBA8 with 5 padding bytes per row; the pad is not written.
+  {
+    const std::uint32_t stream = openAndRead(rgba_png.file);
+    CHECK(stream != 0);
+    setParam(0, kSpaceRgba, 8);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kOk);
+    CHECK(dalRead64(base, out_param) == 12);
+    CHECK(dalRead32(base, out_param + 8) == 3 && dalRead32(base, out_param + 12) == 2);
+    CHECK(dalRead32(base, out_param + 16) == 4 && dalRead32(base, out_param + 20) == 8);
+    CHECK(dalRead32(base, out_param + 24) == 0 && dalRead32(base, out_param + 28) == kSpaceRgba);
+    CHECK(dalRead32(base, out_param + 32) == 0);
+    const Decoded decoded = decode(stream, 17, 29);
+    CHECK(decoded.result == kOk);
+    std::vector<std::uint8_t> expected(29, 0xEE);
+    std::copy(rgba.begin(), rgba.begin() + 12, expected.begin());
+    std::copy(rgba.begin() + 12, rgba.end(), expected.begin() + 17);
+    CHECK(decoded.out == expected);
+    CHECK(dalRead32(base, out_info) == (1u << 15) && dalRead32(base, out_info + 4) == 0);
+    CHECK(dalRead32(base, out_info + 8) == 0 && dalRead32(base, out_info + 12) == 0);
+    // A row pitch below outputWidthByte is refused and leaves the status at STOP.
+    const Decoded refused = decode(stream, 11, 29);
+    CHECK(refused.result == kErrArg);
+    CHECK(dalRead32(base, out_info + 12) == 1);
+    closeStream(stream);
+  }
+
+  // RGBA8 -> ARGB8, and the same bottom to top.
+  {
+    const std::uint32_t stream = openAndRead(rgba_png.file);
+    const Decoded top = setAndDecode(stream, 0, kSpaceArgb, 8, 0, 0, 12, 24);
+    CHECK(top.result == kOk);
+    const std::vector<std::uint8_t> argb = {4,  1,  2,  3,  8,  5,  6,  7,  12, 9,  10, 11,
+                                            16, 13, 14, 15, 20, 17, 18, 19, 24, 21, 22, 23};
+    CHECK(top.out == argb);
+    CHECK(dalRead32(base, out_param + 28) == kSpaceArgb);
+    const Decoded flipped = setAndDecode(stream, 1, kSpaceArgb, 8, 0, 0, 12, 24);
+    CHECK(flipped.result == kOk);
+    std::vector<std::uint8_t> argb_flipped(argb.begin() + 12, argb.end());
+    argb_flipped.insert(argb_flipped.end(), argb.begin(), argb.begin() + 12);
+    CHECK(flipped.out == argb_flipped);
+    CHECK(dalRead32(base, out_param + 24) == 1);
+    closeStream(stream);
+  }
+
+  // RGBA8 -> RGB8 drops the alpha; colour to gray-alpha is refused.
+  {
+    const std::uint32_t stream = openAndRead(rgba_png.file);
+    const Decoded rgb = setAndDecode(stream, 0, kSpaceRgb, 8, 0, 0, 9, 18);
+    CHECK(rgb.result == kOk);
+    const std::vector<std::uint8_t> expected = {1,  2,  3,  5,  6,  7,  9,  10, 11,
+                                                13, 14, 15, 17, 18, 19, 21, 22, 23};
+    CHECK(rgb.out == expected);
+    CHECK(dalRead32(base, out_param + 16) == 3);
+    setParam(0, kSpaceGa, 8);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kErrArg);
+    closeStream(stream);
+  }
+
+  // Palette input: 4x2, 8-bit indices, a palette with one translucent entry.
+  {
+    LodePNGColorMode pal = colorMode(LCT_PALETTE, 8);
+    CHECK(lodepng_palette_add(&pal, 255, 0, 0, 255) == 0);
+    CHECK(lodepng_palette_add(&pal, 0, 255, 0, 128) == 0);
+    CHECK(lodepng_palette_add(&pal, 0, 0, 255, 255) == 0);
+    const std::vector<std::uint8_t> indices = {0, 1, 2, 1, 2, 2, 0, 0};
+    const PngTestImage image = encodePng(4, 2, indices, pal, pal);
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(stream != 0);
+    CHECK(dalRead32(base, info + 8) == 1 && dalRead32(base, info + 12) == kSpacePal);
+    CHECK(dalRead32(base, info + 16) == 8);
+    CHECK((dalRead32(base, info + 24) & (1u << 3)) != 0);  // PLTE
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 16, 32);
+    CHECK(decoded.result == kOk);
+    const std::uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 128}, blue[] = {0, 0, 255, 255};
+    std::vector<std::uint8_t> expected;
+    for (const std::uint8_t index : indices) {
+      const std::uint8_t* color = index == 0 ? red : index == 1 ? green : blue;
+      expected.insert(expected.end(), color, color + 4);
+    }
+    CHECK(decoded.out == expected);
+    // Fixed alpha applies to a palette input, whatever its palette alpha.
+    const Decoded fixed = setAndDecode(stream, 0, kSpaceArgb, 8, 1, 0x40, 16, 32);
+    CHECK(fixed.result == kOk);
+    for (std::size_t pixel = 0; pixel < 8; pixel++) {
+      const std::uint8_t* color = indices[pixel] == 0 ? red : indices[pixel] == 1 ? green : blue;
+      CHECK(fixed.out[pixel * 4] == 0x40 && fixed.out[pixel * 4 + 1] == color[0] &&
+            fixed.out[pixel * 4 + 3] == color[2]);
+    }
+    // Palette output at the input's own depth hands the indices through.
+    const Decoded raw = setAndDecode(stream, 0, kSpacePal, 8, 0, 0, 4, 8);
+    CHECK(raw.result == kOk);
+    CHECK(raw.out == indices);
+    CHECK(dalRead64(base, out_param) == 4);
+    closeStream(stream);
+  }
+
+  // 2-bit palette, width 5 (the file pads its rows to bytes), expanded to RGBA.
+  {
+    LodePNGColorMode pal_raw = colorMode(LCT_PALETTE, 8), pal_png = colorMode(LCT_PALETTE, 2);
+    for (const std::uint8_t gray : {10, 90, 170, 250}) {
+      CHECK(lodepng_palette_add(&pal_raw, gray, gray, gray, 255) == 0);
+      CHECK(lodepng_palette_add(&pal_png, gray, gray, gray, 255) == 0);
+    }
+    const std::vector<std::uint8_t> indices = {0, 1, 2, 3, 0, 3, 2, 1, 0, 3};
+    const PngTestImage image = encodePng(5, 2, indices, pal_raw, pal_png);
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(stream != 0);
+    CHECK(dalRead32(base, info + 16) == 2);
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 20, 40);
+    CHECK(decoded.result == kOk);
+    const std::uint8_t levels[] = {10, 90, 170, 250};
+    bool match = decoded.result == kOk;
+    for (std::size_t pixel = 0; pixel < indices.size() && match; pixel++) {
+      match = decoded.out[pixel * 4] == levels[indices[pixel]] && decoded.out[pixel * 4 + 3] == 255;
+    }
+    CHECK(match);
+    closeStream(stream);
+  }
+
+  // RGB8: stream alpha is opaque, fixed alpha is the requested value, RGB output is the data.
+  {
+    const std::vector<std::uint8_t> rgb = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
+    const PngTestImage image = encodePng(2, 2, rgb, colorMode(LCT_RGB, 8), colorMode(LCT_RGB, 8));
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(dalRead32(base, info + 8) == 3 && dalRead32(base, info + 12) == kSpaceRgb);
+    const Decoded opaque = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 8, 16);
+    CHECK(opaque.result == kOk);
+    CHECK(opaque.out == (std::vector<std::uint8_t>{10, 20, 30, 255, 40, 50, 60, 255,
+                                                   70, 80, 90, 255, 100, 110, 120, 255}));
+    const Decoded fixed = setAndDecode(stream, 0, kSpaceRgba, 8, 1, 0x7f, 8, 16);
+    CHECK(fixed.out[3] == 0x7f && fixed.out[7] == 0x7f && fixed.out[15] == 0x7f &&
+          fixed.out[0] == 10);
+    const Decoded same = setAndDecode(stream, 0, kSpaceRgb, 8, 0, 0, 6, 12);
+    CHECK(same.out == rgb);
+    closeStream(stream);
+  }
+
+  // 16-bit RGBA: stripped to the high byte for 8-bit output, kept big-endian for 16-bit output.
+  {
+    const std::vector<std::uint8_t> rgba16 = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                                              0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    const PngTestImage image =
+        encodePng(2, 1, rgba16, colorMode(LCT_RGBA, 16), colorMode(LCT_RGBA, 16));
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(dalRead32(base, info + 16) == 16);
+    const Decoded eight = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 8, 8);
+    CHECK(eight.result == kOk);
+    CHECK(eight.out == (std::vector<std::uint8_t>{0x12, 0x56, 0x9a, 0xde, 0x01, 0x03, 0x05, 0x07}));
+    const Decoded sixteen = setAndDecode(stream, 0, kSpaceRgba, 16, 0, 0, 16, 16);
+    CHECK(sixteen.result == kOk && sixteen.out == rgba16);
+    CHECK(dalRead64(base, out_param) == 16 && dalRead32(base, out_param + 20) == 16);
+    const Decoded argb16 = setAndDecode(stream, 0, kSpaceArgb, 16, 0, 0, 16, 16);
+    CHECK(argb16.out[0] == 0xde && argb16.out[1] == 0xf0 && argb16.out[2] == 0x12 &&
+          argb16.out[3] == 0x34 && argb16.out[6] == 0x9a && argb16.out[7] == 0xbc);
+    closeStream(stream);
+  }
+
+  // Adam7: the guest gets the same image as from a non-interlaced file.
+  {
+    std::vector<std::uint8_t> grid;
+    for (unsigned i = 0; i < 5 * 5 * 4; i++) grid.push_back(static_cast<std::uint8_t>(i * 7 + 3));
+    const PngTestImage image =
+        encodePng(5, 5, grid, colorMode(LCT_RGBA, 8), colorMode(LCT_RGBA, 8), 1);
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(stream != 0 && dalRead32(base, info + 20) == 1);
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 20, 100);
+    CHECK(decoded.result == kOk && decoded.out == grid);
+    closeStream(stream);
+  }
+
+  // Chunk bits: ReadHeader sees what precedes IDAT, DecodeData everything plus IDAT.
+  {
+    PngTestImage image = rgba_png;
+    insertChunk(image.file, image.file.size() - 12, "tIME", {0x07, 0xe8, 1, 1, 0, 0, 0});
+    insertChunk(image.file, 33, "prVt", {1, 2, 3});
+    insertChunk(image.file, 33, "tEXt", {'k', 0, 'v'});
+    insertChunk(image.file, 33, "gAMA", {0, 1, 0x86, 0xa0});
+    const std::uint32_t stream = openAndRead(image.file);
+    CHECK(stream != 0);
+    CHECK(dalRead32(base, info + 24) == 1u);  // gAMA only
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 12, 24);
+    CHECK(decoded.result == kOk);
+    CHECK(dalRead32(base, out_info) == ((1u << 0) | (1u << 9) | (1u << 15)));
+    CHECK(dalRead32(base, out_info + 4) == 1 && dalRead32(base, out_info + 8) == 1);
+    closeStream(stream);
+  }
+
+  // Header errors and argument checks of Open.
+  {
+    putSource(std::vector<std::uint8_t>(64, 0x42));
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrHeader);
+    putSource(std::vector<std::uint8_t>(4, 0x89));
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrHeader);
+    putSource(rgba_png.file);
+    CHECK(call(ExtOpen, {0, stream_pp, src, open_info, 0, 0}) == kErrArg);
+    CHECK(call(ExtOpen, {handle, 0, src, open_info, 0, 0}) == kErrArg);
+    dalWrite32(base, src, 7);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrArg);
+    // A truncated image opens (the signature is fine) and fails when decoded.
+    std::vector<std::uint8_t> broken = rgba_png.file;
+    broken.resize(40);
+    putSource(broken);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kOk);
+    const std::uint32_t stream = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, stream, info, 0}) == kOk);
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 12, 24);
+    CHECK(decoded.result == kErrFormat);
+    CHECK(dalRead32(base, out_info + 12) == 1);
+    closeStream(stream);
+  }
+
+  // ExtSetParameter's extra parameters: LINE_MODE only, and the extra output.
+  {
+    const std::uint32_t stream = openAndRead(rgba_png.file);
+    setParam(0, kSpaceRgba, 8);
+    dalWrite32(base, ext_in, 0);
+    dalWrite32(base, ext_in + 4, 1);
+    dalWrite32(base, ext_in + 8, 0);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, ext_in, ext_out}) == kErrArg);
+    dalWrite32(base, ext_in, 1);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, ext_in, ext_out}) == kOk);
+    CHECK(dalRead64(base, ext_out) == 12 && dalRead32(base, ext_out + 8) == 1);
+    dalWrite32(base, ext_in + 4, 0);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, ext_in, ext_out}) == kOk);
+    CHECK(dalRead32(base, ext_out + 8) == 2);
+    dalWrite32(base, ext_in + 4, 9);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, ext_in, ext_out}) == kOk);
+    CHECK(dalRead32(base, ext_out + 8) == 2);
+    // Partial output through cbCtrlDisp is not implemented: refused, not silently ignored.
+    dalWrite32(base, ext_in + 4, 1);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, ext_in, ext_out}) == kOk);
+    dalWrite64(base, ctrl_param, 12);
+    CHECK(call(ExtDecodeData, {handle, stream, out_buf, ctrl_param, out_info, cb_strm, 0}) == kErrArg);
+    // Invalid output parameters.
+    setParam(2, kSpaceRgba, 8);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kErrArg);
+    setParam(0, 3, 8);
+    CHECK(call(ExtSetParameter, {handle, stream, in_param, out_param, 0, 0}) == kErrArg);
+    closeStream(stream);
+  }
+
+  // File source through the VFS, with an offset into the file.
+  {
+    const std::string name = "/dev_bdvd/test.png";
+    std::vector<std::uint8_t> padded = {1, 2, 3, 4, 5};
+    padded.insert(padded.end(), rgba_png.file.begin(), rgba_png.file.end());
+    {
+      std::ofstream out(root / "game" / "test.png", std::ios::binary);
+      out.write(reinterpret_cast<const char*>(padded.data()),
+                static_cast<std::streamsize>(padded.size()));
+    }
+    std::memcpy(base + file_name, name.c_str(), name.size() + 1);
+    dalWrite32(base, src, 0);  // CELL_PNGDEC_FILE
+    dalWrite32(base, src + 4, file_name);
+    dalWrite64(base, src + 8, 5);
+    dalWrite32(base, src + 16, 0);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kOk);
+    const std::uint32_t stream = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, stream, info, 0}) == kOk);
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 12, 24);
+    CHECK(decoded.result == kOk && decoded.out == rgba);
+    closeStream(stream);
+
+    // The size limits what is read: a file size short of the image cannot decode.
+    dalWrite32(base, src + 16, 40);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kOk);
+    const std::uint32_t cut = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, cut, info, 0}) == kOk);
+    CHECK(setAndDecode(cut, 0, kSpaceRgba, 8, 0, 0, 12, 24).result == kErrFormat);
+    closeStream(cut);
+
+    dalWrite64(base, src + 8, 0);
+    dalWrite32(base, src + 16, 0);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrHeader);  // junk first
+    const std::string missing = "/dev_bdvd/missing.png";
+    std::memcpy(base + file_name, missing.c_str(), missing.size() + 1);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrOpenFile);
+    // Partial decoding is for buffers only.
+    dalWrite32(base, cb_strm, stream_opd);
+    dalWrite32(base, cb_strm + 4, 0x3333);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, cb_strm, 0}) == kErrFormat);
+  }
+
+  // Streamed source: the first buffer holds only the start, the callback supplies the rest.
+  {
+    const std::size_t head = 40;
+    const std::vector<std::uint8_t> first(rgba_png.file.begin(), rgba_png.file.begin() + head);
+    g_png_feed = {};
+    g_png_feed.staging = staging;
+    g_png_feed.rest.assign(rgba_png.file.begin() + head, rgba_png.file.end());
+    putSource(first);
+    dalWrite32(base, cb_strm, stream_opd);
+    dalWrite32(base, cb_strm + 4, 0x3333);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, cb_strm, 0}) == kOk);
+    const std::uint32_t stream = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, stream, info, 0}) == kOk);
+    CHECK(g_png_feed.calls == 0);  // the header was already there
+    const std::size_t frees_before = g_png_heap.freed.size();
+    const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 12, 24);
+    CHECK(decoded.result == kOk && decoded.out == rgba);
+    CHECK(g_png_feed.calls >= 2 && g_png_feed.arg_seen == 0x3333);
+    CHECK(g_png_feed.pos == g_png_feed.rest.size());
+    CHECK(g_png_feed.last_decoded > head);
+    CHECK(g_png_heap.freed.size() == frees_before + 1);  // the callback's scratch block
+    closeStream(stream);
+
+    // A callback that runs dry before the image ends fails the decode.
+    g_png_feed = {};
+    g_png_feed.staging = staging;
+    g_png_feed.rest.assign(rgba_png.file.begin() + head, rgba_png.file.begin() + head + 20);
+    putSource(first);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, cb_strm, 0}) == kOk);
+    const std::uint32_t dry = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, dry, info, 0}) == kOk);
+    CHECK(setAndDecode(dry, 0, kSpaceRgba, 8, 0, 0, 12, 24).result == kErrFormat);
+    closeStream(dry);
+  }
+
+  // The dump holds the first decoded image.
+  {
+    const stdfs::path dumped = root / "dump" / "png_0.png";
+    CHECK(stdfs::exists(dumped));
+    unsigned char* pixels = nullptr;
+    unsigned w = 0, h = 0;
+    CHECK(lodepng_decode32_file(&pixels, &w, &h, dumped.string().c_str()) == 0);
+    CHECK(w == 3 && h == 2 && pixels != nullptr && std::memcmp(pixels, rgba.data(), 24) == 0);
+    std::free(pixels);
+  }
+
+  // Destroy frees the handle block; the handle is then unknown.
+  const std::size_t frees_before_destroy = g_png_heap.freed.size();
+  CHECK(call(Destroy, {handle}) == kOk);
+  CHECK(g_png_heap.freed.size() == frees_before_destroy + 1 && g_png_heap.freed.back() == handle);
+  CHECK(call(Destroy, {handle}) == kErrArg);
+  CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrArg);
+  CHECK(ctx->gpr[1] == 0x500000);
+
+  stdfs::remove_all(root, ec);
+  p.main.free(scratch);
+  dal::resetCellPngDec();
+  dal::resetHostFunctions();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -4772,6 +5383,7 @@ int main(int argc, char** argv) {
   testCellPad();
   testCellMsgDialog();
   testCellSaveData();
+  testCellPngDec();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();

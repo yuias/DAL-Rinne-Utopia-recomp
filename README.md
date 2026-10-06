@@ -23,7 +23,7 @@ game" for what is and is not implemented.
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
-- git, with the submodules initialised: `git submodule update --init` (spdlog under `externals/`;
+- git, with the submodules initialised: `git submodule update --init` (spdlog and lodepng under `externals/`;
   clone with `--recurse-submodules` to do it in one step)
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
@@ -475,6 +475,7 @@ code was emitted from.
 ```sh
 dal_game --game-dir DIR [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR] [--seconds N] [--strict]
          [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
+         [--png-dump DIR]
 ```
 
 | Option | Meaning |
@@ -489,6 +490,7 @@ dal_game --game-dir DIR [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR] [--seco
 | `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
 | `--pad none\|neutral` | Input source: `neutral` (the default) connects a standard pad on port 0 that never changes, `none` connects no pad. |
+| `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 
 Game paths are command-line arguments only; no tracked file contains one. The build wrapper takes
@@ -629,7 +631,7 @@ name; struct layouts and error codes are restated from its headers.
 
 ### Implemented imports
 
-Imports are matched to handlers by module and FNID. 105 of the executable's 166 imports have a
+Imports are matched to handlers by module and FNID. 112 of the executable's 166 imports have a
 handler; the rest use the default handler. Behaviour follows the RPCS3 function of the same name
 (`Emu/Cell/Modules/`); each handler file lists its deviations in its header comment.
 
@@ -643,6 +645,7 @@ handler; the rest use the default handler. Behaviour follows the RPCS3 function 
 | `cellGame` | `cellGameDataCheck`, `cellGameCreateGameData`, `cellGameContentPermit`, `cellGameContentErrorDialog` |
 | `sys_fs` | `cellFsOpen`, `cellFsSdataOpen`, `cellFsReadWithOffset`, `cellFsWriteWithOffset`, `cellFsClose`, `cellFsFstat`, `cellFsStat`, `cellFsMkdir`, `cellFsUnlink` |
 | `sys_io` | `cellPadInit`, `cellPadEnd`, `cellPadSetPortSetting`, `cellPadGetData`, `cellPadGetInfo2`, `cellPadSetActDirect` |
+| `cellPngDec` | `cellPngDecCreate`, `cellPngDecDestroy`, `cellPngDecExtOpen`, `cellPngDecExtReadHeader`, `cellPngDecExtSetParameter`, `cellPngDecExtDecodeData`, `cellPngDecClose`; see "PNG decoding" |
 | `sceNp`, `sceNpTrophy` | `sceNpInit`, `sceNpTerm`, `sceNpDrmIsAvailable`; the 10 trophy imports (`sceNpTrophyInit` to `sceNpTrophyUnlockTrophy`) |
 
 Video and audio out report what the game's `PARAM.SFO` allows (the `RESOLUTION` and
@@ -673,6 +676,20 @@ interface, so each module follows a documented policy that never blocks on a per
   `--hdd-dir` directory.
 - **Input**: see `--pad`. A host keyboard or gamepad backend plugs in through a provider
   interface (`runtime/src/hle/hle.h`); none is implemented.
+
+### PNG decoding
+
+`cellPngDec` decodes with lodepng (`externals/lodepng`, pinned to a commit because the project
+publishes no release tags; `LODEPNG_VERSION_STRING` is 20261001), which reads IHDR without decoding
+and converts to any colour type and bit depth. The handle and stream objects are allocated through
+the game's malloc and free callbacks, as on the console. A buffer or file source is read into one
+host buffer; with a `cbCtrlStrm` callback the runtime calls it for more data until the IEND chunk
+is complete and then decodes the whole image. Output RGBA, ARGB, RGB, gray and gray-alpha come
+from the stored format (palette, tRNS and sub-8-bit samples expand, 16-bit samples drop to the
+high byte for 8-bit output); rows are written `outputBytesPerLine` apart, top to bottom or bottom
+to top. Not implemented: RGB to grayscale, partial output through `cbCtrlDisp`, the
+`cellPngDecGet*` chunk accessors. Each stream's source, header and output format are logged with
+the `dal: pngdec:` prefix.
 
 ### Default handlers
 
@@ -864,6 +881,7 @@ results are only trusted for the expected build.
 | `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `rsx`, `game_main.cpp`; see "Running the game") and runtime-side tests |
 | `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see "SDAT files" |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
+| `externals/lodepng` | lodepng submodule, the PNG codec behind `cellPngDec` |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
