@@ -184,7 +184,8 @@ class EmitCliTest(TempDirTestCase):
         self.assertIn('kDalPpuExecutableSha256[] = "%s";' % self.sha, text)
 
     def test_max_unhandled_exits_9_after_writing(self):
-        db = self.make_db([(TEXT, [(TEXT, TEXT + 0x1C)])])
+        # The all-zero word after blr is invalid code, so it stays unhandled whatever the handlers cover.
+        db = self.make_db([(TEXT, [(TEXT, TEXT + 0x20)])])
         code, _, _ = self.run_cli(db, "--max-unhandled", "0")
         self.assertEqual(code, 9)
         self.assertEqual(sorted(p.name for p in self.out.iterdir()), FILES)

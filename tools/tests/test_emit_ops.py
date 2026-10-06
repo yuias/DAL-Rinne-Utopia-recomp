@@ -158,5 +158,88 @@ class MemTest(unittest.TestCase):
                           "ctx->xer_count & 0x7f);"])
 
 
+class SysTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["sys"]) - set(load_handlers())), [])
+
+    def test_spr_moves_use_the_context_fields(self):
+        self.assertEqual(body(asm.mflr(3))[0], ["ctx->gpr[3] = ctx->lr;"])
+        self.assertEqual(body(asm.mtctr(3))[0], ["ctx->ctr = ctx->gpr[3];"])
+        self.assertEqual(body(asm.encode("mfspr", rD=3, SPR=1))[0],
+                         ["ctx->gpr[3] = dalMfxer(ctx);"])
+        self.assertEqual(body(asm.encode("mtspr", SPR=1, rS=3))[0], ["dalMtxer(ctx, ctx->gpr[3]);"])
+        self.assertEqual(body(asm.encode("mtspr", SPR=256, rS=3))[0],
+                         ["ctx->vrsave = (uint32_t)ctx->gpr[3];"])
+
+    def test_unknown_spr_is_unhandled_with_its_number(self):
+        for name, fields, key in (("mfspr", {"rD": 3, "SPR": 1013}, "mfspr:spr=1013"),
+                                  ("mtspr", {"SPR": 18, "rS": 3}, "mtspr:spr=18")):
+            lines, stats = body(asm.encode(name, **fields))
+            self.assertTrue(lines[0].startswith("DAL_UNHANDLED"), name)
+            self.assertEqual(dict(stats.unhandled), {key: 1})
+
+    def test_mftb_calls_the_time_base_hook(self):
+        self.assertEqual(body(asm.encode("mftb", rD=3, TBR=268))[0],
+                         ["ctx->gpr[3] = dalMftb(ctx);"])
+        self.assertEqual(body(asm.encode("mftb", rD=3, TBR=269))[0],
+                         ["ctx->gpr[3] = dalMftb(ctx) >> 32;"])
+        lines, stats = body(asm.encode("mftb", rD=3, TBR=300))
+        self.assertTrue(lines[0].startswith("DAL_UNHANDLED"))
+        self.assertEqual(dict(stats.unhandled), {"mftb:tbr=300": 1})
+
+    def test_cache_hints_emit_no_statement(self):
+        for name in ("dcbt", "dcbtst", "dcbf", "dcbst", "icbi"):
+            lines, stats = body(asm.encode(name, rA=4, rB=5))
+            self.assertEqual(lines, [], name)
+            self.assertEqual(sum(stats.unhandled.values()), 0, name)
+
+    def test_dcbz_calls_the_runtime_line_clear(self):
+        self.assertEqual(body(asm.encode("dcbz", rA=4, rB=5))[0],
+                         ["dalDcbz(ctx, base, (uint32_t)(ctx->gpr[4] + ctx->gpr[5]));"])
+        self.assertEqual(body(asm.encode("dcbz", rA=0, rB=5))[0],
+                         ["dalDcbz(ctx, base, (uint32_t)ctx->gpr[5]);"])
+
+    def test_barriers_pass_their_kind(self):
+        self.assertEqual(body(asm.encode("sync", L_sync=0))[0], ["dalSync(ctx, kDalSyncHeavy);"])
+        self.assertEqual(body(asm.encode("sync", L_sync=1))[0], ["dalSync(ctx, kDalSyncLight);"])
+        self.assertEqual(body(asm.encode("eieio"))[0], ["dalSync(ctx, kDalSyncEieio);"])
+        self.assertEqual(body(asm.encode("isync"))[0], ["dalSync(ctx, kDalSyncIsync);"])
+
+    def test_reservations_go_through_the_runtime(self):
+        self.assertEqual(body(asm.encode("lwarx", rD=5, rA=0, rB=4))[0],
+                         ["ctx->gpr[5] = dalLwarx(ctx, base, (uint32_t)ctx->gpr[4]);"])
+        self.assertEqual(body(asm.encode("ldarx", rD=5, rA=3, rB=4))[0],
+                         ["ctx->gpr[5] = dalLdarx(ctx, base, (uint32_t)(ctx->gpr[3] + ctx->gpr[4]));"])
+        self.assertEqual(body(asm.encode("stwcx.", rS=6, rA=0, rB=4))[0],
+                         ["bool t0 = dalStwcx(ctx, base, (uint32_t)ctx->gpr[4], "
+                          "(uint32_t)ctx->gpr[6]);",
+                          "dalSetCr0Conditional(ctx, t0);"])
+        self.assertIn("dalStdcx(ctx, base, ", body(asm.encode("stdcx.", rS=6, rA=0, rB=4))[0][0])
+
+    def test_condition_register_moves(self):
+        self.assertEqual(body(asm.encode("mfcr", rD=3))[0], ["ctx->gpr[3] = dalMfcr(ctx);"])
+        self.assertEqual(body(asm.encode("mtcrf", CRM=0xFF, rS=3))[0],
+                         ["dalMtcrf(ctx, 0xffu, (uint32_t)ctx->gpr[3]);"])
+        self.assertEqual(body(asm.encode("mtcrf", CRM=0, rS=3))[0], [])
+        self.assertEqual(body(asm.encode("mfocrf", rD=3, FXM=0x20))[0],
+                         ["ctx->gpr[3] = (uint64_t)dalGetCrField(ctx, 2) << 20;"])
+        self.assertEqual(body(asm.encode("mtocrf", CRM=0x01, rS=3))[0],
+                         ["dalSetCrField(ctx, 7, (uint32_t)(ctx->gpr[3] >> 0) & 15u);"])
+        self.assertEqual(body(asm.encode("mcrf", crfD=2, crfS=5))[0],
+                         ["dalSetCrField(ctx, 2, dalGetCrField(ctx, 5));"])
+
+    def test_cr_logical_ops_are_byte_operations(self):
+        self.assertEqual(body(asm.encode("cror", crbD=2, crbA=1, crbB=2))[0],
+                         ["ctx->cr[2] = (uint8_t)(ctx->cr[1] | ctx->cr[2]);"])
+        self.assertEqual(body(asm.encode("crnor", crbD=3, crbA=4, crbB=5))[0],
+                         ["ctx->cr[3] = (uint8_t)((ctx->cr[4] | ctx->cr[5]) ^ 1);"])
+        self.assertEqual(body(asm.encode("crxor", crbD=6, crbA=6, crbB=6))[0],
+                         ["ctx->cr[6] = 0;"])
+        self.assertEqual(body(asm.encode("creqv", crbD=6, crbA=6, crbB=6))[0],
+                         ["ctx->cr[6] = 1;"])
+
+
 if __name__ == "__main__":
     unittest.main()

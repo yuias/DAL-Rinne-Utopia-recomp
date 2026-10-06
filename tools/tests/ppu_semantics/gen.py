@@ -89,6 +89,8 @@ def _normalize(case: Case, key: str, value: object) -> tuple[str, int, object]:
         return key, 0, _int_in(case, key, value, 0, _MASK32)
     if key in _FLAG_KEYS:
         return "flag", _FLAG_KEYS.index(key), _int_in(case, key, value, 0, 1)
+    if key == "xer_count":
+        return key, 0, _int_in(case, key, value, 0, 0xFF)
     raise CaseError("case %s: unknown state key %r" % (case.name, key))
 
 
@@ -112,6 +114,8 @@ def _init_stmt(key: str, kind: str, index: int, value: object) -> str:
         return "ctx->%s = %s;" % (kind, u64(value))
     if kind in ("vrsave", "fpscr"):
         return "ctx->%s = %s;" % (kind, u32(value))
+    if kind == "xer_count":
+        return "ctx->xer_count = %d;" % value
     return "ctx->%s = %d;" % (_FLAG_KEYS[index], value)
 
 
@@ -134,6 +138,8 @@ def _check_stmt(key: str, kind: str, index: int, value: object) -> str:
         got, digits = "dalMfcr(ctx)", 8
     elif kind in ("vrsave", "fpscr"):
         got, digits = "ctx->%s" % kind, 8
+    elif kind == "xer_count":
+        got, digits = "ctx->xer_count", 2
     else:
         got, digits = "ctx->%s" % _FLAG_KEYS[index], 1
     return 'n += checkU64(msg, msg_size, n, "%s", %d, %s, %su);' % (key, digits, got, "0x%x" % value)

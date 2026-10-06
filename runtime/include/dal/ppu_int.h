@@ -65,3 +65,11 @@ DAL_FORCEINLINE void dalStoreString(const DalPpuContext* ctx, uint8_t* base, uin
         }
     }
 }
+
+// stwcx./stdcx.: CR0 = {lt 0, gt 0, eq = store happened, so = XER.SO} (RPCS3 `STWCX`).
+DAL_FORCEINLINE void dalSetCr0Conditional(DalPpuContext* ctx, bool stored) {
+    ctx->cr[0] = 0;
+    ctx->cr[1] = 0;
+    ctx->cr[2] = stored;
+    ctx->cr[3] = ctx->xer_so;
+}
