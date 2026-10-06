@@ -1841,6 +1841,147 @@ void testCellGame() {
   stdfs::remove_all(root, ec);
 }
 
+void testCellFs() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t path_a = scratch, buf = scratch + 0x2000, out = scratch + 0x3000,
+                      sb = scratch + 0x3100, arg = scratch + 0x3200;
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_cellfs_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  const stdfs::path game = root / "game";
+  stdfs::create_directories(game / "sub");
+  std::ofstream(game / "b.txt", std::ios::binary) << "0123456789";
+  dal::configureVfs(game, root / "hdd");
+
+  enum Import : std::uint32_t { Read, Close, Open, Stat, Unlink, Write, SdataOpen, Mkdir, Fstat, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x0d5b4a14, "sys_fs", "cellFsReadWithOffset"},
+      {0x00800010, 0x2cb51f0d, "sys_fs", "cellFsClose"},
+      {0x00800020, 0x718bf5f8, "sys_fs", "cellFsOpen"},
+      {0x00800030, 0x7de6dced, "sys_fs", "cellFsStat"},
+      {0x00800040, 0x7f4677a8, "sys_fs", "cellFsUnlink"},
+      {0x00800050, 0x8cb722d5, "sys_fs", "cellFsWriteWithOffset"},
+      {0x00800060, 0xb1840b53, "sys_fs", "cellFsSdataOpen"},
+      {0x00800070, 0xba901fe6, "sys_fs", "cellFsMkdir"},
+      {0x00800080, 0xef3efa34, "sys_fs", "cellFsFstat"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                  std::uint64_t d = 0, std::uint64_t e = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    ctx->gpr[6] = d;
+    ctx->gpr[7] = e;
+    dalHleCall(ctx.get(), base, which);
+    return ctx->gpr[3];
+  };
+  auto put = [&](std::uint32_t addr, std::string_view text) {
+    std::memcpy(base + addr, text.data(), text.size());
+    base[addr + text.size()] = 0;
+  };
+  auto hostRead = [](const stdfs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+  };
+
+  // Open, positional read, close. The file position is not moved by ReadWithOffset.
+  put(path_a, "/dev_bdvd/b.txt");
+  CHECK(call(Open, path_a, 0, out, 0, 0) == 0);
+  const std::uint32_t fd = dalRead32(base, out);
+  CHECK(fd == 3);
+  CHECK(call(Open, path_a, 0, 0, 0, 0) == err(dal::kCellEfault));
+  CHECK(call(Read, fd, 6, buf, 3, out) == 0 && dalRead64(base, out) == 3);
+  CHECK(std::memcmp(base + buf, "678", 3) == 0);
+  CHECK(call(Read, fd, 8, buf, 100, out) == 0 && dalRead64(base, out) == 2);  // short at the end
+  CHECK(call(Read, fd, 50, buf, 4, out) == 0 && dalRead64(base, out) == 0);   // past the end
+  CHECK(call(Read, fd, 0, buf, 2, 0) == 0);                                  // nread is optional
+  CHECK(call(Read, fd, 0, 0, 2, out) == err(dal::kCellEfault) && dalRead64(base, out) == 0);
+  // sys_fs_read continues from the start: the position never moved.
+  CHECK(syscall(802, fd, buf, 4, out) == 0 && std::memcmp(base + buf, "0123", 4) == 0);
+  CHECK(call(Read, fd, 0, buf, 1, out) == 0 && syscall(802, fd, buf + 8, 2, out) == 0);
+  CHECK(std::memcmp(base + buf + 8, "45", 2) == 0);
+  CHECK(call(Read, 99, 0, buf, 1, out) == err(dal::kCellEbadf) && dalRead64(base, out) == 0);
+  CHECK(call(Read, 0, 0, buf, 1, out) == err(dal::kCellEbadf));
+  CHECK(call(Write, fd, 0, buf, 1, out) == err(dal::kCellEbadf));  // opened read-only
+
+  // Stat of a file and of a directory, fstat of the open file.
+  CHECK(call(Stat, path_a, sb) == 0 && dalRead32(base, sb) == 0100444 && dalRead64(base, sb + 36) == 10);
+  CHECK(call(Stat, path_a, 0) == err(dal::kCellEfault));
+  put(path_a, "/dev_bdvd/sub");
+  CHECK(call(Stat, path_a, sb) == 0 && dalRead32(base, sb) == 040555);
+  put(path_a, "/dev_bdvd/none");
+  CHECK(call(Stat, path_a, sb) == err(dal::kCellEnoent));
+  CHECK(call(Fstat, fd, sb) == 0 && dalRead32(base, sb) == 0100444 && dalRead64(base, sb + 36) == 10);
+  CHECK(call(Fstat, 99, sb) == err(dal::kCellEbadf));
+  CHECK(call(Close, fd) == 0);
+  CHECK(call(Close, fd) == err(dal::kCellEbadf));
+
+  // Mkdir, positional write and Unlink under the hdd directory.
+  put(path_a, "/dev_hdd0/tmp/d");
+  CHECK(call(Mkdir, path_a, 0777) == 0);
+  CHECK(call(Mkdir, path_a, 0777) == err(dal::kCellEexist));
+  CHECK(stdfs::is_directory(root / "hdd" / "dev_hdd0" / "tmp" / "d"));
+  put(path_a, "/dev_hdd0/tmp/d/f.bin");
+  CHECK(call(Open, path_a, 0102, out, 0, 0) == 0);  // RDWR | CREAT
+  const std::uint32_t wfd = dalRead32(base, out);
+  put(buf, "abcdef");
+  CHECK(call(Write, wfd, 0, buf, 6, out) == 0 && dalRead64(base, out) == 6);
+  put(buf + 0x10, "XY");
+  CHECK(call(Write, wfd, 2, buf + 0x10, 2, out) == 0 && dalRead64(base, out) == 2);
+  CHECK(call(Write, wfd, 0, 0, 2, out) == err(dal::kCellEfault) && dalRead64(base, out) == 0);
+  // The file position stayed at 0, so a plain write lands at the start.
+  put(buf + 0x20, "Z");
+  CHECK(syscall(803, wfd, buf + 0x20, 1, out) == 0);
+  CHECK(call(Fstat, wfd, sb) == 0 && dalRead64(base, sb + 36) == 6);
+  CHECK(call(Close, wfd) == 0);
+  CHECK(hostRead(root / "hdd" / "dev_hdd0" / "tmp" / "d" / "f.bin") == "ZbXYef");
+  CHECK(call(Unlink, path_a) == 0);
+  CHECK(call(Unlink, path_a) == err(dal::kCellEnoent));
+  CHECK(!stdfs::exists(root / "hdd" / "dev_hdd0" / "tmp" / "d" / "f.bin"));
+  put(path_a, "/dev_bdvd/b.txt");
+  CHECK(call(Unlink, path_a) == err(dal::kCellErofs));
+  CHECK(call(Write, 3, 0, buf, 1, out) == err(dal::kCellEbadf));
+
+  // cellFsSdataOpen: argument validation, then ENOENT with nothing written to *fd.
+  dalWrite32(base, out, 0xDEADBEEF);
+  CHECK(call(SdataOpen, path_a, 1, out) == err(dal::kCellEinval));
+  CHECK(call(SdataOpen, path_a, 0, 0) == err(dal::kCellEfault));
+  CHECK(call(SdataOpen, 0, 0, out) == err(dal::kCellEfault));
+  CHECK(call(SdataOpen, path_a, 0, out) == err(dal::kCellEnoent));
+  CHECK(call(SdataOpen, path_a, 0, out) == err(dal::kCellEnoent));
+  CHECK(dalRead32(base, out) == 0xDEADBEEF);
+  int sdata_lines = 0;
+  for (const std::string& line : lines) {
+    sdata_lines += line.find("sdata open not supported: /dev_bdvd/b.txt") != std::string::npos;
+  }
+  CHECK(sdata_lines == 1);  // logged once per path
+  // A plain open through the sdata argument (0x180, 0x10) takes the same route.
+  dalWrite32(base, arg, 0x180);
+  dalWrite32(base, arg + 4, 0x10);
+  CHECK(call(Open, path_a, 0, out, arg, 8) == err(dal::kCellEnoent));
+  CHECK(dalRead32(base, out) == 0xDEADBEEF);
+
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  stdfs::remove_all(root, ec);
+  dal::configureVfs({}, std::nullopt);
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -3443,6 +3584,7 @@ int main(int argc, char** argv) {
   testCellGcmSys();
   testParamSfo();
   testCellGame();
+  testCellFs();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();

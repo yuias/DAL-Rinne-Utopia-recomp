@@ -377,6 +377,97 @@ bool setPos(HANDLE file, std::int64_t offset, DWORD method, std::uint64_t* resul
   return true;
 }
 
+// Reads or writes `size` bytes at the current position; returns the byte count and sets `code` on
+// a host error.
+std::uint64_t transfer(HANDLE file, bool write, std::uint8_t* data, std::uint64_t size,
+                       std::uint32_t& code) {
+  std::uint64_t total = 0;
+  while (total < size) {
+    const DWORD chunk = static_cast<DWORD>(std::min<std::uint64_t>(size - total, 0x40000000));
+    DWORD done = 0;
+    const BOOL ok = write ? WriteFile(file, data + total, chunk, &done, nullptr)
+                          : ReadFile(file, data + total, chunk, &done, nullptr);
+    if (!ok) {
+      code = mapWinError(GetLastError(), {});
+      break;
+    }
+    total += done;
+    if (done < chunk) {
+      break;
+    }
+  }
+  return total;
+}
+
+// Like transfer() at an absolute offset, leaving the file position where it was (the console's
+// cellFsReadWithOffset/cellFsWriteWithOffset do not move it either).
+std::uint64_t transferAt(HANDLE file, bool write, std::uint64_t offset, std::uint8_t* data,
+                         std::uint64_t size, std::uint32_t& code) {
+  std::uint64_t saved = 0;
+  if (!setPos(file, 0, FILE_CURRENT, &saved)) {
+    code = mapWinError(GetLastError(), {});
+    return 0;
+  }
+  std::uint64_t total = 0;
+  if (offset > static_cast<std::uint64_t>(INT64_MAX)) {
+    // Beyond any file: a read hits the end, a write cannot be placed.
+    code = write ? kCellEinval : kCellOk;
+  } else if (!setPos(file, static_cast<std::int64_t>(offset), FILE_BEGIN, nullptr)) {
+    code = mapWinError(GetLastError(), {});
+  } else {
+    total = transfer(file, write, data, size, code);
+  }
+  setPos(file, static_cast<std::int64_t>(saved), FILE_BEGIN, nullptr);
+  return total;
+}
+
+// The container kind a guest asks for through the open argument (RPCS3 `lv2_file::open`): a
+// big-endian u64 at `arg` when the argument size is 8.
+enum class FileKind { Plain, Sdata, Edata };
+constexpr std::uint64_t kArgSdata = 0x18000000010;
+constexpr std::uint64_t kArgEdata = 2;
+
+// Opens an sdata container file. Decryption is not available, so the file is reported missing; a
+// lookup of a decrypted copy belongs here.
+std::uint32_t openSdata(std::string_view path, std::uint32_t& /*fd*/) {
+  const VfsResolution res = resolveVfs(path);
+  if (res.device == VfsDevice::Root) {
+    return kCellEisdir;
+  }
+  if (res.status != VfsStatus::Ok) {
+    return vfsError(res.status);
+  }
+  logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path), "dal: fs: sdata open not supported: {}", path);
+  return kCellEnoent;
+}
+
+std::uint32_t openGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
+                        std::uint32_t fd_addr, FileKind kind) {
+  std::string path;
+  std::uint32_t code = readOpPath("open", base, path_addr, path);
+  if (code != kCellOk) {
+    return code;
+  }
+  std::uint32_t fd = 0;
+  if (kind == FileKind::Sdata) {
+    code = openSdata(path, fd);
+  } else {
+    if (kind == FileKind::Edata) {
+      logOnce("fs-open-edata", "dal: fs: edata open is not decrypted, \"{}\" opens as a plain file", path);
+    }
+    code = openFile(path, flags, fd);
+    logPathOp("open", path, code);
+  }
+  if (code == kCellOk && !guestRangeOk(fd_addr, 4)) {
+    removeObject(fd, false);
+    code = kCellEfault;
+  }
+  if (code == kCellOk) {
+    dalWrite32(base, fd_addr, fd);
+  }
+  return code;
+}
+
 }  // namespace
 
 std::uint32_t fsStatPath(std::string_view guest_path, FsStat& out) {
@@ -429,28 +520,179 @@ void writeCellFsStat(std::uint8_t* base, std::uint32_t addr, const FsStat& stat)
   dalWrite64(base, addr + 44, stat.blksize);
 }
 
-// 801 sys_fs_open(const char* path, s32 flags, u32* fd, s32 mode, const void* arg, u64 size).
-// The sdata/edata variants selected through arg/size are not supported: the file opens as plain.
-void sysFsOpen(DalPpuContext* ctx, std::uint8_t* base) {
-  const auto path_addr = static_cast<std::uint32_t>(ctx->gpr[3]);
-  const auto flags = static_cast<std::int32_t>(ctx->gpr[4]);
-  const auto fd_addr = static_cast<std::uint32_t>(ctx->gpr[5]);
-
-  std::string path;
-  std::uint32_t code = readOpPath("open", base, path_addr, path);
-  std::uint32_t fd = 0;
-  if (code == kCellOk) {
-    code = openFile(path, flags, fd);
-    if (code == kCellOk && !guestRangeOk(fd_addr, 4)) {
-      removeObject(fd, false);
-      code = kCellEfault;
+// The mode argument is not used: host permissions are not modelled.
+std::uint32_t fsOpenGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
+                          std::uint32_t fd_addr, std::uint32_t arg_addr, std::uint64_t arg_size) {
+  FileKind kind = FileKind::Plain;
+  if (arg_size == 8) {
+    if (!guestRangeOk(arg_addr, 8)) {
+      return kCellEfault;
     }
-    logPathOp("open", path, code);
+    const std::uint64_t marker = dalRead64(base, arg_addr);
+    kind = marker == kArgSdata ? FileKind::Sdata : marker == kArgEdata ? FileKind::Edata : FileKind::Plain;
+  }
+  return openGuest(base, path_addr, flags, fd_addr, kind);
+}
+
+std::uint32_t fsSdataOpenGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
+                               std::uint32_t fd_addr) {
+  if (flags != 0) {
+    return kCellEinval;
+  }
+  if (fd_addr == 0) {
+    return kCellEfault;
+  }
+  return openGuest(base, path_addr, 0, fd_addr, FileKind::Sdata);
+}
+
+std::uint32_t fsCloseFd(std::uint32_t fd) {
+  return removeObject(fd, false) ? kCellOk : kCellEbadf;
+}
+
+std::uint32_t fsStatGuest(std::uint8_t* base, std::uint32_t path_addr, std::uint32_t sb) {
+  std::string path;
+  std::uint32_t code = readOpPath("stat", base, path_addr, path);
+  if (code != kCellOk) {
+    return code;
+  }
+  FsStat stat;
+  code = fsStatPath(path, stat);
+  if (code == kCellOk && !guestRangeOk(sb, kCellFsStatSize)) {
+    code = kCellEfault;
   }
   if (code == kCellOk) {
-    dalWrite32(base, fd_addr, fd);
+    writeCellFsStat(base, sb, stat);
   }
-  setResultCode(ctx, code);
+  logPathOp("stat", path, code);
+  return code;
+}
+
+std::uint32_t fsFstatGuest(std::uint8_t* base, std::uint32_t fd, std::uint32_t sb) {
+  FsStat stat;
+  std::uint32_t code = fsStatFd(fd, stat);
+  if (code == kCellOk && !guestRangeOk(sb, kCellFsStatSize)) {
+    code = kCellEfault;
+  }
+  if (code == kCellOk) {
+    writeCellFsStat(base, sb, stat);
+  }
+  return code;
+}
+
+std::uint32_t fsMkdirGuest(std::uint8_t* base, std::uint32_t path_addr) {
+  std::string path;
+  std::uint32_t code = readOpPath("mkdir", base, path_addr, path);
+  if (code != kCellOk) {
+    return code;
+  }
+  const VfsResolution res = resolveVfs(path);
+  if (res.device == VfsDevice::Root) {
+    code = kCellEexist;
+  } else if (res.status != VfsStatus::Ok) {
+    code = vfsError(res.status);
+  } else if (res.read_only) {
+    code = kCellErofs;
+  } else {
+    std::error_code ec;
+    if (stdfs::exists(stdfs::symlink_status(res.host, ec))) {
+      code = kCellEexist;
+    } else if (res.protected_parent) {
+      code = kCellEacces;
+    } else if (!CreateDirectoryW(res.host.c_str(), nullptr)) {
+      code = mapWinError(GetLastError(), res.host);
+    }
+  }
+  logPathOp("mkdir", path, code);
+  return code;
+}
+
+std::uint32_t fsUnlinkGuest(std::uint8_t* base, std::uint32_t path_addr) {
+  std::string path;
+  std::uint32_t code = readOpPath("unlink", base, path_addr, path);
+  if (code != kCellOk) {
+    return code;
+  }
+  const VfsResolution res = resolveVfs(path);
+  if (res.device == VfsDevice::Root) {
+    code = kCellEisdir;
+  } else if (res.status != VfsStatus::Ok) {
+    code = vfsError(res.status);
+  } else {
+    std::error_code ec;
+    if (stdfs::is_directory(stdfs::status(res.host, ec))) {
+      code = kCellEisdir;
+    } else if (res.read_only) {
+      code = kCellErofs;
+    } else if (!DeleteFileW(res.host.c_str())) {
+      code = mapWinError(GetLastError(), res.host);
+    }
+  }
+  logPathOp("unlink", path, code);
+  return code;
+}
+
+// The console reaches these through sys_fs_fcntl (RPCS3 `sys_fs_fcntl` 0x8000000a / 0x8000000b).
+std::uint32_t fsReadWithOffset(std::uint8_t* base, std::uint32_t fd, std::uint64_t offset,
+                               std::uint32_t buf, std::uint64_t size, std::uint32_t nread_addr) {
+  if (nread_addr != 0 && !guestRangeOk(nread_addr, 8)) {
+    return kCellEfault;
+  }
+  const auto finish = [&](std::uint32_t code, std::uint64_t done) {
+    if (nread_addr != 0) {
+      dalWrite64(base, nread_addr, code == kCellOk ? done : 0);
+    }
+    return code;
+  };
+
+  const std::shared_ptr<FsObject> file = findObject(fd, false);
+  if (file == nullptr || (file->flags & kOWronly) != 0) {
+    return finish(kCellEbadf, 0);
+  }
+  if (size != 0 && (buf == 0 || !guestRangeOk(buf, size))) {
+    return finish(kCellEfault, 0);
+  }
+  std::uint32_t code = kCellOk;
+  const std::uint64_t done = transferAt(file->file, false, offset, base + buf, size, code);
+  return finish(code, done);
+}
+
+std::uint32_t fsWriteWithOffset(std::uint8_t* base, std::uint32_t fd, std::uint64_t offset,
+                                std::uint32_t buf, std::uint64_t size, std::uint32_t nwrite_addr) {
+  if (nwrite_addr != 0 && !guestRangeOk(nwrite_addr, 8)) {
+    return kCellEfault;
+  }
+  const auto finish = [&](std::uint32_t code, std::uint64_t done) {
+    if (nwrite_addr != 0) {
+      dalWrite64(base, nwrite_addr, code == kCellOk ? done : 0);
+    }
+    return code;
+  };
+
+  if (buf == 0) {
+    return finish(kCellEfault, 0);
+  }
+  const std::shared_ptr<FsObject> file = findObject(fd, false);
+  // The positional write is refused on append-mode files, as on the console.
+  if (file == nullptr || (file->flags & kOAccMode) == 0 || (file->flags & kOAppend) != 0) {
+    return finish(kCellEbadf, 0);
+  }
+  if (file->read_only) {
+    return finish(kCellErofs, 0);
+  }
+  if (size != 0 && !guestRangeOk(buf, size)) {
+    return finish(kCellEfault, 0);
+  }
+  std::uint32_t code = kCellOk;
+  const std::uint64_t done = transferAt(file->file, true, offset, base + buf, size, code);
+  return finish(code, done);
+}
+
+// 801 sys_fs_open(const char* path, s32 flags, u32* fd, s32 mode, const void* arg, u64 size).
+void sysFsOpen(DalPpuContext* ctx, std::uint8_t* base) {
+  setResultCode(ctx, fsOpenGuest(base, static_cast<std::uint32_t>(ctx->gpr[3]),
+                                 static_cast<std::int32_t>(ctx->gpr[4]),
+                                 static_cast<std::uint32_t>(ctx->gpr[5]),
+                                 static_cast<std::uint32_t>(ctx->gpr[7]), ctx->gpr[8]));
 }
 
 // 802 sys_fs_read(u32 fd, void* buf, u64 nbytes, u64* nread)
@@ -481,20 +723,8 @@ void sysFsRead(DalPpuContext* ctx, std::uint8_t* base) {
     return;
   }
 
-  std::uint64_t total = 0;
   std::uint32_t code = kCellOk;
-  while (total < nbytes) {
-    const DWORD chunk = static_cast<DWORD>(std::min<std::uint64_t>(nbytes - total, 0x40000000));
-    DWORD got = 0;
-    if (!ReadFile(file->file, base + buf + total, chunk, &got, nullptr)) {
-      code = mapWinError(GetLastError(), {});
-      break;
-    }
-    total += got;
-    if (got < chunk) {
-      break;
-    }
-  }
+  const std::uint64_t total = transfer(file->file, false, base + buf, nbytes, code);
   dalWrite64(base, nread, total);
   setResultCode(ctx, code);
 }
@@ -540,20 +770,8 @@ void sysFsWrite(DalPpuContext* ctx, std::uint8_t* base) {
   if ((file->flags & kOAppend) != 0) {
     setPos(file->file, 0, FILE_END, nullptr);
   }
-  std::uint64_t total = 0;
   std::uint32_t code = kCellOk;
-  while (total < nbytes) {
-    const DWORD chunk = static_cast<DWORD>(std::min<std::uint64_t>(nbytes - total, 0x40000000));
-    DWORD wrote = 0;
-    if (!WriteFile(file->file, base + buf + total, chunk, &wrote, nullptr)) {
-      code = mapWinError(GetLastError(), {});
-      break;
-    }
-    total += wrote;
-    if (wrote < chunk) {
-      break;
-    }
-  }
+  const std::uint64_t total = transfer(file->file, true, base + buf, nbytes, code);
   dalWrite64(base, nwrite, total);
   setResultCode(ctx, code);
 }
@@ -561,7 +779,7 @@ void sysFsWrite(DalPpuContext* ctx, std::uint8_t* base) {
 // 804 sys_fs_close(u32 fd)
 void sysFsClose(DalPpuContext* ctx, std::uint8_t* base) {
   (void)base;
-  setResultCode(ctx, removeObject(static_cast<std::uint32_t>(ctx->gpr[3]), false) ? kCellOk : kCellEbadf);
+  setResultCode(ctx, fsCloseFd(static_cast<std::uint32_t>(ctx->gpr[3])));
 }
 
 // 805 sys_fs_opendir(const char* path, u32* fd)
@@ -631,89 +849,24 @@ void sysFsClosedir(DalPpuContext* ctx, std::uint8_t* base) {
 
 // 808 sys_fs_stat(const char* path, CellFsStat* sb)
 void sysFsStat(DalPpuContext* ctx, std::uint8_t* base) {
-  const auto path_addr = static_cast<std::uint32_t>(ctx->gpr[3]);
-  const auto sb = static_cast<std::uint32_t>(ctx->gpr[4]);
-
-  std::string path;
-  std::uint32_t code = readOpPath("stat", base, path_addr, path);
-  if (code == kCellOk) {
-    FsStat stat;
-    code = fsStatPath(path, stat);
-    if (code == kCellOk && !guestRangeOk(sb, kCellFsStatSize)) {
-      code = kCellEfault;
-    }
-    if (code == kCellOk) {
-      writeCellFsStat(base, sb, stat);
-    }
-    logPathOp("stat", path, code);
-  }
-  setResultCode(ctx, code);
+  setResultCode(ctx, fsStatGuest(base, static_cast<std::uint32_t>(ctx->gpr[3]),
+                                 static_cast<std::uint32_t>(ctx->gpr[4])));
 }
 
 // 809 sys_fs_fstat(u32 fd, CellFsStat* sb)
 void sysFsFstat(DalPpuContext* ctx, std::uint8_t* base) {
-  const auto sb = static_cast<std::uint32_t>(ctx->gpr[4]);
-  FsStat stat;
-  std::uint32_t code = fsStatFd(static_cast<std::uint32_t>(ctx->gpr[3]), stat);
-  if (code == kCellOk && !guestRangeOk(sb, kCellFsStatSize)) {
-    code = kCellEfault;
-  }
-  if (code == kCellOk) {
-    writeCellFsStat(base, sb, stat);
-  }
-  setResultCode(ctx, code);
+  setResultCode(ctx, fsFstatGuest(base, static_cast<std::uint32_t>(ctx->gpr[3]),
+                                  static_cast<std::uint32_t>(ctx->gpr[4])));
 }
 
 // 811 sys_fs_mkdir(const char* path, s32 mode)
 void sysFsMkdir(DalPpuContext* ctx, std::uint8_t* base) {
-  std::string path;
-  std::uint32_t code = readOpPath("mkdir", base, static_cast<std::uint32_t>(ctx->gpr[3]), path);
-  if (code == kCellOk) {
-    const VfsResolution res = resolveVfs(path);
-    if (res.device == VfsDevice::Root) {
-      code = kCellEexist;
-    } else if (res.status != VfsStatus::Ok) {
-      code = vfsError(res.status);
-    } else if (res.read_only) {
-      code = kCellErofs;
-    } else {
-      std::error_code ec;
-      if (stdfs::exists(stdfs::symlink_status(res.host, ec))) {
-        code = kCellEexist;
-      } else if (res.protected_parent) {
-        code = kCellEacces;
-      } else if (!CreateDirectoryW(res.host.c_str(), nullptr)) {
-        code = mapWinError(GetLastError(), res.host);
-      }
-    }
-    logPathOp("mkdir", path, code);
-  }
-  setResultCode(ctx, code);
+  setResultCode(ctx, fsMkdirGuest(base, static_cast<std::uint32_t>(ctx->gpr[3])));
 }
 
 // 814 sys_fs_unlink(const char* path)
 void sysFsUnlink(DalPpuContext* ctx, std::uint8_t* base) {
-  std::string path;
-  std::uint32_t code = readOpPath("unlink", base, static_cast<std::uint32_t>(ctx->gpr[3]), path);
-  if (code == kCellOk) {
-    const VfsResolution res = resolveVfs(path);
-    if (res.device == VfsDevice::Root) {
-      code = kCellEisdir;
-    } else if (res.status != VfsStatus::Ok) {
-      code = vfsError(res.status);
-    } else {
-      std::error_code ec;
-      if (stdfs::is_directory(stdfs::status(res.host, ec))) {
-        code = kCellEisdir;
-      } else if (res.read_only) {
-        code = kCellErofs;
-      } else if (!DeleteFileW(res.host.c_str())) {
-        code = mapWinError(GetLastError(), res.host);
-      }
-    }
-    logPathOp("unlink", path, code);
-  }
-  setResultCode(ctx, code);
+  setResultCode(ctx, fsUnlinkGuest(base, static_cast<std::uint32_t>(ctx->gpr[3])));
 }
 
 // 818 sys_fs_lseek(u32 fd, s64 offset, s32 whence, u64* pos)

@@ -76,4 +76,24 @@ std::uint32_t fsStatFd(std::uint32_t fd, FsStat& out);
 // Writes the big-endian CellFsStat (kCellFsStatSize bytes) at guest address `addr`.
 void writeCellFsStat(std::uint8_t* base, std::uint32_t addr, const FsStat& stat);
 
+// Guest-facing operations behind the sys_fs syscalls, also used by the cellFs imports (same object
+// table). Arguments are guest addresses read like the console does; each returns a cell error code
+// and writes its outputs only on success, except the read/write counts, which are zeroed on failure.
+// Defined in sys_fs.cpp.
+std::uint32_t fsOpenGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
+                          std::uint32_t fd_addr, std::uint32_t arg_addr, std::uint64_t arg_size);
+// cellFsSdataOpen: read-only open of an sdata container file.
+std::uint32_t fsSdataOpenGuest(std::uint8_t* base, std::uint32_t path_addr, std::int32_t flags,
+                               std::uint32_t fd_addr);
+std::uint32_t fsCloseFd(std::uint32_t fd);
+std::uint32_t fsStatGuest(std::uint8_t* base, std::uint32_t path_addr, std::uint32_t sb);
+std::uint32_t fsFstatGuest(std::uint8_t* base, std::uint32_t fd, std::uint32_t sb);
+std::uint32_t fsMkdirGuest(std::uint8_t* base, std::uint32_t path_addr);
+std::uint32_t fsUnlinkGuest(std::uint8_t* base, std::uint32_t path_addr);
+// Positional read/write: the file position is left unchanged. `count_addr` may be 0.
+std::uint32_t fsReadWithOffset(std::uint8_t* base, std::uint32_t fd, std::uint64_t offset,
+                               std::uint32_t buf, std::uint64_t size, std::uint32_t count_addr);
+std::uint32_t fsWriteWithOffset(std::uint8_t* base, std::uint32_t fd, std::uint64_t offset,
+                                std::uint32_t buf, std::uint64_t size, std::uint32_t count_addr);
+
 }  // namespace dal

@@ -33,6 +33,7 @@ function(dal_runtime_add_core)
     runtime/src/core/log.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
+    runtime/src/hle/cell_fs.cpp
     runtime/src/hle/cell_game.cpp
     runtime/src/hle/cell_gcm_sys.cpp
     runtime/src/hle/cell_spurs.cpp

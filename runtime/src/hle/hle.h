@@ -33,6 +33,9 @@ std::span<const HleEntry> cellGameHandlers();
 // Forgets the outstanding cellGameDataCheck state. Intended for tests.
 void resetCellGame();
 
+// Handlers of the sys_fs module (cellFs*).
+std::span<const HleEntry> cellFsHandlers();
+
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();
 

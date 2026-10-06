@@ -335,10 +335,13 @@ void gameContentErrorDialog(DalPpuContext* ctx, std::uint8_t* base) {
     message += std::format(" Directory: {}", readGuestString(base, dir_name_addr, kDirNameSize));
   }
 
-  // There is no UI to show the dialog on; a dialog that ends the application ends the run.
+  // There is no UI to show the dialog on. The terminating types end the application on the console;
+  // here that is a game-data failure, so it stops with the fatal exit code instead of a clean exit.
   logError("dal: game: cellGameContentErrorDialog: {}", message);
   if (type > kErrDialogNoSpace) {
-    stopProcess(ExitCode::ProcessExit, "dal: stop: cellGameContentErrorDialog requested exit");
+    stopProcess(ExitCode::Fatal,
+                std::format("dal: stop: cellGameContentErrorDialog (type {}) terminates the application: {}",
+                            type, message));
   }
   ctx->gpr[3] = kCellOk;
 }
