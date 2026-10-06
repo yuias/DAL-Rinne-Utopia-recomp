@@ -431,5 +431,51 @@ class FpTest(unittest.TestCase):
                          ["dalSetCrField(ctx, 1, (uint32_t)(dalMffs(ctx) >> 12) & 15u);"])
 
 
+class VmxMemTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["vmx_mem"]) - set(load_handlers())), [])
+
+    def test_block_accesses_use_the_truncated_ea(self):
+        self.assertEqual(body(asm.encode("lvx", vD=3, rA=4, rB=5))[0],
+                         ["ctx->vr[3] = dalReadVr(base, (uint32_t)(ctx->gpr[4] + ctx->gpr[5]));"])
+        self.assertEqual(body(asm.encode("stvx", vS=3, rA=0, rB=5))[0],
+                         ["dalWriteVr(base, (uint32_t)ctx->gpr[5], ctx->vr[3]);"])
+
+    def test_element_loads_load_the_whole_block(self):
+        for name in ("lvebx", "lvehx", "lvewx", "lvxl"):
+            lines, _ = body(asm.encode(name, vD=3, rA=4, rB=5))
+            self.assertEqual(lines[0].split("(")[0], "ctx->vr[3] = dalReadVr", name)
+
+    def test_partial_accesses_call_their_helpers(self):
+        for name, helper in (("lvlx", "dalLvlx"), ("lvlxl", "dalLvlx"), ("lvrx", "dalLvrx"),
+                             ("lvrxl", "dalLvrx"), ("lvsl", "dalLvsl"), ("lvsr", "dalLvsr")):
+            lines, _ = body(asm.encode(name, vD=3, rA=4, rB=5))
+            self.assertTrue(lines[0].startswith("ctx->vr[3] = %s(" % helper), name)
+        for name, helper in (("stvlx", "dalStvlx"), ("stvlxl", "dalStvlx"), ("stvrx", "dalStvrx"),
+                             ("stvrxl", "dalStvrx"), ("stvebx", "dalStvebx"),
+                             ("stvehx", "dalStvehx"), ("stvewx", "dalStvewx")):
+            lines, _ = body(asm.encode(name, vS=3, rA=4, rB=5))
+            self.assertTrue(lines[0].startswith("%s(base, " % helper), name)
+            self.assertTrue(lines[0].endswith(", ctx->vr[3]);"), name)
+
+    def test_logic_is_one_expression_on_the_words(self):
+        self.assertEqual(body(asm.encode("vand", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u32 = ctx->vr[1].u32 & ctx->vr[2].u32;"])
+        self.assertEqual(body(asm.encode("vandc", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u32 = ctx->vr[1].u32 & ~ctx->vr[2].u32;"])
+        self.assertEqual(body(asm.encode("vnor", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u32 = ~(ctx->vr[1].u32 | ctx->vr[2].u32);"])
+
+    def test_vsel_takes_vb_where_vc_is_set(self):
+        self.assertEqual(body(asm.encode("vsel", vD=4, vA=1, vB=2, vC=3))[0],
+                         ["ctx->vr[4] = dalVsel(ctx->vr[1], ctx->vr[2], ctx->vr[3]);"])
+
+    def test_vscr_moves_go_through_the_helpers(self):
+        self.assertEqual(body(asm.encode("mfvscr", vD=3))[0], ["ctx->vr[3] = dalMfvscr(ctx);"])
+        self.assertEqual(body(asm.encode("mtvscr", vB=2))[0], ["dalMtvscr(ctx, ctx->vr[2]);"])
+
+
 if __name__ == "__main__":
     unittest.main()
