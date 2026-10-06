@@ -271,6 +271,41 @@ class CheckOnlyTest(GhidraTestBase):
         export["memory_blocks"].insert(1, {"start": "0x00010008", "end": "0x00010020"})
         self.assertEqual(self.check_only(self.data, export)[0], 0)
 
+    def _export_with_text_gap(self, words, gap):
+        """Export whose text block is split in two, leaving [gap[0], gap[1]) unmapped."""
+        data = build_vmx_elf(words)
+        export = make_export(data, words=words)
+        text_end = TEXT_VA + 4 * len(words)
+        export["memory_blocks"][0] = {"start": "0x%08x" % TEXT_VA, "end": "0x%08x" % gap[0]}
+        export["memory_blocks"].insert(1, {"start": "0x%08x" % gap[1],
+                                           "end": "0x%08x" % text_end})
+        return data, export
+
+    def test_zero_filled_hole_between_blocks_is_tolerated(self):
+        # Section padding that Ghidra leaves unmapped is all zero in the file.
+        words = (0x7C0802A6, VMADDFP, 0, VPERM, LVX, STVX, LVLX, 0x4E800020)
+        data, export = self._export_with_text_gap(words, (0x10008, 0x1000C))
+        self.assertEqual(self.check_only(data, export)[0], 0)
+
+    def test_nonzero_hole_between_blocks_is_exit_6(self):
+        words = (0x7C0802A6, VMADDFP, 0x60000000, VPERM, LVX, STVX, LVLX, 0x4E800020)
+        data, export = self._export_with_text_gap(words, (0x10008, 0x1000C))
+        code, _, err = self.check_only(data, export)
+        self.assertEqual(code, 6)
+        self.assertIn("0x00010008-0x0001000c is not covered", err)
+
+    def test_hole_with_one_nonzero_byte_is_exit_6(self):
+        words = (0x7C0802A6, VMADDFP, 0x00000100, VPERM, LVX, STVX, LVLX, 0x4E800020)
+        data, export = self._export_with_text_gap(words, (0x10008, 0x1000C))
+        self.assertEqual(self.check_only(data, export)[0], 6)
+
+    def test_zero_filled_hole_at_segment_end_is_tolerated(self):
+        words = VMX_TEXT + (0,)
+        data = build_vmx_elf(words)
+        export = make_export(data, words=words)
+        export["memory_blocks"][0]["end"] = "0x%08x" % (TEXT_VA + 4 * len(VMX_TEXT))
+        self.assertEqual(self.check_only(data, export)[0], 0)
+
     def test_covering_filesz_but_not_memsz_is_ok(self):
         code, out, _ = self.check_only(self.data, make_export(self.data, cover_memsz=False))
         self.assertEqual(code, 0)

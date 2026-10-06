@@ -156,7 +156,8 @@ def _uncovered(merged: list[tuple[int, int]], start: int, end: int) -> list[tupl
     return holes
 
 
-def validate_export(export: dict, elf: ElfFile, sha256: str) -> None:
+def validate_export(export: dict, elf: ElfFile, sha256: str,
+                    check_memory_map: bool = True) -> None:
     if not isinstance(export, dict):
         raise CliError(EXIT_IO, "invalid Ghidra export: not a JSON object")
     if export.get("schema") != SCHEMA:
@@ -174,6 +175,8 @@ def validate_export(export: dict, elf: ElfFile, sha256: str) -> None:
         if not isinstance(export[key], list):
             raise CliError(EXIT_IO, "invalid Ghidra export: %r is not a list" % key)
     export_text_range(export)
+    if not check_memory_map:
+        return
 
     merged = _merged_blocks(export)
     # Ghidra's ELF loader maps sections, so the alignment padding between them is left

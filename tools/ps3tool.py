@@ -9,6 +9,7 @@ COMMANDS = {
     "probe": "probe",
     "disasm": "disasm",
     "ghidra-export": "ghidra",
+    "ghidra-diff": "ghidra_diff",
 }
 
 
