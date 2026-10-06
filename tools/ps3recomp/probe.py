@@ -16,6 +16,7 @@ from .info import (DEFAULT_CONFIG, EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliErro
                    load_config, parse_ppu_elf, read_input, reject_encrypted)
 from .nids import DEFAULT_SYSCALLS, load_syscall_table
 from .ppu import decode
+from .ppu_flow import written_gprs
 
 DEFAULT_OUTPUT = REPO_ROOT / "generated" / "analysis" / "probe.json"
 
@@ -78,25 +79,6 @@ _BRANCHES = frozenset({"b", "bc", "bclr", "bcctr"})
 # `sc` with LEV = 0, the lv2 syscall form. The decoder's `sc` entry matches the primary
 # opcode only, so it also hits float constants and ASCII data; compare the whole word.
 _SC_WORD = 0x44000002
-_UPDATE_FORMS = frozenset(
-    "lwzu lbzu lhzu lhau lfsu lfdu stwu stbu sthu stfsu stfdu ldu stdu "
-    "lwzux lbzux lhzux lhaux lwaux ldux stwux stbux sthux stdux lfsux lfdux "
-    "stfsux stfdux".split())
-
-
-def _written_gprs(insn) -> frozenset[int]:
-    """GPRs an instruction overwrites (rD, logical-op rA, update-form rA)."""
-    spec = insn.spec
-    written = set()
-    if spec.operands[:1] == ("rD",):
-        written.add(insn.field("rD"))
-        if spec.name == "lmw":
-            written.update(range(insn.field("rD"), 32))
-    if spec.operands[:2] == ("rA", "rS"):
-        written.add(insn.field("rA"))
-    if spec.name in _UPDATE_FORMS:
-        written.add(insn.field("rA"))
-    return frozenset(written)
 
 
 def _is_unconditional_branch(insn) -> bool:
@@ -106,7 +88,7 @@ def _is_unconditional_branch(insn) -> bool:
     return name in ("bc", "bclr", "bcctr") and insn.field("BO") & 0x14 == 0x14
 
 
-def _resolve_syscall_number(words: tuple[int, ...], index: int) -> int | None:
+def resolve_syscall_number(words: tuple[int, ...], index: int) -> int | None:
     """Find the `li r11, N` that feeds the `sc` at `words[index]`, scanning backwards."""
     # Known limitation: a branch target between the `li` and the `sc` is not detected
     # without a CFG, so a join point could in theory mix in another path's r11.
@@ -117,7 +99,7 @@ def _resolve_syscall_number(words: tuple[int, ...], index: int) -> int | None:
             return None
         if spec.name == "addi" and insn.field("rD") == 11 and insn.field("rA") == 0:
             return insn.field("SIMM")
-        if 11 in _written_gprs(insn):
+        if 11 in written_gprs(insn):
             return None
         if spec.name in _BRANCHES:
             # A call clobbers r11; an unconditional jump leaves the fall-through path.
@@ -139,7 +121,7 @@ def census_syscalls(main: ElfFile) -> dict:
             if word != _SC_WORD:
                 continue
             sites += 1
-            number = _resolve_syscall_number(words, i)
+            number = resolve_syscall_number(words, i)
             if number is None:
                 unresolved += 1
             else:

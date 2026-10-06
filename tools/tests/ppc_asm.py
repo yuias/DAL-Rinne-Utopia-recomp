@@ -1,0 +1,194 @@
+"""Tiny PPC encoder for tests: each function returns one big-endian instruction word.
+
+Operand order follows assembler syntax (`lwz(rd, d, ra)` is `lwz rD,d(rA)`). Branch helpers
+take the instruction address and the target, and compute the displacement.
+"""
+
+
+def _d_form(primary: int, rt: int, ra: int, imm: int) -> int:
+    return primary << 26 | rt << 21 | ra << 16 | imm & 0xFFFF
+
+
+def _x_form(xo: int, rt: int, ra: int, rb: int, rc: int = 0) -> int:
+    return 31 << 26 | rt << 21 | ra << 16 | rb << 11 | xo << 1 | rc
+
+
+def _ds_form(primary: int, rt: int, ra: int, ds: int, xo: int) -> int:
+    return primary << 26 | rt << 21 | ra << 16 | ds & 0xFFFC | xo
+
+
+def _md_form(xo: int, ra: int, rs: int, sh: int, mb: int) -> int:
+    # The 6-bit mb/me field is stored rotated: low five bits first, high bit last.
+    return (30 << 26 | rs << 21 | ra << 16 | (sh & 31) << 11 | (mb & 31) << 6
+            | (mb >> 5) << 5 | xo << 2 | (sh >> 5) << 1)
+
+
+def _spr_form(xo: int, rt: int, spr: int) -> int:
+    # The two five-bit halves of the SPR number are swapped in the encoding.
+    return 31 << 26 | rt << 21 | (spr & 31) << 16 | (spr >> 5) << 11 | xo << 1
+
+
+def b(addr: int, target: int, lk: bool = False, aa: bool = False) -> int:
+    disp = target if aa else target - addr
+    return 18 << 26 | disp & 0x03FFFFFC | int(aa) << 1 | int(lk)
+
+
+def bc(bo: int, bi: int, addr: int, target: int, lk: bool = False, aa: bool = False) -> int:
+    disp = target if aa else target - addr
+    return 16 << 26 | bo << 21 | bi << 16 | disp & 0xFFFC | int(aa) << 1 | int(lk)
+
+
+def bclr(bo: int, bi: int, lk: bool = False) -> int:
+    return 19 << 26 | bo << 21 | bi << 16 | 16 << 1 | int(lk)
+
+
+def bcctr(bo: int, bi: int, lk: bool = False) -> int:
+    return 19 << 26 | bo << 21 | bi << 16 | 528 << 1 | int(lk)
+
+
+def blr() -> int:
+    return bclr(20, 0)
+
+
+def bctr() -> int:
+    return bcctr(20, 0)
+
+
+def bctrl() -> int:
+    return bcctr(20, 0, lk=True)
+
+
+def mtctr(rs: int) -> int:
+    return _spr_form(467, rs, 9)
+
+
+def mflr(rd: int) -> int:
+    return _spr_form(339, rd, 8)
+
+
+def nop() -> int:
+    return ori(0, 0, 0)
+
+
+def addi(rd: int, ra: int, simm: int) -> int:
+    return _d_form(14, rd, ra, simm)
+
+
+def addis(rd: int, ra: int, simm: int) -> int:
+    return _d_form(15, rd, ra, simm)
+
+
+def li(rd: int, simm: int) -> int:
+    return addi(rd, 0, simm)
+
+
+def lis(rd: int, simm: int) -> int:
+    return addis(rd, 0, simm)
+
+
+def ori(ra: int, rs: int, uimm: int) -> int:
+    return _d_form(24, rs, ra, uimm)
+
+
+def oris(ra: int, rs: int, uimm: int) -> int:
+    return _d_form(25, rs, ra, uimm)
+
+
+def mr(ra: int, rs: int) -> int:
+    return _x_form(444, rs, ra, rs)
+
+
+def lwz(rd: int, d: int, ra: int) -> int:
+    return _d_form(32, rd, ra, d)
+
+
+def ld(rd: int, ds: int, ra: int) -> int:
+    return _ds_form(58, rd, ra, ds, 0)
+
+
+def stdu(rs: int, ds: int, ra: int) -> int:
+    return _ds_form(62, rs, ra, ds, 1)
+
+
+def lwzx(rd: int, ra: int, rb: int) -> int:
+    return _x_form(23, rd, ra, rb)
+
+
+def lwax(rd: int, ra: int, rb: int) -> int:
+    return _x_form(341, rd, ra, rb)
+
+
+def add(rd: int, ra: int, rb: int) -> int:
+    return _x_form(266, rd, ra, rb)
+
+
+def slwi(ra: int, rs: int, n: int) -> int:
+    # rlwinm ra,rs,n,0,31-n
+    return 21 << 26 | rs << 21 | ra << 16 | n << 11 | 0 << 6 | (31 - n) << 1
+
+
+def sldi(ra: int, rs: int, n: int) -> int:
+    # rldicr ra,rs,n,63-n
+    return _md_form(1, ra, rs, n, 63 - n)
+
+
+def clrldi(ra: int, rs: int, n: int) -> int:
+    # rldicl ra,rs,0,n
+    return _md_form(0, ra, rs, 0, n)
+
+
+def cmplwi(crf: int, ra: int, uimm: int) -> int:
+    return 10 << 26 | crf << 23 | ra << 16 | uimm & 0xFFFF
+
+
+def cmplw(crf: int, ra: int, rb: int) -> int:
+    return 31 << 26 | crf << 23 | ra << 16 | rb << 11 | 32 << 1
+
+
+def sc() -> int:
+    return 0x44000002
+
+
+def tw(to: int, ra: int, rb: int) -> int:
+    return _x_form(4, to, ra, rb)
+
+
+def twi(to: int, ra: int, simm: int) -> int:
+    return _d_form(3, to, ra, simm)
+
+
+def trap() -> int:
+    return tw(31, 0, 0)
+
+
+# Cell-only vector loads/stores (not in stock AltiVec).
+def lvlx(vd: int, ra: int, rb: int) -> int:
+    return _x_form(519, vd, ra, rb)
+
+
+def lvlxl(vd: int, ra: int, rb: int) -> int:
+    return _x_form(775, vd, ra, rb)
+
+
+def lvrx(vd: int, ra: int, rb: int) -> int:
+    return _x_form(551, vd, ra, rb)
+
+
+def lvrxl(vd: int, ra: int, rb: int) -> int:
+    return _x_form(807, vd, ra, rb)
+
+
+def stvlx(vs: int, ra: int, rb: int) -> int:
+    return _x_form(647, vs, ra, rb)
+
+
+def stvlxl(vs: int, ra: int, rb: int) -> int:
+    return _x_form(903, vs, ra, rb)
+
+
+def stvrx(vs: int, ra: int, rb: int) -> int:
+    return _x_form(679, vs, ra, rb)
+
+
+def stvrxl(vs: int, ra: int, rb: int) -> int:
+    return _x_form(935, vs, ra, rb)
