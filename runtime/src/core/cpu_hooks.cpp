@@ -139,24 +139,7 @@ void dalMtfsb(DalPpuContext* ctx, uint32_t bit, uint32_t value) {
   ctx->fpscr = value ? (ctx->fpscr | mask) : (ctx->fpscr & ~mask);
 }
 
-// Stand-ins for hooks that belong to the syscall, HLE and thread layers. They keep the generated
-// code linkable against this library alone; each is deleted when its real implementation lands.
-
-void dalSyscall(DalPpuContext* ctx, uint8_t* base, uint32_t site) {
-  (void)base;
-  (void)site;
-  const uint32_t number = static_cast<uint32_t>(ctx->gpr[11]);
-  dal::censusSyscall(number, nullptr, false);
-  dal::logOnce(std::format("default-sc-{}", number), "dal: default sc {}", number);
-  ctx->gpr[3] = 0;
-}
-
-void dalHleCall(DalPpuContext* ctx, uint8_t* base, uint32_t import_index) {
-  (void)base;
-  dal::logOnce(std::format("default-hle-{}", import_index), "dal: default hle import {}",
-               import_index);
-  ctx->gpr[3] = 0;
-}
+// Stand-in for a hook that belongs to the thread layer; deleted when its real implementation lands.
 
 void dalYield(DalPpuContext* ctx, uint8_t* base) {
   (void)base;

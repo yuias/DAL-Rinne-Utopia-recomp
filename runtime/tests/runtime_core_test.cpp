@@ -18,6 +18,9 @@
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "dal/ppu_context.h"
+#include "hle/hle.h"
+#include "lv2/cell_error.h"
+#include "lv2/syscalls.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -474,6 +477,113 @@ void testCensus() {
   dal::resetCensus();
 }
 
+void testSyscalls() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+
+  const auto table = dal::syscallTable();
+  CHECK(table.size() == 53);
+  bool sorted = true;
+  for (std::size_t i = 1; i < table.size(); i++) sorted = sorted && table[i - 1].number < table[i].number;
+  CHECK(sorted);
+  const dal::SyscallEntry* usleep_entry = dal::findSyscall(141);
+  CHECK(usleep_entry != nullptr && std::string_view(usleep_entry->name) == "sys_timer_usleep");
+  const dal::SyscallEntry* unnamed = dal::findSyscall(988);
+  CHECK(unnamed != nullptr && unnamed->name == nullptr);
+  CHECK(dal::findSyscall(999) == nullptr);
+
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[11] = 141;
+  ctx->gpr[3] = 0x1234;
+  dalSyscall(ctx.get(), nullptr, 0x10000);
+  CHECK(ctx->gpr[3] == dal::kCellOk);
+  dalSyscall(ctx.get(), nullptr, 0x10000);
+  ctx->gpr[11] = 999;
+  ctx->gpr[3] = 0x1234;
+  dalSyscall(ctx.get(), nullptr, 0x10004);
+  CHECK(ctx->gpr[3] == dal::kCellOk);
+
+  CHECK(countContaining(lines, "dal: first sc 141 sys_timer_usleep") == 1);
+  CHECK(countContaining(lines, "dal: first sc 999 ?") == 1);
+  CHECK(countContaining(lines, "dal: default sc 141 sys_timer_usleep(0x1234") == 1);
+  CHECK(countContaining(lines, "dal: default sc 999 ?(0x1234") == 1);
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("census: syscalls 3 calls, 2 distinct, 2 default-handled") != std::string::npos);
+  CHECK(census.find("  sc 141 sys_timer_usleep: 2 [default]") != std::string::npos);
+  CHECK(census.find("  sc 999 ?: 1 [default]") != std::string::npos);
+
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+DAL_PPU_FUNC(opdTarget) {
+  (void)base;
+  ctx->gpr[3] = ctx->gpr[2] + 1;  // proves r2 holds the descriptor's TOC
+  ctx->gpr[4] = ctx->lr;
+  ctx->gpr[2] = 0;
+  ctx->lr = 0x7777;
+}
+
+void testHle() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+
+  const DalImportInfo imports[] = {
+      {0x00800000, 0xdeadbeef, "cellTestModule", "cellTestFirst"},
+      {0x00800010, 0xcafef00d, "cellTestModule", "cellTestSecond"},
+  };
+  dal::installImports(imports, 2);
+  CHECK(countContaining(lines, "dal: hle: 2 imports, 0 with handlers") == 1);
+
+  auto ctx = std::make_unique<DalPpuContext>();
+  for (int i = 0; i < 10; i++) {
+    ctx->gpr[3] = 0x55;
+    ctx->gpr[4] = 0x66;
+    dalHleCall(ctx.get(), nullptr, 0);
+    CHECK(ctx->gpr[3] == 0);
+  }
+  CHECK(countContaining(lines, "dal: default hle cellTestModule::cellTestFirst(0x55, 0x66,") == 8);
+  CHECK(countContaining(lines, "dal: default hle cellTestModule::cellTestFirst(") == 8);
+  CHECK(countContaining(lines, "dal: first hle cellTestModule::cellTestFirst") == 1);
+
+  dal::setQuietHle(true);
+  ctx->gpr[3] = 0x55;
+  dalHleCall(ctx.get(), nullptr, 1);
+  dal::setQuietHle(false);
+  CHECK(ctx->gpr[3] == 0);
+  CHECK(countContaining(lines, "cellTestSecond(") == 0);
+  CHECK(countContaining(lines, "dal: first hle cellTestModule::cellTestSecond") == 1);
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("census: hle 11 calls, 2 distinct, 2 default-handled") != std::string::npos);
+  CHECK(census.find("  cellTestModule::cellTestFirst: 10 [default]") != std::string::npos);
+
+  // callGuestOpd: the descriptor holds the entry address and the TOC.
+  std::vector<std::uint8_t> memory(0x20000);
+  std::uint8_t* base = memory.data();
+  const DalFuncMapping mappings[] = {{0x10200, opdTarget}};
+  dalRegisterFuncs(mappings, 1);
+  dalWrite32(base, 0x18000, 0x10200);
+  dalWrite32(base, 0x18004, 0xd0000);
+  ctx->gpr[2] = 0x1111;
+  ctx->lr = 0x2222;
+  dal::callGuestOpd(ctx.get(), base, 0x18000);
+  CHECK(ctx->gpr[3] == 0xd0001);
+  CHECK(ctx->gpr[4] == 0);
+  CHECK(ctx->gpr[2] == 0x1111);
+  CHECK(ctx->lr == 0x2222);
+
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testTimebase() {
   auto ctx = std::make_unique<DalPpuContext>();
   LARGE_INTEGER frequency, t0, t1;
@@ -736,6 +846,8 @@ int main(int argc, char** argv) {
   testElfLoader();
   testDispatch();
   testCensus();
+  testSyscalls();
+  testHle();
   testTimebase();
   testReservationAndDcbz();
   testFaultChild();
