@@ -9,8 +9,10 @@
 //  - The install step creates the trophy directory under /dev_hdd0/home/00000001/trophy with the
 //    config and a plain-text unlock state (UNLOCKED.TXT: "<index> <rtc tick>" per line) instead of
 //    TROPUSR.DAT.
-//  - The status callbacks that RPCS3 delivers later through cellSysutilCheckCallback, spread over
-//    two seconds, run synchronously inside sceNpTrophyRegisterContext.
+//  - The status callbacks that RPCS3 delivers through cellSysutilCheckCallback, spread over two
+//    seconds while sceNpTrophyRegisterContext blocks its caller until each one has been consumed,
+//    run synchronously inside sceNpTrophyRegisterContext. This is deliberate: a caller that pumps
+//    the queue itself would only get through RPCS3's wait by timeout, delaying every boot.
 //  - The config language is fixed to English (RPCS3's default system language, index 1).
 //  - Unlocking shows no notification.
 

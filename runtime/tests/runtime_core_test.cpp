@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -2229,6 +2230,138 @@ void testSceNpAndTrophy() {
   stdfs::remove_all(root, ec);
 }
 
+struct SysutilCallbackCall {
+  std::uint64_t status, param;
+  std::uint32_t userdata;
+};
+std::vector<SysutilCallbackCall> g_sysutil_callbacks;
+std::function<void()> g_sysutil_callback_hook;
+
+DAL_PPU_FUNC(sysutilCallback) {
+  (void)base;
+  g_sysutil_callbacks.push_back(
+      {ctx->gpr[3], ctx->gpr[4], static_cast<std::uint32_t>(ctx->gpr[5])});
+  if (g_sysutil_callback_hook) g_sysutil_callback_hook();
+}
+
+void testCellSysutil() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetHostFunctions();
+  dal::resetCellSysutil();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+
+  enum Import : std::uint32_t { Register, Unregister, Check, EnableBgm, BgmStatus, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x9d98afa0, "cellSysutil", "cellSysutilRegisterCallback"},
+      {0x00800010, 0x02ff3c1b, "cellSysutil", "cellSysutilUnregisterCallback"},
+      {0x00800020, 0x189a74da, "cellSysutil", "cellSysutilCheckCallback"},
+      {0x00800030, 0x220894e3, "cellSysutil", "cellSysutilEnableBgmPlayback"},
+      {0x00800040, 0xa11552f6, "cellSysutil", "cellSysutilGetBgmPlaybackStatus"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  CHECK(p.memory.commit(0x4f0000, 0x10000));
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kErrorValue = 0x8002b102, kErrorBusy = 0x8002b105,
+                          kBgmErrorParam = 0x8002b101;
+
+  const std::uint32_t cb = dal::registerHostFunction("sysutilCallback", sysutilCallback);
+  g_sysutil_callbacks.clear();
+  g_sysutil_callback_hook = nullptr;
+
+  // Only slots 0..3 exist.
+  CHECK(call(Register, 4, cb, 1) == kErrorValue);
+  CHECK(call(Unregister, 4) == kErrorValue);
+  CHECK(call(Unregister, 0xffffffff) == kErrorValue);
+
+  // No registered callback: nothing is queued and a check does nothing.
+  CHECK(dal::queueSysutilEvent(dal::kSysutilRequestExitGame, 1) == 0);
+  CHECK(call(Check) == 0 && g_sysutil_callbacks.empty());
+
+  // An event is delivered by the next check, once, with (status, param, userdata).
+  CHECK(call(Register, 0, cb, 0x1234) == 0);
+  CHECK(call(Register, 2, cb, 0x5678) == 0);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilRequestExitGame, 7) == 2);
+  CHECK(g_sysutil_callbacks.empty());
+  CHECK(call(Check) == 0);
+  CHECK(g_sysutil_callbacks.size() == 2);
+  if (g_sysutil_callbacks.size() == 2) {
+    CHECK(g_sysutil_callbacks[0].status == 0x101 && g_sysutil_callbacks[0].param == 7 &&
+          g_sysutil_callbacks[0].userdata == 0x1234);
+    CHECK(g_sysutil_callbacks[1].status == 0x101 && g_sysutil_callbacks[1].param == 7 &&
+          g_sysutil_callbacks[1].userdata == 0x5678);
+  }
+  CHECK(call(Check) == 0 && g_sysutil_callbacks.size() == 2);
+
+  // An unregistered slot gets nothing; an event keeps the registrations of its enqueue time.
+  g_sysutil_callbacks.clear();
+  CHECK(call(Unregister, 2) == 0);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilBgmPlaybackPlay, 0) == 1);
+  CHECK(call(Register, 3, cb, 9) == 0);
+  CHECK(call(Check) == 0 && g_sysutil_callbacks.size() == 1 &&
+        g_sysutil_callbacks[0].userdata == 0x1234);
+  CHECK(call(Unregister, 3) == 0);
+
+  // A plain closure runs on the checking thread with its context; one queued from inside a
+  // callback waits for the next check.
+  g_sysutil_callbacks.clear();
+  int ran = 0;
+  g_sysutil_callback_hook = [&] {
+    dal::queueSysutilCall([&](DalPpuContext*, std::uint8_t*) { ran += 10; });
+  };
+  dal::queueSysutilCall([&](DalPpuContext* c, std::uint8_t*) {
+    CHECK(c == ctx.get());
+    ran++;
+  });
+  CHECK(dal::queueSysutilEvent(dal::kSysutilSystemMenuOpen, 0) == 1);
+  CHECK(call(Check) == 0 && ran == 1 && g_sysutil_callbacks.size() == 1);
+  g_sysutil_callback_hook = nullptr;
+  CHECK(call(Check) == 0 && ran == 11 && g_sysutil_callbacks.size() == 1);
+
+  // The callback is called through callGuestFunction: r1 is restored.
+  CHECK(ctx->gpr[1] == 0x500000);
+
+  // DRAWING_BEGIN/END pair up.
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingEnd, 0) == -1);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingBegin, 0) == 1);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingBegin, 0) == static_cast<std::int32_t>(kErrorBusy));
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingEnd, 0) == 1);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingEnd, 0) == -1);
+  CHECK(call(Check) == 0);
+
+  // BGM status: stopped and disabled until enabled.
+  const std::uint32_t status = scratch;
+  std::memset(base + status, 0xaa, 40);
+  CHECK(call(BgmStatus, 0) == kBgmErrorParam);
+  CHECK(call(BgmStatus, status) == 0);
+  CHECK(base[status] == 1 && base[status + 1] == 1);
+  bool zero_rest = true;
+  for (std::uint32_t i = 2; i < 32; i++) zero_rest &= base[status + i] == 0;
+  CHECK(zero_rest && base[status + 32] == 0xaa);
+  CHECK(call(EnableBgm) == 0);
+  CHECK(call(BgmStatus, status) == 0 && base[status] == 1 && base[status + 1] == 0);
+
+  dal::resetCellSysutil();
+  g_sysutil_callbacks.clear();
+  dal::resetHostFunctions();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -3833,6 +3966,7 @@ int main(int argc, char** argv) {
   testCellGame();
   testCellFs();
   testSceNpAndTrophy();
+  testCellSysutil();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();

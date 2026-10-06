@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <span>
 #include <string>
@@ -44,6 +45,38 @@ std::span<const HleEntry> sceNpTrophyHandlers();
 
 // Forgets the trophy init state, contexts and handles. Intended for tests.
 void resetSceNpTrophy();
+
+// Handlers of the cellSysutil module that this file implements: the callback pump
+// (Register/Unregister/CheckCallback) and the BGM playback status.
+std::span<const HleEntry> cellSysutilHandlers();
+
+// Status codes passed to cellSysutil callbacks (CELL_SYSUTIL_*) and the module's error codes.
+inline constexpr std::uint64_t kSysutilRequestExitGame = 0x0101;
+inline constexpr std::uint64_t kSysutilDrawingBegin = 0x0121;
+inline constexpr std::uint64_t kSysutilDrawingEnd = 0x0122;
+inline constexpr std::uint64_t kSysutilSystemMenuOpen = 0x0131;
+inline constexpr std::uint64_t kSysutilSystemMenuClose = 0x0132;
+inline constexpr std::uint64_t kSysutilBgmPlaybackPlay = 0x0141;
+inline constexpr std::uint64_t kSysutilBgmPlaybackStop = 0x0142;
+inline constexpr std::uint32_t kSysutilErrorValue = 0x8002b102;  // CELL_SYSUTIL_ERROR_VALUE
+inline constexpr std::uint32_t kSysutilErrorBusy = 0x8002b105;   // CELL_SYSUTIL_ERROR_BUSY
+
+// A unit of work that runs on the guest thread that calls cellSysutilCheckCallback, with that
+// thread's context, and may call guest functions through callGuestFunction.
+using SysutilCall = std::function<void(DalPpuContext*, std::uint8_t*)>;
+
+// Queues `call` for the next cellSysutilCheckCallback (RPCS3 sysutil_register_cb). Call under the
+// guest lock.
+void queueSysutilCall(SysutilCall call);
+
+// Queues func(status, param, userdata) for every callback registered right now, in slot order
+// (RPCS3 sysutil_send_system_cmd). Returns how many were queued; DRAWING_BEGIN while one is open
+// returns kSysutilErrorBusy and DRAWING_END without one returns -1, queueing nothing. Call under
+// the guest lock.
+std::int32_t queueSysutilEvent(std::uint64_t status, std::uint64_t param);
+
+// Forgets the registered callbacks, the queue and the BGM state. Intended for tests.
+void resetCellSysutil();
 
 // Handlers of the sys_fs module (cellFs*).
 std::span<const HleEntry> cellFsHandlers();
