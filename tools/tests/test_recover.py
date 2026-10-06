@@ -153,7 +153,8 @@ class CanonicalFixtureTest(RecoverTestBase):
         self.assertEqual(code, 0, err)
         lines = out.splitlines()
         self.assertEqual([ln.split(":")[0] for ln in lines],
-                         ["seeds", "thunks", "jump tables", "partition", "elapsed"])
+                         ["seeds", "thunks", "jump tables", "partition", "coverage",
+                          "elapsed"])
         self.assertRegex(lines[0], re.compile(
             r"^seeds: ghidra \d+, opd \d+, bl \d+ \(\d+ not ghidra\), entry \d+, export \d+, "
             r"data_ptr \d+, ghidra_data_ref \d+, prologue (\d+|off), manual \d+; "
@@ -163,7 +164,27 @@ class CanonicalFixtureTest(RecoverTestBase):
         self.assertEqual(lines[3],
                          "partition: 1 rounds, converged, 2 functions, 0 promoted, "
                          "0 call-discovered")
-        self.assertRegex(lines[4], r"^elapsed: \d+\.\d s$")
+        self.assertRegex(lines[4], r"^coverage: owned \d+ / \d+ words \(\d+\.\d%\); "
+                         r"uncovered \d+ words: zero \d+, padding \d+, jump_table \d+, "
+                         r"data \d+, code \d+$")
+        self.assertRegex(lines[5], r"^elapsed: \d+\.\d s$")
+
+    def test_ghidra_lines_and_section_need_a_summary(self):
+        summary = self.write_summary([(at(0), None), (at(6), None)])
+        code, out, err = self.run_recover("--ghidra-summary", summary)
+        self.assertEqual(code, 0, err)
+        lines = out.splitlines()
+        self.assertEqual([ln.split(":")[0] for ln in lines],
+                         ["seeds", "thunks", "jump tables", "partition", "coverage",
+                          "ghidra extents", "ghidra code not owned", "elapsed"])
+        self.assertEqual(lines[5], "ghidra extents: equal 1, ours_larger 1, ours_smaller 0, "
+                         "different 0, missing 0; cell-truncated 0, extended 0")
+        report = self.report()
+        self.assertEqual(list(report)[-2:], ["coverage", "ghidra"])
+        self.assertEqual(report["ghidra"]["extents"]["ours_larger"]["count"], 1)
+        self.assertEqual(report["coverage"]["owned_words"], 7)
+        self.run_recover("--no-ghidra")
+        self.assertNotIn("ghidra", self.report())
 
     def test_unreadable_thunk_stub_counts_as_slot_mismatch(self):
         # The fixture's slot values are zero, so the single thunk lies outside any segment.
@@ -175,7 +196,8 @@ class CanonicalFixtureTest(RecoverTestBase):
     def test_report_sections(self):
         self.run_recover("--no-ghidra")
         report = self.report()
-        self.assertEqual(list(report), ["seeds", "thunks", "jump_tables", "partition"])
+        self.assertEqual(list(report),
+                         ["seeds", "thunks", "jump_tables", "partition", "coverage"])
         seeds = report["seeds"]
         self.assertEqual(seeds["counts"]["opd"], 2)
         self.assertEqual(seeds["by_source"], {"entry": 1, "export": 1, "opd": 2})
@@ -184,6 +206,8 @@ class CanonicalFixtureTest(RecoverTestBase):
         self.assertEqual((part["rounds"], part["converged"], part["functions"]), (1, True, 2))
         self.assertEqual(part["by_source"], {"entry": 1, "export": 1, "opd": 2})
         self.assertEqual(part["tail_edges_by_kind"], {"fallthrough": 1})
+        self.assertEqual(part["fallthrough_tail_edges"],
+                         [{"function": hexs(at(0)), "site": hexs(at(5)), "target": hexs(at(6))}])
         self.assertEqual(part["promoted"], [])
 
     def test_report_is_indented_json_with_trailing_newline(self):

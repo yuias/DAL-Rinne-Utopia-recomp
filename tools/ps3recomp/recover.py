@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import cell
+from .coverage import build_coverage, coverage_lines
 from .elf import ElfError, ElfFile
 from .ghidra import _load_default_config
 from .ghidra_summary import GhidraSummary, load_summary, write_compact_json
@@ -21,7 +22,7 @@ from .nids import DEFAULT_SYSCALLS, load_syscall_table
 from .partition import PartitionResult, partition
 from .ppu_flow import CodeImage
 from .seeds import (ImportThunk, SeedCensus, check_thunk_slots, collect_recovery_seeds,
-                    find_import_thunks)
+                    find_import_thunks, prologue_candidates)
 
 SCHEMA = 1
 GENERATOR = "ps3tool recover"
@@ -197,6 +198,11 @@ def _partition_section(result: PartitionResult, census: SeedCensus,
                       "reached_from": _hex_list(p.reached_from),
                       "edge_sites": _hex_list(p.edge_sites)} for p in result.promotions],
         "tail_edges_by_kind": dict(sorted(tail_kinds.items())),
+        # Fall-through into another start usually means a noreturn callee (not known here).
+        "fallthrough_tail_edges": [
+            {"function": _hex(fn.entry), "site": _hex(e.site), "target": _hex(e.target)}
+            for _, fn in sorted(functions.items()) for e in fn.tail_edges
+            if e.kind == "fallthrough"],
         "invalid_flow": _capped([{"function": _hex(f), "from": _hex(a), "to": _hex(b)}
                                  for f, a, b in result.invalid_flow]),
         "rejected_calls": _capped([{"site": _hex(s), "target": _hex(t)}
@@ -297,11 +303,21 @@ def _run(args: argparse.Namespace) -> int:
         "jump_tables": jt_doc,
         "partition": part_doc,
     }
+    cov_lines: list[str] = []
+    if result.converged:
+        coverage, ghidra = build_coverage(image, result.functions, tables,
+                                          prologue_candidates(image), summary)
+        report["coverage"] = coverage
+        if ghidra is not None:
+            report["ghidra"] = ghidra
+        cov_lines = coverage_lines(coverage, ghidra)
     report_path = Path(args.report) if args.report else DEFAULT_REPORT
     _write_text(report_path,
                 json.dumps(report, indent=2, sort_keys=False, ensure_ascii=False) + "\n")
 
     for line in _stdout_lines(census, thunks_doc, jt_doc, part_doc, args.prologue_seeds):
+        print(line)
+    for line in cov_lines:
         print(line)
 
     if not result.converged:

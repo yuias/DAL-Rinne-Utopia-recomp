@@ -439,6 +439,43 @@ class RealRecoverTest(unittest.TestCase):
             self.assertLessEqual(prev_end, next_start)
 
 
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file() and _COMMITTED_SUMMARY.is_file(),
+                     "DAL_EBOOT_ELF and config/ghidra_summary.json are required")
+class RealCoverageTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _, cls.stdout, _, report = _recover_result()
+        cls.coverage = report["coverage"]
+        cls.ghidra = report["ghidra"]
+
+    def test_uncovered_words_add_up(self):
+        cov = self.coverage
+        self.assertEqual(cov["text_words"], 209727)
+        self.assertEqual(cov["owned_words"] + cov["uncovered"]["words"], cov["text_words"])
+        by_class = cov["uncovered"]["by_class"]
+        self.assertEqual(sum(v["words"] for v in by_class.values()), cov["uncovered"]["words"])
+        # One run per recovered switch table, 732 entries in all.
+        self.assertEqual((by_class["jump_table"]["words"], by_class["jump_table"]["runs"]),
+                         (732, 14))
+
+    def test_cell_truncated_ghidra_functions_are_extended(self):
+        cell_info = self.ghidra["cell_truncated"]
+        self.assertEqual(cell_info["count"], 76)
+        # Observed: every truncated function is owned past its Cell-only word by the same entry.
+        self.assertEqual(cell_info["extended"], 76)
+        self.assertEqual(cell_info["not_extended"], [])
+
+    def test_ghidra_functions_are_never_smaller_in_our_partition(self):
+        ext = self.ghidra["extents"]
+        self.assertEqual((ext["ours_smaller"]["count"], ext["different"]["count"]), (0, 0))
+        self.assertEqual(self.ghidra["code_not_owned"]["words"], 0)
+
+    def test_stdout_has_the_coverage_lines(self):
+        prefixes = [ln.split(":")[0] for ln in self.stdout.splitlines()]
+        self.assertEqual(prefixes[-4:], ["coverage", "ghidra extents", "ghidra code not owned",
+                                         "elapsed"])
+
+
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
                      "DAL_EBOOT_ELF is not set or does not name an existing file")
 class RealEbootNidTest(unittest.TestCase):
