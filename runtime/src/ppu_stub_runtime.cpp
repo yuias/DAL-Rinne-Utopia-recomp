@@ -1,6 +1,6 @@
 // Minimal runtime for the contract hooks in dal/ppu_context.h. It lets generated code be linked
 // and exercised without the real runtime: dispatch works, everything that would need the system
-// (HLE calls, unknown targets, unhandled instructions) reports and aborts.
+// (HLE calls, unknown targets, unhandled instructions) reports and exits.
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +27,13 @@ std::vector<DalFuncMapping>& funcTable() {
     return table;
 }
 
+// std::abort raises a modal "Debug Error!" dialog in debug CRT builds, which stalls unattended test
+// runs; exit with a status code instead.
+[[noreturn]] void fatalExit() {
+    std::fflush(stderr);
+    std::_Exit(3);
+}
+
 }  // namespace
 
 extern "C" {
@@ -49,7 +56,7 @@ void dalUnknownTarget(DalPpuContext* ctx, uint8_t* base, uint32_t target, uint32
     (void)ctx;
     (void)base;
     std::fprintf(stderr, "dal: unknown dynamic target 0x%08x (from 0x%08x)\n", target, site);
-    std::abort();
+    fatalExit();
 }
 
 // The musttail keeps dynamic transfers from adding a host frame per hop.
@@ -71,7 +78,7 @@ void dalHleCall(DalPpuContext* ctx, uint8_t* base, uint32_t import_index) {
     } else {
         std::fprintf(stderr, "dal: HLE call, import index %u\n", import_index);
     }
-    std::abort();
+    fatalExit();
 }
 
 // Reports success so that a harness can observe the call.
@@ -90,14 +97,14 @@ void dalUnhandled(DalPpuContext* ctx, uint8_t* base, uint32_t site, uint32_t wor
     (void)ctx;
     (void)base;
     std::fprintf(stderr, "dal: unhandled instruction 0x%08x at 0x%08x\n", word, site);
-    std::abort();
+    fatalExit();
 }
 
 void dalTrap(DalPpuContext* ctx, uint8_t* base, uint32_t site) {
     (void)ctx;
     (void)base;
     std::fprintf(stderr, "dal: trap at 0x%08x\n", site);
-    std::abort();
+    fatalExit();
 }
 
 // Single-threaded reservation: it holds while the address matches and memory still contains the
