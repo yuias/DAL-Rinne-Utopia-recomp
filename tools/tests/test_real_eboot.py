@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from ps3recomp import (cell, disasm, ghidra_diff, ghidra_summary, info, jumptab, nids,
-                       probe, seeds)
+                       probe, recover, seeds)
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
 from ps3recomp.ppu_flow import CodeImage
@@ -367,6 +367,76 @@ class RealJumpTableTest(unittest.TestCase):
         for table in self.tables.values():
             for target in table.targets:
                 self.assertTrue(self.image.valid(target), hex(target))
+
+
+_RECOVER_CACHE = []
+
+
+def _recover_result():
+    """One `recover` run per process; the command takes a while on the real ELF."""
+    if not _RECOVER_CACHE:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "functions.json"
+            report_path = Path(tmp) / "report.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                code = recover.main([_ELF_PATH, "-o", str(out_path), "--report", str(report_path),
+                                     "--seeds-out", str(Path(tmp) / "seeds.txt")])
+            db = report = None
+            if code == 0:
+                db = json.loads(out_path.read_text(encoding="utf-8"))
+            if report_path.is_file():
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+        _RECOVER_CACHE.append((code, stdout.getvalue(), db, report))
+    return _RECOVER_CACHE[0]
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file() and _COMMITTED_SUMMARY.is_file(),
+                     "DAL_EBOOT_ELF and config/ghidra_summary.json are required")
+class RealRecoverTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.code, cls.stdout, cls.db, cls.report = _recover_result()
+
+    def test_exit_code_and_convergence(self):
+        self.assertEqual(self.code, 0)
+        self.assertTrue(self.report["partition"]["converged"])
+        self.assertIn("elapsed:", self.stdout)
+
+    def test_every_ghidra_start_in_text_is_a_function_entry(self):
+        summary = ghidra_summary.load_summary(_COMMITTED_SUMMARY)
+        start, end = summary.text
+        rejected = {int(r["addr"], 16) for r in self.report["seeds"]["rejected"]}
+        entries = {int(f["entry"], 16) for f in self.db["functions"]}
+        missing = [hex(f.entry) for f in summary.functions
+                   if start <= f.entry < end and f.entry not in rejected
+                   and f.entry not in entries]
+        self.assertEqual(missing, [])
+
+    def test_thunks(self):
+        self.assertEqual(len(self.db["import_thunks"]), 166)
+        self.assertEqual(self.report["thunks"]["count"], 166)
+        self.assertEqual(self.report["thunks"]["slot_mismatches"], [])
+
+    def test_function_count_covers_the_seed_union(self):
+        counts = self.report["seeds"]["counts"]
+        floor = counts["union_ghidra_bl_opd"] - counts["rejected"]
+        self.assertGreaterEqual(len(self.db["functions"]), floor)
+        self.assertGreaterEqual(len(self.db["functions"]), 2688 - counts["rejected"])
+
+    def test_jump_tables_are_all_resolved(self):
+        jt = self.report["jump_tables"]
+        self.assertEqual((jt["bcctr_sites"], jt["resolved"], jt["targets"]), (14, 14, 732))
+        self.assertEqual(self.db["unresolved_indirect"], [])
+        self.assertEqual(len(self.db["jump_tables"]), 14)
+
+    def test_database_is_sorted_and_ranges_are_disjoint(self):
+        entries = [f["entry"] for f in self.db["functions"]]
+        self.assertEqual(entries, sorted(entries))
+        spans = sorted((int(a, 16), int(b, 16))
+                       for f in self.db["functions"] for a, b in f["ranges"])
+        for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(prev_end, next_start)
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),

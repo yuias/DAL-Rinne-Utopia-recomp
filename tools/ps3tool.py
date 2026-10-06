@@ -11,6 +11,7 @@ COMMANDS = {
     "ghidra-export": "ghidra",
     "ghidra-diff": "ghidra_diff",
     "ghidra-summary": "ghidra_summary",
+    "recover": "recover",
     "nidgen": "nidgen",
 }
 

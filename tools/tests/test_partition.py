@@ -165,6 +165,19 @@ class SharedCodeTest(unittest.TestCase):
         self.assertEqual(results[0].promotions, ())
 
 
+    def test_seed_order_does_not_change_a_promoting_result(self):
+        words = self.shared_words()
+        seeds = [Seed(at(0), "ghidra"), Seed(at(3), "bl"), Seed(at(3), "opd")]
+        results = [partition(build(words), list(order), {}, {})
+                   for order in itertools.permutations(seeds)]
+        self.assertTrue(all(r == results[0] for r in results))
+        self.assertEqual(len(results[0].promotions), 1)
+        self.assertEqual(results[0].promotions[0].addr, at(6))
+        self.assertEqual(sorted(results[0].functions), [at(0), at(3), at(6)])
+        self.assertEqual(results[0].functions[at(3)].sources, {"bl", "opd"})
+        self.assertEqual(results[0].functions[at(6)].sources, {"promoted"})
+
+
 class RoundLimitTest(unittest.TestCase):
     WORDS = [b_to(0, at(3), lk=True), asm.blr(), asm.blr(), asm.blr()]
 
