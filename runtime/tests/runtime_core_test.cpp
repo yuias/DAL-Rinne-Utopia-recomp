@@ -2523,6 +2523,359 @@ void testCellMsgDialog() {
   dal::resetLogOnce();
 }
 
+// Script and observations shared by the save data callbacks below.
+struct SaveFileOp {
+  std::uint32_t operation = 0, type = 1, offset = 0, size = 0, buf_size = 0, buf = 0;
+  std::string name;
+};
+
+struct SaveScript {
+  // funcStat
+  std::int32_t stat_result = 0;
+  std::uint32_t set_param = 0, recreate = 0;
+  std::uint32_t stat_calls = 0, stat_is_new = 0, stat_file_num = 0, stat_file_list_num = 0;
+  std::int32_t stat_size_kb = 0, stat_hdd_free = 0;
+  std::string stat_title, stat_dir;
+  // funcFile
+  std::vector<SaveFileOp> file_ops;
+  std::size_t next_op = 0;
+  std::int32_t file_final = 1;
+  std::vector<std::uint32_t> file_exc;
+  // funcList
+  std::int32_t list_result = 0;
+  std::uint32_t list_calls = 0, list_dir_num = 0, list_dir_list_num = 0, focus = 1, fixed_num = 0,
+                fixed_list = 0, new_data = 0, focus_dir = 0;
+};
+SaveScript g_save;
+
+DAL_PPU_FUNC(saveStatCallback) {
+  const auto result = static_cast<std::uint32_t>(ctx->gpr[3]);
+  const auto get = static_cast<std::uint32_t>(ctx->gpr[4]);
+  const auto set = static_cast<std::uint32_t>(ctx->gpr[5]);
+  g_save.stat_calls++;
+  g_save.stat_hdd_free = static_cast<std::int32_t>(dalRead32(base, get));
+  g_save.stat_is_new = dalRead32(base, get + 4);
+  g_save.stat_dir = reinterpret_cast<const char*>(base + get + 32);
+  g_save.stat_title = reinterpret_cast<const char*>(base + get + 64);
+  g_save.stat_size_kb = static_cast<std::int32_t>(dalRead32(base, get + 1620));
+  g_save.stat_file_num = dalRead32(base, get + 1628);
+  g_save.stat_file_list_num = dalRead32(base, get + 1632);
+  dalWrite32(base, result, static_cast<std::uint32_t>(g_save.stat_result));
+  dalWrite32(base, set, g_save.set_param);
+  dalWrite32(base, set + 4, g_save.recreate);
+}
+
+DAL_PPU_FUNC(saveFileCallback) {
+  const auto result = static_cast<std::uint32_t>(ctx->gpr[3]);
+  const auto get = static_cast<std::uint32_t>(ctx->gpr[4]);
+  const auto set = static_cast<std::uint32_t>(ctx->gpr[5]);
+  g_save.file_exc.push_back(dalRead32(base, get));
+  if (g_save.next_op >= g_save.file_ops.size()) {
+    dalWrite32(base, result, static_cast<std::uint32_t>(g_save.file_final));
+    return;
+  }
+  const SaveFileOp& op = g_save.file_ops[g_save.next_op++];
+  dalWrite32(base, set, op.operation);
+  dalWrite32(base, set + 8, op.type);
+  // The file name goes into a spare area of the callback scratch block (after the structures).
+  const std::uint32_t name_addr = result + 0x900;
+  std::memcpy(base + name_addr, op.name.c_str(), op.name.size() + 1);
+  dalWrite32(base, set + 28, op.name.empty() ? 0 : name_addr);
+  dalWrite32(base, set + 32, op.offset);
+  dalWrite32(base, set + 36, op.size);
+  dalWrite32(base, set + 40, op.buf_size);
+  dalWrite32(base, set + 44, op.buf);
+  dalWrite32(base, result, 0);
+}
+
+DAL_PPU_FUNC(saveListCallback) {
+  const auto result = static_cast<std::uint32_t>(ctx->gpr[3]);
+  const auto get = static_cast<std::uint32_t>(ctx->gpr[4]);
+  const auto set = static_cast<std::uint32_t>(ctx->gpr[5]);
+  g_save.list_calls++;
+  g_save.list_dir_num = dalRead32(base, get);
+  g_save.list_dir_list_num = dalRead32(base, get + 4);
+  dalWrite32(base, result, static_cast<std::uint32_t>(g_save.list_result));
+  dalWrite32(base, set, g_save.focus);
+  dalWrite32(base, set + 4, g_save.focus_dir);
+  dalWrite32(base, set + 8, g_save.fixed_num);
+  dalWrite32(base, set + 12, g_save.fixed_list);
+  dalWrite32(base, set + 16, g_save.new_data);
+}
+
+void testCellSaveData() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetHostFunctions();
+  dal::resetCellSaveData();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t dir_addr = scratch, set_buf = scratch + 0x100, buf = scratch + 0x1000,
+                      set_param = scratch + 0x4000, data = scratch + 0x6000,
+                      set_list = scratch + 0x7100, prefix = scratch + 0x7200,
+                      new_data = scratch + 0x7300, new_dir = scratch + 0x7340,
+                      fixed_list = scratch + 0x7400, focus_dir = scratch + 0x7500;
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_savedata_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  stdfs::create_directories(root / "game", ec);
+  dal::configureVfs(root / "game", root / "hdd");
+  const stdfs::path saves = root / "hdd" / "dev_hdd0" / "home" / "00000001" / "savedata";
+
+  enum Import : std::uint32_t { AutoLoad, AutoSave, ListLoad, ListSave, Delete, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0xfbd5c856, "cellSysutil", "cellSaveDataAutoLoad2"},
+      {0x00800010, 0x8b7ed64b, "cellSysutil", "cellSaveDataAutoSave2"},
+      {0x00800020, 0x1dfbfdd6, "cellSysutil", "cellSaveDataListLoad2"},
+      {0x00800030, 0x2de0d663, "cellSysutil", "cellSaveDataListSave2"},
+      {0x00800040, 0xedadd797, "cellSysutil", "cellSaveDataDelete2"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  CHECK(p.memory.commit(0x4f0000, 0x10000));
+  auto call = [&](Import which, std::initializer_list<std::uint64_t> args) {
+    int reg = 3;
+    for (const std::uint64_t arg : args) ctx->gpr[reg++] = arg;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  auto put = [&](std::uint32_t addr, std::string_view text) {
+    std::memcpy(base + addr, text.data(), text.size());
+    base[addr + text.size()] = 0;
+  };
+  auto logged = [&](std::string_view needle) {
+    for (const std::string& line : lines) {
+      if (line.find(needle) != std::string::npos) return true;
+    }
+    return false;
+  };
+  auto text = [&](const stdfs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  };
+
+  const std::uint32_t stat_cb = dal::registerHostFunction("saveStatCallback", saveStatCallback);
+  const std::uint32_t file_cb = dal::registerHostFunction("saveFileCallback", saveFileCallback);
+  const std::uint32_t list_cb = dal::registerHostFunction("saveListCallback", saveListCallback);
+  constexpr std::uint32_t kErrCbResult = 0x8002b401, kErrParam = 0x8002b404, kErrFailure = 0x8002b407;
+
+  // setBuf: dirListMax 4, fileListMax 8, bufSize 0x2000, buf.
+  dalWrite32(base, set_buf, 4);
+  dalWrite32(base, set_buf + 4, 8);
+  dalWrite32(base, set_buf + 32, 0x2000);
+  dalWrite32(base, set_buf + 36, buf);
+  put(dir_addr, "SAVE0001");
+  auto autoLoad = [&](std::uint32_t err_dialog = 0) {
+    return call(AutoLoad, {0, dir_addr, err_dialog, set_buf, stat_cb, file_cb, 0, 0x1234});
+  };
+  auto autoSave = [&](std::uint32_t err_dialog = 0) {
+    return call(AutoSave, {0, dir_addr, err_dialog, set_buf, stat_cb, file_cb, 0, 0x1234});
+  };
+
+  // Argument checks: lowercase name, version above 1, missing funcStat, bad errDialog, no setBuf.
+  put(dir_addr, "save0001");
+  CHECK(autoLoad() == kErrParam);
+  put(dir_addr, "SAVE0001");
+  CHECK(call(AutoLoad, {2, dir_addr, 0, set_buf, stat_cb, file_cb, 0, 0}) == kErrParam);
+  CHECK(call(AutoLoad, {0, dir_addr, 0, set_buf, 0, file_cb, 0, 0}) == kErrParam);
+  CHECK(autoLoad(3) == kErrParam);
+  CHECK(call(AutoLoad, {0, dir_addr, 0, 0, stat_cb, file_cb, 0, 0}) == kErrParam);
+  CHECK(call(AutoLoad, {0, 0, 0, set_buf, stat_cb, file_cb, 0, 0}) == kErrParam);
+  CHECK(g_save.stat_calls == 0);
+
+  // First boot: no save. funcStat sees isNewData and no files, and reports NODATA.
+  g_save = SaveScript{};
+  g_save.stat_result = -4;
+  CHECK(autoLoad(0) == kErrCbResult);
+  CHECK(g_save.stat_calls == 1 && g_save.stat_is_new == 1 && g_save.stat_file_num == 0 &&
+        g_save.stat_size_kb == 0 && g_save.stat_dir == "SAVE0001" &&
+        g_save.stat_hdd_free == 40 * 1024 * 1024 - 256);
+  CHECK(logged("there is no save data (no dialog requested)"));
+  lines.clear();
+  CHECK(autoLoad(1) == kErrCbResult);
+  CHECK(logged("error dialog (headless, not shown): there is no save data"));
+  lines.clear();
+  CHECK(autoLoad(2) == kErrCbResult && logged("error dialog"));  // NOREPEAT: the first one shows
+  lines.clear();
+  CHECK(autoLoad(2) == kErrCbResult);  // the same error again raises no dialog
+  CHECK(!logged("error dialog"));
+  g_save.stat_result = 1;  // OK_LAST ends the call successfully
+  CHECK(autoLoad(1) == 0);
+  g_save.stat_result = 0;  // OK_NEXT for a new save without setParam is a parameter error
+  CHECK(autoLoad(1) == kErrParam);
+  g_save.stat_result = 9;  // out of range
+  CHECK(autoLoad() == kErrParam);
+  CHECK(!stdfs::exists(saves / "SAVE0001"));
+
+  // Save: setParam, a secure file, a normal file and the icon.
+  g_save = SaveScript{};
+  put(set_param + 0, "My title");
+  put(set_param + 128, "My subtitle");
+  put(set_param + 256, "My detail");
+  put(set_param + 1288, "LP-1");
+  g_save.set_param = set_param;
+  put(data, "hello");
+  put(data + 0x100, "xyz");
+  put(data + 0x200, "PNG!");
+  g_save.file_ops = {{1, 0, 0, 5, 5, data, "DATA.BIN"},
+                     {1, 1, 0, 3, 3, data + 0x100, "B.DAT"},
+                     {1, 2, 0, 4, 4, data + 0x200, ""}};
+  CHECK(autoSave() == 0);
+  CHECK(g_save.stat_is_new == 1 && g_save.next_op == 3);
+  CHECK(text(saves / "SAVE0001" / "DATA.BIN") == "hello" && text(saves / "SAVE0001" / "B.DAT") == "xyz" &&
+        text(saves / "SAVE0001" / "ICON0.PNG") == "PNG!");
+  CHECK(!stdfs::exists(saves / ".working_SAVE0001") && !stdfs::exists(saves / ".backup_SAVE0001"));
+  {
+    const auto sfo = dal::readParamSfoFile(saves / "SAVE0001" / "PARAM.SFO");
+    CHECK(sfo.has_value());
+    if (sfo) {
+      CHECK(sfo->strings.at("CATEGORY") == "SD" && sfo->strings.at("TITLE") == "My title" &&
+            sfo->strings.at("SUB_TITLE") == "My subtitle" && sfo->strings.at("DETAIL") == "My detail" &&
+            sfo->strings.at("SAVEDATA_DIRECTORY") == "SAVE0001" &&
+            sfo->strings.at("SAVEDATA_LIST_PARAM") == "LP-1");
+      CHECK(sfo->ints.at("*DATA.BIN") == 1 && sfo->ints.at("*B.DAT") == 0 && sfo->ints.at("ATTRIBUTE") == 0);
+    }
+  }
+  CHECK(g_save.file_exc.size() == 4 && g_save.file_exc[1] == 5 && g_save.file_exc[2] == 3);
+
+  // Load: the stat step lists the files (PARAM.SFO excluded) and the READ returns the bytes.
+  g_save = SaveScript{};
+  std::memset(base + data + 0x400, 0, 16);
+  g_save.file_ops = {{0, 0, 0, 5, 16, data + 0x400, "DATA.BIN"}};
+  CHECK(autoLoad() == 0);
+  CHECK(g_save.stat_is_new == 0 && g_save.stat_title == "My title" && g_save.stat_file_num == 3 &&
+        g_save.stat_file_list_num == 3 && g_save.stat_size_kb == 3 + 35);
+  CHECK(std::memcmp(base + data + 0x400, "hello", 6) == 0);
+  CHECK(g_save.file_exc.size() == 2 && g_save.file_exc[1] == 5);
+  // Sorted by name: B.DAT (normal), DATA.BIN (secure), ICON0.PNG (icon).
+  CHECK(dalRead32(base, buf + 0) == 1 && dalRead32(base, buf + 56) == 0 && dalRead32(base, buf + 112) == 2);
+  CHECK(dalRead64(base, buf + 8) == 3 && dalRead64(base, buf + 64) == 5);
+  CHECK(std::strcmp(reinterpret_cast<const char*>(base + buf + 40), "B.DAT") == 0);
+  CHECK(std::strcmp(reinterpret_cast<const char*>(base + buf + 96), "DATA.BIN") == 0);
+  CHECK(text(saves / "SAVE0001" / "DATA.BIN") == "hello");  // a load commits nothing
+
+  // Reads of a missing file and past the end fail; callback result codes map to the CBRESULT error.
+  g_save = SaveScript{};
+  g_save.file_ops = {{0, 1, 0, 4, 4, data + 0x400, "NONE.DAT"}};
+  CHECK(autoLoad() == kErrFailure);
+  g_save = SaveScript{};
+  g_save.file_ops = {{0, 0, 5, 4, 4, data + 0x400, "DATA.BIN"}};
+  CHECK(autoLoad() == kErrFailure);
+  g_save = SaveScript{};
+  g_save.file_final = -3;
+  CHECK(autoLoad() == kErrCbResult);
+  g_save = SaveScript{};
+  g_save.file_final = 7;
+  CHECK(autoLoad() == kErrParam);
+  g_save = SaveScript{};
+  g_save.file_ops = {{0, 0, 0, 8, 4, data + 0x400, "DATA.BIN"}};  // buffer smaller than the size
+  CHECK(autoLoad() == kErrParam);
+  g_save = SaveScript{};
+  g_save.file_ops = {{0, 0, 0, 1, 1, data + 0x400, "PARAM.SFO"}};  // system files are refused
+  CHECK(autoLoad() == kErrParam);
+
+  // Write without truncation, a delete and a missing delete.
+  g_save = SaveScript{};
+  put(data + 0x300, "EY");
+  g_save.file_ops = {{3, 0, 1, 2, 2, data + 0x300, "DATA.BIN"}, {2, 1, 0, 0, 0, 0, "B.DAT"}};
+  CHECK(autoSave() == 0);
+  CHECK(text(saves / "SAVE0001" / "DATA.BIN") == "hEYlo" && !stdfs::exists(saves / "SAVE0001" / "B.DAT"));
+  {
+    const auto sfo = dal::readParamSfoFile(saves / "SAVE0001" / "PARAM.SFO");
+    CHECK(sfo && !sfo->ints.contains("*B.DAT") && sfo->ints.at("*DATA.BIN") == 1);
+  }
+  g_save = SaveScript{};
+  g_save.file_ops = {{2, 1, 0, 0, 0, 0, "B.DAT"}};
+  CHECK(autoSave() == kErrFailure);
+  g_save = SaveScript{};  // a plain WRITE truncates
+  g_save.file_ops = {{1, 0, 0, 2, 2, data + 0x300, "DATA.BIN"}};
+  CHECK(autoSave() == 0 && text(saves / "SAVE0001" / "DATA.BIN") == "EY");
+
+  // reCreateMode YES needs setParam and drops the old files.
+  g_save = SaveScript{};
+  g_save.recreate = 2;
+  g_save.file_ops = {{1, 1, 0, 3, 3, data + 0x100, "NEW.DAT"}};
+  CHECK(autoSave() == kErrParam);
+  g_save.set_param = set_param;
+  g_save.next_op = 0;
+  CHECK(autoSave() == 0);
+  CHECK(!stdfs::exists(saves / "SAVE0001" / "DATA.BIN") && text(saves / "SAVE0001" / "NEW.DAT") == "xyz");
+  {
+    const auto sfo = dal::readParamSfoFile(saves / "SAVE0001" / "PARAM.SFO");
+    CHECK(sfo && !sfo->ints.contains("*DATA.BIN") && sfo->ints.contains("*NEW.DAT"));
+  }
+
+  // List operations: ListSave2 creates the game's new-data slot; ListLoad2 picks by focus.
+  put(prefix, "SAVE");
+  dalWrite32(base, set_list, 0);
+  dalWrite32(base, set_list + 4, 1);
+  dalWrite32(base, set_list + 8, prefix);
+  put(new_dir, "SAVE0002");
+  dalWrite32(base, new_data, 0);
+  dalWrite32(base, new_data + 4, new_dir);
+  g_save = SaveScript{};
+  g_save.focus = 5;  // NEWDATA
+  g_save.new_data = new_data;
+  g_save.set_param = set_param;
+  g_save.file_ops = {{1, 1, 0, 3, 3, data + 0x100, "B.DAT"}};
+  CHECK(call(ListSave, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == 0);
+  CHECK(g_save.list_calls == 1 && g_save.list_dir_num == 1 && g_save.stat_dir == "SAVE0002" &&
+        g_save.stat_is_new == 1);
+  CHECK(text(saves / "SAVE0002" / "B.DAT") == "xyz");
+
+  g_save = SaveScript{};
+  put(fixed_list, "SAVE0001");
+  put(fixed_list + 48, "SAVE0002");
+  put(focus_dir, "SAVE0001");
+  g_save.focus = 0;  // DIRNAME
+  g_save.focus_dir = focus_dir;
+  g_save.fixed_num = 2;
+  g_save.fixed_list = fixed_list;
+  g_save.file_ops = {{0, 1, 0, 3, 3, data + 0x400, "NEW.DAT"}};
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == 0);
+  CHECK(g_save.list_dir_num == 2 && g_save.list_dir_list_num == 2 && g_save.stat_dir == "SAVE0001" &&
+        g_save.stat_is_new == 0);
+  CHECK(std::memcmp(base + data + 0x400, "xyz", 3) == 0);
+
+  g_save.focus = 1;  // LISTHEAD
+  g_save.stat_calls = 0;
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == 0);
+  CHECK(g_save.stat_calls == 1);
+
+  g_save = SaveScript{};  // nothing matches the prefix and there is no new-data slot: cancel
+  put(prefix, "NOPE");
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == 1);
+  CHECK(g_save.stat_calls == 0);
+  g_save.list_result = 1;  // funcList OK_LAST ends the call
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == 0);
+  g_save.list_result = -4;
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == kErrCbResult);
+  put(prefix, "");  // an empty prefix is a parameter error
+  CHECK(call(ListLoad, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == kErrParam);
+  CHECK(call(ListLoad, {0, 0, set_buf, list_cb, stat_cb, file_cb, 0, 0}) == kErrParam);
+  CHECK(call(ListLoad, {0, set_list, set_buf, 0, stat_cb, file_cb, 0, 0}) == kErrParam);
+
+  // Delete2 has only a selection UI in RPCS3.
+  CHECK(call(Delete, {0}) == 1);
+  CHECK(ctx->gpr[1] == 0x500000);
+
+  stdfs::remove_all(root, ec);
+  dal::resetCellSaveData();
+  dal::resetHostFunctions();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -4129,6 +4482,7 @@ int main(int argc, char** argv) {
   testSceNpAndTrophy();
   testCellSysutil();
   testCellMsgDialog();
+  testCellSaveData();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();

@@ -95,6 +95,14 @@ void setDialogAnswerDelay(std::chrono::milliseconds delay);
 // Forgets the open dialog and restores the answer and delay defaults. Intended for tests.
 void resetCellMsgDialog();
 
+// Handlers of the cellSaveData imports (cellSysutil module): AutoLoad2, AutoSave2, ListLoad2,
+// ListSave2 and Delete2.
+std::span<const HleEntry> cellSaveDataHandlers();
+
+// Forgets the busy flag, the NOREPEAT error-dialog memory and the callback scratch block. Intended
+// for tests; a test that reserves guest memory anew must call it.
+void resetCellSaveData();
+
 // Handlers of the sys_fs module (cellFs*).
 std::span<const HleEntry> cellFsHandlers();
 
