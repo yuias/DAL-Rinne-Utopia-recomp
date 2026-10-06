@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ps3recomp import info
+from ps3recomp import info, probe
 
 _ELF_PATH = os.environ.get("DAL_EBOOT_ELF")
 
@@ -78,6 +78,31 @@ class RealEbootInfoTest(unittest.TestCase):
         self.assertEqual(sum(len(m["functions"]) for m in imports), 166)
         self.assertEqual([(m["name"], len(m["functions"])) for m in imports],
                          _IMPORT_COUNTS)
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealEbootProbeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "probe.json"
+            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
+                cls.exit_code = probe.main([_ELF_PATH, "-o", str(out_path)])
+            cls.doc = json.loads(out_path.read_text(encoding="utf-8"))
+
+    def test_no_embedded_spu_images(self):
+        self.assertEqual(self.exit_code, 0)
+        self.assertEqual(self.doc["summary"]["spu_image_count"], 0)
+        self.assertEqual(self.doc["spu_images"], [])
+
+    def test_spu_related_imports(self):
+        self.assertEqual(self.doc["summary"]["spu_related_imports"], ["cellSpurs"])
+        imports = self.doc["imports"]
+        self.assertEqual(len(imports), 15)
+        spurs = [i for i in imports if i["name"] == "cellSpurs"]
+        self.assertEqual(len(spurs), 1)
+        self.assertEqual(spurs[0]["num_func"], 4)
 
 
 if __name__ == "__main__":

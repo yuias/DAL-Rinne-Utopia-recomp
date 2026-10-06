@@ -6,6 +6,7 @@ import sys
 # Subcommand name -> module under ps3recomp. Modules are imported lazily.
 COMMANDS = {
     "info": "info",
+    "probe": "probe",
 }
 
 

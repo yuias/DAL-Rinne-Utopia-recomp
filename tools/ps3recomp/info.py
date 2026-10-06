@@ -36,7 +36,7 @@ _SEGMENT_TYPE_NAMES = {
 }
 
 
-class _CliError(Exception):
+class CliError(Exception):
     def __init__(self, code: int, message: str):
         super().__init__(message)
         self.code = code
@@ -158,7 +158,7 @@ def _export_json(mod: cell.ExportModule) -> dict:
     return out
 
 
-def buildSummary(elf: ElfFile, path: str, size: int, sha256: str, pin: str) -> dict:
+def build_summary(elf: ElfFile, path: str, size: int, sha256: str, pin: str) -> dict:
     entry = cell.parse_entry(elf)
     prx = cell.parse_prx_param(elf)
     imports = cell.parse_imports(elf, prx) if prx is not None else []
@@ -195,49 +195,61 @@ def buildSummary(elf: ElfFile, path: str, size: int, sha256: str, pin: str) -> d
     }
 
 
-def _load_config(path: Path) -> dict:
+def load_config(path: Path) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             config = json.load(f)
     except OSError as e:
-        raise _CliError(EXIT_IO, "cannot read target config %s: %s" % (path, e.strerror))
+        raise CliError(EXIT_IO, "cannot read target config %s: %s" % (path, e.strerror))
     except ValueError as e:
-        raise _CliError(EXIT_IO, "invalid target config %s: %s" % (path, e))
+        raise CliError(EXIT_IO, "invalid target config %s: %s" % (path, e))
     if not isinstance(config, dict):
-        raise _CliError(EXIT_IO, "invalid target config %s: not an object" % path)
+        raise CliError(EXIT_IO, "invalid target config %s: not an object" % path)
     return config
 
 
-def _pinned_sha(config: dict, key: str) -> str | None:
+def pinned_sha(config: dict, key: str) -> str | None:
     section = config.get(key)
     sha = section.get("sha256") if isinstance(section, dict) else None
     return sha.lower() if isinstance(sha, str) else None
 
 
-def _run(args: argparse.Namespace) -> int:
+def read_input(path: str) -> bytes:
     try:
-        with open(args.elf, "rb") as f:
-            data = f.read()
+        with open(path, "rb") as f:
+            return f.read()
     except OSError as e:
-        raise _CliError(EXIT_IO, "cannot read %s: %s" % (args.elf, e.strerror))
+        raise CliError(EXIT_IO, "cannot read %s: %s" % (path, e.strerror))
 
-    sha256 = hashlib.sha256(data).hexdigest()
-    config = None if args.no_verify else _load_config(Path(args.target_config))
 
-    if is_self(data) or (config is not None and sha256 == _pinned_sha(config, "eboot_bin")):
-        raise _CliError(EXIT_NOT_PPU_ELF, SELF_HINT)
+def reject_encrypted(data: bytes, sha256: str, config: dict | None) -> None:
+    if is_self(data) or (config is not None and sha256 == pinned_sha(config, "eboot_bin")):
+        raise CliError(EXIT_NOT_PPU_ELF, SELF_HINT)
 
+
+def parse_ppu_elf(data: bytes) -> ElfFile:
     try:
         elf = ElfFile.from_bytes(data)
         if elf.ei_class != ELFCLASS64 or elf.e_machine != EM_PPC64:
             raise ElfError("not a 64-bit PPC ELF (class %d, machine %d)"
                            % (elf.ei_class, elf.e_machine))
     except ElfError as e:
-        raise _CliError(EXIT_NOT_PPU_ELF, "not a decrypted PPU ELF: %s" % e)
+        raise CliError(EXIT_NOT_PPU_ELF, "not a decrypted PPU ELF: %s" % e)
+    return elf
+
+
+def _run(args: argparse.Namespace) -> int:
+    data = read_input(args.elf)
+
+    sha256 = hashlib.sha256(data).hexdigest()
+    config = None if args.no_verify else load_config(Path(args.target_config))
+
+    reject_encrypted(data, sha256, config)
+    elf = parse_ppu_elf(data)
 
     pin = "skipped"
     if config is not None:
-        pinned = _pinned_sha(config, "eboot_elf")
+        pinned = pinned_sha(config, "eboot_elf")
         if pinned is None:
             pin = "unpinned"
             print("note: no eboot_elf sha256 is pinned; size=%d sha256=%s\n"
@@ -247,9 +259,9 @@ def _run(args: argparse.Namespace) -> int:
             pin = "verified" if pinned == sha256 else "mismatch"
 
     try:
-        summary = buildSummary(elf, args.elf, len(data), sha256, pin)
+        summary = build_summary(elf, args.elf, len(data), sha256, pin)
     except ElfError as e:
-        raise _CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
+        raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
     out_path = Path(args.output) if args.output else DEFAULT_OUTPUT
     try:
@@ -258,7 +270,7 @@ def _run(args: argparse.Namespace) -> int:
             json.dump(summary, f, indent=2, sort_keys=False, ensure_ascii=False)
             f.write("\n")
     except OSError as e:
-        raise _CliError(EXIT_IO, "cannot write %s: %s" % (out_path, e.strerror))
+        raise CliError(EXIT_IO, "cannot write %s: %s" % (out_path, e.strerror))
 
     entry = summary["entry"]
     print("sha256:   %s" % sha256)
@@ -273,7 +285,7 @@ def _run(args: argparse.Namespace) -> int:
     print("output:   %s" % out_path)
 
     if pin == "mismatch":
-        raise _CliError(EXIT_PIN_MISMATCH,
+        raise CliError(EXIT_PIN_MISMATCH,
                         "SHA-256 %s does not match the pinned eboot_elf value" % sha256)
     return EXIT_OK
 
@@ -299,6 +311,6 @@ def main(argv: list[str]) -> int:
         return e.code if isinstance(e.code, int) else 2
     try:
         return _run(args)
-    except _CliError as e:
+    except CliError as e:
         print("error: %s" % e, file=sys.stderr)
         return e.code

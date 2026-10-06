@@ -131,8 +131,12 @@ _PS3_TEXT_WORDS = (0x7C0802A6, 0xF821FF91, 0x3960008D, 0x44000002,
                    0x38210070, 0x7C0803A6, 0x4E800020, 0x00000000)
 
 
-def build_ps3_fixture() -> bytes:
-    """Canonical PS3-style image: OPDs, one export, two imports, param segments, TLS."""
+def build_ps3_fixture(with_spu: bool = False) -> bytes:
+    """Canonical PS3-style image: OPDs, one export, two imports, param segments, TLS.
+
+    With `with_spu`, the data segment also holds an embedded SPU ELF at vaddr 0x20200
+    followed by a truncated ELF header.
+    """
     text = struct.pack(">8I", *_PS3_TEXT_WORDS)
 
     data = bytearray(0x200)
@@ -152,6 +156,14 @@ def build_ps3_fixture() -> bytes:
     data[0x120:0x12C] = b"cellSysutil\0"
     data[0x130:0x13A] = b"cellSpurs\0"
     put(0x140, ">III", *PS3_FNIDS)
+
+    if with_spu:
+        spu = build_elf32_be(entry=0x0,
+                             segments=[FixtureSegment(1, 0x0, bytes(32), flags=5)])
+        data.extend(spu)
+        data.extend(bytes(_align(len(data)) - len(data)))
+        # A bare magic with an all-zero remainder must count as an invalid hit.
+        data.extend(b"\x7fELF\x01\x02\x01\x00" + bytes(8))
 
     proc_param = struct.pack(">IIIIiIII", 0x20, 0x13BCC5F6, 0x00330000, 0x00440001,
                              1000, 0x10000, 0x100000, 0)
