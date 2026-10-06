@@ -139,11 +139,4 @@ void dalMtfsb(DalPpuContext* ctx, uint32_t bit, uint32_t value) {
   ctx->fpscr = value ? (ctx->fpscr | mask) : (ctx->fpscr & ~mask);
 }
 
-// Stand-in for a hook that belongs to the thread layer; deleted when its real implementation lands.
-
-void dalYield(DalPpuContext* ctx, uint8_t* base) {
-  (void)base;
-  ctx->preempt_budget = kDalPreemptBudget;
-}
-
 }  // extern "C"

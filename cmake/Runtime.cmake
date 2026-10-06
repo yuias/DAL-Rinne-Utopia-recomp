@@ -23,6 +23,7 @@ function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
 
   add_library(dal_runtime_core STATIC
+    runtime/src/core/boot.cpp
     runtime/src/core/census.cpp
     runtime/src/core/cpu_hooks.cpp
     runtime/src/core/dispatch.cpp
@@ -30,6 +31,7 @@ function(dal_runtime_add_core)
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_memory.cpp
     runtime/src/core/log.cpp
+    runtime/src/core/threads.cpp
     runtime/src/hle/hle.cpp
     runtime/src/lv2/syscalls.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)

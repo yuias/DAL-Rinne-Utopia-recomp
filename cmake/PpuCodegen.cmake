@@ -69,8 +69,9 @@ function(dal_ppu_add_generated_tree)
       COMMAND dal_game --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}" ${boot_args})
     set_tests_properties(game_boot PROPERTIES
       TIMEOUT 60
-      PASS_REGULAR_EXPRESSION "${DAL_GAME_BOOT_MILESTONE}"
-      FAIL_REGULAR_EXPRESSION "dal: stop: fatal")
+      # Only the milestone is asserted: while boot HLE is incomplete the run is expected to stop
+      # (often fatally) somewhere after it, and a stop before it leaves the pattern unmatched.
+      PASS_REGULAR_EXPRESSION "${DAL_GAME_BOOT_MILESTONE}")
   endif()
 endfunction()
 

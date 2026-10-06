@@ -8,12 +8,15 @@
 #include <system_error>
 #include <string_view>
 
+#include "core/boot.h"
 #include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/threads.h"
 #include "dal/ppu_context.h"
+#include "hle/hle.h"
 
 namespace {
 
@@ -127,6 +130,8 @@ int main(int argc, char** argv) {
   }
 
   dalRegisterFuncs(kDalPpuFuncMappings, kDalPpuFuncMappingCount);
+  dal::setQuietHle(opt.quiet_hle);
+  dal::installImports(kDalPpuImports, kDalPpuImportCount);
 
   dal::logInfo(
       "dal: loaded {}: entry {:#010x} toc {:#010x} opd {:#010x} tls {:#010x}/{}/{:#x} sdk {:#010x} "
@@ -140,6 +145,7 @@ int main(int argc, char** argv) {
     return static_cast<int>(dal::ExitCode::ProcessExit);
   }
 
-  std::fputs("error: execution not available yet\n", stderr);
-  return static_cast<int>(dal::ExitCode::Usage);
+  // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
+  dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
+  dal::runSupervisor(opt.seconds);
 }

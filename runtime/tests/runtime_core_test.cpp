@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "core/census.h"
@@ -17,6 +18,7 @@
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
 #include "lv2/cell_error.h"
@@ -584,6 +586,34 @@ void testHle() {
   dal::resetLogOnce();
 }
 
+// Waiters get the lock in the order they queued, whatever the host scheduler does.
+void testGuestLockFifo() {
+  dal::GuestLock lock;
+  std::vector<int> order;  // guarded by `lock`
+
+  lock.lock();
+  CHECK(!lock.hasWaiters());
+
+  std::vector<std::thread> threads;
+  for (int id = 1; id <= 3; id++) {
+    threads.emplace_back([&lock, &order, id] {
+      lock.lock();
+      order.push_back(id);
+      lock.unlock();
+    });
+    // The next thread starts only after this one has its place in the queue.
+    while (lock.waiterCount() < static_cast<std::size_t>(id)) {
+      std::this_thread::yield();
+    }
+  }
+  CHECK(lock.hasWaiters());
+  lock.unlock();
+  for (std::thread& t : threads) t.join();
+
+  CHECK(order == (std::vector<int>{1, 2, 3}));
+  CHECK(!lock.hasWaiters());
+}
+
 void testTimebase() {
   auto ctx = std::make_unique<DalPpuContext>();
   LARGE_INTEGER frequency, t0, t1;
@@ -849,6 +879,7 @@ int main(int argc, char** argv) {
   testSyscalls();
   testHle();
   testTimebase();
+  testGuestLockFifo();
   testReservationAndDcbz();
   testFaultChild();
   testOverflowChild();
