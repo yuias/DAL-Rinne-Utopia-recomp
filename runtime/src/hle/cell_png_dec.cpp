@@ -5,15 +5,25 @@
 // format and DecodeData writes rows at outputBytesPerLine intervals. Handlers run under the guest
 // lock, so the handle and stream tables need no mutex.
 //
-// The codec is lodepng, which is not progressive: a stream is held as one host buffer. A source in
-// guest memory is copied at open; a file source is read through the VFS. When cbCtrlStrm names a
-// callback, DecodeData (and ReadHeader, if the first buffer lacks IHDR) calls it for more data
-// until the IEND chunk is complete, then decodes the whole image.
+// The codec is libpng's classic read API over a host buffer: a source in guest memory is copied at
+// open, a file source is read through the VFS. When cbCtrlStrm names a callback, DecodeData (and
+// ReadHeader, if the first buffer lacks IHDR) calls it for more data until the IEND chunk is
+// complete, then decodes the whole image. ReadHeader runs png_read_info over whatever is buffered
+// and accepts a buffer that ends after IHDR, since libpng has recorded the IHDR fields by then; the
+// chunk bits and the text/unknown chunk counts come from scanChunks, which walks the chunk
+// framing without a codec.
 //
-// Colour handling maps RPCS3's libpng transforms onto lodepng conversions: palette, tRNS and
-// sub-8-bit samples expand when the output is RGB/RGBA/ARGB, 16-bit samples are stripped to their
-// high byte for an 8-bit output, ARGB is RGBA with the alpha moved to the front, and FIX_ALPHA
-// overwrites the alpha only when the input has none.
+// Colour handling uses the same libpng transforms RPCS3 does: palette, tRNS and sub-8-bit samples
+// expand when the output is RGB/RGBA/ARGB, 16-bit samples are stripped to their high byte for an
+// 8-bit output, ARGB is RGBA with the alpha moved to the front, and FIX_ALPHA overwrites the alpha
+// only when the input has none. Adam7 images are de-interlaced by libpng into whole rows.
+//
+// libpng reports errors by longjmp. Every libpng call that can fail therefore sits in a function
+// (pngReadHeader, pngDecode) that owns the setjmp and holds only trivially destructible locals;
+// the jump crosses nothing but libpng's C frames and the two callbacks, which are equally plain.
+// Buffers and containers are created by the callers and handed in as raw pointers, and the error
+// text travels in a fixed array inside PngJob. The error callback never returns, so libpng's
+// default handler (which prints to stderr and would abort without a jump target) is never reached.
 //
 // Deviations from RPCS3: every `throw_exception` site returns a logged error code instead; RGB to
 // grayscale and palette-to-palette conversions that change the bit depth are refused with
@@ -22,8 +32,9 @@
 // (the cellPngDecGet* calls are not implemented).
 
 #include <algorithm>
+#include <csetjmp>
 #include <cstdint>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -39,10 +50,10 @@
 #include "core/log.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
-#include "lodepng.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_sync.h"
 #include "lv2/vfs.h"
+#include "png.h"
 
 namespace dal {
 namespace {
@@ -140,7 +151,7 @@ struct Stream {
   // IHDR.
   std::uint32_t width = 0;
   std::uint32_t height = 0;
-  LodePNGColorType png_type = LCT_RGBA;
+  int png_type = PNG_COLOR_TYPE_RGB_ALPHA;
   std::uint32_t png_depth = 8;
   std::uint32_t interlace = 0;
   std::uint32_t in_space = 0;  // CellPngDecColorSpace of the stored image
@@ -149,7 +160,6 @@ struct Stream {
   std::uint32_t out_space = 0;
   std::uint32_t out_depth = 8;
   bool raw = false;  // output equals the stored format
-  LodePNGColorType out_type = LCT_RGBA;
   bool fix_alpha = false;
   std::uint32_t alpha = 0;
   bool flip = false;
@@ -181,13 +191,13 @@ bool spaceHasAlpha(std::uint32_t space) {
 }
 
 // libpng colour type -> CellPngDecColorSpace; 0 for a type this decoder does not know.
-std::uint32_t spaceOfType(LodePNGColorType type) {
+std::uint32_t spaceOfType(int type) {
   switch (type) {
-    case LCT_GREY: return kGrayscale;
-    case LCT_RGB: return kRgb;
-    case LCT_PALETTE: return kPalette;
-    case LCT_GREY_ALPHA: return kGrayscaleAlpha;
-    case LCT_RGBA: return kRgba;
+    case PNG_COLOR_TYPE_GRAY: return kGrayscale;
+    case PNG_COLOR_TYPE_RGB: return kRgb;
+    case PNG_COLOR_TYPE_PALETTE: return kPalette;
+    case PNG_COLOR_TYPE_GRAY_ALPHA: return kGrayscaleAlpha;
+    case PNG_COLOR_TYPE_RGB_ALPHA: return kRgba;
     default: return 0;
   }
 }
@@ -311,22 +321,179 @@ std::uint32_t pullStream(DalPpuContext* ctx, std::uint8_t* base, const Handle& h
   return result;
 }
 
+// State shared by the guarded libpng functions and their callbacks. It must stay trivially
+// destructible: a longjmp does not run destructors.
+struct PngJob {
+  png_structp png = nullptr;
+  png_infop info = nullptr;
+  const std::uint8_t* data = nullptr;
+  std::size_t size = 0;
+  std::size_t pos = 0;
+  std::uint32_t warnings = 0;
+  char error[160] = {};
+  char warning[96] = {};
+};
+
+void pngReadData(png_structp png, png_bytep out, size_t count) {
+  auto* job = static_cast<PngJob*>(png_get_io_ptr(png));
+  if (count > job->size - job->pos) png_error(png, "unexpected end of data");
+  std::memcpy(out, job->data + job->pos, count);
+  job->pos += count;
+}
+
+void pngErrorCallback(png_structp png, png_const_charp message) {
+  auto* job = static_cast<PngJob*>(png_get_error_ptr(png));
+  std::snprintf(job->error, sizeof job->error, "%s", message != nullptr ? message : "unknown error");
+  png_longjmp(png, 1);
+}
+
+// Warnings (bad ancillary chunks and the like) do not fail a decode; the first one is kept for the
+// log.
+void pngWarningCallback(png_structp png, png_const_charp message) {
+  auto* job = static_cast<PngJob*>(png_get_error_ptr(png));
+  if (job->warnings++ == 0) {
+    std::snprintf(job->warning, sizeof job->warning, "%s", message != nullptr ? message : "");
+  }
+}
+
+// Creates the libpng structures over `data`, which must outlive `job`. Nothing here can fail
+// through libpng's error path: the creation functions report allocation failures by returning null.
+bool openJob(PngJob* job, const std::vector<std::uint8_t>& data) {
+  job->data = data.data();
+  job->size = data.size();
+  job->png = png_create_read_struct(PNG_LIBPNG_VER_STRING, job, pngErrorCallback, pngWarningCallback);
+  if (job->png == nullptr) return false;
+  job->info = png_create_info_struct(job->png);
+  if (job->info == nullptr) {
+    png_destroy_read_struct(&job->png, nullptr, nullptr);
+    return false;
+  }
+  png_set_read_fn(job->png, job, pngReadData);
+  return true;
+}
+
+void closeJob(PngJob* job) { png_destroy_read_struct(&job->png, &job->info, nullptr); }
+
+struct PngHeader {
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  int color_type = 0;
+  std::uint32_t bit_depth = 0;
+  std::uint32_t interlace = 0;
+};
+
+bool pngHeaderFromInfo(const PngJob* job, PngHeader* header) {
+  // Not png_get_IHDR: it re-validates the stored fields and raises a libpng error for the zero
+  // width of an IHDR that was never recorded, which would jump back into pngReadHeader forever.
+  const png_uint_32 width = png_get_image_width(job->png, job->info);
+  const png_uint_32 height = png_get_image_height(job->png, job->info);
+  if (width == 0 || height == 0) return false;
+  header->width = width;
+  header->height = height;
+  header->color_type = png_get_color_type(job->png, job->info);
+  header->bit_depth = png_get_bit_depth(job->png, job->info);
+  header->interlace = png_get_interlace_type(job->png, job->info) == PNG_INTERLACE_NONE ? 0 : 1;
+  return true;
+}
+
+// Runs png_read_info and extracts IHDR. The buffer may end anywhere after IHDR (a streamed source
+// whose first block is short): the read then fails, but libpng has recorded IHDR by that point.
+// Owns a setjmp; see the file comment.
+bool pngReadHeader(PngJob* job, PngHeader* header) {
+  if (setjmp(png_jmpbuf(job->png)) != 0) return pngHeaderFromInfo(job, header);
+  png_read_info(job->png, job->info);
+  return pngHeaderFromInfo(job, header);
+}
+
+struct PngRequest {
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t space = 0;  // CellPngDecColorSpace of the output; ARGB is passed as RGBA
+  std::uint32_t depth = 8;
+  std::uint64_t width_byte = 0;
+  bool raw = false;
+  bool alpha_first = false;   // ARGB
+  png_bytep* rows = nullptr;  // `height` row buffers of `width_byte` bytes
+};
+
+bool pngFail(PngJob* job, const char* message) {
+  std::snprintf(job->error, sizeof job->error, "%s", message);
+  return false;
+}
+
+// Re-reads the header, applies the transforms for `request`, decodes into its rows and reads up to
+// IEND. Owns a setjmp; see the file comment.
+bool pngDecode(PngJob* job, const PngRequest* request) {
+  png_structp png = job->png;
+  png_infop info = job->info;
+  if (setjmp(png_jmpbuf(png)) != 0) return false;
+
+  png_read_info(png, info);
+  const int color_type = png_get_color_type(png, info);
+  const int in_depth = png_get_bit_depth(png, info);
+  if (png_get_image_width(png, info) != request->width ||
+      png_get_image_height(png, info) != request->height) {
+    return pngFail(job, "image size differs from the header");
+  }
+
+  if (!request->raw) {
+    const bool in_palette = color_type == PNG_COLOR_TYPE_PALETTE;
+    const bool in_gray =
+        color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA;
+    const bool out_alpha = request->space == kRgba || request->space == kGrayscaleAlpha;
+    const bool out_gray = request->space == kGrayscale || request->space == kGrayscaleAlpha;
+    if (in_palette) {
+      png_set_palette_to_rgb(png);  // the palette's tRNS becomes an alpha channel
+    } else if (color_type == PNG_COLOR_TYPE_GRAY && in_depth < 8) {
+      png_set_expand_gray_1_2_4_to_8(png);
+    }
+    if (out_alpha && !in_palette && png_get_valid(png, info, PNG_INFO_tRNS) != 0) {
+      png_set_tRNS_to_alpha(png);
+    }
+    if (request->depth == 8 && in_depth == 16) png_set_strip_16(png);  // high byte
+    if (request->depth == 16 && in_depth < 16) png_set_expand_16(png);
+    if (!out_gray && in_gray) png_set_gray_to_rgb(png);
+    // A palette has no luminance to reduce; take the red channel, which is what the previous
+    // codec did. Reducing true colour is refused before decoding.
+    if (out_gray && in_palette) png_set_rgb_to_gray_fixed(png, 1, 100000, 0);
+    if (!out_alpha) {
+      png_set_strip_alpha(png);
+    } else {
+      // A no-op when alpha is present. libpng's filler does not count as alpha for the swap, so
+      // for ARGB the filler goes in front and the swap handles the real-alpha cases.
+      png_set_add_alpha(png, 0xffff,
+                        request->alpha_first ? PNG_FILLER_BEFORE : PNG_FILLER_AFTER);
+    }
+    if (request->alpha_first) png_set_swap_alpha(png);
+  }
+  png_set_interlace_handling(png);
+  png_read_update_info(png, info);
+  if (png_get_rowbytes(png, info) != request->width_byte) {
+    return pngFail(job, "row size differs from the output format");
+  }
+  png_read_image(png, request->rows);
+  png_read_end(png, nullptr);
+  return true;
+}
+
 // Fills the IHDR fields of `stream` from its data.
 std::uint32_t inspect(Stream& stream) {
-  lodepng::State state;
-  unsigned w = 0, h = 0;
-  const unsigned error = lodepng_inspect(&w, &h, &state, stream.data.data(), stream.data.size());
-  if (error != 0 || w == 0 || h == 0) {
-    logWarn("dal: pngdec: bad PNG header: {}", lodepng_error_text(error));
-    return kErrorHeader;
+  PngJob job;
+  if (!openJob(&job, stream.data)) {
+    logError("dal: pngdec: cannot create the libpng reader");
+    return kErrorFatal;
   }
-  const LodePNGColorType type = state.info_png.color.colortype;
-  stream.width = w;
-  stream.height = h;
-  stream.png_type = type;
-  stream.png_depth = state.info_png.color.bitdepth;
-  stream.interlace = state.info_png.interlace_method;
-  stream.in_space = spaceOfType(type);
+  PngHeader header;
+  const bool ok = pngReadHeader(&job, &header);
+  if (!ok) logWarn("dal: pngdec: bad PNG header: {}", job.error);
+  closeJob(&job);
+  if (!ok) return kErrorHeader;
+  stream.width = header.width;
+  stream.height = header.height;
+  stream.png_type = header.color_type;
+  stream.png_depth = header.bit_depth;
+  stream.interlace = header.interlace;
+  stream.in_space = spaceOfType(header.color_type);
   return stream.in_space == 0 ? kErrorHeader : kCellOk;
 }
 
@@ -602,19 +769,13 @@ void pngExtSetParameter(DalPpuContext* ctx, std::uint8_t* base) {
       setResultCode(ctx, kErrorArg);
       return;
     }
-    // lodepng cannot reduce colour to grayscale; RPCS3 does it through libpng's
+    // Reducing colour to grayscale is not implemented; RPCS3 does it through libpng's
     // png_set_rgb_to_gray.
     const bool in_color = update.in_space == kRgb || update.in_space == kRgba;
     if ((out_space == kGrayscale || out_space == kGrayscaleAlpha) && in_color) {
       logError("dal: pngdec: RGB to grayscale conversion is not implemented");
       setResultCode(ctx, kErrorArg);
       return;
-    }
-    switch (out_space) {
-      case kGrayscale: update.out_type = LCT_GREY; break;
-      case kRgb: update.out_type = LCT_RGB; break;
-      case kGrayscaleAlpha: update.out_type = LCT_GREY_ALPHA; break;
-      default: update.out_type = LCT_RGBA; break;
     }
   }
   update.fix_alpha = !update.raw && alpha_select == kFixAlpha && spaceHasAlpha(out_space) &&
@@ -658,72 +819,105 @@ void pngExtSetParameter(DalPpuContext* ctx, std::uint8_t* base) {
   setResultCode(ctx, kCellOk);
 }
 
-// Writes the decoded image as 8-bit RGBA PNG for inspection.
-void dumpImage(const Stream& stream) {
-  if (!g_dump_dir || g_dump_count >= kMaxDumpedImages) return;
-  unsigned char* pixels = nullptr;
-  unsigned w = 0, h = 0;
-  if (lodepng_decode32(&pixels, &w, &h, stream.data.data(), stream.data.size()) != 0) return;
-  const std::filesystem::path path = *g_dump_dir / std::format("png_{}.png", g_dump_count++);
-  const unsigned error = lodepng_encode32_file(path.string().c_str(), pixels, w, h);
-  std::free(pixels);
-  if (error != 0) {
-    logWarn("dal: pngdec: cannot write {}: {}", path.string(), lodepng_error_text(error));
-  } else {
-    logInfo("dal: pngdec: dumped {}x{} image to {}", w, h, path.string());
-  }
+// How the decoded image is laid out: what SetParameter chose, or RGBA8 for the dump.
+struct OutputFormat {
+  std::uint32_t space = kRgba;
+  std::uint32_t depth = 8;
+  bool raw = false;
+  bool fix_alpha = false;
+  std::uint32_t alpha = 0;
+  std::uint64_t width_byte = 0;
+};
+
+OutputFormat outputFormatOf(const Stream& stream) {
+  return {stream.out_space, stream.out_depth, stream.raw,
+          stream.fix_alpha, stream.alpha,     stream.width_byte};
 }
 
-// Decodes the stream into the output format chosen by SetParameter. Returns the pixel rows
-// (width_byte bytes each, top to bottom) or an error code.
-std::optional<std::vector<std::uint8_t>> decodePixels(const Stream& stream) {
-  lodepng::State state;
-  state.decoder.color_convert = stream.raw ? 0 : 1;
-  state.decoder.read_text_chunks = 0;
-  if (!stream.raw) {
-    state.info_raw.colortype = stream.out_type;
-    state.info_raw.bitdepth = stream.out_depth;
+// Decodes the stream into `format`. Returns the pixel rows (width_byte bytes each, top to bottom)
+// or nothing after logging the failure.
+std::optional<std::vector<std::uint8_t>> decodePixels(const Stream& stream,
+                                                      const OutputFormat& format) {
+  std::vector<std::uint8_t> pixels(format.width_byte * stream.height);
+  std::vector<png_bytep> rows(stream.height);
+  for (std::uint32_t row = 0; row < stream.height; row++) {
+    rows[row] = pixels.data() + row * format.width_byte;
   }
-  unsigned char* out = nullptr;
-  unsigned w = 0, h = 0;
-  const unsigned error = lodepng_decode(&out, &w, &h, &state, stream.data.data(), stream.data.size());
-  if (error != 0) {
-    logError("dal: pngdec: decode failed: {}", lodepng_error_text(error));
-    return std::nullopt;
-  }
-  const std::size_t size =
-      lodepng_get_raw_size(w, h, stream.raw ? &state.info_png.color : &state.info_raw);
-  std::vector<std::uint8_t> pixels(out, out + size);
-  std::free(out);
-  if (w != stream.width || h != stream.height || pixels.size() != stream.width_byte * h) {
-    logError("dal: pngdec: decoded image is {}x{} with {} bytes, expected {}x{} with {}", w, h,
-             pixels.size(), stream.width, stream.height, stream.width_byte * stream.height);
-    return std::nullopt;
-  }
+  PngRequest request;
+  request.width = stream.width;
+  request.height = stream.height;
+  request.space = format.space == kArgb ? kRgba : format.space;
+  request.depth = format.depth;
+  request.width_byte = format.width_byte;
+  request.raw = format.raw;
+  request.alpha_first = format.space == kArgb;
+  request.rows = rows.data();
 
-  const std::size_t sample = stream.out_depth / 8;
-  const std::size_t components = componentCount(stream.out_space == kArgb ? kRgba : stream.out_space);
-  if (stream.fix_alpha) {
-    // RGBA or gray-alpha, alpha last (ARGB is swizzled below).
+  PngJob job;
+  if (!openJob(&job, stream.data)) {
+    logError("dal: pngdec: cannot create the libpng reader");
+    return std::nullopt;
+  }
+  const bool ok = pngDecode(&job, &request);
+  if (job.warnings != 0) {
+    logInfo("dal: pngdec: libpng: {} warning(s), first: {}", job.warnings, job.warning);
+  }
+  if (!ok) logError("dal: pngdec: decode failed: {}", job.error);
+  closeJob(&job);
+  if (!ok) return std::nullopt;
+
+  if (format.fix_alpha) {
+    // RGBA or gray-alpha with the alpha last, or ARGB with it first.
+    const std::size_t sample = format.depth / 8;
+    const std::size_t components = componentCount(format.space);
     const std::size_t pixel_size = components * sample;
+    const std::size_t alpha_offset = format.space == kArgb ? 0 : (components - 1) * sample;
     for (std::size_t pos = 0; pos + pixel_size <= pixels.size(); pos += pixel_size) {
-      std::uint8_t* alpha = pixels.data() + pos + (components - 1) * sample;
+      std::uint8_t* alpha = pixels.data() + pos + alpha_offset;
       if (sample == 1) {
-        alpha[0] = static_cast<std::uint8_t>(stream.alpha);
+        alpha[0] = static_cast<std::uint8_t>(format.alpha);
       } else {
-        alpha[0] = static_cast<std::uint8_t>(stream.alpha >> 8);
-        alpha[1] = static_cast<std::uint8_t>(stream.alpha);
+        alpha[0] = static_cast<std::uint8_t>(format.alpha >> 8);
+        alpha[1] = static_cast<std::uint8_t>(format.alpha);
       }
     }
   }
-  if (stream.out_space == kArgb) {
-    const std::size_t pixel_size = 4 * sample;
-    for (std::size_t pos = 0; pos + pixel_size <= pixels.size(); pos += pixel_size) {
-      std::rotate(pixels.begin() + pos, pixels.begin() + pos + 3 * sample,
-                  pixels.begin() + pos + pixel_size);
-    }
-  }
   return pixels;
+}
+
+// Writes the decoded image as 8-bit RGBA PNG for inspection.
+void dumpImage(const Stream& stream) {
+  if (!g_dump_dir || g_dump_count >= kMaxDumpedImages) return;
+  OutputFormat format;
+  format.width_byte = std::uint64_t{stream.width} * 4;
+  const auto pixels = decodePixels(stream, format);
+  if (!pixels) return;
+
+  // The simplified write API keeps its own setjmp inside libpng, so it is safe to call here.
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  image.width = stream.width;
+  image.height = stream.height;
+  image.format = PNG_FORMAT_RGBA;
+  png_alloc_size_t size = 0;
+  std::vector<std::uint8_t> file;
+  bool ok = png_image_write_get_memory_size(image, size, 0, pixels->data(), 0, nullptr) != 0;
+  if (ok) {
+    file.resize(size);
+    ok = png_image_write_to_memory(&image, file.data(), &size, 0, pixels->data(), 0, nullptr) != 0;
+  }
+  const std::filesystem::path path = *g_dump_dir / std::format("png_{}.png", g_dump_count++);
+  if (ok) {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(size));
+    ok = static_cast<bool>(out);
+  }
+  png_image_free(&image);
+  if (!ok) {
+    logWarn("dal: pngdec: cannot write {}", path.string());
+  } else {
+    logInfo("dal: pngdec: dumped {}x{} image to {}", stream.width, stream.height, path.string());
+  }
 }
 
 // cellPngDecExtDecodeData(CellPngDecMainHandle mainHandle, CellPngDecSubHandle subHandle,
@@ -770,7 +964,7 @@ void pngExtDecodeData(DalPpuContext* ctx, std::uint8_t* base) {
     setResultCode(ctx, pulled);
     return;
   }
-  const auto pixels = decodePixels(*stream);
+  const auto pixels = decodePixels(*stream, outputFormatOf(*stream));
   if (!pixels) {
     setResultCode(ctx, kErrorStreamFormat);
     return;

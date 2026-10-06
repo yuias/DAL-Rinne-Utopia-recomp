@@ -23,7 +23,7 @@ game" for what is and is not implemented.
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
-- git, with the submodules initialised: `git submodule update --init` (spdlog, lodepng and nlohmann/json under `externals/`;
+- git, with the submodules initialised: `git submodule update --init` (spdlog, libpng, zlib and nlohmann/json under `externals/`;
   clone with `--recurse-submodules` to do it in one step)
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
@@ -681,15 +681,16 @@ interface, so each module follows a documented policy that never blocks on a per
 
 ### PNG decoding
 
-`cellPngDec` decodes with lodepng (`externals/lodepng`, pinned to a commit because the project
-publishes no release tags; `LODEPNG_VERSION_STRING` is 20261001), which reads IHDR without decoding
-and converts to any colour type and bit depth. The handle and stream objects are allocated through
+`cellPngDec` decodes with libpng's classic API (`externals/libpng` at v1.6.59, built as a static
+library together with zlib v1.3.2 from `externals/zlib`; nothing is installed or downloaded).
+libpng reports errors by `longjmp`, so every call that can fail runs in a function that owns the
+`setjmp` and has no locals with destructors. The handle and stream objects are allocated through
 the game's malloc and free callbacks, as on the console. A buffer or file source is read into one
 host buffer; with a `cbCtrlStrm` callback the runtime calls it for more data until the IEND chunk
 is complete and then decodes the whole image. Output RGBA, ARGB, RGB, gray and gray-alpha come
 from the stored format (palette, tRNS and sub-8-bit samples expand, 16-bit samples drop to the
-high byte for 8-bit output); rows are written `outputBytesPerLine` apart, top to bottom or bottom
-to top. Not implemented: RGB to grayscale, partial output through `cbCtrlDisp`, the
+high byte for 8-bit output, Adam7 images are de-interlaced); rows are written
+`outputBytesPerLine` apart, top to bottom or bottom to top. Not implemented: RGB to grayscale, partial output through `cbCtrlDisp`, the
 `cellPngDecGet*` chunk accessors. Each stream's source, header and output format are logged with
 the `dal: pngdec:` prefix.
 
@@ -947,7 +948,7 @@ results are only trusted for the expected build.
 | `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `rsx`, `game_main.cpp`; see "Running the game") and runtime-side tests |
 | `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see "SDAT files" |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
-| `externals/lodepng` | lodepng submodule, the PNG codec behind `cellPngDec` |
+| `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
 | `externals/json` | nlohmann/json submodule (v3.12.0, header-only), used only to parse the VFS configuration |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <csetjmp>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
@@ -33,7 +34,7 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
-#include "lodepng.h"
+#include "png.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_ppu_thread.h"
 #include "lv2/sys_spu.h"
@@ -45,6 +46,7 @@
 #include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
+#include "zlib.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -3554,30 +3556,99 @@ struct PngTestImage {
   std::vector<std::uint8_t> file;
 };
 
-LodePNGColorMode colorMode(LodePNGColorType type, unsigned depth) {
-  LodePNGColorMode mode;
-  lodepng_color_mode_init(&mode);
-  mode.colortype = type;
-  mode.bitdepth = depth;
-  return mode;
+struct PngPaletteEntry {
+  std::uint8_t r, g, b, a;
+};
+
+// Input of the libpng writer. Like the decoder, the writer keeps its setjmp in a function with
+// plain locals only; the caller owns every container.
+struct PngWriteJob {
+  unsigned width = 0;
+  unsigned height = 0;
+  int color_type = 0;
+  int depth = 8;
+  unsigned interlace = 0;
+  png_bytep* rows = nullptr;
+  const png_color* palette = nullptr;
+  const std::uint8_t* trans = nullptr;
+  int palette_size = 0;
+  std::vector<std::uint8_t>* out = nullptr;
+};
+
+void pngWriteCallback(png_structp png, png_bytep data, size_t count) {
+  auto* job = static_cast<PngWriteJob*>(png_get_io_ptr(png));
+  job->out->insert(job->out->end(), data, data + count);
 }
 
-// Encodes `raw` (laid out per `raw_mode`) into a PNG of `png_mode`.
+void pngFlushCallback(png_structp) {}
+
+void pngWriteErrorCallback(png_structp png, png_const_charp) { png_longjmp(png, 1); }
+
+bool writePng(PngWriteJob* job) {
+  png_structp png =
+      png_create_write_struct(PNG_LIBPNG_VER_STRING, job, pngWriteErrorCallback, nullptr);
+  if (png == nullptr) return false;
+  png_infop info = png_create_info_struct(png);
+  if (info == nullptr) {
+    png_destroy_write_struct(&png, nullptr);
+    return false;
+  }
+  if (setjmp(png_jmpbuf(png)) != 0) {
+    png_destroy_write_struct(&png, &info);
+    return false;
+  }
+  png_set_write_fn(png, job, pngWriteCallback, pngFlushCallback);
+  png_set_IHDR(png, info, job->width, job->height, job->depth, job->color_type,
+               job->interlace != 0 ? PNG_INTERLACE_ADAM7 : PNG_INTERLACE_NONE,
+               PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+  if (job->palette != nullptr) {
+    png_set_PLTE(png, info, job->palette, job->palette_size);
+    if (job->trans != nullptr) png_set_tRNS(png, info, job->trans, job->palette_size, nullptr);
+  }
+  png_write_info(png, info);
+  if (job->depth < 8) png_set_packing(png);  // the rows carry one index per byte
+  png_set_interlace_handling(png);
+  png_write_image(png, job->rows);
+  png_write_end(png, info);
+  png_destroy_write_struct(&png, &info);
+  return true;
+}
+
+// Encodes `raw` into a PNG of the given type and depth. Rows are tightly packed, 16-bit samples
+// are big-endian, and a depth below 8 takes one index (or gray level) per byte.
 PngTestImage encodePng(unsigned width, unsigned height, const std::vector<std::uint8_t>& raw,
-                       const LodePNGColorMode& raw_mode, const LodePNGColorMode& png_mode,
-                       unsigned interlace = 0) {
-  lodepng::State state;
-  lodepng_color_mode_copy(&state.info_raw, &raw_mode);
-  lodepng_color_mode_copy(&state.info_png.color, &png_mode);
-  state.info_png.interlace_method = interlace;
-  state.encoder.auto_convert = 0;
-  unsigned char* out = nullptr;
-  std::size_t size = 0;
-  const unsigned error = lodepng_encode(&out, &size, raw.data(), width, height, &state);
-  CHECK(error == 0);
+                       int color_type, int png_depth, unsigned interlace = 0,
+                       const std::vector<PngPaletteEntry>& palette = {}) {
+  const std::size_t channels = color_type == PNG_COLOR_TYPE_RGB_ALPHA ? 4
+                               : color_type == PNG_COLOR_TYPE_RGB    ? 3
+                               : color_type == PNG_COLOR_TYPE_GRAY_ALPHA ? 2
+                                                                         : 1;
+  const std::size_t row_bytes = std::size_t{width} * channels * (png_depth == 16 ? 2 : 1);
+  CHECK(raw.size() == row_bytes * height);
+  std::vector<png_bytep> rows(height);
+  std::vector<std::uint8_t> pixels = raw;  // libpng wants non-const rows
+  for (unsigned row = 0; row < height; row++) rows[row] = pixels.data() + row * row_bytes;
+  std::vector<png_color> colors;
+  std::vector<std::uint8_t> alphas;
+  bool translucent = false;
+  for (const PngPaletteEntry& entry : palette) {
+    colors.push_back({entry.r, entry.g, entry.b});
+    alphas.push_back(entry.a);
+    translucent = translucent || entry.a != 255;
+  }
   PngTestImage image{width, height, {}};
-  if (error == 0) image.file.assign(out, out + size);
-  std::free(out);
+  PngWriteJob job;
+  job.width = width;
+  job.height = height;
+  job.color_type = color_type;
+  job.depth = png_depth;
+  job.interlace = interlace;
+  job.rows = rows.data();
+  job.palette = colors.empty() ? nullptr : colors.data();
+  job.trans = translucent ? alphas.data() : nullptr;
+  job.palette_size = static_cast<int>(colors.size());
+  job.out = &image.file;
+  CHECK(writePng(&job));
   return image;
 }
 
@@ -3585,12 +3656,14 @@ PngTestImage encodePng(unsigned width, unsigned height, const std::vector<std::u
 // 12 bytes of a file are IEND).
 void insertChunk(std::vector<std::uint8_t>& png, std::size_t at, const char* type,
                  const std::vector<std::uint8_t>& payload) {
-  unsigned char* chunk = nullptr;
-  std::size_t chunk_size = 0;
-  CHECK(lodepng_chunk_create(&chunk, &chunk_size, static_cast<unsigned>(payload.size()), type,
-                             payload.data()) == 0);
-  png.insert(png.begin() + static_cast<std::ptrdiff_t>(at), chunk, chunk + chunk_size);
-  std::free(chunk);
+  std::vector<std::uint8_t> chunk;
+  const auto length = static_cast<std::uint32_t>(payload.size());
+  for (int shift = 24; shift >= 0; shift -= 8) chunk.push_back(static_cast<std::uint8_t>(length >> shift));
+  chunk.insert(chunk.end(), type, type + 4);
+  chunk.insert(chunk.end(), payload.begin(), payload.end());
+  const auto crc = static_cast<std::uint32_t>(crc32(0, chunk.data() + 4, static_cast<uInt>(chunk.size() - 4)));
+  for (int shift = 24; shift >= 0; shift -= 8) chunk.push_back(static_cast<std::uint8_t>(crc >> shift));
+  png.insert(png.begin() + static_cast<std::ptrdiff_t>(at), chunk.begin(), chunk.end());
 }
 
 void testCellPngDec() {
@@ -3731,7 +3804,7 @@ void testCellPngDec() {
   const std::vector<std::uint8_t> rgba = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
                                           13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
   const PngTestImage rgba_png =
-      encodePng(3, 2, rgba, colorMode(LCT_RGBA, 8), colorMode(LCT_RGBA, 8));
+      encodePng(3, 2, rgba, PNG_COLOR_TYPE_RGB_ALPHA, 8);
 
   // Header values; SetParameter and DecodeData before ReadHeader are sequence errors.
   {
@@ -3817,12 +3890,9 @@ void testCellPngDec() {
 
   // Palette input: 4x2, 8-bit indices, a palette with one translucent entry.
   {
-    LodePNGColorMode pal = colorMode(LCT_PALETTE, 8);
-    CHECK(lodepng_palette_add(&pal, 255, 0, 0, 255) == 0);
-    CHECK(lodepng_palette_add(&pal, 0, 255, 0, 128) == 0);
-    CHECK(lodepng_palette_add(&pal, 0, 0, 255, 255) == 0);
+    const std::vector<PngPaletteEntry> pal = {{255, 0, 0, 255}, {0, 255, 0, 128}, {0, 0, 255, 255}};
     const std::vector<std::uint8_t> indices = {0, 1, 2, 1, 2, 2, 0, 0};
-    const PngTestImage image = encodePng(4, 2, indices, pal, pal);
+    const PngTestImage image = encodePng(4, 2, indices, PNG_COLOR_TYPE_PALETTE, 8, 0, pal);
     const std::uint32_t stream = openAndRead(image.file);
     CHECK(stream != 0);
     CHECK(dalRead32(base, info + 8) == 1 && dalRead32(base, info + 12) == kSpacePal);
@@ -3855,13 +3925,10 @@ void testCellPngDec() {
 
   // 2-bit palette, width 5 (the file pads its rows to bytes), expanded to RGBA.
   {
-    LodePNGColorMode pal_raw = colorMode(LCT_PALETTE, 8), pal_png = colorMode(LCT_PALETTE, 2);
-    for (const std::uint8_t gray : {10, 90, 170, 250}) {
-      CHECK(lodepng_palette_add(&pal_raw, gray, gray, gray, 255) == 0);
-      CHECK(lodepng_palette_add(&pal_png, gray, gray, gray, 255) == 0);
-    }
+    std::vector<PngPaletteEntry> pal;
+    for (const std::uint8_t gray : {10, 90, 170, 250}) pal.push_back({gray, gray, gray, 255});
     const std::vector<std::uint8_t> indices = {0, 1, 2, 3, 0, 3, 2, 1, 0, 3};
-    const PngTestImage image = encodePng(5, 2, indices, pal_raw, pal_png);
+    const PngTestImage image = encodePng(5, 2, indices, PNG_COLOR_TYPE_PALETTE, 2, 0, pal);
     const std::uint32_t stream = openAndRead(image.file);
     CHECK(stream != 0);
     CHECK(dalRead32(base, info + 16) == 2);
@@ -3879,7 +3946,7 @@ void testCellPngDec() {
   // RGB8: stream alpha is opaque, fixed alpha is the requested value, RGB output is the data.
   {
     const std::vector<std::uint8_t> rgb = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
-    const PngTestImage image = encodePng(2, 2, rgb, colorMode(LCT_RGB, 8), colorMode(LCT_RGB, 8));
+    const PngTestImage image = encodePng(2, 2, rgb, PNG_COLOR_TYPE_RGB, 8);
     const std::uint32_t stream = openAndRead(image.file);
     CHECK(dalRead32(base, info + 8) == 3 && dalRead32(base, info + 12) == kSpaceRgb);
     const Decoded opaque = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 8, 16);
@@ -3899,7 +3966,7 @@ void testCellPngDec() {
     const std::vector<std::uint8_t> rgba16 = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
                                               0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
     const PngTestImage image =
-        encodePng(2, 1, rgba16, colorMode(LCT_RGBA, 16), colorMode(LCT_RGBA, 16));
+        encodePng(2, 1, rgba16, PNG_COLOR_TYPE_RGB_ALPHA, 16);
     const std::uint32_t stream = openAndRead(image.file);
     CHECK(dalRead32(base, info + 16) == 16);
     const Decoded eight = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 8, 8);
@@ -3919,7 +3986,7 @@ void testCellPngDec() {
     std::vector<std::uint8_t> grid;
     for (unsigned i = 0; i < 5 * 5 * 4; i++) grid.push_back(static_cast<std::uint8_t>(i * 7 + 3));
     const PngTestImage image =
-        encodePng(5, 5, grid, colorMode(LCT_RGBA, 8), colorMode(LCT_RGBA, 8), 1);
+        encodePng(5, 5, grid, PNG_COLOR_TYPE_RGB_ALPHA, 8, 1);
     const std::uint32_t stream = openAndRead(image.file);
     CHECK(stream != 0 && dalRead32(base, info + 20) == 1);
     const Decoded decoded = setAndDecode(stream, 0, kSpaceRgba, 8, 0, 0, 20, 100);
@@ -3955,6 +4022,14 @@ void testCellPngDec() {
     CHECK(call(ExtOpen, {handle, 0, src, open_info, 0, 0}) == kErrArg);
     dalWrite32(base, src, 7);
     CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kErrArg);
+    // A valid signature followed by junk opens, but there is no IHDR to report.
+    std::vector<std::uint8_t> junk = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
+    junk.insert(junk.end(), 56, 0x42);
+    putSource(junk);
+    CHECK(call(ExtOpen, {handle, stream_pp, src, open_info, 0, 0}) == kOk);
+    const std::uint32_t junk_stream = dalRead32(base, stream_pp);
+    CHECK(call(ExtReadHeader, {handle, junk_stream, info, 0}) == kErrHeader);
+    closeStream(junk_stream);
     // A truncated image opens (the signature is fine) and fails when decoded.
     std::vector<std::uint8_t> broken = rgba_png.file;
     broken.resize(40);
@@ -4079,11 +4154,15 @@ void testCellPngDec() {
   {
     const stdfs::path dumped = root / "dump" / "png_0.png";
     CHECK(stdfs::exists(dumped));
-    unsigned char* pixels = nullptr;
-    unsigned w = 0, h = 0;
-    CHECK(lodepng_decode32_file(&pixels, &w, &h, dumped.string().c_str()) == 0);
-    CHECK(w == 3 && h == 2 && pixels != nullptr && std::memcmp(pixels, rgba.data(), 24) == 0);
-    std::free(pixels);
+    png_image image{};
+    image.version = PNG_IMAGE_VERSION;
+    CHECK(png_image_begin_read_from_file(&image, dumped.string().c_str()) != 0);
+    image.format = PNG_FORMAT_RGBA;
+    std::vector<std::uint8_t> pixels(PNG_IMAGE_SIZE(image));
+    CHECK(png_image_finish_read(&image, nullptr, pixels.data(), 0, nullptr) != 0);
+    CHECK(image.width == 3 && image.height == 2 && pixels.size() == 24 &&
+          std::memcmp(pixels.data(), rgba.data(), 24) == 0);
+    png_image_free(&image);
   }
 
   // Destroy frees the handle block; the handle is then unknown.

@@ -17,15 +17,39 @@ function(dal_runtime_add_spdlog)
     ${CMAKE_BINARY_DIR}/externals/spdlog EXCLUDE_FROM_ALL)
 endfunction()
 
-# lodepng is a two-file C++ library (lodepng.cpp/.h) that decodes and encodes PNG without zlib.
-# It compiles without the project's warning flags, like spdlog.
-function(dal_runtime_add_lodepng)
-  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/lodepng/lodepng.cpp)
+# zlib and libpng are built from the submodules as static libraries, so their sources compile
+# with the project's default flags (no -Werror). libpng's CMake finds zlib through FindZLIB, which
+# only sees installed copies; the cache variables below point it at the zlib target built here.
+# Nothing is installed and nothing is fetched or generated at configure time: pnglibconf.h comes
+# from libpng's prebuilt copy instead of the awk-driven generator.
+function(dal_runtime_add_libpng)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/zlib/CMakeLists.txt OR
+     NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/libpng/CMakeLists.txt)
     message(FATAL_ERROR
-      "DAL: externals/lodepng is missing or empty. Run: git submodule update --init")
+      "DAL: externals/zlib or externals/libpng is missing or empty. Run: git submodule update --init")
   endif()
-  add_library(lodepng STATIC ${CMAKE_SOURCE_DIR}/externals/lodepng/lodepng.cpp)
-  target_include_directories(lodepng PUBLIC ${CMAKE_SOURCE_DIR}/externals/lodepng)
+
+  set(ZLIB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(ZLIB_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(ZLIB_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/zlib
+    ${CMAKE_BINARY_DIR}/externals/zlib EXCLUDE_FROM_ALL)
+  add_library(ZLIB::ZLIB ALIAS zlibstatic)
+  set(ZLIB_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/externals/zlib CACHE PATH "" FORCE)
+  set(ZLIB_LIBRARY zlibstatic CACHE STRING "" FORCE)
+
+  set(PNG_SHARED OFF CACHE BOOL "" FORCE)
+  set(PNG_STATIC ON CACHE BOOL "" FORCE)
+  set(PNG_FRAMEWORK OFF CACHE BOOL "" FORCE)
+  set(PNG_TESTS OFF CACHE BOOL "" FORCE)
+  set(PNG_TOOLS OFF CACHE BOOL "" FORCE)
+  set(PNG_LIBCONF_HEADER
+    ${CMAKE_SOURCE_DIR}/externals/libpng/scripts/pnglibconf.h.prebuilt CACHE FILEPATH "" FORCE)
+  set(ld-version-script OFF CACHE BOOL "" FORCE)
+  set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/libpng
+    ${CMAKE_BINARY_DIR}/externals/libpng EXCLUDE_FROM_ALL)
 endfunction()
 
 # nlohmann/json is header-only; its INTERFACE target supplies the include path. SystemInclude
@@ -46,7 +70,7 @@ endfunction()
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
-  dal_runtime_add_lodepng()
+  dal_runtime_add_libpng()
   dal_runtime_add_nlohmann_json()
 
   add_library(dal_runtime_core STATIC
@@ -95,14 +119,14 @@ function(dal_runtime_add_core)
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
-  target_link_libraries(dal_runtime_core PRIVATE lodepng)
+  target_link_libraries(dal_runtime_core PRIVATE png_static)
   # PRIVATE as well: JSON types stay inside vfs_config.cpp.
   target_link_libraries(dal_runtime_core PRIVATE nlohmann_json::nlohmann_json)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
   target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  # The tests build their PNG inputs with lodepng's encoder.
-  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core lodepng)
+  # The tests build their PNG inputs with libpng's writer.
+  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core png_static)
 
   add_test(NAME runtime_core COMMAND dal_runtime_tests)
   set_tests_properties(runtime_core PROPERTIES
