@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import (cell, disasm, ghidra_diff, ghidra_summary, info, jumptab, nids,
+from ps3recomp import (cell, disasm, emit, ghidra_diff, ghidra_summary, info, jumptab, nids,
                        probe, recover, seeds)
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
@@ -494,6 +494,47 @@ class RealSyscallCfgTest(unittest.TestCase):
     def test_stdout_line(self):
         line = next(ln for ln in self.stdout.splitlines() if ln.startswith("syscalls:"))
         self.assertIn("%d sites in .text" % self.syscalls["sites"], line)
+
+
+_EMIT_CENSUS_CACHE = []
+
+
+def _emit_census_result():
+    """One `emit --census` run per process, against the committed function DB."""
+    if not _EMIT_CENSUS_CACHE:
+        with tempfile.TemporaryDirectory() as tmp:
+            census_path = Path(tmp) / "census.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                code = emit.main([_ELF_PATH, "--census", "--census-out", str(census_path)])
+            doc = None
+            if census_path.is_file():
+                doc = json.loads(census_path.read_text(encoding="utf-8"))
+        _EMIT_CENSUS_CACHE.append((code, stdout.getvalue(), doc))
+    return _EMIT_CENSUS_CACHE[0]
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealEmitCensusTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.code, cls.stdout, cls.doc = _emit_census_result()
+
+    def test_census_totals(self):
+        self.assertEqual(self.code, 0)
+        self.assertEqual((self.doc["words"], self.doc["distinct"]), (206045, 168))
+        self.assertEqual(self.doc["invalid_owned"], [])
+
+    def test_every_counted_mnemonic_has_a_group(self):
+        self.assertTrue(all(m["group"] is not None for m in self.doc["mnemonics"]))
+        self.assertEqual(sum(m["count"] for m in self.doc["mnemonics"]), self.doc["words"])
+        self.assertEqual(sum(g["words"] for g in self.doc["by_group"].values()),
+                         self.doc["words"])
+
+    def test_stdout_header(self):
+        self.assertEqual(self.stdout.splitlines()[0],
+                         "census: 206045 words, 168 distinct mnemonics, 0 invalid owned")
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),

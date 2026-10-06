@@ -1,0 +1,113 @@
+"""`emit` command: turn the function DB and the decrypted ELF into C source for the runtime."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from . import cell
+from .elf import ElfError
+from .emit_db import census_doc, census_lines, check_db_matches, load_function_db, take_census
+from .ghidra import _load_default_config
+from .info import (EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliError, parse_ppu_elf, read_input,
+                   reject_encrypted)
+from .ppu_flow import CodeImage
+
+EXIT_UNHANDLED = 9
+
+DEFAULT_DB = REPO_ROOT / "config" / "functions.json"
+DEFAULT_OUT = REPO_ROOT / "generated" / "ppu"
+DEFAULT_REPORT = REPO_ROOT / "generated" / "analysis" / "emit_report.json"
+DEFAULT_CENSUS = REPO_ROOT / "generated" / "analysis" / "emit_census.json"
+
+DEFAULT_CHUNKS = 16
+
+
+def _write_text(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    except OSError as e:
+        raise CliError(EXIT_IO, "cannot write %s: %s" % (path, e.strerror))
+
+
+def _run(args: argparse.Namespace) -> int:
+    if not args.census:
+        raise CliError(2, "only --census is available")
+
+    data = read_input(args.elf)
+    sha256 = hashlib.sha256(data).hexdigest()
+    reject_encrypted(data, sha256, _load_default_config())
+    elf = parse_ppu_elf(data)
+    try:
+        text_range = cell.find_text_range(elf)
+    except ElfError as e:
+        raise CliError(EXIT_NOT_PPU_ELF, "no code range found: %s" % e)
+
+    db = load_function_db(Path(args.db) if args.db else DEFAULT_DB)
+    check_db_matches(db, sha256, text_range)
+    try:
+        image = CodeImage.from_elf(elf, text_range)
+    except ElfError as e:
+        raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
+
+    census = take_census(image, db)
+    out_path = Path(args.census_out) if args.census_out else DEFAULT_CENSUS
+    _write_text(out_path, json.dumps(census_doc(census), indent=2, ensure_ascii=False) + "\n")
+    for line in census_lines(census):
+        print(line)
+    return 0
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return number
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ps3tool.py emit",
+        description="Emit C source for the recovered functions of a decrypted PPU ELF.")
+    parser.add_argument("elf", help="decrypted EBOOT.elf")
+    parser.add_argument("--db", metavar="PATH",
+                        help="function DB (default: config/functions.json)")
+    parser.add_argument("--out", metavar="DIR",
+                        help="output directory (default: generated/ppu)")
+    parser.add_argument("--chunks", type=_positive_int, default=DEFAULT_CHUNKS, metavar="N",
+                        help="number of generated source chunks (default: %(default)s)")
+    parser.add_argument("--comments", action="store_true",
+                        help="annotate generated code with the guest disassembly")
+    parser.add_argument("--report", metavar="PATH",
+                        help="report path (default: generated/analysis/emit_report.json)")
+    parser.add_argument("--census", action="store_true",
+                        help="only count the owned instructions by mnemonic")
+    parser.add_argument("--census-out", metavar="PATH",
+                        help="census path (default: generated/analysis/emit_census.json)")
+    parser.add_argument("--max-unhandled", type=_non_negative_int, metavar="N",
+                        help="exit 9 if more than N words are emitted as unhandled")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+    try:
+        return _run(args)
+    except CliError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return e.code
