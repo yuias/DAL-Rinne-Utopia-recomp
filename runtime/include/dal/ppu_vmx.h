@@ -90,6 +90,222 @@ DAL_FORCEINLINE DalVr dalVsel(DalVr a, DalVr b, DalVr c) {
     return v;
 }
 
+// Permute, splat, pack, unpack and whole-register shift helpers. Merges, vsldoi and the splats are
+// emitted as __builtin_shufflevector calls with constant host lane indices (see emit_ops_vmx_perm.py).
+
+typedef int8_t DalS8x8 __attribute__((vector_size(8)));
+typedef uint8_t DalU8x8 __attribute__((vector_size(8)));
+typedef int16_t DalS16x4 __attribute__((vector_size(8)));
+typedef uint16_t DalU16x4 __attribute__((vector_size(8)));
+
+// SAT is sticky: it is only ever set here, never cleared (mtvscr clears it).
+DAL_FORCEINLINE void dalSetSat(DalPpuContext* ctx, int clamped) {
+    ctx->vscr_sat |= (uint8_t)(clamped != 0);
+}
+
+// vperm: big-endian byte i of the result is concat(a, b)[c[i] & 31] (RPCS3 `VPERM`). In the host
+// layout that is b || a indexed by ~c & 31.
+DAL_FORCEINLINE DalVr dalVperm(DalVr a, DalVr b, DalVr c) {
+    DalU8x16 idx = ~c.u8 & 0x1f;
+    DalVr v;
+#if defined(__SSSE3__)
+    // pshufb reads the low four index bits; indices above 15 take a, the rest take b.
+    DalU8x16 from_a = (DalU8x16)(idx > 15);
+    DalU8x16 pa = (DalU8x16)__builtin_ia32_pshufb128((DalS8x16)a.u8, (DalS8x16)idx);
+    DalU8x16 pb = (DalU8x16)__builtin_ia32_pshufb128((DalS8x16)b.u8, (DalS8x16)idx);
+    v.u8 = (pa & from_a) | (pb & ~from_a);
+#else
+    uint8_t ab[32];
+    __builtin_memcpy(ab, &b, 16);
+    __builtin_memcpy(ab + 16, &a, 16);
+    for (uint32_t i = 0; i < 16u; i++) v.u8[i] = ab[idx[i]];
+#endif
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVspltisb(int8_t imm) {
+    DalS8x16 zero = {};
+    DalVr v;
+    v.s8 = zero + imm;
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVspltish(int16_t imm) {
+    DalS16x8 zero = {};
+    DalVr v;
+    v.s16 = zero + imm;
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVspltisw(int32_t imm) {
+    DalS32x4 zero = {};
+    DalVr v;
+    v.s32 = zero + imm;
+    return v;
+}
+
+// vsl/vsr/vslo/vsro shift the whole 128-bit register. vsl/vsr use the low three bits of vB's
+// big-endian byte 15 for the bit count; the architecture leaves the result undefined when the
+// other bytes differ, where RPCS3 `VSL`/`VSR` shift each byte by its own count. vslo/vsro shift by
+// whole octets, count = byte 15 bits 121:124 (RPCS3 `VSLO`: `b._u8[0] & 0x78`, host byte 0).
+DAL_FORCEINLINE DalVr dalVsl(DalVr a, DalVr b) {
+    return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 7u));
+}
+
+DAL_FORCEINLINE DalVr dalVsr(DalVr a, DalVr b) {
+    return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 7u));
+}
+
+DAL_FORCEINLINE DalVr dalVslo(DalVr a, DalVr b) {
+    return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 0x78u));
+}
+
+DAL_FORCEINLINE DalVr dalVsro(DalVr a, DalVr b) {
+    return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 0x78u));
+}
+
+// Packs: the result holds a's elements in big-endian elements 0 .. n/2-1 and b's in the rest, which
+// is `b` then `a` in host lane order. The saturating packs set SAT when any element is clamped
+// (RPCS3 `VPKSHSS` etc.). Signed-to-unsigned packs clamp negative values to 0 and also set SAT.
+DAL_FORCEINLINE DalVr dalVpkshss(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalS16x8 zero = {};
+    DalS16x8 lo = zero - 128, hi = zero + 127;
+    DalS16x8 ca = __builtin_elementwise_min(__builtin_elementwise_max(a.s16, lo), hi);
+    DalS16x8 cb = __builtin_elementwise_min(__builtin_elementwise_max(b.s16, lo), hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.s16) | (cb != b.s16)));
+    DalS8x8 na = __builtin_convertvector(ca, DalS8x8);
+    DalS8x8 nb = __builtin_convertvector(cb, DalS8x8);
+    DalVr v;
+    v.s8 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVpkshus(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalS16x8 zero = {};
+    DalS16x8 hi = zero + 255;
+    DalS16x8 ca = __builtin_elementwise_min(__builtin_elementwise_max(a.s16, zero), hi);
+    DalS16x8 cb = __builtin_elementwise_min(__builtin_elementwise_max(b.s16, zero), hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.s16) | (cb != b.s16)));
+    DalU8x8 na = __builtin_convertvector(ca, DalU8x8);
+    DalU8x8 nb = __builtin_convertvector(cb, DalU8x8);
+    DalVr v;
+    v.u8 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVpkuhus(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalU16x8 zero = {};
+    DalU16x8 hi = zero + 255;
+    DalU16x8 ca = __builtin_elementwise_min(a.u16, hi);
+    DalU16x8 cb = __builtin_elementwise_min(b.u16, hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.u16) | (cb != b.u16)));
+    DalU8x8 na = __builtin_convertvector(ca, DalU8x8);
+    DalU8x8 nb = __builtin_convertvector(cb, DalU8x8);
+    DalVr v;
+    v.u8 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVpkswss(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalS32x4 zero = {};
+    DalS32x4 lo = zero - 32768, hi = zero + 32767;
+    DalS32x4 ca = __builtin_elementwise_min(__builtin_elementwise_max(a.s32, lo), hi);
+    DalS32x4 cb = __builtin_elementwise_min(__builtin_elementwise_max(b.s32, lo), hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.s32) | (cb != b.s32)));
+    DalS16x4 na = __builtin_convertvector(ca, DalS16x4);
+    DalS16x4 nb = __builtin_convertvector(cb, DalS16x4);
+    DalVr v;
+    v.s16 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVpkswus(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalS32x4 zero = {};
+    DalS32x4 hi = zero + 65535;
+    DalS32x4 ca = __builtin_elementwise_min(__builtin_elementwise_max(a.s32, zero), hi);
+    DalS32x4 cb = __builtin_elementwise_min(__builtin_elementwise_max(b.s32, zero), hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.s32) | (cb != b.s32)));
+    DalU16x4 na = __builtin_convertvector(ca, DalU16x4);
+    DalU16x4 nb = __builtin_convertvector(cb, DalU16x4);
+    DalVr v;
+    v.u16 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVpkuwus(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalU32x4 zero = {};
+    DalU32x4 hi = zero + 65535u;
+    DalU32x4 ca = __builtin_elementwise_min(a.u32, hi);
+    DalU32x4 cb = __builtin_elementwise_min(b.u32, hi);
+    dalSetSat(ctx, __builtin_reduce_or((ca != a.u32) | (cb != b.u32)));
+    DalU16x4 na = __builtin_convertvector(ca, DalU16x4);
+    DalU16x4 nb = __builtin_convertvector(cb, DalU16x4);
+    DalVr v;
+    v.u16 = __builtin_shufflevector(nb, na, 0, 1, 2, 3, 4, 5, 6, 7);
+    return v;
+}
+
+// vpkpx: each 32-bit pixel a:8 r:8 g:8 b:8 becomes 1:5:5:5 from the low bit of a and the top five
+// bits of r, g and b (RPCS3 `VPKPX`).
+DAL_FORCEINLINE DalU16x4 dalPackPixels(DalU32x4 w) {
+    DalU32x4 h = ((w >> 9) & 0xfc00u) | ((w >> 6) & 0x3e0u) | ((w >> 3) & 0x1fu);
+    return __builtin_convertvector(h, DalU16x4);
+}
+
+DAL_FORCEINLINE DalVr dalVpkpx(DalVr a, DalVr b) {
+    DalVr v;
+    v.u16 = __builtin_shufflevector(dalPackPixels(b.u32), dalPackPixels(a.u32), 0, 1, 2, 3, 4, 5, 6, 7);
+    return v;
+}
+
+// Unpacks sign-extend half of the elements; `h` (high) is big-endian elements 0 .. n/2-1, which are
+// the upper host lanes. vupk*px widen 1:5:5:5 pixels to a:8 r:8 g:8 b:8, the 1-bit field becoming
+// 0x00 or 0xff (RPCS3 `VUPKHPX`).
+DAL_FORCEINLINE DalVr dalVupkhsb(DalVr b) {
+    DalVr v;
+    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 8, 9, 10, 11, 12, 13, 14, 15),
+                                    DalS16x8);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVupklsb(DalVr b) {
+    DalVr v;
+    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 1, 2, 3, 4, 5, 6, 7),
+                                    DalS16x8);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVupkhsh(DalVr b) {
+    DalVr v;
+    v.s32 = __builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 4, 5, 6, 7), DalS32x4);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVupklsh(DalVr b) {
+    DalVr v;
+    v.s32 = __builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 0, 1, 2, 3), DalS32x4);
+    return v;
+}
+
+DAL_FORCEINLINE DalU32x4 dalUnpackPixels(DalS32x4 x) {
+    DalU32x4 u = (DalU32x4)x;
+    return ((u << 6) & 0x1f0000u) | ((u << 3) & 0x1f00u) | (u & 0xff00001fu);
+}
+
+DAL_FORCEINLINE DalVr dalVupkhpx(DalVr b) {
+    DalVr v;
+    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 4, 5, 6, 7),
+                                                    DalS32x4));
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVupklpx(DalVr b) {
+    DalVr v;
+    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 0, 1, 2, 3),
+                                                    DalS32x4));
+    return v;
+}
+
 // VSCR: NJ is bit 16 and SAT bit 0 of the register's big-endian word 3 (AltiVec PEM). RPCS3's
 // interpreter indexes `_u32[3]`, which is big-endian word 0 in its byte-reversed register layout,
 // while its LLVM translator uses element 0 of the same byte-reversed layout, which is the PEM word;

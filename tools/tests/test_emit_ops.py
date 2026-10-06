@@ -477,5 +477,58 @@ class VmxMemTest(unittest.TestCase):
         self.assertEqual(body(asm.encode("mtvscr", vB=2))[0], ["dalMtvscr(ctx, ctx->vr[2]);"])
 
 
+class VmxPermTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["vmx_perm"]) - set(load_handlers())), [])
+
+    def test_splats_pick_the_host_lane_of_the_big_endian_element(self):
+        word = asm.encode("vspltw", vD=3, vB=2, UIMM5=3)
+        self.assertEqual(body(word)[0], ["ctx->vr[3].u32 = __builtin_shufflevector("
+                                         "ctx->vr[2].u32, ctx->vr[2].u32, 0, 0, 0, 0);"])
+        word = asm.encode("vspltw", vD=3, vB=2, UIMM5=0)
+        self.assertTrue(body(word)[0][0].endswith(", 3, 3, 3, 3);"))
+        # The element number wraps around the lane count.
+        word = asm.encode("vsplth", vD=3, vB=2, UIMM5=9)
+        self.assertTrue(body(word)[0][0].endswith(", 6, 6, 6, 6, 6, 6, 6, 6);"))
+
+    def test_merges_interleave_a_before_b(self):
+        for name, tail in (("vmrghw", "6, 2, 7, 3"), ("vmrglw", "4, 0, 5, 1")):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3].u32 = __builtin_shufflevector("
+                              "ctx->vr[1].u32, ctx->vr[2].u32, %s);" % tail], name)
+
+    def test_vsldoi_zero_keeps_vra(self):
+        lines, _ = body(asm.encode("vsldoi", vD=3, vA=1, vB=2, SHB=0))
+        self.assertEqual(lines, ["ctx->vr[3].u8 = __builtin_shufflevector(ctx->vr[1].u8, "
+                                 "ctx->vr[2].u8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);"])
+
+    def test_modulo_pack_takes_the_low_halves(self):
+        lines, _ = body(asm.encode("vpkuwum", vD=3, vA=1, vB=2))
+        self.assertTrue(lines[0].endswith(", 8, 10, 12, 14, 0, 2, 4, 6);"))
+
+    def test_saturating_packs_receive_the_context(self):
+        for name, helper in (("vpkshss", "dalVpkshss"), ("vpkshus", "dalVpkshus"),
+                             ("vpkuhus", "dalVpkuhus"), ("vpkswss", "dalVpkswss"),
+                             ("vpkswus", "dalVpkswus"), ("vpkuwus", "dalVpkuwus")):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = %s(ctx, ctx->vr[1], ctx->vr[2]);" % helper], name)
+
+    def test_splat_immediates_are_sign_extended(self):
+        self.assertEqual(body(asm.encode("vspltisw", vD=3, SIMM5=-1))[0],
+                         ["ctx->vr[3] = dalVspltisw(-1);"])
+        self.assertEqual(body(asm.encode("vspltisb", vD=3, SIMM5=15))[0],
+                         ["ctx->vr[3] = dalVspltisb(15);"])
+
+    def test_shifts_and_permute_call_their_helpers(self):
+        for name, helper in (("vsl", "dalVsl"), ("vsr", "dalVsr"), ("vslo", "dalVslo"),
+                             ("vsro", "dalVsro")):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = %s(ctx->vr[1], ctx->vr[2]);" % helper], name)
+        self.assertEqual(body(asm.encode("vperm", vD=3, vA=1, vB=2, vC=4))[0],
+                         ["ctx->vr[3] = dalVperm(ctx->vr[1], ctx->vr[2], ctx->vr[4]);"])
+
+
 if __name__ == "__main__":
     unittest.main()
