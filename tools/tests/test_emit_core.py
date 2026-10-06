@@ -244,9 +244,11 @@ class CallTest(unittest.TestCase):
         text, _ = emit([asm.b(BASE, BASE + 4, lk=True), asm.blr()])
         self.assertEqual(lines_of(text)[2], "ctx->lr = 0x00010004u;")
 
-    def test_conditional_get_pc_is_unhandled_for_now(self):
-        _, stats = emit([asm.bc(16, 0, BASE, BASE + 4, lk=True), asm.blr()])
-        self.assertEqual(stats.unhandled["bc"], 1)
+    def test_conditional_get_pc_keeps_the_ctr_decrement_and_lr_write(self):
+        text, stats = emit([asm.bc(16, 0, BASE, BASE + 4, lk=True), asm.blr()])
+        self.assertEqual(lines_of(text)[2:-1],
+                         ["ctx->ctr -= 1;", "ctx->lr = 0x00010004u;", "return;"])
+        self.assertEqual(sum(stats.unhandled.values()), 0)
 
 
 class FallThroughTest(unittest.TestCase):
@@ -295,10 +297,275 @@ class SyscallAndTrapTest(unittest.TestCase):
             self.assertEqual(stats.edges["traps"], 1)
             self.assertEqual(stats.edges["fallthrough_tails"], 0)
 
-    def test_conditional_traps_are_unhandled_for_now(self):
-        _, stats = emit([asm.tw(4, 3, 4), asm.twi(1, 3, 5), asm.blr()])
-        self.assertEqual(stats.unhandled["tw"], 1)
-        self.assertEqual(stats.unhandled["twi"], 1)
+    def test_trap_with_no_condition_bits_emits_nothing(self):
+        for word in (asm.tw(0, 3, 4), asm.twi(0, 3, 4), asm.td(0, 3, 4), asm.tdi(0, 3, 4)):
+            text, stats = emit([word, asm.blr()])
+            self.assertEqual(lines_of(text)[2:-1], ["return;"])
+            self.assertEqual(stats.edges["traps"], 0)
+            self.assertEqual(sum(stats.unhandled.values()), 0)
+
+    def test_conditional_trap_forms(self):
+        cases = [
+            (asm.tw(4, 3, 4), "if ((uint32_t)ctx->gpr[3] == (uint32_t)ctx->gpr[4]) "),
+            (asm.tw(0x10 | 0x01, 3, 4), "if ((int32_t)ctx->gpr[3] < (int32_t)ctx->gpr[4]"
+                                        " || (uint32_t)ctx->gpr[3] > (uint32_t)ctx->gpr[4]) "),
+            (asm.td(0x08, 5, 6), "if ((int64_t)ctx->gpr[5] > (int64_t)ctx->gpr[6]) "),
+            (asm.td(0x02, 5, 6), "if ((uint64_t)ctx->gpr[5] < (uint64_t)ctx->gpr[6]) "),
+            (asm.twi(0x10, 3, -5), "if ((int32_t)ctx->gpr[3] < -5) "),
+            (asm.twi(0x03, 3, -5), "if ((uint32_t)ctx->gpr[3] < 0xfffffffbu"
+                                   " || (uint32_t)ctx->gpr[3] > 0xfffffffbu) "),
+            (asm.tdi(0x0C, 3, -5), "if ((int64_t)ctx->gpr[3] > -5"
+                                   " || (uint64_t)ctx->gpr[3] == 0xfffffffffffffffbull) "),
+            (asm.twi(0x04, 3, 7), "if ((uint32_t)ctx->gpr[3] == 0x00000007u) "),
+        ]
+        for word, prefix in cases:
+            text, stats = emit([word, asm.blr()])
+            self.assertEqual(lines_of(text)[2], prefix + "DAL_TRAP(0x00010000u);", hex(word))
+            self.assertEqual(stats.edges["traps"], 1)
+            # A conditional trap falls through.
+            self.assertEqual(lines_of(text)[3], "return;")
+
+    def test_conditional_trap_at_the_end_has_a_fall_through_tail(self):
+        _, stats = emit([asm.tw(4, 3, 4)])
+        self.assertEqual(stats.edges["fallthrough_tails"], 1)
+
+
+class ConditionalBranchTest(unittest.TestCase):
+    # bc displacements are 16 bits, so the targets must be close to BASE (or absolute below 32K).
+    FN = BASE + 0x2000
+    IMP = BASE + 0x2100
+    DYN = BASE + 0x2200
+    ABS_FN = 0x4000
+
+    def body(self, word, **kwargs):
+        kwargs.setdefault("env", make_env(
+            names={self.FN: "fn_%08x" % self.FN, self.ABS_FN: "fn_%08x" % self.ABS_FN},
+            thunks={self.IMP: "imp_%08x" % self.IMP}))
+        text, stats = emit([word] + kwargs.pop("rest", [asm.blr()]), **kwargs)
+        return lines_of(text)[2:-1], stats
+
+    def test_cr_condition_classes(self):
+        # BO bit 0x01 is a prediction hint and must not change the result.
+        for bo, cond in ((12, "ctx->cr[6]"), (13, "ctx->cr[6]"), (4, "!ctx->cr[6]"),
+                         (5, "!ctx->cr[6]")):
+            body, _ = self.body(asm.bc(bo, 6, BASE, BASE + 8), rest=[asm.nop(), asm.blr()])
+            self.assertEqual(body[0], "if (%s) goto L_00010008;" % cond, bo)
+
+    def test_ctr_condition_classes(self):
+        cases = [(16, ["ctx->ctr -= 1;", "if (ctx->ctr != 0) goto L_00010008;"]),
+                 (18, ["ctx->ctr -= 1;", "if (ctx->ctr == 0) goto L_00010008;"]),
+                 (8, ["ctx->ctr -= 1;", "if (ctx->ctr != 0 && ctx->cr[5]) goto L_00010008;"]),
+                 (0, ["ctx->ctr -= 1;", "if (ctx->ctr != 0 && !ctx->cr[5]) goto L_00010008;"]),
+                 (10, ["ctx->ctr -= 1;", "if (ctx->ctr == 0 && ctx->cr[5]) goto L_00010008;"]),
+                 (2, ["ctx->ctr -= 1;", "if (ctx->ctr == 0 && !ctx->cr[5]) goto L_00010008;"])]
+        for bo, expected in cases:
+            body, _ = self.body(asm.bc(bo, 5, BASE, BASE + 8), rest=[asm.nop(), asm.blr()])
+            self.assertEqual(body[:2], expected, bo)
+
+    def test_ignored_ctr_with_reserved_bit_set_does_not_decrement(self):
+        # BO = 0b01110: ignore CTR, branch on CR true; bit 0x02 is ignored with it.
+        body, _ = self.body(asm.bc(14, 5, BASE, BASE + 8), rest=[asm.nop(), asm.blr()])
+        self.assertEqual(body[0], "if (ctx->cr[5]) goto L_00010008;")
+
+    def test_bdnz_loop_text(self):
+        words = [asm.li(3, 1), asm.bdnz(BASE + 4, BASE), asm.blr()]
+        text, stats = emit(words)
+        print("\n" + text)
+        self.assertEqual(text, "DAL_PPU_FUNC(fn_00010000) {\n"
+                               "    DAL_ENTER(0x00010000u);\n"
+                               "L_00010000:\n"
+                               "    ctx->gpr[3] = 1;\n"
+                               "    ctx->ctr -= 1;\n"
+                               "    if (ctx->ctr != 0) { DAL_LOOP(0x00010004u); goto L_00010000; }\n"
+                               "    return;\n"
+                               "}\n")
+        self.assertEqual((stats.labels, stats.loop_hooks), (1, 1))
+
+    def test_forward_conditional_goto_has_no_hook(self):
+        body, stats = self.body(asm.bgt(0, BASE, BASE + 8), rest=[asm.nop(), asm.blr()])
+        self.assertEqual(body[0], "if (ctx->cr[1]) goto L_00010008;")
+        self.assertEqual(stats.loop_hooks, 0)
+
+    def test_conditional_branch_to_itself_is_a_loop(self):
+        text, stats = emit([asm.bge(0, BASE, BASE), asm.blr()])
+        self.assertIn("    if (!ctx->cr[0]) { DAL_LOOP(0x00010000u); goto L_00010000; }\n", text)
+        self.assertEqual(stats.loop_hooks, 1)
+
+    def test_conditional_tails_by_target_kind(self):
+        words = [asm.bgt(0, BASE, self.FN), asm.bgt(0, BASE + 4, self.IMP),
+                 asm.bgt(0, BASE + 8, self.DYN), asm.blr()]
+        body, stats = self.body(words[0], rest=words[1:])
+        self.assertEqual(body, ["if (ctx->cr[1]) DAL_TAIL(fn_00012000);",
+                                "if (ctx->cr[1]) DAL_TAIL(imp_00012100);",
+                                "if (ctx->cr[1]) DAL_TAIL_DYN(0x00010008u, 0x00012200u);",
+                                "return;"])
+        self.assertEqual((stats.edges["tails_direct"], stats.edges["tails_import"],
+                          stats.edges["tails_dynamic"]), (1, 1, 1))
+        self.assertEqual(stats.dynamic_targets, [(BASE + 8, self.DYN, "tail")])
+
+    def test_conditional_absolute_branch(self):
+        body, _ = self.body(asm.bc(12, 2, BASE, self.ABS_FN, aa=True))
+        self.assertEqual(body[0], "if (ctx->cr[2]) DAL_TAIL(fn_00004000);")
+
+    def test_conditional_branch_at_the_end_has_a_fall_through_tail(self):
+        body, stats = self.body(asm.bgt(0, BASE, self.FN), rest=[])
+        self.assertEqual(body, ["if (ctx->cr[1]) DAL_TAIL(fn_00012000);",
+                        "DAL_TAIL_DYN(0x00010000u, 0x00010004u);"])
+        self.assertEqual(stats.edges["fallthrough_tails"], 1)
+
+    def test_conditional_call_writes_lr_before_the_test(self):
+        words = [asm.bc(12, 2, BASE, self.FN, lk=True), asm.bc(16, 0, BASE + 4, self.IMP, lk=True),
+                 asm.bc(4, 2, BASE + 8, self.DYN, lk=True), asm.blr()]
+        body, stats = self.body(words[0], rest=words[1:])
+        self.assertEqual(body, [
+            "ctx->lr = 0x00010004u;",
+            "if (ctx->cr[2]) DAL_CALL(fn_00012000, 0x00010004u);",
+            "ctx->ctr -= 1;",
+            "ctx->lr = 0x00010008u;",
+            "if (ctx->ctr != 0) DAL_CALL(imp_00012100, 0x00010008u);",
+            "ctx->lr = 0x0001000cu;",
+            "if (!ctx->cr[2]) DAL_CALL_DYN(0x00010008u, 0x00012200u, 0x0001000cu);",
+            "return;"])
+        self.assertEqual((stats.edges["calls_direct"], stats.edges["calls_import"],
+                          stats.edges["calls_dynamic_const"]), (1, 1, 1))
+        self.assertEqual(stats.dynamic_targets, [(BASE + 8, self.DYN, "call")])
+        self.assertEqual(stats.edges["fallthrough_tails"], 0)
+
+    def test_conditional_bclr(self):
+        body, stats = self.body(asm.bclr(12, 2))
+        self.assertEqual(body, ["if (ctx->cr[2]) return;", "return;"])
+        self.assertEqual(stats.edges["returns"], 2)
+        body, _ = self.body(asm.bclr(16, 0))
+        self.assertEqual(body[:2], ["ctx->ctr -= 1;", "if (ctx->ctr != 0) return;"])
+        body, _ = self.body(asm.bclr(2, 3))
+        self.assertEqual(body[:2], ["ctx->ctr -= 1;", "if (ctx->ctr == 0 && !ctx->cr[3]) return;"])
+
+    def test_conditional_bclr_has_a_fall_through_tail_at_the_end(self):
+        text, stats = emit([asm.bclr(12, 2)])
+        self.assertEqual(lines_of(text)[2:-1], ["if (ctx->cr[2]) return;",
+                                                "DAL_TAIL_DYN(0x00010000u, 0x00010004u);"])
+        self.assertEqual(stats.edges["fallthrough_tails"], 1)
+
+    def test_conditional_bclrl_reads_the_target_before_writing_lr(self):
+        body, stats = self.body(asm.bclr(16, 0, lk=True))
+        self.assertEqual(body, ["{",
+                                "uint32_t t0 = (uint32_t)ctx->lr;",
+                                "ctx->ctr -= 1;",
+                                "ctx->lr = 0x00010004u;",
+                                "if (ctx->ctr != 0) DAL_CALL_DYN(0x00010000u, t0, 0x00010004u);",
+                                "}",
+                                "return;"])
+        self.assertEqual(stats.edges["calls_indirect"], 1)
+
+    def test_conditional_bcctr(self):
+        body, stats = self.body(asm.bcctr(12, 2))
+        self.assertEqual(body, ["if (ctx->cr[2]) DAL_TAIL_DYN(0x00010000u, ctx->ctr);", "return;"])
+        self.assertEqual(stats.edges["tails_dynamic"], 1)
+        self.assertEqual(sum(stats.unhandled.values()), 0)
+
+    def test_conditional_bcctrl(self):
+        body, stats = self.body(asm.bcctr(4, 2, lk=True))
+        self.assertEqual(body, ["ctx->lr = 0x00010004u;",
+                                "if (!ctx->cr[2]) DAL_CALL_DYN(0x00010000u, ctx->ctr, 0x00010004u);",
+                                "return;"])
+        self.assertEqual(stats.edges["calls_indirect"], 1)
+
+    def test_every_conditional_form_is_handled(self):
+        tail = [asm.bclr(bo, 3, lk) for bo in range(32) for lk in (False, True)]
+        # bcctr is only defined with BO bit 0x04 set.
+        tail += [asm.bcctr(bo, 3, lk) for bo in range(4, 32, 8) for lk in (False, True)]
+        tail.append(asm.blr())
+        end = BASE + 4 * (32 + len(tail) - 1)
+        words = [asm.bc(bo, 3, BASE + 4 * bo, end) for bo in range(32)] + tail
+        _, stats = emit(words)
+        self.assertEqual(sum(stats.unhandled.values()), 0)
+
+
+class SwitchTest(unittest.TestCase):
+    SITE = BASE + 8
+
+    def switch_text(self, targets, words=None, **kwargs):
+        words = words or [asm.nop(), asm.nop(), asm.bctr(), asm.nop(), asm.nop(), asm.blr()]
+        env = make_env(switches={self.SITE: tuple(targets)})
+        return emit(words, env=env, **kwargs)
+
+    def test_forward_switch(self):
+        text, stats = self.switch_text([BASE + 12, BASE + 16])
+        print("\n" + text)
+        self.assertEqual(text, "DAL_PPU_FUNC(fn_00010000) {\n"
+                               "    DAL_ENTER(0x00010000u);\n"
+                               "    switch ((uint32_t)ctx->ctr) {\n"
+                               "        case 0x0001000cu: goto L_0001000c;\n"
+                               "        case 0x00010010u: goto L_00010010;\n"
+                               "        default: DAL_TAIL_DYN(0x00010008u, ctx->ctr);\n"
+                               "    }\n"
+                               "L_0001000c:\n"
+                               "L_00010010:\n"
+                               "    return;\n"
+                               "}\n")
+        self.assertEqual((stats.edges["switches"], stats.edges["switch_cases"]), (1, 2))
+        self.assertEqual((stats.labels, stats.loop_hooks), (2, 0))
+        self.assertEqual(stats.edges["tails_dynamic"], 1)    # the default
+
+    def test_duplicates_collapse_and_cases_are_sorted(self):
+        text, stats = self.switch_text([BASE + 16, BASE + 12, BASE + 16, BASE + 12])
+        cases = [line for line in lines_of(text) if line.startswith("case ")]
+        self.assertEqual(cases, ["case 0x0001000cu: goto L_0001000c;",
+                                 "case 0x00010010u: goto L_00010010;"])
+        self.assertEqual(stats.edges["switch_cases"], 2)
+
+    def test_backward_target_gets_one_loop_hook_before_the_switch(self):
+        text, stats = self.switch_text([BASE, BASE + 12, BASE + 4, BASE + 12])
+        lines = lines_of(text)
+        at = lines.index("DAL_LOOP(0x00010008u);")
+        self.assertEqual(lines[at + 1], "switch ((uint32_t)ctx->ctr) {")
+        self.assertEqual(text.count("DAL_LOOP"), 1)
+        self.assertEqual(stats.loop_hooks, 1)
+        self.assertIn("case 0x00010000u: goto L_00010000;", lines)
+
+    def test_target_equal_to_the_site_is_backward(self):
+        text, stats = self.switch_text([self.SITE])
+        self.assertIn("DAL_LOOP(0x00010008u);", lines_of(text))
+        self.assertEqual(stats.loop_hooks, 1)
+
+    def test_non_intra_cases_use_the_tail_forms(self):
+        text, stats = self.switch_text([BASE + 12, OTHER, STUB, 0x40000])
+        lines = lines_of(text)
+        self.assertIn("case 0x00020000u: DAL_TAIL(fn_00020000);", lines)
+        self.assertIn("case 0x00030000u: DAL_TAIL(imp_00030000);", lines)
+        self.assertIn("case 0x00040000u: DAL_TAIL_DYN(0x00010008u, 0x00040000u);", lines)
+        self.assertNotIn("DAL_LOOP(0x00010008u);", lines)
+        self.assertEqual(stats.edges["switch_cases"], 4)
+        self.assertEqual(stats.dynamic_targets, [(self.SITE, 0x40000, "tail")])
+
+    def test_switch_site_has_no_fall_through_tail(self):
+        _, stats = self.switch_text([BASE + 12], words=[asm.nop(), asm.nop(), asm.bctr()])
+        self.assertEqual(stats.edges["fallthrough_tails"], 0)
+
+    def test_bcctr_that_is_not_a_switch_site_stays_a_dynamic_tail(self):
+        text, _ = emit([asm.nop(), asm.nop(), asm.bctr(), asm.blr()],
+                       env=make_env(switches={BASE + 100: (BASE,)}))
+        self.assertIn("    DAL_TAIL_DYN(0x00010008u, ctx->ctr);\n", text)
+        self.assertNotIn("switch", text)
+
+    def test_bcctrl_at_a_switch_site_is_still_a_call(self):
+        words = [asm.nop(), asm.nop(), asm.bctrl(), asm.blr()]
+        text, _ = emit(words, env=make_env(switches={self.SITE: (BASE,)}))
+        self.assertIn("DAL_CALL_DYN(0x00010008u, ctx->ctr, 0x0001000cu);", text)
+        self.assertNotIn("switch", text)
+
+    def test_conditional_bcctr_at_a_switch_site_guards_the_switch(self):
+        words = [asm.nop(), asm.nop(), asm.bcctr(12, 2), asm.nop(), asm.blr()]
+        text, _ = emit(words, env=make_env(switches={self.SITE: (BASE + 12,)}))
+        self.assertEqual(lines_of(text)[2:7],
+                         ["if (ctx->cr[2]) {", "switch ((uint32_t)ctx->ctr) {",
+                          "case 0x0001000cu: goto L_0001000c;",
+                          "default: DAL_TAIL_DYN(0x00010008u, ctx->ctr);", "}"])
+
+    def test_empty_target_set_falls_back_to_a_dynamic_tail(self):
+        text, stats = self.switch_text([])
+        self.assertNotIn("switch", text)
+        self.assertEqual(stats.edges["switches"], 0)
 
 
 class UnhandledTest(unittest.TestCase):
@@ -338,17 +605,12 @@ class UnhandledTest(unittest.TestCase):
         self.assertEqual(stats.unhandled_sites["addi:ra0"], [BASE + 4 * i for i in range(5)])
         self.assertNotIn("addi", stats.unhandled)
 
-    def test_conditional_branch_forms_are_unhandled_for_now(self):
-        words = [asm.bgt(0, BASE, BASE + 12), asm.bclr(12, 2), asm.bcctr(12, 2), asm.blr()]
-        text, stats = emit(words)
-        self.assertEqual(dict(stats.unhandled), {"bc": 1, "bclr": 1, "bcctr": 1})
-        self.assertNotRegex(text, r"(^|[ \n])L_")
-        self.assertEqual(stats.labels, 0)
-
-    def test_conditional_linking_indirect_branch_is_not_a_call(self):
-        _, stats = emit([asm.bclr(12, 2, lk=True), asm.bcctr(12, 2, lk=True), asm.blr()])
-        self.assertEqual(dict(stats.unhandled), {"bclr": 1, "bcctr": 1})
-        self.assertEqual(stats.edges["calls_indirect"], 0)
+    def test_bcctr_with_ctr_decrement_is_invalid(self):
+        for word in (asm.bcctr(0, 2), asm.bcctr(8, 2, lk=True), asm.bcctr(16, 0)):
+            text, stats = emit([word, asm.blr()])
+            self.assertEqual(dict(stats.unhandled), {"bcctr:ctr": 1})
+            self.assertIn("DAL_UNHANDLED(0x00010000u, ", text)
+            self.assertEqual(stats.edges["tails_dynamic"] + stats.edges["calls_indirect"], 0)
 
 
 class RegistryTest(unittest.TestCase):

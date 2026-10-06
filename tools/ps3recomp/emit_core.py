@@ -19,9 +19,6 @@ _MASK64 = 0xFFFFFFFFFFFFFFFF
 _SITE_EXAMPLES = 5
 _INDENT = "    "
 
-# BO value bits that make a conditional branch unconditional: "ignore CR" and "ignore CTR".
-_BO_ALWAYS = 0x14
-
 
 def u32(v: int) -> str:
     return "0x%08xu" % (v & _MASK32)
@@ -154,10 +151,6 @@ def _default_handlers() -> dict[str, Handler]:
     return load_handlers()
 
 
-def _always(insn: Insn) -> bool:
-    return insn.field("BO") & _BO_ALWAYS == _BO_ALWAYS
-
-
 class _FunctionEmitter:
     """Collects the statements of one function and the labels they reference."""
 
@@ -232,36 +225,140 @@ class _FunctionEmitter:
         self.stats.edges["tails_dynamic"] += 1
         return ["DAL_TAIL_DYN(%s, ctx->%s);" % (u32(site), reg)]
 
-    def control(self, op: Op) -> list[str] | None:
-        """Statements for a control-group instruction, or None when it is not supported."""
+    def switch_stmt(self, site: int, targets: Iterable[int]) -> list[str]:
+        """`bcctr` over a resolved jump table: switch on the CTR value (no index register is known)."""
+        cases = sorted(set(targets))
+        lines: list[str] = []
+        body: list[str] = []
+        hook = False
+        for target in cases:
+            if self.classify(target, allow_intra=True) == "intra":
+                self.targeted.add(target)
+                hook = hook or target <= site
+                body.append("    case %s: goto L_%08x;" % (u32(target), target))
+            else:
+                body.append("    case %s: %s" % (u32(target),
+                                                 self.tail_stmt(site, target, "tails", "tail")[0]))
+        if hook:
+            # One hook for the whole switch instead of one per backward case.
+            self.stats.loop_hooks += 1
+            lines.append("DAL_LOOP(%s);" % u32(site))
+        self.stats.edges["switches"] += 1
+        self.stats.edges["switch_cases"] += len(cases)
+        lines.append("switch ((uint32_t)ctx->ctr) {")
+        lines.extend(body)
+        lines.append("    default: %s" % self.indirect_stmt(site, "ctr", False)[0])
+        lines.append("}")
+        return lines
+
+    @staticmethod
+    def condition(insn: Insn) -> str | None:
+        """C condition of a conditional branch, or None when it is always taken (BO, BI)."""
+        bo = insn.field("BO")
+        parts = []
+        if not bo & 0x04:
+            parts.append("ctx->ctr == 0" if bo & 0x02 else "ctx->ctr != 0")
+        if not bo & 0x10:
+            bit = "ctx->cr[%d]" % insn.field("BI")
+            parts.append(bit if bo & 0x08 else "!" + bit)
+        return " && ".join(parts) or None
+
+    @staticmethod
+    def guarded(cond: str | None, lines: list[str]) -> list[str]:
+        if cond is None:
+            return lines
+        if len(lines) == 1:
+            return ["if (%s) %s" % (cond, lines[0])]
+        return ["if (%s) {" % cond] + [_INDENT + line for line in lines] + ["}"]
+
+    def branch(self, op: Op) -> list[str] | None:
+        """b, bc, bclr and bcctr. Semantics follow RPCS3 `BC`, `BCLR` and `BCCTR`."""
         insn, site, name = op.insn, op.addr, op.name
-        link = bool(insn.field("LK")) if name in ("b", "bc", "bclr", "bcctr") else False
+        link = bool(insn.field("LK"))
+        ret = u32(site + 4)
+        cond = None if name == "b" else self.condition(insn)
+        ctr_ignored = bool(insn.field("BO") & 0x04) if name != "b" else True
+        if name == "bcctr" and not ctr_ignored:
+            return op.unsupported("ctr")    # CTR decrement is not defined for bcctr
+        # CTR is decremented whether or not the branch is taken.
+        pre = [] if ctr_ignored else ["ctx->ctr -= 1;"]
+        # LR is written whether or not a conditional branch is taken.
+        set_lr = ["ctx->lr = %s;" % ret] if link and cond is not None else []
+
         if name in ("b", "bc"):
             flow = flow_of(insn)
-            if name == "bc" and not _always(insn):
-                return None
             if flow.kind == "seq":
-                # get-PC idiom `bcl 20,31,$+4`: only LR is written.
-                return ["ctx->lr = %s;" % u32(site + 4)]
+                # `bcl 20,31,$+4` get-PC idiom (and its conditional forms): both outcomes
+                # continue at the next word.
+                return pre + ["ctx->lr = %s;" % ret]
             if link:
-                return self.call_stmt(site, flow.target)
-            return self.tail_stmt(site, flow.target, "tails", "tail")
-        if name in ("bclr", "bcctr"):
-            if not _always(insn):
-                return None
-            if name == "bclr":
+                transfer = self.call_stmt(site, flow.target)
+            else:
+                transfer = self.tail_stmt(site, flow.target, "tails", "tail")
+            return pre + set_lr + self.guarded(cond, transfer)
+
+        if name == "bclr":
+            if cond is None:
                 if link:
                     return self.indirect_stmt(site, "lr", True)
                 self.stats.edges["returns"] += 1
                 return ["return;"]
-            return self.indirect_stmt(site, "ctr", link)
-        if name == "sc":
+            if link:
+                # The target is read before LR is overwritten.
+                self.stats.edges["calls_indirect"] += 1
+                call = "DAL_CALL_DYN(%s, t0, %s);" % (u32(site), ret)
+                return (["{", _INDENT + "uint32_t t0 = (uint32_t)ctx->lr;"]
+                        + [_INDENT + line for line in pre + set_lr + self.guarded(cond, [call])]
+                        + ["}"])
+            self.stats.edges["returns"] += 1
+            return pre + self.guarded(cond, ["return;"])
+
+        # bcctr
+        if link:
+            return set_lr + self.guarded(cond, self.indirect_stmt(site, "ctr", True))
+        targets = self.env.switch_targets.get(site)
+        transfer = (self.switch_stmt(site, targets) if targets
+                    else self.indirect_stmt(site, "ctr", False))
+        return self.guarded(cond, transfer)
+
+    def trap(self, op: Op) -> list[str]:
+        """tw, twi, td, tdi. Semantics follow RPCS3 `TW`, `TWI`, `TD` and `TDI`."""
+        insn, site = op.insn, op.addr
+        to = insn.field("TO")
+        if to == 0:
+            return []
+        self.stats.edges["traps"] += 1
+        trap = ["DAL_TRAP(%s);" % u32(site)]
+        if to == 31:
+            return trap
+        bits = 64 if op.name in ("td", "tdi") else 32
+        reg_a = op.gpr(insn.field("rA"))
+        signed_a = "(int%d_t)%s" % (bits, reg_a)
+        unsigned_a = "(uint%d_t)%s" % (bits, reg_a)
+        if op.name in ("twi", "tdi"):
+            simm = insn.field("SIMM")
+            signed_b = str(simm)
+            unsigned_b = u64(simm) if bits == 64 else u32(simm)
+        else:
+            reg_b = op.gpr(insn.field("rB"))
+            signed_b = "(int%d_t)%s" % (bits, reg_b)
+            unsigned_b = "(uint%d_t)%s" % (bits, reg_b)
+        terms = [(0x10, "%s < %s" % (signed_a, signed_b)),
+                 (0x08, "%s > %s" % (signed_a, signed_b)),
+                 (0x04, "%s == %s" % (unsigned_a, unsigned_b)),
+                 (0x02, "%s < %s" % (unsigned_a, unsigned_b)),
+                 (0x01, "%s > %s" % (unsigned_a, unsigned_b))]
+        cond = " || ".join(text for bit, text in terms if to & bit)
+        return self.guarded(cond, trap)
+
+    def control(self, op: Op) -> list[str] | None:
+        """Statements for a control-group instruction, or None when it is not supported."""
+        if op.name in ("b", "bc", "bclr", "bcctr"):
+            return self.branch(op)
+        if op.name == "sc":
             self.stats.edges["syscalls"] += 1
-            return ["DAL_SYSCALL(%s);" % u32(site)]
-        if name in ("tw", "twi", "td", "tdi") and insn.field("TO") == 31:
-            self.stats.edges["traps"] += 1
-            return ["DAL_TRAP(%s);" % u32(site)]
-        return None
+            return ["DAL_SYSCALL(%s);" % u32(op.addr)]
+        return self.trap(op)
 
     def instruction(self, addr: int) -> list[str]:
         image = self.image

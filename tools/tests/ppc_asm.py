@@ -194,6 +194,18 @@ def twi(to: int, ra: int, simm: int) -> int:
     return _d_form(3, to, ra, simm)
 
 
+def td(to: int, ra: int, rb: int) -> int:
+    return _x_form(68, to, ra, rb)
+
+
+def tdi(to: int, ra: int, simm: int) -> int:
+    return _d_form(2, to, ra, simm)
+
+
+def bdnz(addr: int, target: int) -> int:
+    return bc(16, 0, addr, target)
+
+
 def trap() -> int:
     return tw(31, 0, 0)
 
