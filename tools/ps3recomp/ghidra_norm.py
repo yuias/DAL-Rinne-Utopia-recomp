@@ -6,18 +6,100 @@ import re
 from collections.abc import Callable
 from functools import lru_cache
 
-from .ppu import Insn
+from .ppu import ALL_OPS, Insn
 from .ppu_format import format_insn
 
 Token = str | int
 
-_MEM_OPERAND = re.compile(r"^(.*)\((r\d+)\)$")
+# Ghidra prints a zero base register (rA = 0 in an rA|0 slot) as a bare "0".
+_MEM_OPERAND = re.compile(r"^(.*)\((r\d+|0)\)$")
 _INT = re.compile(r"^-?(?:0x[0-9a-f]+|\d+)$")
 _INT_MODULI = tuple(1 << k for k in (16, 32, 64))
 
+Rewrite = Callable[[tuple[Token, ...]], tuple[str, tuple[Token, ...]]]
+
+# Ghidra prints addi/addic/addic./addis with a negative immediate as subi/... with the magnitude.
+_SUB_TO_ADD = {"subi": "addi", "subic": "addic", "subic.": "addic.", "subis": "addis"}
+
+# Ghidra names the SPRs of mfspr/mtspr/mftb; we print the number.
+_SPR_NUMBERS = {"lr": 8, "ctr": 9, "tblr": 268}
+
+_CR_BIT_NAMES = ("lt", "gt", "eq", "so")
+_CR_BIT = re.compile(r"^(?:4\*cr(\d)\+)?(lt|gt|eq|so)$")
+_CR_LOGICAL = ("crand", "crandc", "creqv", "crnand", "crnor", "cror", "crorc", "crxor")
+
+_RA_OR_ZERO_FIRST = frozenset({"rD", "rS", "frD", "frS", "vD", "vS"})
+
+
+def _sub_to_add(name: str) -> Rewrite:
+    def rewrite(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+        *head, imm = tokens
+        if not isinstance(imm, int):
+            return name, tokens
+        return _SUB_TO_ADD[name], (*head, -imm)
+    return rewrite
+
+
+def _spr_number(name: str) -> Rewrite:
+    def rewrite(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+        return name, tuple(_SPR_NUMBERS.get(t, t) if isinstance(t, str) else t for t in tokens)
+    return rewrite
+
+
+def _cr_bit_number(token: Token) -> Token:
+    m = _CR_BIT.match(token) if isinstance(token, str) else None
+    return 4 * int(m.group(1) or 0) + _CR_BIT_NAMES.index(m.group(2)) if m else token
+
+
+def _cr_logical(name: str) -> Rewrite:
+    def rewrite(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+        return name, tuple(_cr_bit_number(t) for t in tokens)
+    return rewrite
+
+
+def _zero_base(name: str) -> Rewrite:
+    # rA is the second-to-last operand of the indexed forms "rA,rB" and "rT,rA,rB".
+    def rewrite(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+        if len(tokens) >= 2 and tokens[-2] == 0:
+            return name, (*tokens[:-2], "r0", tokens[-1])
+        return name, tokens
+    return rewrite
+
+
+def _sc_level(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+    # We omit the LEV operand of `sc`, Ghidra prints it. A non-zero level stays a mismatch.
+    return "sc", () if tokens == (0,) else tokens
+
+
+def _trap_to_zero(name: str) -> Rewrite:
+    # Ghidra omits the TO operand when it is 0.
+    def rewrite(tokens: tuple[Token, ...]) -> tuple[str, tuple[Token, ...]]:
+        return name, (0, *tokens) if len(tokens) == 2 else tokens
+    return rewrite
+
+
+def _indexed_rewrites() -> dict[str, Rewrite]:
+    rewrites: dict[str, Rewrite] = {}
+    for spec in ALL_OPS:
+        ops = spec.operands
+        indexed = ops == ("rA", "rB") or (
+            len(ops) == 3 and ops[0] in _RA_OR_ZERO_FIRST and ops[1:] == ("rA", "rB"))
+        if spec.form == "X" and spec.primary == 31 and indexed:
+            rewrites[spec.name] = _zero_base(spec.name)
+    return rewrites
+
+
 # Per normalised Ghidra mnemonic: rewrite into the form we print. Each entry must be a pure
-# syntax change.
-GHIDRA_REWRITES: dict[str, Callable[[tuple[Token, ...]], tuple[str, tuple[Token, ...]]]] = {}
+# syntax change; the operands still have to equal ours afterwards.
+GHIDRA_REWRITES: dict[str, Rewrite] = {
+    **{name: _sub_to_add(name) for name in _SUB_TO_ADD},
+    **{name: _spr_number(name) for name in ("mfspr", "mtspr", "mftb")},
+    **{name: _cr_logical(name) for name in _CR_LOGICAL},
+    **_indexed_rewrites(),
+    "sc": _sc_level,
+    "twi": _trap_to_zero("twi"),
+    "tdi": _trap_to_zero("tdi"),
+}
 
 # (our raw spec name or None if we cannot decode, normalised Ghidra mnemonic or None if Ghidra
 # cannot decode) -> reason. Ghidra-side limitations only, never our bugs.
@@ -56,7 +138,7 @@ def normalize(mnemonic: str, operands: str | None) -> tuple[str, tuple[Token, ..
         if m:
             if m.group(1):
                 tokens.append(_token(m.group(1)))
-            tokens.append(m.group(2))
+            tokens.append("r0" if m.group(2) == "0" else m.group(2))
         else:
             tokens.append(_token(part))
     return normalize_mnemonic(mnemonic), _drop_cr0(tuple(tokens))

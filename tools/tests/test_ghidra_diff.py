@@ -29,16 +29,16 @@ UNKNOWN = 0x00000000
 # (word, (kind, mnemonic, operands)) rows; the expected categories are listed in the tests.
 ROWS = (
     (MFLR, ("code", "mflr", "r0")),                      # match
-    (MFLR, ("code", "mfspr", "r0,LR")),                  # operand_mismatch
-    (MFLR, ("code", "mtspr", "r0,LR")),                  # mnemonic_mismatch
+    (MFLR, ("code", "mfspr", "r0,CTR")),                 # operand_mismatch
+    (MFLR, ("code", "mtspr", "r0,CTR")),                 # mnemonic_mismatch
     (UNKNOWN, ("code", "lvlx", "v2,r0,r5")),             # ghidra_code_we_unknown
     (MFLR, ("data", None, None)),                        # we_code_ghidra_noncode, ghidra_bad
     (UNKNOWN, ("undefined", None, None)),                # both_noncode_unknown, agree
     (BLR, ("code", "blr", "")),                          # match
     (BLR, ("data", "blr", "")),                          # we_code_ghidra_noncode, agree
     (UNKNOWN, ("data", "add", "r1,r2,r3")),              # both_noncode_unknown, we_unknown
-    (MFLR, ("undefined", "mfspr", "r0,LR")),             # we_code_ghidra_noncode, operand_mismatch
-    (MFLR, ("undefined", "mtspr", "r0,LR")),             # we_code_ghidra_noncode, mnemonic_mismatch
+    (MFLR, ("undefined", "mfspr", "r0,CTR")),            # we_code_ghidra_noncode, operand_mismatch
+    (MFLR, ("undefined", "mtspr", "r0,CTR")),            # we_code_ghidra_noncode, mnemonic_mismatch
 )
 
 
@@ -96,6 +96,10 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(ghidra_norm.normalize("li", "r3,0xFF")[1], ("r3", 255))
         self.assertEqual(ghidra_norm.normalize("mfspr", "r0,LR")[1], ("r0", "lr"))
 
+    def test_zero_base_in_memory_operand(self):
+        self.assertEqual(ghidra_norm.normalize("lwz", "r0,0x0(0)"), ("lwz", ("r0", 0, "r0")))
+        self.assertEqual(ghidra_norm.normalize("lwz", "r0,0x0(r0)"), ("lwz", ("r0", 0, "r0")))
+
     def test_sign_extension_display(self):
         insn = decode(STDU)
         self.assertEqual(ghidra_norm.compare(insn, "stdu", "r1,-0x70(r1)"), "match")
@@ -125,17 +129,84 @@ class NormalizeTest(unittest.TestCase):
 
     def test_int_vs_string_tokens_differ(self):
         insn = decode(MFLR)
-        self.assertEqual(ghidra_norm.compare(insn, "mfspr", "r0,LR"), "operand_mismatch")
+        self.assertEqual(ghidra_norm.compare(insn, "mfspr", "r0,LR"), "match")
+        self.assertEqual(ghidra_norm.compare(insn, "mfspr", "r0,lr_"), "operand_mismatch")
 
     def test_rewrite_hook(self):
         insn = decode(ADDI_M1)
-        self.assertEqual(ghidra_norm.compare(insn, "subi", "r3,r3,0x1"), "mnemonic_mismatch")
-        rewrite = {"subi": lambda t: ("addi", (t[0], t[1], -t[2]))}
+        self.assertEqual(ghidra_norm.compare(insn, "frobi", "r3,r3,0x1"), "mnemonic_mismatch")
+        rewrite = {"frobi": lambda t: ("addi", (t[0], t[1], -t[2]))}
         with mock.patch.dict(ghidra_norm.GHIDRA_REWRITES, rewrite):
-            self.assertEqual(ghidra_norm.compare(insn, "subi", "r3,r3,0x1"), "match")
+            self.assertEqual(ghidra_norm.compare(insn, "frobi", "r3,r3,0x1"), "match")
 
-    def test_tables_start_empty(self):
-        self.assertEqual(ghidra_norm.GHIDRA_REWRITES, {})
+    def test_rewrite_keys_are_normalised_mnemonics(self):
+        self.assertTrue(ghidra_norm.GHIDRA_REWRITES)
+        for name in ghidra_norm.GHIDRA_REWRITES:
+            self.assertEqual(ghidra_norm.normalize_mnemonic(name), name)
+
+
+class RewriteTest(unittest.TestCase):
+    """Real words from the executable whose Ghidra text differs only in syntax."""
+
+    def check(self, word, mnemonic, operands, expected="match"):
+        self.assertEqual(ghidra_norm.compare(decode(word), mnemonic, operands), expected,
+                         "%08x %s %s" % (word, mnemonic, operands))
+
+    def test_sub_forms_are_negative_add_forms(self):
+        self.check(0x38638814, "subi", "r3,r3,0x77ec")      # addi r3,r3,-0x77ec
+        self.check(0x3084E4F8, "subic", "r4,r4,0x1b08")     # addic r4,r4,-0x1b08
+        self.check(0x37FFFFFF, "subic.", "r31,r31,0x1")     # addic. r31,r31,-1
+        self.check(0x3D29FEED, "subis", "r9,r9,0x113")      # addis r9,r9,-0x113
+        self.check(0x38638814, "subi", "r3,r3,0x77ed", "operand_mismatch")
+        self.check(0x38638814, "subi", "r3,r3,-0x77ec", "operand_mismatch")
+        self.check(0x38638814, "subic", "r3,r3,0x77ec", "mnemonic_mismatch")
+
+    def test_spr_names(self):
+        self.check(0x7C0803A6, "mtspr", "LR,r0")            # mtlr r0
+        self.check(0x7C0802A6, "mfspr", "r0,LR")
+        self.check(0x7C0903A6, "mtspr", "CTR,r0")           # mtctr r0
+        self.check(0x7C6C42E6, "mftb", "r3,TBLr")           # mftb r3,268
+        self.check(0x7C0802A6, "mfspr", "r0,CTR", "operand_mismatch")
+        self.check(0x7C0802A6, "mfspr", "r0,8")
+
+    def test_zero_base_register(self):
+        self.check(0x7C4018CE, "lvx", "v2,0,r3")            # lvx v2,r0,r3
+        self.check(0x7FE001CE, "stvx", "v31,0,r0")
+        self.check(0x7C001A2C, "dcbt", "0,r3")
+        self.check(0x7C004FAE, "stfiwx", "f0,0,r9")
+        self.check(0x7C60198E, "stvewx", "v3,0,r3")
+        self.check(0x80000000, "lwz", "r0,0x0(0)")
+        self.check(0x7C4018CE, "lvx", "v2,r0,r3")
+        # A base register that is not r0 must not match a zero.
+        self.check(0x7C4118CE, "lvx", "v2,0,r3", "operand_mismatch")
+        self.check(0x7C4118CE, "lvx", "v2,r1,r3")
+
+    def test_zero_base_rewrites_cover_indexed_forms_only(self):
+        for name in ("lvx", "stvx", "dcbt", "stfiwx", "stvewx", "lwzx", "stwcx.", "lfdx"):
+            self.assertIn(name, ghidra_norm.GHIDRA_REWRITES)
+        for name in ("add", "and", "lwz", "cmp", "tw"):
+            self.assertNotIn(name, ghidra_norm.GHIDRA_REWRITES)
+
+    def test_sc_level(self):
+        self.check(0x44000002, "sc", "0x0")
+        self.check(0x44000002, "sc", "")
+        self.check(0x44000002, "sc", "0x1", "operand_mismatch")
+
+    def test_trap_without_to_operand(self):
+        self.check(0x0C0D0E0F, "twi", "r13,0xe0f")          # twi 0,r13,0xe0f
+        self.check(0x08090A0B, "tdi", "r9,0xa0b")
+        self.check(0x0C8D0001, "twi", "r13,0x1", "operand_mismatch")   # twi 4,r13,1
+
+    def test_condition_register_bit_names(self):
+        self.check(0x4C402B82, "cror", "eq,lt,4*cr1+gt")    # cror 2,0,5
+        self.check(0x4C460342, "crorc", "eq,4*cr1+eq,lt")   # crorc 2,6,0
+        self.check(0x4C4231C2, "crnand", "eq,eq,4*cr1+eq")  # crnand 2,2,6
+        self.check(0x4C423042, "crnor", "eq,eq,4*cr1+eq")   # crnor 2,2,6
+        self.check(0x4C402B82, "cror", "eq,lt,4*cr1+eq", "operand_mismatch")
+        self.check(0x4C402B82, "cror", "eq,lt,gt", "operand_mismatch")
+
+    def test_no_known_ghidra_differences_yet(self):
+        # No word in the real .text is a Ghidra-side limitation; add entries here when one is.
         self.assertEqual(ghidra_norm.KNOWN_GHIDRA_DIFFERENCES, {})
 
 
@@ -166,8 +237,8 @@ class ClassifyTest(unittest.TestCase):
                          "match")
 
     def test_known_difference_wins_over_bug_categories(self):
-        known = {("addi", "subi"): "Ghidra prints subi"}
-        row = ("code", "subi", "r3,r3,0x1")
+        known = {("addi", "addic"): "different mnemonic"}
+        row = ("code", "addic", "r3,r3,-0x1")
         self.assertEqual(self.classify(ADDI_M1, row)[0], "mnemonic_mismatch")
         with mock.patch.dict(ghidra_norm.KNOWN_GHIDRA_DIFFERENCES, known):
             self.assertEqual(self.classify(ADDI_M1, row)[0], "known_difference")
@@ -266,7 +337,7 @@ class DiffCliTest(unittest.TestCase):
         self.assertEqual(pairs["operand_mismatch"], [{
             "ours": "mfspr", "ghidra": "mfspr", "count": 1,
             "examples": [{"addr": "0x00010004", "word": "0x7c0802a6", "ours": "mflr r0",
-                          "ghidra": "mfspr r0,LR"}]}])
+                          "ghidra": "mfspr r0,CTR"}]}])
         self.assertEqual(pairs["ghidra_code_we_unknown"], [{
             "ours": None, "ghidra": "lvlx", "count": 1,
             "examples": [{"addr": "0x0001000c", "word": "0x00000000", "ours": ".long 0x00000000",
