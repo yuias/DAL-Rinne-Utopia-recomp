@@ -21,6 +21,7 @@
 #include "core/elf_loader.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
+#include "core/host_functions.h"
 #include "core/log.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
@@ -673,6 +674,99 @@ void testHleOutPointerHints() {
   dal::setLogSink({});
   dal::resetCensus();
   dal::resetLogOnce();
+}
+
+DAL_PPU_FUNC(hostFunctionA) {
+  (void)base;
+  ctx->gpr[3] = ctx->gpr[3] + 100;
+}
+
+DAL_PPU_FUNC(hostFunctionB) {
+  (void)base;
+  ctx->gpr[3] = 0xB0B;
+}
+
+struct CallSnapshot {
+  std::uint64_t r1 = 0, r2 = 0, lr = 0, back_chain = 0;
+};
+CallSnapshot g_call_snapshot;
+
+DAL_PPU_FUNC(sumTarget) {
+  g_call_snapshot = {ctx->gpr[1], ctx->gpr[2], ctx->lr,
+                     dalRead64(base, static_cast<std::uint32_t>(ctx->gpr[1]))};
+  ctx->gpr[3] = ctx->gpr[3] + ctx->gpr[4] + ctx->gpr[5];
+  ctx->gpr[1] = 0;  // callee-side clobbers must not leak to the caller
+  ctx->gpr[2] = 0;
+  ctx->lr = 0x7777;
+}
+
+void testHostFunctionsAndCallGuestFunction() {
+  dal::resetHostFunctions();
+  CHECK(dal::process().memory.reserve());
+  std::uint8_t* base = dal::process().memory.base();
+  CHECK(dal::process().memory.commit(0x500000, 0x2000));
+  CHECK(dal::process().memory.commit(0x10000, 0x10000));
+  const DalFuncMapping mappings[] = {{0x10200, sumTarget}};
+  dalRegisterFuncs(mappings, 1);
+
+  CHECK(dalLookup(dal::kHostFunctionBase) == nullptr);  // nothing registered yet
+  const std::uint32_t opd_a = dal::registerHostFunction("hostFunctionA", hostFunctionA);
+  const std::uint32_t opd_b = dal::registerHostFunction("hostFunctionB", hostFunctionB);
+  CHECK(opd_a != 0 && opd_b == opd_a + 8);
+  CHECK(dal::process().memory.isCommitted(opd_a, 16));
+  CHECK(dalRead32(base, opd_a) == dal::kHostFunctionBase);
+  CHECK(dalRead32(base, opd_a + 4) == 0);
+  CHECK(dalRead32(base, opd_b) == dal::kHostFunctionBase + 4);
+
+  CHECK(dalLookup(dal::kHostFunctionBase) == hostFunctionA);
+  CHECK(dalLookup(dal::kHostFunctionBase + 4) == hostFunctionB);
+  CHECK(dalLookup(dal::kHostFunctionBase + 8) == nullptr);  // not registered
+  CHECK(dalLookup(dal::kHostFunctionBase + 2) == nullptr);  // misaligned
+  CHECK(dalLookup(dal::kHostFunctionBase - 4) == nullptr);
+  CHECK(dalLookup(0xFFFFFFFCu) == nullptr);
+  CHECK(dalLookup(0x10200) == sumTarget);  // the code table still resolves
+
+  // Guest code reaches a host function through the OPD's entry word.
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[3] = 5;
+  ctx->jump_target = dalRead32(base, opd_a);
+  dalDispatch(ctx.get(), base);
+  CHECK(ctx->gpr[3] == 105);
+  ctx->jump_target = dalRead32(base, opd_b);
+  dalDispatch(ctx.get(), base);
+  CHECK(ctx->gpr[3] == 0xB0B);
+
+  // callGuestFunction: arguments in r3..r5, a lowered and aligned r1 with a back chain, and
+  // r1/r2/lr restored afterwards.
+  dalWrite32(base, 0x18000, 0x10200);
+  dalWrite32(base, 0x18004, 0xd0000);
+  ctx->gpr[1] = 0x500808;  // deliberately not 16-aligned
+  ctx->gpr[2] = 0x1111;
+  ctx->lr = 0x2222;
+  const std::uint64_t result = dal::callGuestFunction(ctx.get(), base, 0x18000, {10, 20, 30});
+  CHECK(result == 60);
+  CHECK(g_call_snapshot.r1 == 0x500800 - 0x70);
+  CHECK(g_call_snapshot.r2 == 0xd0000);
+  CHECK(g_call_snapshot.lr == 0);
+  CHECK(g_call_snapshot.back_chain == 0x500808);
+  CHECK(ctx->gpr[1] == 0x500808 && ctx->gpr[2] == 0x1111 && ctx->lr == 0x2222);
+
+  CHECK(dal::callGuestFunction(ctx.get(), base, opd_a, {7}) == 107);  // host function OPD
+  CHECK(ctx->gpr[1] == 0x500808);
+
+  CHECK(dal::argU32(ctx.get(), 0) == 107);
+  ctx->gpr[5] = 0x1ffffffffull;
+  CHECK(dal::argU32(ctx.get(), 2) == 0xffffffffu);
+
+  std::memcpy(base + 0x500100, "hello\0world", 12);
+  CHECK(dal::readGuestString(base, 0x500100, 64) == "hello");
+  CHECK(dal::readGuestString(base, 0x500100, 3) == "hel");
+  CHECK(dal::readGuestString(base, 0x500100, 0).empty());
+
+  dalRegisterFuncs(nullptr, 0);
+  dal::resetHostFunctions();
+  dal::process().memory.decommit(0x500000, 0x2000);
+  dal::process().memory.decommit(0x10000, 0x10000);
 }
 
 // Issues a syscall through the dispatcher and returns r3.
@@ -1874,6 +1968,7 @@ int main(int argc, char** argv) {
   testSyscalls();
   testHle();
   testHleOutPointerHints();
+  testHostFunctionsAndCallGuestFunction();
   testStartupSyscalls();
   testSysPrxForUser();
   testMutexAndCond();

@@ -3,6 +3,7 @@
 
 #include "hle/hle.h"
 
+#include <array>
 #include <format>
 #include <map>
 #include <span>
@@ -30,6 +31,11 @@ struct InstalledImport {
   GuestHandler handler = nullptr;
   std::uint32_t default_calls = 0;
 };
+
+// Every module's handler list. No static self-registration: archive members are not pulled in by
+// static initialisers, so each module is named here.
+using HandlerList = std::span<const HleEntry> (*)();
+constexpr std::array<HandlerList, 1> kRegistries{sysPrxForUserHandlers};
 
 // Written by installImports before any guest thread starts; the call counters are updated under
 // the guest lock.
@@ -63,8 +69,17 @@ void hintOutPointers(const InstalledImport& import, const DalPpuContext* ctx) {
 
 void installImports(const DalImportInfo* imports, std::uint32_t count) {
   std::map<std::pair<std::string, std::uint32_t>, const HleEntry*> registry;
-  for (const HleEntry& entry : sysPrxForUserHandlers()) {
-    registry.emplace(std::pair{std::string(entry.module), entry.fnid}, &entry);
+  for (const HandlerList list : kRegistries) {
+    for (const HleEntry& entry : list()) {
+      const auto [it, inserted] =
+          registry.emplace(std::pair{std::string(entry.module), entry.fnid}, &entry);
+      if (!inserted) {
+        fatal(FatalKind::Internal,
+              std::format("hle: {}::{} (fnid {:#010x}) is registered twice (also as {})",
+                          entry.module, entry.name != nullptr ? entry.name : "?", entry.fnid,
+                          it->second->name != nullptr ? it->second->name : "?"));
+      }
+    }
   }
 
   g_imports.assign(count, InstalledImport{});
@@ -101,6 +116,40 @@ void callGuestOpd(DalPpuContext* ctx, uint8_t* base, std::uint32_t opd_addr) {
   dalDispatch(ctx, base);
   ctx->gpr[2] = saved_toc;
   ctx->lr = saved_lr;
+}
+
+std::uint64_t callGuestFunction(DalPpuContext* ctx, std::uint8_t* base, std::uint32_t opd_addr,
+                                std::initializer_list<std::uint64_t> args) {
+  if (args.size() > 8) {
+    fatal(FatalKind::Internal,
+          std::format("callGuestFunction({:#010x}): {} arguments, at most 8 are supported", opd_addr,
+                      args.size()));
+  }
+  const std::uint64_t saved_r1 = ctx->gpr[1];
+  // RPCS3 PPUCallback.h `_func_caller`: align r1, then reserve 0x70 bytes below it.
+  const std::uint64_t frame = ((saved_r1 & ~std::uint64_t{15}) - 0x70);
+  dalWrite64(base, static_cast<std::uint32_t>(frame), saved_r1);
+  ctx->gpr[1] = frame;
+  int reg = 3;
+  for (const std::uint64_t arg : args) {
+    ctx->gpr[reg++] = arg;
+  }
+
+  callGuestOpd(ctx, base, opd_addr);
+
+  const std::uint64_t result = ctx->gpr[3];
+  ctx->gpr[1] = saved_r1;
+  return result;
+}
+
+std::string readGuestString(const std::uint8_t* base, std::uint32_t addr, std::uint32_t max) {
+  std::string text;
+  for (std::uint32_t i = 0; i < max; i++) {
+    const char c = static_cast<char>(base[addr + i]);
+    if (c == '\0') break;
+    text += c;
+  }
+  return text;
 }
 
 }  // namespace dal
