@@ -618,3 +618,244 @@ DAL_FORCEINLINE DalVr dalVsumsws(DalPpuContext* ctx, DalVr a, DalVr b) {
     v.s32[0] = dalClampS32(ctx, (int64_t)a.s32[3] + a.s32[2] + a.s32[1] + a.s32[0] + b.s32[0]);
     return v;
 }
+
+// Floating-point vector helpers. Each follows the body of the RPCS3 handler named in its comment,
+// which is not always what the handler's `select<>` flag list suggests: the `exec` body decides where
+// denormals are flushed and which operands `ppu_set_vnan` receives. Non-Java mode (VSCR[NJ]) is
+// honoured per the context and NaN propagation is the "full" variant of `ppu_set_vnan`. Lanes use
+// plain IEEE operations in round-to-nearest; denormals are flushed in software, never through MXCSR.
+
+// RPCS3 `ppu_flush_denormal`: with NJ set, a lane whose exponent field is 0 keeps only its sign.
+DAL_FORCEINLINE DalVr dalFlushDenormals(const DalPpuContext* ctx, DalVr v) {
+    DalU32x4 denormal = (DalU32x4)((v.u32 & 0x7f800000u) == 0u);
+    denormal = denormal & (0u - (uint32_t)(ctx->vscr_nj & 1u));
+    v.u32 = v.u32 & ~(denormal >> 1);
+    return v;
+}
+
+DAL_FORCEINLINE DalU32x4 dalIsNanBits(DalU32x4 bits) {
+    return (DalU32x4)((bits & 0x7fffffffu) > 0x7f800000u);
+}
+
+// RPCS3 `ppu_fix_vnan`: a NaN result becomes the default quiet NaN, whatever the host produced.
+DAL_FORCEINLINE DalU32x4 dalFixNanBits(DalU32x4 r) {
+    DalU32x4 nan = dalIsNanBits(r);
+    return (r & ~nan) | (nan & 0x7fc00000u);
+}
+
+// RPCS3 `ppu_select_vnan`: operand `a` if it is a NaN (quieted, payload and sign kept), else `rest`.
+DAL_FORCEINLINE DalU32x4 dalSelectNan(DalU32x4 a, DalU32x4 rest) {
+    DalU32x4 na = dalIsNanBits(a);
+    return ((a | 0x7fc00000u) & na) | (rest & ~na);
+}
+
+// RPCS3 `ppu_set_vnan` with operands: the first NaN among the operands wins, otherwise the result
+// with a NaN replaced by the default NaN.
+DAL_FORCEINLINE DalU32x4 dalSetVnan1(DalU32x4 r, DalU32x4 a) {
+    return dalSelectNan(a, dalFixNanBits(r));
+}
+
+DAL_FORCEINLINE DalU32x4 dalSetVnan2(DalU32x4 r, DalU32x4 a, DalU32x4 b) {
+    return dalSelectNan(a, dalSelectNan(b, dalFixNanBits(r)));
+}
+
+// vaddfp, vsubfp (RPCS3 `VADDFP`, `VSUBFP`): flags use_nj fix_nj set_vnan fix_vnan; inputs and result
+// are flushed, NaN operands a then b propagate.
+DAL_FORCEINLINE DalVr dalVaddfp(const DalPpuContext* ctx, DalVr a, DalVr b) {
+    a = dalFlushDenormals(ctx, a);
+    b = dalFlushDenormals(ctx, b);
+    DalVr r;
+    r.f32 = a.f32 + b.f32;
+    r.u32 = dalSetVnan2(r.u32, a.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+DAL_FORCEINLINE DalVr dalVsubfp(const DalPpuContext* ctx, DalVr a, DalVr b) {
+    a = dalFlushDenormals(ctx, a);
+    b = dalFlushDenormals(ctx, b);
+    DalVr r;
+    r.f32 = a.f32 - b.f32;
+    r.u32 = dalSetVnan2(r.u32, a.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+// vmaddfp = a * c + b, vnmsubfp = -(a * c - b), both with a single rounding (RPCS3 `VMADDFP`,
+// `VNMSUBFP`, `gv_fmafs`): flags use_nj fix_nj set_vnan fix_vnan, but `ppu_set_vnan` gets no operands
+// so any NaN result, including one propagated from an operand, is the default NaN. vnmsubfp negates
+// by sign-bit xor on the addend and on the result, as the handler does.
+DAL_FORCEINLINE DalVr dalVmaddfp(const DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    a = dalFlushDenormals(ctx, a);
+    b = dalFlushDenormals(ctx, b);
+    c = dalFlushDenormals(ctx, c);
+    DalVr r;
+    r.f32 = __builtin_elementwise_fma(a.f32, c.f32, b.f32);
+    r.u32 = dalFixNanBits(r.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+DAL_FORCEINLINE DalVr dalVnmsubfp(const DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    a = dalFlushDenormals(ctx, a);
+    b = dalFlushDenormals(ctx, b);
+    c = dalFlushDenormals(ctx, c);
+    DalVr r;
+    r.f32 = __builtin_elementwise_fma(a.f32, c.f32, (DalF32x4)(b.u32 ^ 0x80000000u));
+    r.u32 = dalFixNanBits(r.u32 ^ 0x80000000u);
+    return dalFlushDenormals(ctx, r);
+}
+
+// vmaxfp, vminfp (RPCS3 `VMAXFP`, `VMINFP`): the result is flushed but the inputs are not (the
+// handlers apply no input flush although VMAXFP lists use_nj); NaN operands a then b propagate. For
+// equal operands, including +0 and -0, the second operand is returned, which is what `gv_maxfs` /
+// `gv_minfs` give as x86 `maxps` / `minps` (their definition is not among the reference sources).
+DAL_FORCEINLINE DalVr dalVmaxfp(const DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalU32x4 pick_a = (DalU32x4)(a.f32 > b.f32);
+    DalVr r;
+    r.u32 = dalSetVnan2((a.u32 & pick_a) | (b.u32 & ~pick_a), a.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+DAL_FORCEINLINE DalVr dalVminfp(const DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalU32x4 pick_a = (DalU32x4)(a.f32 < b.f32);
+    DalVr r;
+    r.u32 = dalSetVnan2((a.u32 & pick_a) | (b.u32 & ~pick_a), a.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+// vrefp, vrsqrtefp (RPCS3 `VREFP`, `VRSQRTEFP`): exact reciprocal and reciprocal square root, which
+// is within the architected estimate error. Flags use_nj fix_nj set_vnan fix_vnan; operand b.
+DAL_FORCEINLINE DalVr dalVrefp(const DalPpuContext* ctx, DalVr b) {
+    DalF32x4 one = {1.0f, 1.0f, 1.0f, 1.0f};
+    b = dalFlushDenormals(ctx, b);
+    DalVr r;
+    r.f32 = one / b.f32;
+    r.u32 = dalSetVnan1(r.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+DAL_FORCEINLINE DalVr dalVrsqrtefp(const DalPpuContext* ctx, DalVr b) {
+    DalF32x4 one = {1.0f, 1.0f, 1.0f, 1.0f};
+    b = dalFlushDenormals(ctx, b);
+    DalVr r;
+    r.f32 = one / __builtin_elementwise_sqrt(b.f32);
+    r.u32 = dalSetVnan1(r.u32, b.u32);
+    return dalFlushDenormals(ctx, r);
+}
+
+// vexptefp, vlogefp (RPCS3 `VEXPTEFP`, `VLOGEFP`): flag fix_vnan only, so no flush and no operand
+// NaN propagation; a NaN result is the default NaN.
+DAL_FORCEINLINE DalVr dalVexptefp(DalVr b) {
+    DalVr r;
+    for (int i = 0; i < 4; i++) r.f32[i] = __builtin_exp2f(b.f32[i]);
+    r.u32 = dalFixNanBits(r.u32);
+    return r;
+}
+
+DAL_FORCEINLINE DalVr dalVlogefp(DalVr b) {
+    DalVr r;
+    for (int i = 0; i < 4; i++) r.f32[i] = __builtin_log2f(b.f32[i]);
+    r.u32 = dalFixNanBits(r.u32);
+    return r;
+}
+
+// vrfin/vrfiz/vrfip/vrfim (RPCS3 `VRFIN`, `VRFIZ`, `VRFIP`, `VRFIM`): round to nearest even, toward
+// zero, up, down; NaN operand b propagates. VRFIP and VRFIM flush the input as well (flags use_nj
+// fix_nj), which matters: a negative denormal rounds down to -1.0 unflushed but to -0 flushed.
+// VRFIN and VRFIZ flush the result only; flushing their input first gives the same result, so all
+// four share one shape here.
+#define DAL_VMX_ROUND(fn, builtin)                                                             \
+    DAL_FORCEINLINE DalVr fn(const DalPpuContext* ctx, DalVr b) {                              \
+        b = dalFlushDenormals(ctx, b);                                                         \
+        DalVr r;                                                                               \
+        r.f32 = builtin(b.f32);                                                                \
+        r.u32 = dalSetVnan1(r.u32, b.u32);                                                     \
+        return dalFlushDenormals(ctx, r);                                                      \
+    }
+
+DAL_VMX_ROUND(dalVrfin, __builtin_elementwise_roundeven)
+DAL_VMX_ROUND(dalVrfiz, __builtin_elementwise_trunc)
+DAL_VMX_ROUND(dalVrfip, __builtin_elementwise_ceil)
+DAL_VMX_ROUND(dalVrfim, __builtin_elementwise_floor)
+#undef DAL_VMX_ROUND
+
+// 2^e as a float for |e| <= 31, built from the exponent field so no libm call is needed.
+DAL_FORCEINLINE float dalPow2f(int32_t e) {
+    uint32_t bits = (uint32_t)(127 + e) << 23;
+    float f;
+    __builtin_memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+// vcfsx/vcfux (RPCS3 `VCFSX`, `VCFUX`): convert and divide by 2^uimm. The handlers subtract the
+// shift from the exponent field instead of multiplying; the two agree for every input because a
+// nonzero integer converts to an exponent of at least 127 and the shift is at most 31.
+DAL_FORCEINLINE DalVr dalVcfsx(DalVr b, uint32_t uimm) {
+    DalVr r;
+    r.f32 = __builtin_convertvector(b.s32, DalF32x4) * dalPow2f(-(int32_t)uimm);
+    return r;
+}
+
+DAL_FORCEINLINE DalVr dalVcfux(DalVr b, uint32_t uimm) {
+    DalVr r;
+    r.f32 = __builtin_convertvector(b.u32, DalF32x4) * dalPow2f(-(int32_t)uimm);
+    return r;
+}
+
+// vctsxs/vctuxs (RPCS3 `VCTSXS`, `VCTUXS`): multiply by 2^uimm, truncate, saturate. SAT is set when
+// the scaled value is below the range (unsigned: below 0, even for -0.5) or at or above the upper
+// bound; NaN gives 0 without SAT (flag fix_vnan, and the handler's comparisons are ordered). Lanes
+// are range-checked before the C conversion, which is undefined for out-of-range values.
+DAL_FORCEINLINE DalVr dalVctsxs(DalPpuContext* ctx, DalVr b, uint32_t uimm) {
+    DalF32x4 scaled = b.f32 * dalPow2f((int32_t)uimm);
+    DalVr r;
+    int sat = 0;
+    for (int i = 0; i < 4; i++) {
+        float x = scaled[i];
+        if (x < -2147483648.0f) {
+            r.s32[i] = INT32_MIN;
+            sat = 1;
+        } else if (x >= 2147483648.0f) {
+            r.s32[i] = INT32_MAX;
+            sat = 1;
+        } else if (x != x) {
+            r.s32[i] = 0;
+        } else {
+            r.s32[i] = (int32_t)x;
+        }
+    }
+    dalSetSat(ctx, sat);
+    return r;
+}
+
+DAL_FORCEINLINE DalVr dalVctuxs(DalPpuContext* ctx, DalVr b, uint32_t uimm) {
+    DalF32x4 scaled = b.f32 * dalPow2f((int32_t)uimm);
+    DalVr r;
+    int sat = 0;
+    for (int i = 0; i < 4; i++) {
+        float x = scaled[i];
+        if (x < 0.0f) {
+            r.u32[i] = 0;
+            sat = 1;
+        } else if (x >= 4294967296.0f) {
+            r.u32[i] = UINT32_MAX;
+            sat = 1;
+        } else if (x != x) {
+            r.u32[i] = 0;
+        } else {
+            r.u32[i] = (uint32_t)x;
+        }
+    }
+    dalSetSat(ctx, sat);
+    return r;
+}
+
+// vcmpbfp (RPCS3 `VCMPBFP`): bit 0 (value 0x80000000) is set when a > b or unordered, bit 1
+// (0x40000000) when a < -b or unordered; a lane is within bounds when both are clear. The record
+// form sets CR6 eq when every lane is in bounds (and lt = gt = so = 0); dalSetCr6 produces exactly
+// that because the result lanes can never be all ones.
+DAL_FORCEINLINE DalVr dalVcmpbfp(DalVr a, DalVr b) {
+    DalU32x4 above = ~(DalU32x4)(a.f32 <= b.f32);
+    DalU32x4 below = ~(DalU32x4)(a.f32 >= (DalF32x4)(b.u32 ^ 0x80000000u));
+    DalVr r;
+    r.u32 = (above & 0x80000000u) | ((below & 0x80000000u) >> 1);
+    return r;
+}

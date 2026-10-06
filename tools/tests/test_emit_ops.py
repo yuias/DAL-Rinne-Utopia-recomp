@@ -603,5 +603,57 @@ class VmxMulTest(unittest.TestCase):
             self.assertNotIn("ctx,", lines[0], name)
 
 
+class VmxFpTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["vmx_fp"]) - set(load_handlers())), [])
+
+    def test_arithmetic_receives_the_context_for_non_java_mode(self):
+        for name in ("vaddfp", "vsubfp", "vmaxfp", "vminfp"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[1], ctx->vr[2]);" % name.capitalize()],
+                             name)
+
+    def test_madd_family_passes_vrb_as_the_addend_between_vra_and_vrc(self):
+        for name in ("vmaddfp", "vnmsubfp"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2, vC=4))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[1], ctx->vr[2], ctx->vr[4]);"
+                              % name.capitalize()], name)
+
+    def test_one_source_forms(self):
+        for name in ("vrefp", "vrsqrtefp", "vrfin", "vrfiz", "vrfip", "vrfim"):
+            self.assertEqual(body(asm.encode(name, vD=3, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[2]);" % name.capitalize()], name)
+        for name in ("vexptefp", "vlogefp"):
+            self.assertEqual(body(asm.encode(name, vD=3, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx->vr[2]);" % name.capitalize()], name)
+
+    def test_conversions_pass_the_scale_and_only_float_to_int_gets_the_context(self):
+        self.assertEqual(body(asm.encode("vcfsx", vD=3, vB=2, UIMM5=5))[0],
+                         ["ctx->vr[3] = dalVcfsx(ctx->vr[2], 5);"])
+        self.assertEqual(body(asm.encode("vcfux", vD=3, vB=2, UIMM5=31))[0],
+                         ["ctx->vr[3] = dalVcfux(ctx->vr[2], 31);"])
+        self.assertEqual(body(asm.encode("vctsxs", vD=3, vB=2, UIMM5=0))[0],
+                         ["ctx->vr[3] = dalVctsxs(ctx, ctx->vr[2], 0);"])
+        self.assertEqual(body(asm.encode("vctuxs", vD=3, vB=2, UIMM5=7))[0],
+                         ["ctx->vr[3] = dalVctuxs(ctx, ctx->vr[2], 7);"])
+
+    def test_compares_use_the_float_view(self):
+        for name, sign in (("vcmpeqfp", "=="), ("vcmpgefp", ">="), ("vcmpgtfp", ">")):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3].u32 = (DalU32x4)(ctx->vr[1].f32 %s ctx->vr[2].f32);" % sign],
+                             name)
+
+    def test_only_the_record_forms_update_cr6(self):
+        for name in ("vcmpeqfp", "vcmpgefp", "vcmpgtfp", "vcmpbfp"):
+            plain, _ = body(asm.encode(name, vD=3, vA=1, vB=2))
+            record, _ = body(asm.encode(name, vD=3, vA=1, vB=2, Rc_vc=1))
+            self.assertFalse(any("dalSetCr6" in line for line in plain), name)
+            self.assertEqual(record[1:], ["dalSetCr6(ctx, ctx->vr[3]);"], name)
+        self.assertEqual(body(asm.encode("vcmpbfp", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3] = dalVcmpbfp(ctx->vr[1], ctx->vr[2]);"])
+
+
 if __name__ == "__main__":
     unittest.main()
