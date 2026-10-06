@@ -3,7 +3,7 @@
 import struct
 import unittest
 
-from ps3recomp import ppu
+from ps3recomp import ppu, ppu_ops, ppu_vmx
 from ps3recomp.ppu import ALL_OPS, bits, decode, decode_range, op
 
 # (word, addr, mnemonic, expected field values)
@@ -43,6 +43,27 @@ INT_CASES = [
     (0x4200FFF8, 0x10008, "bc", {"BO": 16, "BI": 0, "BD": -8}),
     (0x4BFFFFFC, 0x10000, "b", {"LI": -4}),
     (0x48000011, 0x10000, "bl", {"LI": 0x10, "LK": 1}),
+]
+
+FP_CASES = [
+    (0xFC000890, 0x10000, "fmr", {"frD": 0, "frB": 1, "Rc": 0}),
+    (0xEC21102A, 0x10000, "fadds", {"frD": 1, "frA": 1, "frB": 2}),
+    (0xFC2220FA, 0x10000, "fmadd", {"frD": 1, "frA": 2, "frC": 3, "frB": 4}),
+    (0xFC2220FB, 0x10000, "fmadd.", {"Rc": 1}),
+]
+
+VMX_CASES = [
+    (0x7C0018CE, 0x10000, "lvx", {"vD": 0, "rA": 0, "rB": 3}),
+    (0x7C0019CE, 0x10000, "stvx", {"vS": 0, "rA": 0, "rB": 3}),
+    (0x7C03240E, 0x10000, "lvlx", {"vD": 0, "rA": 3, "rB": 4}),
+    (0x10221484, 0x10000, "vor", {"vD": 1, "vA": 2, "vB": 2}),
+    (0x100004C4, 0x10000, "vxor", {"vD": 0, "vA": 0, "vB": 0}),
+    (0x1022192B, 0x10000, "vperm", {"vD": 1, "vA": 2, "vB": 3, "vC": 4}),
+    (0x102220EE, 0x10000, "vmaddfp", {"vD": 1, "vA": 2, "vC": 3, "vB": 4}),
+    (0x1022192C, 0x10000, "vsldoi", {"vD": 1, "vA": 2, "vB": 3, "SHB": 4}),
+    (0x10011486, 0x10000, "vcmpequw.", {"vD": 0, "vA": 1, "vB": 2, "Rc_vc": 1}),
+    (0x10011086, 0x10000, "vcmpequw", {"Rc_vc": 0}),
+    (0x101F038C, 0x10000, "vspltisw", {"vD": 0, "SIMM5": -1}),
 ]
 
 
@@ -118,6 +139,33 @@ class DecodeTest(unittest.TestCase):
                 self.assertEqual(insn.mnemonic, mnemonic)
                 for name, value in fields.items():
                     self.assertEqual(insn.field(name), value, name)
+
+    def _check_cases(self, cases):
+        for word, addr, mnemonic, fields in cases:
+            with self.subTest(word="%08x" % word):
+                insn = decode(word, addr)
+                self.assertIsNotNone(insn.spec)
+                self.assertEqual(insn.mnemonic, mnemonic)
+                for name, value in fields.items():
+                    self.assertEqual(insn.field(name), value, name)
+
+    def test_known_fp_encodings(self):
+        self._check_cases(FP_CASES)
+
+    def test_known_vmx_encodings(self):
+        self._check_cases(VMX_CASES)
+
+    def test_vector_ops_come_from_vmx_table(self):
+        self.assertEqual(len(ALL_OPS), len(ppu_ops.OPS) + len(ppu_vmx.OPS))
+        self.assertIs(decode(0x7C0018CE).spec, next(s for s in ppu_vmx.OPS if s.name == "lvx"))
+
+    def test_sweep_never_raises(self):
+        decoded = 0
+        for primary in (4, 31, 59, 63):
+            for i in range(1 << 16):
+                if decode(primary << 26 | i << 1).spec is not None:
+                    decoded += 1
+        self.assertGreater(decoded, 0)
 
     def test_unknown_words(self):
         for word in (0x00000000, 0x04000000):

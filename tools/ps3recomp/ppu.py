@@ -158,10 +158,10 @@ def _build_lookup(specs: tuple[OpSpec, ...]) -> dict[int, list[tuple[int, dict[i
     }
 
 
-# Imported here because ppu_ops uses `op` from this module; import ppu first, not ppu_ops.
-from . import ppu_ops  # noqa: E402
+# Imported here because the table modules use `op` from this module; import ppu first.
+from . import ppu_ops, ppu_vmx  # noqa: E402
 
-ALL_OPS: tuple[OpSpec, ...] = tuple(ppu_ops.OPS)
+ALL_OPS: tuple[OpSpec, ...] = tuple(ppu_ops.OPS + ppu_vmx.OPS)
 _LOOKUP = _build_lookup(ALL_OPS)
 
 
