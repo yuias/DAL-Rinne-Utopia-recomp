@@ -102,6 +102,20 @@ def parse_entry(elf: ElfFile) -> EntryInfo:
     return EntryInfo("code", None, elf.e_entry, None)
 
 
+def _code_sections(elf: ElfFile) -> list[tuple[int, int, int]]:
+    """File-backed executable sections inside an executable segment as `(start, end, align)`."""
+    segments = elf.exec_segments()
+    found = []
+    for sec in elf.sections:
+        if (not sec.sh_flags & SHF_EXECINSTR or sec.sh_type == SHT_NOBITS
+                or not sec.data_present or sec.sh_size == 0):
+            continue
+        start, end = sec.sh_addr, sec.sh_addr + sec.sh_size
+        if any(s.p_vaddr <= start and end <= s.p_vaddr + s.p_filesz for s in segments):
+            found.append((start, end, max(sec.sh_addralign, 1)))
+    return found
+
+
 def find_text_range(elf: ElfFile) -> tuple[int, int]:
     """Return `(start, end_exclusive)` of the main code range.
 
@@ -109,23 +123,50 @@ def find_text_range(elf: ElfFile) -> tuple[int, int]:
     segment (ties: lowest address). Sections are unnamed in RPCS3 output, so the name
     is never consulted. Without such a section the first executable segment is used.
     """
-    segments = elf.exec_segments()
     best: tuple[int, int] | None = None
-    for sec in elf.sections:
-        if (not sec.sh_flags & SHF_EXECINSTR or sec.sh_type == SHT_NOBITS
-                or not sec.data_present or sec.sh_size == 0):
-            continue
-        start, end = sec.sh_addr, sec.sh_addr + sec.sh_size
-        if not any(s.p_vaddr <= start and end <= s.p_vaddr + s.p_filesz for s in segments):
-            continue
+    for start, end, _ in _code_sections(elf):
         if best is None or (end - start, -start) > (best[1] - best[0], -best[0]):
             best = (start, end)
     if best is not None:
         return best
+    segments = elf.exec_segments()
     if not segments:
         raise ElfError("no executable segment")
     seg = segments[0]
     return seg.p_vaddr, seg.p_vaddr + seg.p_filesz // 4 * 4
+
+
+def find_code_range(elf: ElfFile) -> tuple[int, int]:
+    """Return `(start, end_exclusive)` of the code that is recovered and emitted.
+
+    The main code range (`find_text_range`) extended over the executable sections that
+    directly adjoin it, such as the small initializer and finalizer sections. A gap
+    below a section's alignment counts as adjoining. The import stub section is excluded.
+    """
+    text = find_text_range(elf)
+    sections = _code_sections(elf)
+    first = next((sec for sec in sections if sec[:2] == text), None)
+    if first is None:
+        return text
+    stubs: list[int] = []
+    prx = parse_prx_param(elf)
+    if prx is not None:
+        stubs = [f.slot_value for m in parse_imports(elf, prx) if not m.unknown_layout
+                 for f in m.functions]
+    candidates = [sec for sec in sections
+                  if not any(sec[0] <= addr < sec[1] for addr in stubs)]
+    low = high = first
+    grown = True
+    while grown:
+        grown = False
+        for sec in candidates:
+            if 0 <= sec[0] - high[1] < sec[2] and sec[1] > high[1]:
+                high = sec
+                grown = True
+            elif 0 <= low[0] - sec[1] < low[2] and sec[0] < low[0]:
+                low = sec
+                grown = True
+    return low[0], high[1]
 
 
 def parse_opd_section(elf: ElfFile) -> list[tuple[int, int]] | None:

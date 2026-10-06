@@ -185,6 +185,46 @@ class FindTextRangeTest(unittest.TestCase):
             cell.find_text_range(ElfFile.from_bytes(data))
 
 
+class FindCodeRangeTest(unittest.TestCase):
+    def _elf(self, sections, text_size=0x80):
+        data = build_elf64_be(
+            entry=0x10000,
+            segments=[FixtureSegment(1, 0x10000, bytes(text_size), flags=5),
+                      FixtureSegment(1, 0x20000, bytes(0x40), flags=6)],
+            sections=sections)
+        return ElfFile.from_bytes(data)
+
+    def test_single_section_is_the_text_range(self):
+        elf = ElfFile.from_bytes(fx.build_ps3_fixture())
+        self.assertEqual(cell.find_code_range(elf), cell.find_text_range(elf))
+
+    def test_without_sections_is_the_text_range(self):
+        elf = self._elf(None)
+        self.assertEqual(cell.find_code_range(elf), (0x10000, 0x10080))
+
+    def test_adjoining_sections_are_included(self):
+        # The gap before .text is smaller than its alignment, so it still adjoins.
+        elf = self._elf([FixtureSection("", 1, 0x10000, 0x2c, flags=6, align=4),
+                         FixtureSection("", 1, 0x10030, 0x40, flags=6, align=16),
+                         FixtureSection("", 1, 0x10070, 0x10, flags=6, align=4)])
+        self.assertEqual(cell.find_text_range(elf), (0x10030, 0x10070))
+        self.assertEqual(cell.find_code_range(elf), (0x10000, 0x10080))
+
+    def test_distant_sections_are_not_included(self):
+        elf = self._elf([FixtureSection("", 1, 0x10000, 0x8, flags=6, align=4),
+                         FixtureSection("", 1, 0x10020, 0x40, flags=6, align=16),
+                         FixtureSection("", 1, 0x10068, 0x8, flags=6, align=4)])
+        self.assertEqual(cell.find_code_range(elf), (0x10020, 0x10060))
+
+    def test_chain_of_adjoining_sections(self):
+        elf = self._elf([FixtureSection("", 1, 0x10000, 0x10, flags=6, align=4),
+                         FixtureSection("", 1, 0x10010, 0x10, flags=6, align=4),
+                         FixtureSection("", 1, 0x10020, 0x40, flags=6, align=4),
+                         FixtureSection("", 1, 0x10060, 0x10, flags=6, align=4),
+                         FixtureSection("", 1, 0x10070, 0x10, flags=6, align=4)])
+        self.assertEqual(cell.find_code_range(elf), (0x10000, 0x10080))
+
+
 @unittest.skipUnless(os.environ.get("DAL_EBOOT_ELF"), "DAL_EBOOT_ELF is not set")
 class RealEbootCellTest(unittest.TestCase):
     @classmethod
@@ -196,6 +236,9 @@ class RealEbootCellTest(unittest.TestCase):
 
     def test_text_range(self):
         self.assertEqual(cell.find_text_range(self.elf), (0x00010230, 0x000DCF2C))
+
+    def test_code_range_adds_init_and_fini_but_not_the_stubs(self):
+        self.assertEqual(cell.find_code_range(self.elf), (0x00010200, 0x000DCF50))
 
     def test_entry(self):
         entry = cell.parse_entry(self.elf)

@@ -27,7 +27,8 @@ def hexs(value: int) -> str:
     return "0x%08x" % value
 
 
-def db_doc(sha: str = SHA, text=(TEXT, TEXT + 0x20), functions=None) -> dict:
+def db_doc(sha: str = SHA, text=(TEXT, TEXT + 0x20), functions=None, code=None) -> dict:
+    code = text if code is None else code
     if functions is None:
         functions = [(TEXT, [(TEXT, TEXT + 0x10)]), (TEXT + 0x10, [(TEXT + 0x10, TEXT + 0x1C)])]
     return {
@@ -35,6 +36,7 @@ def db_doc(sha: str = SHA, text=(TEXT, TEXT + 0x20), functions=None) -> dict:
         "generator": "ps3tool recover",
         "input": {"executable_sha256": sha},
         "text": {"start": hexs(text[0]), "end": hexs(text[1])},
+        "code": {"start": hexs(code[0]), "end": hexs(code[1])},
         "toc": hexs(0x28000),
         "functions": [{"entry": hexs(entry), "name": None, "sources": ["ghidra"],
                        "ranges": [[hexs(a), hexs(b)] for a, b in ranges]}
@@ -142,19 +144,27 @@ class LoadFunctionDbTest(TempDirTestCase):
 
 class CheckDbMatchesTest(unittest.TestCase):
     def make_db(self) -> FunctionDb:
-        return FunctionDb(SHA, "00" * 32, (TEXT, TEXT + 0x20), None, (), (), {})
+        span = (TEXT, TEXT + 0x20)
+        return FunctionDb(SHA, "00" * 32, span, span, None, (), (), {})
 
     def test_match(self):
-        check_db_matches(self.make_db(), SHA.upper(), (TEXT, TEXT + 0x20))
+        check_db_matches(self.make_db(), SHA.upper(), (TEXT, TEXT + 0x20),
+                         (TEXT, TEXT + 0x20))
 
     def test_sha_mismatch(self):
         with self.assertRaises(CliError) as ctx:
-            check_db_matches(self.make_db(), "cd" * 32, (TEXT, TEXT + 0x20))
+            check_db_matches(self.make_db(), "cd" * 32, (TEXT, TEXT + 0x20),
+                             (TEXT, TEXT + 0x20))
         self.assertEqual(ctx.exception.code, 4)
 
     def test_text_mismatch(self):
         with self.assertRaises(CliError) as ctx:
-            check_db_matches(self.make_db(), SHA, (TEXT, TEXT + 0x24))
+            check_db_matches(self.make_db(), SHA, (TEXT, TEXT + 0x24), (TEXT, TEXT + 0x20))
+        self.assertEqual(ctx.exception.code, 4)
+
+    def test_code_mismatch(self):
+        with self.assertRaises(CliError) as ctx:
+            check_db_matches(self.make_db(), SHA, (TEXT, TEXT + 0x20), (TEXT - 4, TEXT + 0x20))
         self.assertEqual(ctx.exception.code, 4)
 
 
@@ -165,7 +175,8 @@ class CensusTest(unittest.TestCase):
                  asm.nop(),                     # not owned
                  asm.blr()]
         image = CodeImage.from_words(TEXT, words)
-        db = FunctionDb(SHA, "00" * 32, (TEXT, TEXT + 4 * len(words)), None, (
+        db = FunctionDb(SHA, "00" * 32, (TEXT, TEXT + 4 * len(words)),
+                        (TEXT, TEXT + 4 * len(words)), None, (
             DbFunction(TEXT, None, ((TEXT, TEXT + 0x14),)),
             DbFunction(TEXT + 0x18, None, ((TEXT + 0x18, TEXT + 0x1C),))), (), {})
         census = take_census(image, db)
@@ -258,6 +269,13 @@ class EmitCensusCliTest(TempDirTestCase):
     def test_text_mismatch_exits_4(self):
         elf_path, sha, text = self.fixture()
         db_path = self.write_db(db_doc(sha=sha, text=(text[0], text[1] - 4)))
+        code, _, _ = self.run_cli([str(elf_path), "--census", "--db", str(db_path),
+                                   "--census-out", str(self.tmp / "c.json")])
+        self.assertEqual(code, 4)
+
+    def test_code_mismatch_exits_4(self):
+        elf_path, sha, text = self.fixture()
+        db_path = self.write_db(db_doc(sha=sha, text=text, code=(text[0] - 4, text[1])))
         code, _, _ = self.run_cli([str(elf_path), "--census", "--db", str(db_path),
                                    "--census-out", str(self.tmp / "c.json")])
         self.assertEqual(code, 4)

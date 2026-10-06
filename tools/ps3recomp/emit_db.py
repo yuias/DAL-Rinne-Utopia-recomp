@@ -48,6 +48,7 @@ class FunctionDb:
     sha256: str                                 # SHA-256 of the executable the DB was made from
     file_sha256: str                            # SHA-256 of the DB file bytes
     text: tuple[int, int]
+    code: tuple[int, int]                       # range the functions were recovered in
     toc: int | None
     functions: tuple[DbFunction, ...]           # sorted by entry
     thunks: tuple[DbThunk, ...]                 # sorted by addr
@@ -121,6 +122,7 @@ def _parse_db(doc: dict, file_sha256: str) -> FunctionDb:
     if doc["schema"] != SCHEMA:
         raise ValueError("unsupported schema %r" % (doc["schema"],))
     text = (_parse_hex(doc["text"]["start"]), _parse_hex(doc["text"]["end"]))
+    code = (_parse_hex(doc["code"]["start"]), _parse_hex(doc["code"]["end"]))
     toc = doc["toc"]
     functions = []
     for item in doc["functions"]:
@@ -142,7 +144,7 @@ def _parse_db(doc: dict, file_sha256: str) -> FunctionDb:
         table = DbJumpTable(_parse_hex(t["branch"]), _parse_hex(t["table"]), t["kind"],
                             int(t["count"]), tuple(_parse_hex(x) for x in t["targets"]))
         tables[table.branch] = table
-    return FunctionDb(doc["input"]["executable_sha256"].lower(), file_sha256, text,
+    return FunctionDb(doc["input"]["executable_sha256"].lower(), file_sha256, text, code,
                       None if toc is None else _parse_hex(toc), tuple(functions),
                       tuple(thunks), tables)
 
@@ -161,7 +163,8 @@ def load_function_db(path: Path) -> FunctionDb:
         raise CliError(EXIT_IO, "invalid function DB %s: %s" % (path, detail))
 
 
-def check_db_matches(db: FunctionDb, elf_sha256: str, text: tuple[int, int]) -> None:
+def check_db_matches(db: FunctionDb, elf_sha256: str, text: tuple[int, int],
+                     code: tuple[int, int]) -> None:
     if db.sha256 != elf_sha256.lower():
         raise CliError(EXIT_PIN_MISMATCH,
                        "function DB was made from a different ELF (SHA-256 %s, expected %s)"
@@ -170,6 +173,10 @@ def check_db_matches(db: FunctionDb, elf_sha256: str, text: tuple[int, int]) -> 
         raise CliError(EXIT_PIN_MISMATCH,
                        "function DB text range 0x%08x-0x%08x differs from the ELF's "
                        "0x%08x-0x%08x" % (*db.text, *text))
+    if tuple(db.code) != tuple(code):
+        raise CliError(EXIT_PIN_MISMATCH,
+                       "function DB code range 0x%08x-0x%08x differs from the ELF's "
+                       "0x%08x-0x%08x" % (*db.code, *code))
 
 
 @dataclass(frozen=True)

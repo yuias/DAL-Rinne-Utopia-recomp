@@ -109,7 +109,7 @@ def _owner_map(result: PartitionResult) -> dict[int, int]:
 
 
 def _build_db(elf_sha: str, summary_sha: str | None, extra_count: int,
-              text_range: tuple[int, int], toc: int | None, summary: GhidraSummary | None,
+              text_range: tuple[int, int], code_range: tuple[int, int], toc: int | None, summary: GhidraSummary | None,
               result: PartitionResult, thunks: dict[int, ImportThunk],
               tables: dict[int, JumpTable], unresolved: dict[int, UnresolvedJump],
               owner: dict[int, int]) -> dict:
@@ -129,6 +129,7 @@ def _build_db(elf_sha: str, summary_sha: str | None, extra_count: int,
         "input": {"executable_sha256": elf_sha, "ghidra_summary_sha256": summary_sha,
                   "extra_seeds": extra_count},
         "text": {"start": _hex(text_range[0]), "end": _hex(text_range[1])},
+        "code": {"start": _hex(code_range[0]), "end": _hex(code_range[1])},
         "toc": _hex(toc),
         "functions": functions,
         "import_thunks": [
@@ -215,11 +216,11 @@ def _partition_section(result: PartitionResult, census: SeedCensus,
     }
 
 
-def _syscalls_section(image: CodeImage, elf: ElfFile, text_range: tuple[int, int],
+def _syscalls_section(image: CodeImage, elf: ElfFile, code_range: tuple[int, int],
                       result: PartitionResult, tables: dict[int, JumpTable],
                       names: dict[int, str]) -> dict:
     sites = resolve_syscalls(image, result.functions, tables)
-    outside = count_sites_outside_text(elf, text_range)
+    outside = count_sites_outside_text(elf, code_range)
     resolved = [s for s in sites if s.number is not None]
     disagreements, probe_only, cfg_only = [], [], []
     for site in sites:
@@ -293,6 +294,7 @@ def _run(args: argparse.Namespace) -> int:
 
     try:
         text_range = cell.find_text_range(elf)
+        code_range = cell.find_code_range(elf)
     except ElfError as e:
         raise CliError(EXIT_NOT_PPU_ELF, "no code range found: %s" % e)
 
@@ -329,7 +331,7 @@ def _run(args: argparse.Namespace) -> int:
         entry = cell.parse_entry(elf)
         thunks = find_import_thunks(elf, nid_table)
         mismatches = _slot_mismatches(elf, thunks)
-        image = CodeImage.from_elf(elf, text_range)
+        image = CodeImage.from_elf(elf, code_range)
         tables, unresolved = recover_jump_tables(image, make_reader(elf), entry.toc)
         table_targets = {t for table in tables.values() for t in table.targets}
         census = collect_recovery_seeds(
@@ -358,7 +360,7 @@ def _run(args: argparse.Namespace) -> int:
             report["ghidra"] = ghidra
         cov_lines = coverage_lines(coverage, ghidra)
         try:
-            report["syscalls"] = _syscalls_section(image, elf, text_range, result, tables,
+            report["syscalls"] = _syscalls_section(image, elf, code_range, result, tables,
                                                    syscall_names)
         except ElfError as e:
             raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
@@ -380,7 +382,7 @@ def _run(args: argparse.Namespace) -> int:
 
     out_path = Path(args.output) if args.output else DEFAULT_OUTPUT
     write_compact_json(out_path, _build_db(
-        sha256, summary_sha, len(extra), text_range, entry.toc, summary, result, thunks,
+        sha256, summary_sha, len(extra), text_range, code_range, entry.toc, summary, result, thunks,
         tables, unresolved, owner))
 
     ghidra_starts = set() if summary is None else {f.entry for f in summary.functions}

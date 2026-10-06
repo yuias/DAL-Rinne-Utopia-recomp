@@ -127,12 +127,14 @@ class CanonicalFixtureTest(RecoverTestBase):
         code, out, err = self.run_recover("--no-ghidra")
         self.assertEqual(code, 0, err)
         db = self.db()
-        self.assertEqual(list(db), ["schema", "generator", "input", "text", "toc", "functions",
+        self.assertEqual(list(db), ["schema", "generator", "input", "text", "code", "toc",
+                                    "functions",
                                     "import_thunks", "jump_tables", "unresolved_indirect"])
         self.assertEqual((db["schema"], db["generator"]), (1, "ps3tool recover"))
         self.assertEqual(db["input"], {"executable_sha256": self.elf_sha,
                                        "ghidra_summary_sha256": None, "extra_seeds": 0})
         self.assertEqual(db["text"], {"start": hexs(TEXT), "end": hexs(TEXT + 0x20)})
+        self.assertEqual(db["code"], db["text"])
         self.assertEqual(db["toc"], hexs(TOC))
         # The first function falls through into the second one's OPD start.
         self.assertEqual(db["functions"], [

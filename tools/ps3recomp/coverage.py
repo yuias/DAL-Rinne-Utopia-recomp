@@ -1,4 +1,4 @@
-"""Coverage of `.text` by the recovered functions and consistency with the Ghidra summary."""
+"""Coverage of the code range by the recovered functions and consistency with the Ghidra summary."""
 
 from __future__ import annotations
 

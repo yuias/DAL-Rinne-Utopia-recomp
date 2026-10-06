@@ -27,6 +27,7 @@ class FixtureSection:
     addr: int
     size: int
     flags: int = 0
+    align: int = 1
 
 
 def _align(value: int, alignment: int = 16) -> int:
@@ -93,7 +94,7 @@ def build_elf64_be(*, entry: int, segments: list[FixtureSegment],
         for sec, name_off in zip(sections, name_offs):
             rows.append(struct.pack(">IIQQQQIIQQ", name_off, sec.sh_type, sec.flags,
                                     sec.addr, section_offset(sec.addr), sec.size,
-                                    0, 0, 1, 0))
+                                    0, 0, sec.align, 0))
         rows.append(struct.pack(">IIQQQQIIQQ", strtab_name, _SHT_STRTAB, 0, 0,
                                 strtab_off, len(strtab), 0, 0, 1, 0))
         buf[shoff:shoff + shentsize * shnum] = b"".join(rows)

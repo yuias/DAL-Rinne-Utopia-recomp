@@ -294,8 +294,8 @@ class RealSeedsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.elf = ElfFile.from_path(_ELF_PATH)
-        cls.text = cell.find_text_range(cls.elf)
-        cls.image = CodeImage.from_elf(cls.elf, cls.text)
+        cls.code_range = cell.find_code_range(cls.elf)
+        cls.image = CodeImage.from_elf(cls.elf, cls.code_range)
         cls.thunks = seeds.find_import_thunks(
             cls.elf, nids.load_nid_table(nids.DEFAULT_NIDS))
         summary = ghidra_summary.load_summary(_COMMITTED_SUMMARY)
@@ -305,7 +305,9 @@ class RealSeedsTest(unittest.TestCase):
 
     def test_anchor_counts(self):
         counts = self.census.counts
-        expected = {"opd": 854, "opd_not_ghidra": 0, "bl_targets_in_text": 1697,
+        # Counted over the code range: the descriptors of .init/.fini and the calls from
+        # them add 2 OPD functions and 5 `bl` targets to the .text-only counts (854, 1697).
+        expected = {"opd": 856, "opd_not_ghidra": 0, "bl_targets_in_text": 1702,
                     "bl_targets_not_ghidra": 139, "bl_targets_thunk": 161, "thunks": 166,
                     "union_ghidra_bl_opd": 2688}
         self.assertEqual({k: counts[k] for k in expected}, expected)
@@ -313,11 +315,11 @@ class RealSeedsTest(unittest.TestCase):
     def test_thunks_load_their_slots(self):
         self.assertEqual(seeds.check_thunk_slots(self.elf, self.thunks), [])
 
-    def test_stub_range_is_executable_and_outside_text(self):
+    def test_stub_range_is_executable_and_outside_the_code_range(self):
         start, end = seeds.stub_range(self.thunks)
         self.assertTrue(any(s.p_vaddr <= start and end <= s.p_vaddr + s.p_filesz
                             for s in self.elf.exec_segments()))
-        self.assertTrue(end <= self.text[0] or start >= self.text[1])
+        self.assertTrue(end <= self.code_range[0] or start >= self.code_range[1])
 
     def test_every_seed_starts_on_a_decodable_word_in_text(self):
         for seed in self.census.seeds:
@@ -337,7 +339,7 @@ class RealJumpTableTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         elf = ElfFile.from_path(_ELF_PATH)
-        cls.image = CodeImage.from_elf(elf, cell.find_text_range(elf))
+        cls.image = CodeImage.from_elf(elf, cell.find_code_range(elf))
         cls.tables, cls.unresolved = jumptab.recover_jump_tables(
             cls.image, jumptab.make_reader(elf), cell.parse_entry(elf).toc)
 
@@ -413,6 +415,15 @@ class RealRecoverTest(unittest.TestCase):
                    and f.entry not in entries]
         self.assertEqual(missing, [])
 
+    def test_init_and_fini_are_recovered_functions(self):
+        self.assertEqual(self.db["text"], {"start": "0x00010230", "end": "0x000dcf2c"})
+        self.assertEqual(self.db["code"], {"start": "0x00010200", "end": "0x000dcf50"})
+        ranges = {f["entry"]: f["ranges"] for f in self.db["functions"]}
+        self.assertEqual(ranges["0x00010200"], [["0x00010200", "0x0001022c"]])
+        self.assertEqual(ranges["0x000dcf2c"], [["0x000dcf2c", "0x000dcf50"]])
+        rejected = {r["addr"] for r in self.report["seeds"]["rejected"]}
+        self.assertFalse(rejected & {"0x00010200", "0x000dcf2c"})
+
     def test_thunks(self):
         self.assertEqual(len(self.db["import_thunks"]), 166)
         self.assertEqual(self.report["thunks"]["count"], 166)
@@ -450,7 +461,8 @@ class RealCoverageTest(unittest.TestCase):
 
     def test_uncovered_words_add_up(self):
         cov = self.coverage
-        self.assertEqual(cov["text_words"], 209727)
+        # 209727 words of .text plus 11 of .init (with its pad word) and 9 of .fini.
+        self.assertEqual(cov["text_words"], 209748)
         self.assertEqual(cov["owned_words"] + cov["uncovered"]["words"], cov["text_words"])
         by_class = cov["uncovered"]["by_class"]
         self.assertEqual(sum(v["words"] for v in by_class.values()), cov["uncovered"]["words"])
@@ -523,7 +535,7 @@ class RealEmitCensusTest(unittest.TestCase):
 
     def test_census_totals(self):
         self.assertEqual(self.code, 0)
-        self.assertEqual((self.doc["words"], self.doc["distinct"]), (206045, 168))
+        self.assertEqual((self.doc["words"], self.doc["distinct"]), (206065, 168))
         self.assertEqual(self.doc["invalid_owned"], [])
 
     def test_every_counted_mnemonic_has_a_group(self):
@@ -534,7 +546,7 @@ class RealEmitCensusTest(unittest.TestCase):
 
     def test_stdout_header(self):
         self.assertEqual(self.stdout.splitlines()[0],
-                         "census: 206045 words, 168 distinct mnemonics, 0 invalid owned")
+                         "census: 206065 words, 168 distinct mnemonics, 0 invalid owned")
 
 
 _EMIT_CACHE = []
@@ -568,11 +580,15 @@ class RealEmitTest(unittest.TestCase):
     def test_counts(self):
         self.assertEqual(self.code, 0)
         self.assertEqual((self.report["functions"], self.report["import_trampolines"],
-                          self.report["edges"]["switches"]), (2529, 166, 14))
+                          self.report["edges"]["switches"]), (2531, 166, 14))
 
     def test_every_non_control_word_is_unhandled_without_group_modules(self):
         control = self.census["by_group"]["control"]["words"]
         self.assertEqual(self.report["unhandled"]["total"], self.census["words"] - control)
+
+    def test_no_dynamic_targets(self):
+        self.assertEqual(self.report["dynamic_targets"], [])
+        self.assertEqual(self.report["edges"]["calls_dynamic_const"], 0)
 
     def test_every_thunk_saves_the_toc(self):
         self.assertEqual(self.report["thunks_without_toc_save"], [])

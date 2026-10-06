@@ -177,9 +177,11 @@ python tools/ps3tool.py recover        <elf> -o config/functions.json
 - `recover` needs no Ghidra installation. It reads the committed summary
   (`--ghidra-summary`, default `config/ghidra_summary.json`) and combines it with its own
   seeds: `bl` targets, function-descriptor (OPD) entries, the entry point, exports and
-  extra seeds. It then partitions `.text` into functions until the set of functions no
-  longer changes. It writes the function database (`-o`, default
-  `generated/analysis/functions.json`), a report (`--report`, default
+  extra seeds. It then partitions the code range into functions until the set of functions
+  no longer changes. The code range is `.text` plus the executable sections that adjoin it
+  (the small initializer and finalizer sections), up to but excluding the import stubs.
+  `disasm`, `ghidra-diff` and `probe` still work on `.text` alone. It writes the function
+  database (`-o`, default `generated/analysis/functions.json`), a report (`--report`, default
   `generated/analysis/recovery_report.json`) and the list of recovered starts that Ghidra
   lacks (`--seeds-out`, default `generated/analysis/ghidra_seeds.txt`).
 - `--no-ghidra` runs `recover` without a summary, from the ELF's own seeds only. Without
@@ -258,7 +260,8 @@ python tools/ps3tool.py recover        <elf> -o config/functions.json
 
 - `input`: the ELF SHA-256, the summary SHA-256 (`null` with `--no-ghidra`) and the number
   of extra seeds;
-- `text` and `toc`: the `.text` range and the TOC base;
+- `text`, `code` and `toc`: the `.text` range, the code range that was recovered and emitted,
+  and the TOC base;
 - `functions`: for each function its entry, a name (Ghidra's non-default name, otherwise
   `null`), the sources that found it (`bl`, `ghidra`, `ghidra_data_ref`, `opd`, `entry`,
   `manual`, and `prologue` with `--prologue-seeds`) and its address ranges;
@@ -279,7 +282,7 @@ top-level sections:
 | `thunks` | Import thunk count, slot mismatches, thunks that no `bl` reaches |
 | `jump_tables` | `bctr` sites, resolved tables and targets, unresolved sites by reason |
 | `partition` | Rounds, convergence, functions by source, promoted shared code, tail-edge kinds, invalid flow, rejected calls, external targets, functions seeded only by an unowned `bl` |
-| `coverage` | Words owned and not owned in `.text`; uncovered runs classified as `zero`, `padding`, `jump_table`, `data` or `code`; prologue candidates by position |
+| `coverage` | Words owned and not owned in the code range; uncovered runs classified as `zero`, `padding`, `jump_table`, `data` or `code`; prologue candidates by position |
 | `ghidra` | Function extents compared with Ghidra's (`equal`, `ours_larger`, `ours_smaller`, `different`, `missing`), Ghidra functions cut at Cell-only vector instructions and whether ours extend past them, Ghidra code not owned by any function, data references by target class, Ghidra starts reached only by branches |
 | `syscalls` | `sc` sites and the lv2 number resolved at each by walking the CFG back to the `r11` load, unresolved sites with reasons, and disagreements with `probe` |
 

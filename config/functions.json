@@ -3,8 +3,10 @@
 "generator": "ps3tool recover",
 "input": {"executable_sha256": "8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348", "ghidra_summary_sha256": "9741ee1debba3c982f22c7ade27ae8e2d918748b479dbe7412ef5ee21274e2aa", "extra_seeds": 2},
 "text": {"start": "0x00010230", "end": "0x000dcf2c"},
+"code": {"start": "0x00010200", "end": "0x000dcf50"},
 "toc": "0x00109f80",
 "functions": [
+{"entry": "0x00010200", "name": null, "sources": ["bl", "ghidra", "opd"], "ranges": [["0x00010200", "0x0001022c"]]},
 {"entry": "0x00010230", "name": null, "sources": ["ghidra", "opd"], "ranges": [["0x00010230", "0x0001024c"]]},
 {"entry": "0x0001024c", "name": null, "sources": ["ghidra", "ghidra_data_ref", "opd"], "ranges": [["0x0001024c", "0x0001029c"]]},
 {"entry": "0x000102a0", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x000102a0", "0x00010354"]]},
@@ -1260,9 +1262,9 @@
 {"entry": "0x000748e4", "name": null, "sources": ["ghidra", "ghidra_data_ref", "opd"], "ranges": [["0x000748e4", "0x0007491c"]]},
 {"entry": "0x0007491c", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x0007491c", "0x00074954"]]},
 {"entry": "0x00074954", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074954", "0x00074b28"]]},
-{"entry": "0x00074b28", "name": null, "sources": ["ghidra"], "ranges": [["0x00074b28", "0x00074bc4"]]},
-{"entry": "0x00074bc4", "name": null, "sources": ["ghidra"], "ranges": [["0x00074bc4", "0x00074c34"]]},
-{"entry": "0x00074c34", "name": null, "sources": ["ghidra"], "ranges": [["0x00074c34", "0x00074ca0"]]},
+{"entry": "0x00074b28", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074b28", "0x00074bc4"]]},
+{"entry": "0x00074bc4", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074bc4", "0x00074c34"]]},
+{"entry": "0x00074c34", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074c34", "0x00074ca0"]]},
 {"entry": "0x00074ca0", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074ca0", "0x00074d68"]]},
 {"entry": "0x00074d68", "name": null, "sources": ["bl", "ghidra"], "ranges": [["0x00074d68", "0x00074e10"]]},
 {"entry": "0x00074e10", "name": null, "sources": ["ghidra", "ghidra_data_ref", "opd"], "ranges": [["0x00074e10", "0x00074e68"]]},
@@ -2533,7 +2535,8 @@
 {"entry": "0x000dce8c", "name": null, "sources": ["ghidra", "opd"], "ranges": [["0x000dce8c", "0x000dce94"]]},
 {"entry": "0x000dce94", "name": null, "sources": ["ghidra", "ghidra_data_ref", "opd"], "ranges": [["0x000dce94", "0x000dceb8"]]},
 {"entry": "0x000dceb8", "name": null, "sources": ["ghidra", "ghidra_data_ref", "opd"], "ranges": [["0x000dceb8", "0x000dcefc"]]},
-{"entry": "0x000dcefc", "name": null, "sources": ["ghidra", "opd"], "ranges": [["0x000dcefc", "0x000dcf2c"]]}
+{"entry": "0x000dcefc", "name": null, "sources": ["ghidra", "opd"], "ranges": [["0x000dcefc", "0x000dcf2c"]]},
+{"entry": "0x000dcf2c", "name": null, "sources": ["bl", "ghidra", "opd"], "ranges": [["0x000dcf2c", "0x000dcf50"]]}
 ],
 "import_thunks": [
 {"addr": "0x000dcf50", "module": "sys_io", "fnid": "0x1cf98800", "name": "cellPadInit", "slot": "0x001004a4"},

@@ -47,13 +47,14 @@ def _run(args: argparse.Namespace) -> int:
     elf = parse_ppu_elf(data)
     try:
         text_range = cell.find_text_range(elf)
+        code_range = cell.find_code_range(elf)
     except ElfError as e:
         raise CliError(EXIT_NOT_PPU_ELF, "no code range found: %s" % e)
 
     db = load_function_db(Path(args.db) if args.db else DEFAULT_DB)
-    check_db_matches(db, sha256, text_range)
+    check_db_matches(db, sha256, text_range, code_range)
     try:
-        image = CodeImage.from_elf(elf, text_range)
+        image = CodeImage.from_elf(elf, code_range)
     except ElfError as e:
         raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
