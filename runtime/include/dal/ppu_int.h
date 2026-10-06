@@ -20,6 +20,66 @@ DAL_FORCEINLINE uint64_t dalCntlzw(uint64_t v) {
 
 DAL_FORCEINLINE uint64_t dalCntlzd(uint64_t v) { return v ? (uint64_t)__builtin_clzll(v) : 64u; }
 
+// rlw*: rotate the low word and duplicate it into both halves, so that masks reaching into the
+// high half (MB > ME) see the rotated word there (RPCS3 `dup32`, `rol32`). The count is mod 32.
+DAL_FORCEINLINE uint64_t dalRotl32Dup(uint64_t v, uint32_t n) {
+    uint32_t w = (uint32_t)v;
+    n &= 31;
+    uint32_t r = n ? (w << n) | (w >> (32 - n)) : w;
+    return ((uint64_t)r << 32) | r;
+}
+
+DAL_FORCEINLINE uint64_t dalRotl64(uint64_t v, uint32_t n) {
+    n &= 63;
+    return n ? (v << n) | (v >> (64 - n)) : v;
+}
+
+// slw/srw: the amount is the low 6 bits of rB; 32..63 gives 0. The result is zero-extended.
+DAL_FORCEINLINE uint64_t dalSlw(uint64_t v, uint64_t amount) {
+    return (amount & 0x20) ? 0 : (uint64_t)(uint32_t)(v << (amount & 31));
+}
+
+DAL_FORCEINLINE uint64_t dalSrw(uint64_t v, uint64_t amount) {
+    return (amount & 0x20) ? 0 : (uint64_t)((uint32_t)v >> (amount & 31));
+}
+
+// sld/srd: the amount is the low 7 bits of rB; 64..127 gives 0.
+DAL_FORCEINLINE uint64_t dalSld(uint64_t v, uint64_t amount) {
+    return (amount & 0x40) ? 0 : v << (amount & 63);
+}
+
+DAL_FORCEINLINE uint64_t dalSrd(uint64_t v, uint64_t amount) {
+    return (amount & 0x40) ? 0 : v >> (amount & 63);
+}
+
+// sraw/srawi: arithmetic shift of the sign-extended low word (`amount` is taken mod 64); CA = the
+// word is negative and a 1 bit was shifted out. Amounts above 31 give the sign fill (RPCS3 `SRAW`).
+DAL_FORCEINLINE uint64_t dalSraw(DalPpuContext* ctx, uint64_t v, uint64_t amount) {
+    uint32_t w = (uint32_t)v;
+    uint32_t n = (uint32_t)(amount & 63);
+    bool negative = w >> 31;
+    if (n > 31) {
+        ctx->xer_ca = negative;
+        return negative ? ~0ull : 0;
+    }
+    ctx->xer_ca = negative && (w & ((1u << n) - 1)) != 0;
+    // Shift on the unsigned word and refill the vacated bits with the sign.
+    uint32_t r = (w >> n) | (negative && n ? ~0u << (32 - n) : 0);
+    return (uint64_t)(int64_t)(int32_t)r;
+}
+
+// srad/sradi: 64-bit form; the amount is the low 7 bits of rB (RPCS3 `SRAD`).
+DAL_FORCEINLINE uint64_t dalSrad(DalPpuContext* ctx, uint64_t v, uint64_t amount) {
+    uint32_t n = (uint32_t)(amount & 127);
+    bool negative = v >> 63;
+    if (n > 63) {
+        ctx->xer_ca = negative;
+        return negative ? ~0ull : 0;
+    }
+    ctx->xer_ca = negative && (v & ((1ull << n) - 1)) != 0;
+    return (v >> n) | (negative && n ? ~0ull << (64 - n) : 0);
+}
+
 // lfs/stfs: the FPR holds a double. `(double)` is exact (denormal floats stay normal doubles) and
 // `(float)` rounds to nearest even (RPCS3 `LFS`, `STFS`).
 DAL_FORCEINLINE double dalReadF32(const uint8_t* base, uint32_t ea) {

@@ -80,6 +80,56 @@ class IntAluTest(unittest.TestCase):
                          ["ctx->gpr[3] = dalCntlzd(ctx->gpr[4]);"])
 
 
+class IntRotateTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["int_rotate"]) - set(load_handlers())), [])
+
+    def test_rlwinm_masks_in_the_high_half(self):
+        # slwi 8: mask(32, 55)
+        self.assertEqual(body(asm.encode("rlwinm", rA=3, rS=4, SH=8, MB=0, ME=23))[0],
+                         ["ctx->gpr[3] = dalRotl32Dup(ctx->gpr[4], 8) & 0x00000000ffffff00ull;"])
+        # MB > ME: the wrapping mask keeps the duplicated high word.
+        self.assertEqual(body(asm.encode("rlwinm", rA=3, rS=4, SH=0, MB=28, ME=3))[0],
+                         ["ctx->gpr[3] = dalRotl32Dup(ctx->gpr[4], 0) & 0xfffffffff000000full;"])
+
+    def test_rld_forms_drop_a_full_mask_and_a_zero_rotate(self):
+        self.assertEqual(body(asm.encode("rldicl", rA=3, rS=4, SH64=0, MB64=0))[0],
+                         ["ctx->gpr[3] = ctx->gpr[4];"])
+        self.assertEqual(body(asm.encode("rldicl", rA=3, rS=4, SH64=0, MB64=32))[0],
+                         ["ctx->gpr[3] = ctx->gpr[4] & 0x00000000ffffffffull;"])
+        self.assertEqual(body(asm.encode("rldicr", rA=3, rS=4, SH64=8, MB64=55))[0],
+                         ["ctx->gpr[3] = dalRotl64(ctx->gpr[4], 8) & 0xffffffffffffff00ull;"])
+
+    def test_rldimi_keeps_the_unmasked_bits_of_ra(self):
+        self.assertEqual(body(asm.encode("rldimi", rA=3, rS=4, SH64=16, MB64=32))[0],
+                         ["ctx->gpr[3] = (ctx->gpr[3] & ~0x00000000ffff0000ull) | "
+                          "(dalRotl64(ctx->gpr[4], 16) & 0x00000000ffff0000ull);"])
+
+    def test_record_form_records_the_64_bit_result(self):
+        lines, _ = body(asm.encode("rlwinm", rA=3, rS=4, SH=0, MB=28, ME=3, Rc=1))
+        self.assertEqual(lines[-3:], ["uint64_t t0 = dalRotl32Dup(ctx->gpr[4], 0) & "
+                                      "0xfffffffff000000full;",
+                                      "ctx->gpr[3] = t0;", "dalRecord(ctx, t0);"])
+
+    def test_algebraic_shifts_go_through_the_carry_helpers(self):
+        self.assertEqual(body(asm.encode("srawi", rA=3, rS=4, SH=5))[0],
+                         ["ctx->gpr[3] = dalSraw(ctx, ctx->gpr[4], 5);"])
+        self.assertEqual(body(asm.encode("sradi", rA=3, rS=4, SH64=63))[0],
+                         ["ctx->gpr[3] = dalSrad(ctx, ctx->gpr[4], 63);"])
+        self.assertEqual(body(asm.encode("sraw", rA=3, rS=4, rB=5))[0],
+                         ["ctx->gpr[3] = dalSraw(ctx, ctx->gpr[4], ctx->gpr[5]);"])
+        self.assertEqual(body(asm.encode("srad", rA=3, rS=4, rB=5))[0],
+                         ["ctx->gpr[3] = dalSrad(ctx, ctx->gpr[4], ctx->gpr[5]);"])
+
+    def test_plain_shifts_do_not_touch_the_carry(self):
+        for name, helper in (("slw", "dalSlw"), ("srw", "dalSrw"), ("sld", "dalSld"),
+                             ("srd", "dalSrd")):
+            self.assertEqual(body(asm.encode(name, rA=3, rS=4, rB=5))[0],
+                             ["ctx->gpr[3] = %s(ctx->gpr[4], ctx->gpr[5]);" % helper])
+
+
 class MemTest(unittest.TestCase):
     def test_every_member_of_the_group_is_handled(self):
         from ps3recomp.emit_db import GROUPS
