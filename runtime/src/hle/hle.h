@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -105,6 +108,60 @@ void resetCellSaveData();
 
 // Handlers of the sys_fs module (cellFs*).
 std::span<const HleEntry> cellFsHandlers();
+
+// Handlers of the cellPad imports (sys_io module).
+std::span<const HleEntry> cellPadHandlers();
+
+// Index of each word in CellPadData::button, as far as a standard pad fills it.
+inline constexpr std::size_t kPadButtonDigital1 = 2;   // select, L3, R3, start, d-pad
+inline constexpr std::size_t kPadButtonDigital2 = 3;   // L2, R2, L1, R1, triangle, circle, cross, square
+inline constexpr std::size_t kPadButtonAnalogRightX = 4;
+inline constexpr std::size_t kPadButtonAnalogRightY = 5;
+inline constexpr std::size_t kPadButtonAnalogLeftX = 6;
+inline constexpr std::size_t kPadButtonAnalogLeftY = 7;
+inline constexpr std::size_t kPadButtonPressureFirst = 8;  // 12 pressure words, 8..19
+inline constexpr std::size_t kPadButtonSensorFirst = 20;   // 4 sensor words, 20..23
+inline constexpr std::size_t kPadButtonCount = 24;
+
+// A pad port as a host input backend sees it right now.
+struct PadPortState {
+  bool connected = false;
+  std::uint32_t device_capability = 0;  // CELL_PAD_CAPABILITY_* bits
+  std::uint32_t device_type = 0;        // CELL_PAD_DEV_TYPE_*
+  std::array<std::uint16_t, kPadButtonCount> button{};  // host order; words 0 and 1 are unused
+};
+
+// Source of pad input. cellPad calls it under the guest lock, so an implementation must return
+// without blocking (read an atomic snapshot that its own input thread updates). Ports are 0..6.
+class PadProvider {
+ public:
+  virtual ~PadProvider() = default;
+
+  // Current state of `port`. Return connected = false for a port without a pad.
+  virtual PadPortState poll(std::uint32_t port) = 0;
+
+  // cellPadSetActDirect: motor values 0..255 (the small motor is on/off in hardware). Optional.
+  virtual void setVibration(std::uint32_t port, std::uint8_t small_motor, std::uint8_t large_motor) {
+    (void)port;
+    (void)small_motor;
+    (void)large_motor;
+  }
+};
+
+// Neutral standard pad: sticks centred, no button pressed, sensors at rest.
+inline constexpr std::uint32_t kPadCapabilityStandard = 0x1f;  // conformity, pressure, sensor, HP stick, actuator
+PadPortState neutralPadState();
+
+// Replaces the pad input source (null: no pad connected on any port). Call before the guest runs
+// or under the guest lock.
+void setPadProvider(std::unique_ptr<PadProvider> provider);
+
+// Selects a built-in provider by name: "none" (no pad connected) or "neutral" (port 0 holds a
+// standard pad that never changes). Returns false for any other name.
+bool setPadBackend(std::string_view name);
+
+// Forgets the init state and restores the default provider. Intended for tests.
+void resetCellPad();
 
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();

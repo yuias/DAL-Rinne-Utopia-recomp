@@ -41,7 +41,7 @@ void printUsage() {
   std::fputs(
       "usage: dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE]\n"
       "                [--hdd-dir DIR] [--sdata-cache DIR] [--quiet-hle] [--load-only]\n"
-      "                [--dialog-answer yes|no|ok]\n",
+      "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n",
       stderr);
 }
 
@@ -70,6 +70,13 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.dialog_answer)) return false;
       if (!dal::setDialogAnswer(opt.dialog_answer)) {
         std::fprintf(stderr, "error: --dialog-answer needs yes, no or ok\n");
+        return false;
+      }
+    } else if (arg == "--pad") {
+      std::string name;
+      if (!value(name)) return false;
+      if (!dal::setPadBackend(name)) {
+        std::fprintf(stderr, "error: --pad needs none or neutral\n");
         return false;
       }
     } else if (arg == "--seconds") {

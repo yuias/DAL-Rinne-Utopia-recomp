@@ -37,6 +37,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/cell_game.cpp
     runtime/src/hle/cell_gcm_sys.cpp
     runtime/src/hle/cell_msg_dialog.cpp
+    runtime/src/hle/cell_pad.cpp
     runtime/src/hle/cell_save_data.cpp
     runtime/src/hle/cell_spurs.cpp
     runtime/src/hle/cell_sysmodule.cpp

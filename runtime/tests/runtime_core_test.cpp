@@ -2490,6 +2490,179 @@ DAL_PPU_FUNC(msgDialogSysutilCallback) {
   g_dialog_sysutil_events.push_back(ctx->gpr[3]);
 }
 
+// A scripted pad for the cellPad tests: the state a host backend would report.
+struct ScriptedPad final : public dal::PadProvider {
+  dal::PadPortState state = dal::neutralPadState();
+  std::uint32_t vibration_port = 99;
+  int small_motor = -1, large_motor = -1;
+
+  dal::PadPortState poll(std::uint32_t port) override {
+    return port == 0 ? state : dal::PadPortState{};
+  }
+  void setVibration(std::uint32_t port, std::uint8_t small, std::uint8_t large) override {
+    vibration_port = port;
+    small_motor = small;
+    large_motor = large;
+  }
+};
+
+void testCellPad() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetCellPad();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t info = scratch, data = scratch + 0x200, act = scratch + 0x400;
+
+  enum Import : std::uint32_t { Init, End, SetPortSetting, GetData, GetInfo2, SetActDirect, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x1cf98800, "sys_io", "cellPadInit"},
+      {0x00800010, 0x4d9b75d5, "sys_io", "cellPadEnd"},
+      {0x00800020, 0x578e3c98, "sys_io", "cellPadSetPortSetting"},
+      {0x00800030, 0x8b72cda1, "sys_io", "cellPadGetData"},
+      {0x00800040, 0xa703a51d, "sys_io", "cellPadGetInfo2"},
+      {0x00800050, 0xf65544ee, "sys_io", "cellPadSetActDirect"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kInvalid = 0x80121102, kAlready = 0x80121103, kUninit = 0x80121104,
+                          kNoDevice = 0x80121107, kUnsupported = 0x80121108;
+  const auto len = [&] { return static_cast<std::int32_t>(dalRead32(base, data)); };
+  const auto word = [&](std::uint32_t i) { return dalRead16(base, data + 4 + 2 * i); };
+  const auto fill = [&](std::uint32_t addr, std::uint32_t size) { std::memset(base + addr, 0xAA, size); };
+
+  // Everything before Init.
+  CHECK(call(End) == kUninit);
+  CHECK(call(GetInfo2, info) == kUninit);
+  CHECK(call(GetData, 0, data) == kUninit);
+  CHECK(call(SetPortSetting, 0, 2) == kUninit);
+  CHECK(call(SetActDirect, 0, act) == kUninit);
+
+  // Init validation and state.
+  CHECK(call(Init, 0) == kInvalid);
+  CHECK(call(Init, 128) == kInvalid);
+  CHECK(call(Init, 7) == 0);
+  CHECK(call(Init, 7) == kAlready);
+  CHECK(call(Init, 0) == kAlready);  // the initialised check comes first
+  CHECK(call(End) == 0 && call(End) == kUninit);
+
+  // No pad connected: zeroed info, NO_DEVICE everywhere, the data block untouched.
+  CHECK(dal::setPadBackend("none") && !dal::setPadBackend("keyboard"));
+  CHECK(call(Init, 7) == 0);
+  fill(info, 0x100);
+  CHECK(call(GetInfo2, 0) == kInvalid);
+  CHECK(call(GetInfo2, info) == 0);
+  bool zero = true;
+  for (std::uint32_t i = 0; i < 124; i++) zero = zero && base[info + i] == (i == 3 ? 7 : 0);
+  CHECK(zero);  // max_connect 7 in the last byte of the first word
+  CHECK(base[info + 124] == 0xAA);
+  fill(data, 0x20);
+  CHECK(call(GetData, 0, data) == kNoDevice && base[data] == 0xAA);
+  CHECK(call(GetData, 6, data) == kNoDevice);
+  CHECK(call(GetData, 127, data) == kInvalid && call(GetData, 0, 0) == kInvalid);
+  std::memset(base + act, 0, 8);
+  CHECK(call(SetActDirect, 0, act) == kNoDevice);
+  CHECK(call(SetPortSetting, 0, 6) == 0 && call(SetPortSetting, 127, 0) == kInvalid);
+  CHECK(call(SetPortSetting, 50, 6) == 0);  // beyond the 7 ports: accepted, no state
+  CHECK(call(End) == 0);
+
+  // Neutral pad: GetInfo2 layout in big-endian words.
+  CHECK(dal::setPadBackend("neutral"));
+  CHECK(call(Init, 4) == 0);
+  fill(info, 0x100);
+  CHECK(call(GetInfo2, info) == 0);
+  CHECK(dalRead32(base, info + 0) == 4 && dalRead32(base, info + 4) == 1 &&
+        dalRead32(base, info + 8) == 0);
+  CHECK(dalRead32(base, info + 12) == 3);  // connected + assign changed, reported once
+  CHECK(dalRead32(base, info + 16) == 0 && dalRead32(base, info + 36) == 0);
+  CHECK(dalRead32(base, info + 40) == 0);  // port_setting
+  CHECK(dalRead32(base, info + 68) == dal::kPadCapabilityStandard && dalRead32(base, info + 96) == 0);
+  CHECK(dalRead32(base, info + 72) == 0);          // port 1: nothing connected
+  CHECK(dalRead32(base, info + 12 + 4 * 4) == 0);  // port 4 is beyond max_connect 4
+  CHECK(base[info + 123] == 0 && base[info + 124] == 0xAA);  // exactly 124 bytes written
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 1 && dalRead32(base, info + 4) == 1);
+
+  // The first GetData reports everything, later ones report no change.
+  fill(data, 0x100);
+  CHECK(call(GetData, 0, data) == 0 && len() == 8);
+  CHECK(word(0) == 0 && word(1) == 0x74 && word(2) == 0 && word(3) == 0);
+  CHECK(word(4) == 0x80 && word(5) == 0x80 && word(6) == 0x80 && word(7) == 0x80);
+  CHECK(word(8) == 0 && word(19) == 0);  // pressure area cleared
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  CHECK(call(GetData, 1, data) == kNoDevice);
+  CHECK(call(GetData, 4, data) == kNoDevice);
+
+  // Port setting keeps only the two defined bits.
+  CHECK(call(SetPortSetting, 0, 0xff) == 0);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 40) == 6);
+  CHECK(call(SetPortSetting, 0, 2) == 0);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 40) == 2);
+
+  // A host backend plugs in; pressure data appears only when asked for.
+  auto host = std::make_unique<ScriptedPad>();
+  ScriptedPad* pad = host.get();
+  dal::setPadProvider(std::move(host));
+  CHECK(call(End) == 0 && call(Init, 4) == 0);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 3 && dalRead32(base, info + 40) == 0);
+  CHECK(call(SetPortSetting, 0, 2) == 0);
+  fill(data, 0x100);
+  pad->state.button[dal::kPadButtonDigital2] = 0x40;  // cross
+  pad->state.button[dal::kPadButtonPressureFirst + 9] = 0xff;
+  CHECK(call(GetData, 0, data) == 0 && len() == 20 && word(1) == 0x7a);
+  CHECK(word(3) == 0x40 && word(17) == 0xff && word(20) == 0xAAAA);  // sensors not copied
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  pad->state.button[dal::kPadButtonDigital1] = 0x10;  // d-pad up
+  CHECK(call(GetData, 0, data) == 0 && len() == 20 && word(2) == 0x10);
+  pad->state.button[dal::kPadButtonSensorFirst] = 600;  // ignored while sensors are off
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  CHECK(call(SetPortSetting, 0, 6) == 0);
+  CHECK(call(GetData, 0, data) == 0 && len() == 24 && word(1) == 0x7c && word(20) == 600 &&
+        word(21) == 399);
+  std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  CHECK(call(GetData, 0, data) == 0 && len() == 24);  // sensors on: repeated every 10 ms
+
+  // Unplugging and replugging is reported through the assign-changed flag.
+  CHECK(call(SetPortSetting, 0, 0) == 0);
+  pad->state.connected = false;
+  CHECK(call(GetData, 0, data) == kNoDevice);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 2 && dalRead32(base, info + 4) == 0 &&
+        dalRead32(base, info + 68) == 0);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 0);
+  pad->state.connected = true;
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 3);
+  CHECK(call(GetData, 0, data) == 0 && len() == 8);  // a replugged pad reports everything again
+
+  // SetActDirect: validation order, capability check, motor routing.
+  std::memset(base + act, 0, 8);
+  base[act] = 1;
+  base[act + 1] = 200;
+  CHECK(call(SetActDirect, 0, 0) == kInvalid && call(SetActDirect, 127, act) == kInvalid);
+  base[act + 5] = 1;  // reserved byte
+  CHECK(call(SetActDirect, 0, act) == kInvalid);
+  base[act + 5] = 0;
+  CHECK(call(SetActDirect, 5, act) == kNoDevice && call(SetActDirect, 1, act) == kNoDevice);
+  CHECK(call(SetActDirect, 0, act) == 0 && pad->vibration_port == 0 && pad->small_motor == 1 &&
+        pad->large_motor == 200);
+  pad->state.device_capability = dal::kPadCapabilityStandard & ~0x10u;
+  CHECK(call(SetActDirect, 0, act) == kUnsupported);
+
+  dal::resetCellPad();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testCellMsgDialog() {
   std::vector<std::string> log_lines;
   dal::setLogSink([&](std::string_view line) { log_lines.emplace_back(line); });
@@ -4596,6 +4769,7 @@ int main(int argc, char** argv) {
   testSceNpAndTrophy();
   testCellSysutil();
   testVideoAndAudioOut();
+  testCellPad();
   testCellMsgDialog();
   testCellSaveData();
   testFifoParser();
