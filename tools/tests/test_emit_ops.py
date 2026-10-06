@@ -130,6 +130,78 @@ class IntRotateTest(unittest.TestCase):
                              ["ctx->gpr[3] = %s(ctx->gpr[4], ctx->gpr[5]);" % helper])
 
 
+class IntCarryMuldivTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["int_carry_muldiv"]) - set(load_handlers())), [])
+
+    def test_addic_takes_the_carry_from_the_64_bit_add(self):
+        self.assertEqual(body(asm.encode("addic", rD=3, rA=4, SIMM=-1))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ctx->gpr[4], 0xffffffffffffffffull, 0);"])
+
+    def test_addic_dot_records_and_addic_does_not(self):
+        lines, _ = body(asm.encode("addic.", rD=3, rA=4, SIMM=1))
+        self.assertEqual(lines[-1], "dalRecord(ctx, t0);")
+        lines, _ = body(asm.encode("addic", rD=3, rA=4, SIMM=1))
+        self.assertFalse(any("dalRecord" in line for line in lines))
+
+    def test_subtract_forms_invert_the_minuend(self):
+        self.assertEqual(body(asm.encode("subfc", rD=3, rA=4, rB=5))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ~ctx->gpr[4], ctx->gpr[5], 1);"])
+        self.assertEqual(body(asm.encode("subfe", rD=3, rA=4, rB=5))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ~ctx->gpr[4], ctx->gpr[5], "
+                          "ctx->xer_ca);"])
+        self.assertEqual(body(asm.encode("subfic", rD=3, rA=4, SIMM=7))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ~ctx->gpr[4], 0x0000000000000007ull, "
+                          "1);"])
+
+    def test_extended_forms_read_ca_and_use_constant_operands(self):
+        self.assertEqual(body(asm.encode("addze", rD=3, rA=4))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ctx->gpr[4], 0x0000000000000000ull, "
+                          "ctx->xer_ca);"])
+        self.assertEqual(body(asm.encode("addme", rD=3, rA=4))[0],
+                         ["ctx->gpr[3] = dalAddCarry(ctx, ctx->gpr[4], 0xffffffffffffffffull, "
+                          "ctx->xer_ca);"])
+
+    def test_oe_forms_copy_the_operands_before_writing_rd(self):
+        lines, _ = body(asm.encode("addc", rD=3, rA=4, rB=5, OE=1))
+        self.assertEqual(lines, ["uint64_t t0 = ctx->gpr[4];", "uint64_t t1 = ctx->gpr[5];",
+                                 "uint64_t t2 = dalAddCarry(ctx, t0, t1, 0);",
+                                 "ctx->gpr[3] = t2;", "dalSetOv(ctx, dalAddOverflows(t0, t1, t2));"])
+
+    def test_oe_forms_set_overflow_and_plain_forms_do_not(self):
+        for name in ("addc", "adde", "addze", "addme", "subfc", "subfe", "subfze", "subfme",
+                     "mullw", "mulld", "divw", "divwu", "divd", "divdu"):
+            fields = {"rD": 3, "rA": 4}
+            if name not in ("addze", "addme", "subfze", "subfme"):
+                fields["rB"] = 5
+            plain, _ = body(asm.encode(name, **fields))
+            with_oe, _ = body(asm.encode(name, OE=1, **fields))
+            self.assertFalse(any("dalSetOv" in line for line in plain), name)
+            self.assertTrue(any("dalSetOv" in line for line in with_oe), name)
+
+    def test_high_multiplies_have_no_oe_form(self):
+        for name in ("mulhw", "mulhwu", "mulhd", "mulhdu"):
+            with self.assertRaises(ValueError):
+                asm.encode(name, rD=3, rA=4, rB=5, OE=1)
+
+    def test_divisions_go_through_the_guarded_helpers(self):
+        for name, helper in (("divw", "dalDivw"), ("divwu", "dalDivwu"), ("divd", "dalDivd"),
+                             ("divdu", "dalDivdu")):
+            self.assertEqual(body(asm.encode(name, rD=3, rA=4, rB=5))[0],
+                             ["ctx->gpr[3] = %s(ctx->gpr[4], ctx->gpr[5]);" % helper])
+
+    def test_record_form_records_the_full_result(self):
+        lines, _ = body(asm.encode("mulhwu", rD=3, rA=4, rB=5, Rc=1))
+        self.assertEqual(lines, ["uint64_t t0 = dalMulhwu(ctx->gpr[4], ctx->gpr[5]);",
+                                 "ctx->gpr[3] = t0;", "dalRecord(ctx, t0);"])
+
+    def test_mulli_multiplies_unsigned(self):
+        self.assertEqual(body(asm.encode("mulli", rD=3, rA=4, SIMM=-3))[0],
+                         ["ctx->gpr[3] = ctx->gpr[4] * 0xfffffffffffffffdull;"])
+
+
 class MemTest(unittest.TestCase):
     def test_every_member_of_the_group_is_handled(self):
         from ps3recomp.emit_db import GROUPS

@@ -11,6 +11,81 @@ DAL_FORCEINLINE bool dalAddOverflows(uint64_t a, uint64_t b, uint64_t r) {
     return ((a ^ r) & (b ^ r)) >> 63;
 }
 
+// r = a + b + carry_in (0 or 1); XER.CA = carry out of bit 63 (RPCS3 `add64_flags`). The subtract
+// forms pass `~a` and a carry_in of 1 or CA, so CA = !borrow.
+DAL_FORCEINLINE uint64_t dalAddCarry(DalPpuContext* ctx, uint64_t a, uint64_t b,
+                                     uint64_t carry_in) {
+    uint64_t sum = a + b;
+    uint64_t r = sum + carry_in;
+    ctx->xer_ca = (sum < a) | (r < sum);
+    return r;
+}
+
+// mullw: full product of the sign-extended low words; it overflows when it does not fit in 32 bits
+// (RPCS3 `MULLW`). The product of two int32 values always fits in int64.
+DAL_FORCEINLINE uint64_t dalMullw(uint64_t a, uint64_t b) {
+    return (uint64_t)((int64_t)(int32_t)a * (int64_t)(int32_t)b);
+}
+
+DAL_FORCEINLINE bool dalMullwOverflows(uint64_t product) {
+    return (int64_t)product != (int64_t)(int32_t)product;
+}
+
+// mulhw/mulhwu: high word of the 32x32 product. mulhw sign-extends the word into rD, mulhwu
+// zero-extends (RPCS3 `MULHW`, `MULHWU`).
+DAL_FORCEINLINE uint64_t dalMulhw(uint64_t a, uint64_t b) {
+    return (uint64_t)(((int64_t)(int32_t)a * (int64_t)(int32_t)b) >> 32);
+}
+
+DAL_FORCEINLINE uint64_t dalMulhwu(uint64_t a, uint64_t b) {
+    return ((uint64_t)(uint32_t)a * (uint64_t)(uint32_t)b) >> 32;
+}
+
+// mulhd/mulhdu: high 64 bits of the 128-bit product (RPCS3 `MULHD`, `MULHDU`).
+__extension__ typedef __int128 DalI128;
+__extension__ typedef unsigned __int128 DalU128;
+
+DAL_FORCEINLINE uint64_t dalMulhd(uint64_t a, uint64_t b) {
+    return (uint64_t)(((DalI128)(int64_t)a * (DalI128)(int64_t)b) >> 64);
+}
+
+DAL_FORCEINLINE uint64_t dalMulhdu(uint64_t a, uint64_t b) {
+    return (uint64_t)(((DalU128)a * (DalU128)b) >> 64);
+}
+
+// mulld OV: the signed 128-bit product does not fit in 64 bits (RPCS3 `MULLD`).
+DAL_FORCEINLINE bool dalMulldOverflows(uint64_t a, uint64_t b, uint64_t low) {
+    return dalMulhd(a, b) != (uint64_t)((int64_t)low >> 63);
+}
+
+// Division: a zero divisor, or INT_MIN / -1 for the signed forms, gives result 0 and OV = 1 instead
+// of a host trap (RPCS3 `DIVW`, `DIVWU`, `DIVD`, `DIVDU`). divw/divwu results are zero-extended.
+DAL_FORCEINLINE bool dalDivwOverflows(uint64_t a, uint64_t b) {
+    int32_t ra = (int32_t)a, rb = (int32_t)b;
+    return rb == 0 || (ra == INT32_MIN && rb == -1);
+}
+
+DAL_FORCEINLINE uint64_t dalDivw(uint64_t a, uint64_t b) {
+    if (dalDivwOverflows(a, b)) return 0;
+    return (uint64_t)(uint32_t)((int32_t)a / (int32_t)b);
+}
+
+DAL_FORCEINLINE bool dalDivwuOverflows(uint64_t b) { return (uint32_t)b == 0; }
+
+DAL_FORCEINLINE uint64_t dalDivwu(uint64_t a, uint64_t b) {
+    return dalDivwuOverflows(b) ? 0 : (uint64_t)((uint32_t)a / (uint32_t)b);
+}
+
+DAL_FORCEINLINE bool dalDivdOverflows(uint64_t a, uint64_t b) {
+    return b == 0 || (a == (uint64_t)INT64_MIN && b == ~0ull);
+}
+
+DAL_FORCEINLINE uint64_t dalDivd(uint64_t a, uint64_t b) {
+    return dalDivdOverflows(a, b) ? 0 : (uint64_t)((int64_t)a / (int64_t)b);
+}
+
+DAL_FORCEINLINE uint64_t dalDivdu(uint64_t a, uint64_t b) { return b == 0 ? 0 : a / b; }
+
 // cntlzw looks at the low word only; both forms return the operand width for zero (the builtin
 // is undefined there).
 DAL_FORCEINLINE uint64_t dalCntlzw(uint64_t v) {
