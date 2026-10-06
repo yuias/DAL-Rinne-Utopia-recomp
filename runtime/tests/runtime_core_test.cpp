@@ -1417,7 +1417,9 @@ void testCellGcmSys() {
 
   enum Import : std::uint32_t {
     TiledPitch, InitBody, AddressToOffset, Func15, TimeStamp, CommandWords, SegmentWords, FifoSize,
-    MapMain, ControlRegister, GetConfig, UnmapEa, ImportCount
+    MapMain, ControlRegister, GetConfig, UnmapEa, SetUserHandler, SetFlipCommand, BindTile, SetFlipMode,
+    GetLastFlipTime, BindZcull, SetFlipHandler, SetDisplayBuffer, UnbindZcull, SetVBlankHandler,
+    ResetFlipStatus, SetTileInfo, FlipWithLabel, UnbindTile, ImportCount
   };
   const DalImportInfo imports[] = {
       {0x00800000, 0x055bd74d, "cellGcmSys", "cellGcmGetTiledPitchSize"},
@@ -1432,6 +1434,20 @@ void testCellGcmSys() {
       {0x00800090, 0xa547adde, "cellGcmSys", "cellGcmGetControlRegister"},
       {0x008000a0, 0xe315a0b2, "cellGcmSys", "cellGcmGetConfiguration"},
       {0x008000b0, 0xefd00f54, "cellGcmSys", "cellGcmUnmapEaIoAddress"},
+      {0x008000c0, 0x06edea9e, "cellGcmSys", "cellGcmSetUserHandler"},
+      {0x008000d0, 0x21397818, "cellGcmSys", "_cellGcmSetFlipCommand"},
+      {0x008000e0, 0x4524cccd, "cellGcmSys", "cellGcmBindTile"},
+      {0x008000f0, 0x4ae8d215, "cellGcmSys", "cellGcmSetFlipMode"},
+      {0x00800100, 0x63387071, "cellGcmSys", "cellGcmGetLastFlipTime"},
+      {0x00800110, 0x9dc04436, "cellGcmSys", "cellGcmBindZcull"},
+      {0x00800120, 0xa41ef7e8, "cellGcmSys", "cellGcmSetFlipHandler"},
+      {0x00800130, 0xa53d12ae, "cellGcmSys", "cellGcmSetDisplayBuffer"},
+      {0x00800140, 0xa75640e8, "cellGcmSys", "cellGcmUnbindZcull"},
+      {0x00800150, 0xa91b0402, "cellGcmSys", "cellGcmSetVBlankHandler"},
+      {0x00800160, 0xb2e761d4, "cellGcmSys", "cellGcmResetFlipStatus"},
+      {0x00800170, 0xbd100dbc, "cellGcmSys", "cellGcmSetTileInfo"},
+      {0x00800180, 0xd8f88e1a, "cellGcmSys", "_cellGcmSetFlipCommandWithWaitLabel"},
+      {0x00800190, 0xd9b7653e, "cellGcmSys", "cellGcmUnbindTile"},
   };
   dal::installImports(imports, ImportCount);
   auto a = makeCaller(0x01000000);
@@ -1458,6 +1474,11 @@ void testCellGcmSys() {
   std::uint32_t offset = 0;
   CHECK(offsetOf(0xc0000000, offset) == kFailure && offset == 0xdeadbeef);
   CHECK(call(TiledPitch, {0x1400}) == 0x1400);
+
+  // Handlers are ignored and the zcull request is refused before initialisation.
+  call(SetFlipHandler, {0x1234});
+  CHECK(dal::rsxState().flip_handler == 0);
+  CHECK(call(BindZcull, {0, 0x1000, 0x500, 0x300, 0, 2, 0, 0}) == kInval);
 
   // A failing init releases what it committed and can be retried.
   CHECK(dal::gcmInitBody(base, out, 0x10000, io_size, io_ea + 0x1000, local_size) == kFailure);
@@ -1582,6 +1603,88 @@ void testCellGcmSys() {
   CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(80));
   CHECK(dalRead32(base, context) == io_ea + 0x8000);
   consumer.join();
+
+  // Display buffers, flip mode and status, handlers.
+  CHECK(call(SetDisplayBuffer, {1, 0x100, 0x2000, 1280, 720}) == 0);
+  CHECK(state.display_count == 2 && state.display[1].offset == 0x100 && state.display[1].pitch == 0x2000);
+  CHECK(state.display[1].width == 1280 && state.display[1].height == 720);
+  CHECK(call(SetDisplayBuffer, {8, 1, 2, 3, 4}) == kFailure && state.display_count == 2);
+  CHECK(call(SetDisplayBuffer, {0x101, 1, 2, 3, 4}) == 0 && state.display[1].offset == 1);  // 8-bit id
+  call(SetFlipMode, {1});
+  CHECK(!state.requested_vsync);
+  call(SetFlipMode, {2});
+  CHECK(state.requested_vsync);
+  CHECK(state.flip_status == dal::kRsxFlipStatusDone);
+  call(ResetFlipStatus, {});
+  CHECK(state.flip_status == dal::kRsxFlipStatusWaiting);
+  call(GetLastFlipTime, {});
+  CHECK(ctx->gpr[3] == state.last_flip_time);
+  call(SetFlipHandler, {0x1111});
+  call(SetVBlankHandler, {0x2222});
+  call(SetUserHandler, {0x3333});
+  CHECK(state.flip_handler == 0x1111 && state.vblank_handler == 0x2222 && state.user_handler == 0x3333);
+
+  // Old-API flip commands: header = method | count << 18 at `current`, no put update.
+  const std::uint32_t cmd = io_ea + 0x2000;
+  dalWrite32(base, context + 8, cmd);
+  dalWrite32(base, 0x10100040, 0x4444);
+  CHECK(call(SetFlipCommand, {context, 3}) == context);  // void: r3 is not written
+  CHECK(dalRead32(base, cmd) == 0x4feac && dalRead32(base, cmd + 4) == 3);
+  CHECK(dalRead32(base, context + 8) == cmd + 8 && dalRead32(base, 0x10100040) == 0x4444);
+  dalWrite32(base, cmd + 8, 0xdeadbeef);
+  call(SetFlipCommand, {context, 8});
+  CHECK(dalRead32(base, cmd + 8) == 0xdeadbeef && dalRead32(base, context + 8) == cmd + 8);
+  call(FlipWithLabel, {context, 2, 5, 0x77});
+  CHECK(dalRead32(base, cmd + 8) == 0x80064 && dalRead32(base, cmd + 12) == 0x50 && dalRead32(base, cmd + 16) == 0x77);
+  CHECK(dalRead32(base, cmd + 20) == 0x4feac && dalRead32(base, cmd + 24) == 2);
+  CHECK(dalRead32(base, context + 8) == cmd + 28);
+  call(FlipWithLabel, {context, 9, 1, 2});  // the label wait is written, the flip is refused
+  CHECK(dalRead32(base, cmd + 28) == 0x80064 && dalRead32(base, context + 8) == cmd + 40);
+  CHECK(countContaining(lines, "display buffer id 8 is out of range") == 1);
+  CHECK(countContaining(lines, "display buffer id 9 is out of range") == 1);
+
+  // Tiles: validation order and error codes of RPCS3.
+  constexpr std::uint32_t kInvalidEnum = 0x80210002, kInvalidValue = 0x80210003, kInvalidAlign = 0x80210004;
+  CHECK(call(SetTileInfo, {5, 0, 0, 0x3a0000, 0x1400, 7, 0, 0}) == 0);
+  CHECK(state.tiles[5].size == 0x3a0000 && state.tiles[5].pitch == 0x1400 && state.tiles[5].comp == 7);
+  CHECK(!state.tiles[5].bound);
+  CHECK(call(BindTile, {5}) == 0 && state.tiles[5].bound);
+  CHECK(call(UnbindTile, {5}) == 0 && !state.tiles[5].bound);
+  CHECK(call(BindTile, {15}) == kInvalidValue && call(UnbindTile, {15}) == kInvalidValue);
+  CHECK(call(SetTileInfo, {15, 0, 0, 0x10000, 0x100, 0, 0, 0}) == kInvalidValue);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10000, 0x100, 0, 2048, 0}) == kInvalidValue);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10000, 0x100, 0, 0, 4}) == kInvalidValue);
+  CHECK(call(SetTileInfo, {1, 0, 0x10, 0x10000, 0x100, 0, 0, 0}) == kInvalidAlign);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10001, 0x100, 0, 0, 0}) == kInvalidAlign);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10000, 0x80, 0, 0, 0}) == kInvalidAlign);
+  CHECK(call(SetTileInfo, {1, 2, 0, 0x10000, 0x100, 0, 0, 0}) == kInvalidEnum);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10000, 0x100, 6, 0, 0}) == kInvalidEnum);
+  CHECK(call(SetTileInfo, {1, 0, 0, 0x10000, 0x100, 13, 0, 0}) == kInvalidEnum);
+  CHECK(call(SetTileInfo, {1, 1, 0, 0x10000, 0x100, 12, 2047, 3}) == 0 && state.tiles[1].bank == 3);
+  CHECK(call(SetTileInfo, {0x101, 0, 0, 0x10000, 0x100, 0, 0, 0}) == 0);  // 8-bit index: tile 1
+
+  // Zcull: the last four arguments (zCullFormat, sFunc, sRef, sMask) come from the stack.
+  const auto bindZcull = [&](std::uint32_t index, std::uint32_t offset, std::uint32_t width, std::uint32_t height,
+                             std::uint32_t cull_start) {
+    dalWrite64(base, stack + 0x70, 1);
+    dalWrite64(base, stack + 0x78, 3);
+    dalWrite64(base, stack + 0x80, 0x41);
+    dalWrite64(base, stack + 0x88, 0xff);
+    return call(BindZcull, {index, offset, width, height, cull_start, 2, 0, 0});
+  };
+  CHECK(bindZcull(0, 0x100000, 0x500, 0x300, 0x1000) == 0);
+  const dal::RsxZcull& zcull = state.zculls[0];
+  CHECK(zcull.bound && zcull.offset == 0x100000 && zcull.width == 0x500 && zcull.height == 0x300);
+  CHECK(zcull.cull_start == 0x1000 && zcull.z_format == 2 && zcull.aa_format == 0 && zcull.zcull_dir == 0);
+  CHECK(zcull.zcull_format == 1 && zcull.s_func == 3 && zcull.s_ref == 0x41 && zcull.s_mask == 0xff);
+  CHECK(bindZcull(1, 0x100000, 0x500, 0x300, 0x1234) == 0 && state.zculls[1].cull_start == 0x1000);
+  CHECK(bindZcull(8, 0x100000, 0x500, 0x300, 0) == 0xffffffef);
+  CHECK(bindZcull(2, 0x100000, 0, 0x300, 0) == kInval);                // empty region
+  CHECK(bindZcull(2, 0x100000, 0x500, 0x300, 0x300000) == kInval);     // beyond the 3 MiB zcull RAM
+  CHECK(bindZcull(2, local_size, 0x500, 0x300, 0) == kInval);          // offset outside local memory
+  CHECK(!state.zculls[2].bound);
+  CHECK(call(UnbindZcull, {0}) == 0 && !zcull.bound);
+  CHECK(call(UnbindZcull, {8}) == kInvalidValue);
 
   CHECK(countContaining(lines, "dal: default hle") == 0);
   CHECK(dal::formatCensus().find("cellGcmSys::cellGcmMapMainMemory: 8 [impl]") != std::string::npos);

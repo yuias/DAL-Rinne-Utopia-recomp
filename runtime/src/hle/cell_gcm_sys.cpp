@@ -1,14 +1,17 @@
-// HLE handlers of the cellGcmSys module: initialisation, configuration, IO mapping and the
-// command buffer wrap callback. Behaviour follows RPCS3 `Emu/Cell/Modules/cellGcmSys.cpp` (function
-// of the same name) and the memory layout of `Emu/Cell/lv2/sys_rsx.cpp`; the state lives in
-// rsx/rsx_state.h. Handlers run under the guest lock.
+// HLE handlers of the cellGcmSys module: initialisation, configuration, IO mapping, the command
+// buffer wrap callback, display buffers, flip commands, tiles and zcull. Behaviour follows RPCS3
+// `Emu/Cell/Modules/cellGcmSys.cpp` (function of the same name) and the memory layout of
+// `Emu/Cell/lv2/sys_rsx.cpp`; the state lives in rsx/rsx_state.h. Handlers run under the guest lock.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <initializer_list>
 #include <iterator>
 #include <optional>
 
+#include "core/census.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/host_functions.h"
@@ -70,6 +73,22 @@ constexpr std::uint32_t kJumpCommand = 0x20000000;  // RSX_METHOD_OLD_JUMP_CMD
 constexpr std::uint32_t kControlStart = 0x1000;
 constexpr std::uint32_t kControlRefInitial = 0xffffffff;
 
+// Method headers are `method | (argument count << 18)`; the methods are byte offsets of the RSX
+// method registers (RPCS3 `GCM_FLIP_COMMAND`, `NV406E_SEMAPHORE_OFFSET`, `rsx::make_command`).
+constexpr std::uint32_t kFlipCommandMethod = 0xfeac;
+constexpr std::uint32_t kSemaphoreOffsetMethod = 0x0064;
+constexpr std::uint32_t kMethodCountShift = 18;
+constexpr std::uint32_t kMaxDisplayId = 7;
+constexpr std::uint64_t kFlipTimeOffsetUs = 1000000;
+
+// Return value of a refused zcull request that the lv1 layer reports (LV1_ILLEGAL_PARAMETER_VALUE).
+constexpr std::uint32_t kLv1IllegalParameterValue = 0xffffffef;
+// The zcull RAM is 3 MiB.
+constexpr std::uint64_t kZcullRamSize = 3u << 20;
+
+// Stack offset of the ninth integer argument (PPC64 ELF ABI parameter save area).
+constexpr std::uint32_t kStackArgBase = 0x70;
+
 constexpr std::uint32_t kTiledPitches[] = {
     0x00000000, 0x00000200, 0x00000300, 0x00000400, 0x00000500, 0x00000600, 0x00000700,
     0x00000800, 0x00000A00, 0x00000C00, 0x00000D00, 0x00000E00, 0x00001000, 0x00001400,
@@ -81,6 +100,29 @@ void requireCommitted(std::uint32_t addr, std::uint32_t size, const char* what) 
   if (addr == 0 || !process().memory.isCommitted(addr, size)) {
     fatal(FatalKind::GuestFault, std::format("cellGcmSys: {} {:#010x} is not committed guest memory", what, addr));
   }
+}
+
+// Integer argument `n` (>= 8) that the caller passed in its stack parameter save area. The slot is
+// a doubleword; the argument is its low word.
+std::uint32_t stackArgU32(const DalPpuContext* ctx, const std::uint8_t* base, std::uint32_t n) {
+  return static_cast<std::uint32_t>(
+      dalRead64(base, static_cast<std::uint32_t>(ctx->gpr[1]) + kStackArgBase + 8 * (n - 8)));
+}
+
+// Appends a method header and its arguments at the context's `current` and advances it.
+void writeCommand(std::uint8_t* base, std::uint32_t context, std::uint32_t method,
+                  std::initializer_list<std::uint32_t> args) {
+  const std::uint32_t bytes = 4 * (static_cast<std::uint32_t>(args.size()) + 1);
+  std::uint32_t current = dalRead32(base, context + kContextCurrent);
+  requireCommitted(current, bytes, "command buffer");
+  const std::uint32_t start = current;
+  dalWrite32(base, current, method | (static_cast<std::uint32_t>(args.size()) << kMethodCountShift));
+  current += 4;
+  for (const std::uint32_t arg : args) {
+    dalWrite32(base, current, arg);
+    current += 4;
+  }
+  dalWrite32(base, context + kContextCurrent, start + bytes);
 }
 
 // Wrap callback of the default context: flush up to `current`, continue in the next fragment.
@@ -217,17 +259,171 @@ void gcmGetTimeStamp(DalPpuContext* ctx, std::uint8_t* base) {
   ctx->gpr[3] = dalRead64(base, kRsxLabelAddr + kRsxReportsReportOffset + 0x10 * index);
 }
 
+// cellGcmSetDisplayBuffer(id, offset, pitch, width, height)
+void gcmSetDisplayBuffer(DalPpuContext* ctx, std::uint8_t*) {
+  const std::uint32_t id = argU32(ctx, 0) & 0xff;
+  if (id > kMaxDisplayId) return setResultCode(ctx, kGcmErrorFailure);
+  RsxState& state = rsxState();
+  state.display[id] = {argU32(ctx, 1), argU32(ctx, 2), argU32(ctx, 3), argU32(ctx, 4)};
+  state.display_count = std::max(state.display_count, id + 1);
+  setResultCode(ctx, kCellOk);
+}
+
+// cellGcmSetFlipMode(mode): void. Only vsync paces the flips; any other mode flips at once.
+void gcmSetFlipMode(DalPpuContext* ctx, std::uint8_t*) {
+  rsxState().requested_vsync = argU32(ctx, 0) == kRsxDisplayVsync;
+}
+
+// cellGcmResetFlipStatus(): void
+void gcmResetFlipStatus(DalPpuContext*, std::uint8_t*) { rsxState().flip_status = kRsxFlipStatusWaiting; }
+
+// cellGcmGetLastFlipTime(): u64
+void gcmGetLastFlipTime(DalPpuContext* ctx, std::uint8_t*) { ctx->gpr[3] = rsxState().last_flip_time; }
+
+// cellGcmSetFlipHandler(handler), cellGcmSetVBlankHandler(handler), cellGcmSetUserHandler(handler):
+// void; the handler is ignored before initialisation, as RPCS3 does.
+template <std::uint32_t RsxState::*Member>
+void gcmSetHandler(DalPpuContext* ctx, std::uint8_t*) {
+  RsxState& state = rsxState();
+  if (state.initialized) state.*Member = argU32(ctx, 0);
+}
+
+// Shared tail of the old-API flip functions: the flip method with the display buffer id.
+// RPCS3 `gcmSetPrepareFlip<true>`: no room check and no update of the put pointer.
+void writeFlipCommand(std::uint8_t* base, std::uint32_t context, std::uint32_t id, const char* name) {
+  if (id > kMaxDisplayId) {
+    logError("dal: gcm: {}: display buffer id {} is out of range, nothing written", name, id);
+    return;
+  }
+  writeCommand(base, context, kFlipCommandMethod, {id});
+}
+
+// _cellGcmSetFlipCommand(context*, id): void
+void gcmSetFlipCommand(DalPpuContext* ctx, std::uint8_t* base) {
+  const std::uint32_t context = argU32(ctx, 0);
+  requireCommitted(context, kContextSize, "command buffer context");
+  writeFlipCommand(base, context, argU32(ctx, 1), "_cellGcmSetFlipCommand");
+}
+
+// _cellGcmSetFlipCommandWithWaitLabel(context*, id, label_index, label_value): void. The label
+// wait is written even when the flip itself is refused.
+void gcmSetFlipCommandWithWaitLabel(DalPpuContext* ctx, std::uint8_t* base) {
+  const std::uint32_t context = argU32(ctx, 0);
+  requireCommitted(context, kContextSize, "command buffer context");
+  writeCommand(base, context, kSemaphoreOffsetMethod, {argU32(ctx, 2) * 0x10, argU32(ctx, 3)});
+  writeFlipCommand(base, context, argU32(ctx, 1), "_cellGcmSetFlipCommandWithWaitLabel");
+}
+
+// cellGcmSetTileInfo(index, location, offset, size, pitch, comp, base, bank)
+void gcmSetTileInfo(DalPpuContext* ctx, std::uint8_t*) {
+  const std::uint32_t index = argU32(ctx, 0) & 0xff, location = argU32(ctx, 1) & 0xff;
+  const std::uint32_t offset = argU32(ctx, 2), size = argU32(ctx, 3), pitch = argU32(ctx, 4);
+  const std::uint32_t comp = argU32(ctx, 5) & 0xff, tile_base = argU32(ctx, 6) & 0xffff, bank = argU32(ctx, 7) & 0xff;
+
+  if (index >= kRsxTileCount || tile_base >= 2048 || bank >= 4) return setResultCode(ctx, kGcmErrorInvalidValue);
+  if ((offset & 0xffff) != 0 || (size & 0xffff) != 0 || (pitch & 0xff) != 0) {
+    return setResultCode(ctx, kGcmErrorInvalidAlignment);
+  }
+  if (location >= 2 || (comp != 0 && (comp < 7 || comp > 12))) return setResultCode(ctx, kGcmErrorInvalidEnum);
+
+  RsxTile& tile = rsxState().tiles[index];
+  tile.location = location;
+  tile.offset = offset;
+  tile.size = size;
+  tile.pitch = pitch;
+  tile.comp = comp;
+  tile.base = tile_base;
+  tile.bank = bank;
+  setResultCode(ctx, kCellOk);
+}
+
+// cellGcmBindTile(index), cellGcmUnbindTile(index)
+template <bool Bound>
+void gcmBindTile(DalPpuContext* ctx, std::uint8_t*) {
+  const std::uint32_t index = argU32(ctx, 0) & 0xff;
+  if (index >= kRsxTileCount) return setResultCode(ctx, kGcmErrorInvalidValue);
+  rsxState().tiles[index].bound = Bound;
+  setResultCode(ctx, kCellOk);
+}
+
+// cellGcmBindZcull(index, offset, width, height, cullStart, zFormat, aaFormat, zCullDir, zCullFormat,
+// sFunc, sRef, sMask). RPCS3 packs the region into the register layout of the lv1 call and its
+// handler (`sys_rsx_context_attribute`, package 0x301) validates and unpacks it again; the fields
+// are kept the way that round trip leaves them.
+void gcmBindZcull(DalPpuContext* ctx, std::uint8_t* base) {
+  const std::uint32_t index = argU32(ctx, 0) & 0xff;
+  const std::uint32_t offset = argU32(ctx, 1), width = argU32(ctx, 2), height = argU32(ctx, 3);
+  const std::uint32_t cull_start = argU32(ctx, 4), z_format = argU32(ctx, 5), aa_format = argU32(ctx, 6);
+  const std::uint32_t zcull_dir = argU32(ctx, 7), zcull_format = stackArgU32(ctx, base, 8);
+  const std::uint32_t s_func = stackArgU32(ctx, base, 9), s_ref = stackArgU32(ctx, base, 10);
+  const std::uint32_t s_mask = stackArgU32(ctx, base, 11);
+
+  const RsxState& state = rsxState();
+  if (!state.initialized) return setResultCode(ctx, kCellEinval);
+  if (index >= kRsxZcullCount) return setResultCode(ctx, kLv1IllegalParameterValue);
+
+  const std::uint32_t region = 1 | (z_format << 4) | (aa_format << 8);
+  const std::uint32_t size = ((width >> 6) << 22) | ((height >> 6) << 6);
+  const std::uint32_t start = cull_start & ~0xfffu;
+  const std::uint32_t status0 =
+      (zcull_dir << 1) | (zcull_format << 2) | ((s_func & 0xf) << 12) | (s_ref << 16) | (s_mask << 24);
+
+  RsxZcull zcull;
+  zcull.z_format = (region >> 4) & 0xf;
+  zcull.aa_format = (region >> 8) & 0xf;
+  zcull.width = (size >> 22) << 6;
+  zcull.height = ((size & 0xffff) >> 6) << 6;
+  zcull.cull_start = start;
+  zcull.offset = offset & 0x0fffffff;
+  zcull.zcull_dir = (status0 >> 1) & 1;
+  zcull.zcull_format = (status0 >> 2) & 0x3ff;
+  zcull.s_func = (status0 >> 12) & 0xf;
+  zcull.s_ref = (status0 >> 16) & 0xff;
+  zcull.s_mask = (status0 >> 24) & 0xff;
+  zcull.bound = true;
+
+  // The region must be non-empty and inside the zcull RAM; the offset inside local memory.
+  const std::uint32_t length = zcull.width * zcull.height;
+  if (length == 0 || std::uint64_t{start} + length - 1 >= kZcullRamSize || zcull.offset >= state.local_size) {
+    return setResultCode(ctx, kCellEinval);
+  }
+  rsxState().zculls[index] = zcull;
+  setResultCode(ctx, kCellOk);
+}
+
+// cellGcmUnbindZcull(index)
+void gcmUnbindZcull(DalPpuContext* ctx, std::uint8_t*) {
+  const std::uint32_t index = argU32(ctx, 0) & 0xff;
+  if (index >= kRsxZcullCount) return setResultCode(ctx, kGcmErrorInvalidValue);
+  rsxState().zculls[index].bound = false;
+  setResultCode(ctx, kCellOk);
+}
+
 constexpr HleEntry kHandlers[] = {
     {kModule, 0x055bd74d, "cellGcmGetTiledPitchSize", gcmGetTiledPitchSize},
+    {kModule, 0x06edea9e, "cellGcmSetUserHandler", gcmSetHandler<&RsxState::user_handler>},
     {kModule, 0x15bae46b, "_cellGcmInitBody", gcmInitBodyHandler},
+    {kModule, 0x21397818, "_cellGcmSetFlipCommand", gcmSetFlipCommand},
     {kModule, 0x21ac3697, "cellGcmAddressToOffset", gcmAddressToOffset},
     {kModule, 0x3a33c1fd, "_cellGcmFunc15", gcmFunc15},
+    {kModule, 0x4524cccd, "cellGcmBindTile", gcmBindTile<true>},
+    {kModule, 0x4ae8d215, "cellGcmSetFlipMode", gcmSetFlipMode},
     {kModule, 0x5a41c10f, "cellGcmGetTimeStamp", gcmGetTimeStamp},
     {kModule, 0x5e2ee0f0, "cellGcmGetDefaultCommandWordSize", gcmGetDefaultCommandWordSize},
+    {kModule, 0x63387071, "cellGcmGetLastFlipTime", gcmGetLastFlipTime},
     {kModule, 0x8cdf8c70, "cellGcmGetDefaultSegmentWordSize", gcmGetDefaultSegmentWordSize},
     {kModule, 0x9ba451e4, "cellGcmSetDefaultFifoSize", gcmSetDefaultFifoSize},
+    {kModule, 0x9dc04436, "cellGcmBindZcull", gcmBindZcull},
     {kModule, 0xa114ec67, "cellGcmMapMainMemory", gcmMapMainMemory},
+    {kModule, 0xa41ef7e8, "cellGcmSetFlipHandler", gcmSetHandler<&RsxState::flip_handler>},
+    {kModule, 0xa53d12ae, "cellGcmSetDisplayBuffer", gcmSetDisplayBuffer},
     {kModule, 0xa547adde, "cellGcmGetControlRegister", gcmGetControlRegister},
+    {kModule, 0xa75640e8, "cellGcmUnbindZcull", gcmUnbindZcull},
+    {kModule, 0xa91b0402, "cellGcmSetVBlankHandler", gcmSetHandler<&RsxState::vblank_handler>},
+    {kModule, 0xb2e761d4, "cellGcmResetFlipStatus", gcmResetFlipStatus},
+    {kModule, 0xbd100dbc, "cellGcmSetTileInfo", gcmSetTileInfo},
+    {kModule, 0xd8f88e1a, "_cellGcmSetFlipCommandWithWaitLabel", gcmSetFlipCommandWithWaitLabel},
+    {kModule, 0xd9b7653e, "cellGcmUnbindTile", gcmBindTile<false>},
     {kModule, 0xe315a0b2, "cellGcmGetConfiguration", gcmGetConfiguration},
     {kModule, 0xefd00f54, "cellGcmUnmapEaIoAddress", gcmUnmapEaIoAddress},
 };
@@ -307,6 +503,9 @@ std::uint32_t gcmInitBody(std::uint8_t* base, std::uint32_t context_pp, std::uin
   state.command_begin = io_address;
   state.fragment_count = cmd_size / kFragmentSize;
   state.wrap_callback = registerHostFunction("cellGcmCallback", gcmCallback);
+  // RPCS3 starts the clock at the RSX thread start, one second in the past.
+  const std::uint64_t now = systemTimeUs();
+  state.last_flip_time = now > kFlipTimeOffsetUs ? now - kFlipTimeOffsetUs : 0;
 
   dalWrite32(base, kRsxDeviceAddr + kContextBegin, io_address + kFragmentReserved);
   dalWrite32(base, kRsxDeviceAddr + kContextEnd, io_address + kFragmentSize - 4);
