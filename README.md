@@ -9,11 +9,13 @@ output is written to ignored directories.
 
 Current state: build scaffold, analysis tools for the PPU executable (ELF summary, SPU probe,
 disassembler, Ghidra cross-check, NID and syscall name tables, function recovery), an emitter
-that turns the recovered functions into C source, and a runtime skeleton (`dal_game`) that
-loads the executable, runs it through the generated code on real guest threads and stops at the
-first missing piece with a census of what the game asked for. Most of the system API is not
-implemented yet, so the game does not get past early start-up. See "Emitting C" and "Running
-the game" for what is and is not implemented.
+that turns the recovered functions into C source, an SDAT decryption tool (`dal_sdat`), and a
+runtime (`dal_game`) that loads the executable, runs it through the generated code on real guest
+threads, serves a first set of lv2 system calls and HLE modules, and runs a fake RSX that
+consumes the game's command buffer without drawing. The game boots, runs its frame loop at the
+60 Hz vertical-blank rate and loads its assets, then waits for modules that are still
+default-handled. Nothing is rendered, played or decoded yet. See "Emitting C" and "Running the
+game" for what is and is not implemented.
 
 ## Prerequisites
 
@@ -84,6 +86,12 @@ CMake options for generated code (also usable with `cmake` directly):
 
 - `DAL_PPU_GENERATED_DIR` is the `emit` output directory; empty (the default) builds
   without generated code.
+- `DAL_RPCS3_CRYPTO_DIR` (default empty) is the `rpcs3/Crypto` directory of a local RPCS3 source
+  checkout. When it is set together with `DAL_GAME_DIR`, the build runs `dal_sdat` to decrypt
+  the game's `.sdat` files into `build/<preset>/sdata_cache` and the `game_boot` test passes that
+  directory to `dal_game` (see "SDAT files"). It is a CMake cache variable, so pass it with
+  `cmake -D` once (`cmake -S . -B build/<preset> -DDAL_RPCS3_CRYPTO_DIR=<dir>`); `tools/build.ps1`
+  has no parameter for it and keeps the cached value.
 - `DAL_PPU_WERROR` (default `ON`) adds `-Werror` for generated code and the code that
   mirrors it (header check, semantics harness, link test). Every such target is compiled with
   `-O1 -march=x86-64-v3 -ffp-contract=off -fpatchable-function-entry=8 -Wall -Wextra`,
@@ -459,23 +467,28 @@ Every instruction word in the code range of the pinned ELF has an emitter handle
 PPU thread the way RPCS3 does and calls the entry function through the generated code. It is
 built only when `DAL_PPU_GENERATED_DIR` is set (`-PpuDir`), because it links the generated
 functions. The runtime core (`dal_runtime_core`, everything under `runtime/src/core`,
-`runtime/src/lv2` and `runtime/src/hle`) does not reference generated symbols and is always
+`runtime/src/lv2`, `runtime/src/hle` and `runtime/src/rsx`) does not reference generated symbols and is always
 built, together with its unit tests (`runtime_core`). Only `runtime/src/game_main.cpp` passes the
 generated tables to the core. The executable is checked against the SHA-256 that the generated
 code was emitted from.
 
 ```sh
-dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE] [--quiet-hle] [--load-only]
+dal_game --game-dir DIR [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR] [--seconds N] [--strict]
+         [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--game-dir DIR` | Required. The game directory, the one that contains `PS3_GAME`. It must exist. Nothing is read from it yet apart from the default ELF location. |
+| `--game-dir DIR` | Required. The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home`, `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. |
 | `--elf PATH` | The decrypted executable. Default: `DIR/PS3_GAME/USRDIR/EBOOT.elf`. |
+| `--hdd-dir DIR` | Host directory behind `/dev_hdd0` and `/dev_hdd1` (`DIR/dev_hdd0`, `DIR/dev_hdd1`; created on demand). Without it the hdd devices do not resolve and the game cannot create its game data or save files. |
+| `--sdata-cache DIR` | Directory of decrypted `.sdat` files, each at its path relative to the game directory, as written by `dal_sdat`. Without it `cellFsSdataOpen` fails. See "SDAT files". |
 | `--seconds N` | Watchdog: stop after `N` seconds. 0 (the default) disables it. |
 | `--strict` | Treat a jump to an address that is not a recovered function as a fatal error (see "Dispatch"). |
 | `--log FILE` | Also write every log line to `FILE`, which is truncated. |
 | `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
+| `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
+| `--pad none\|neutral` | Input source: `neutral` (the default) connects a standard pad on port 0 that never changes, `none` connects no pad. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 
 Game paths are command-line arguments only; no tracked file contains one. The build wrapper takes
@@ -521,13 +534,20 @@ census: hle 118 calls, 21 distinct, 10 default-handled
   sysPrxForUser::sys_lwmutex_lock: 29 [impl]
   cellSysmodule::cellSysmoduleLoadModule: 15 [default]
 census: unknown targets 0 distinct
+census: rsx 280820 headers, 264 distinct methods, 679 flips
+  interrupt handler calls: vblank 1201, flip 0, user 679
+  method 0x324: 5582
+  method 0xfeac GCM_FLIP_COMMAND: 679
 census: threads 5 created, 5 live
   0x01000000 main_thread: running
   0x01000001 _SPU_printf_server: blocked in sys_event_queue_receive
+  0x01000005 _gcm_intr_thread: blocked in gcm interrupt wait [service]
 ```
 
 `[impl]` marks a call that an implemented handler served and `[default]` one that the default
-handler took (see below). An unknown target is printed as `0x<target> from 0x<site>: count`.
+handler took (see below). An unknown target is printed as `0x<target> from 0x<site>: count`. A default-handled import is
+followed by `ptr r3,r5,...`, the argument registers that held a pointer to committed guest memory
+(an out-pointer candidate, see "Default handlers"). The `rsx` section is described under "Fake RSX".
 Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
 each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
 the game runs; these lines are the progress markers that `game_boot` checks.
@@ -542,10 +562,16 @@ guest address and the access kind.
 | Range | Use |
 | --- | --- |
 | `0x00010000..0x10000000` | Main region: the ELF image (committed at its segment addresses), per-thread TLS blocks and the heap handlers' allocations. 64 KiB granularity. |
-| `0x10000000..0x20000000` | Not used yet (left free for the RSX context). |
+| `0x10000000..0x20000000` | RSX context area, fixed by the console memory map: the default command buffer context (`0x10000000`), the DMA control and `put`/`get`/`ref` registers (`0x10100000`, `0x10100040`), the driver info block (`0x10200000`) and the reports and semaphores (`0x10300000`). The first 4 MiB are committed when the game initializes GCM. |
 | `0x20000000..0x30000000` | User memory with 1 MiB pages (`sys_memory_allocate` with flags 0x400 or 0). |
 | `0x30000000..0x40000000` | User memory with 64 KiB pages (`sys_memory_allocate` with flags 0x200). |
+| `0xC0000000..0xCF900000` | RSX local memory (video memory), committed when the game initializes GCM. |
 | `0xD0000000..0xE0000000` | Thread stacks, 4 KiB pages, with an uncommitted 4 KiB guard page on each side of every stack. |
+
+The top 64 KiB, `0xFFFF0000..0xFFFFFFFF`, are never committed: they hold the entry keys of host
+functions, the function descriptors that the HLE layer hands to guest code (for example a callback
+the runtime itself provides). Guest code can call or start a thread on such a descriptor, and the
+dispatcher resolves the key to the host handler.
 
 The primary stack size from the executable's process parameters is clamped as RPCS3 does (the
 game's 0x8000 becomes 0x10000). The argument block (`argv`, `envp`, strings) sits at the top of
@@ -572,7 +598,13 @@ they wait for for the census and for stall detection.
 
 Priority scheduling is deferred. Runnable threads get the lock in arrival order, and
 `sys_ppu_thread_set_priority` and `sys_ppu_thread_get_priority` only store and return the value.
-Thread ids start at `0x01000000`. Interrupt threads are not implemented.
+Thread ids start at `0x01000000`. lv2 interrupt threads are not implemented; the one interrupt
+thread the game needs is the GCM interrupt thread described under "Fake RSX".
+
+A service thread is a guest thread that the runtime starts on the game's behalf and that waits
+for work from the host (the GCM interrupt thread). The census marks it `[service]`, and the
+stall detector and the check for "no guest threads left" ignore it, so a game whose own threads
+are all blocked still ends with a stall stop.
 
 The host main thread is the supervisor. After boot it checks every 100 ms for the watchdog, a
 stall and the absence of live guest threads.
@@ -591,25 +623,56 @@ name; struct layouts and error codes are restated from its headers.
 | Mutex and condition variable | `sys_mutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock` (100-104); `sys_cond_create`, `_destroy`, `_wait`, `_signal`, `_signal_all` (105-109) |
 | Event flag | `sys_event_flag_create` (82), `_destroy` (83), `_wait` (85), `_set` (87), `_clear` (118), `_cancel` (132), `_get` (139) |
 | Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138) |
+| SPU | `sys_spu_initialize` (169), `sys_spu_thread_write_ls` (181), `_read_ls` (182), `_write_spu_mb` (190), `_connect_event` (191), `_disconnect_event` (192), `sys_spu_thread_group_connect_event_all_threads` (251), `_disconnect_event_all_threads` (252). Only the bookkeeping is kept; no SPU code runs. |
+| File system | `sys_fs_open` (801), `_read` (802), `_write` (803), `_close` (804), `_opendir` (805), `_readdir` (806), `_closedir` (807), `_stat` (808), `_fstat` (809), `_mkdir` (811), `_unlink` (814), `_lseek` (818); see "Virtual file system" |
 | Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48) |
 
 ### Implemented imports
 
-Imports are matched to handlers by module and FNID. All 23 `sysPrxForUser` imports of the
-executable have handlers:
+Imports are matched to handlers by module and FNID. 105 of the executable's 166 imports have a
+handler; the rest use the default handler. Behaviour follows the RPCS3 function of the same name
+(`Emu/Cell/Modules/`); each handler file lists its deviations in its header comment.
 
-- `sys_initialize_tls` (per-thread TLS blocks laid out as RPCS3 does), `sys_ppu_thread_create`,
-  `sys_ppu_thread_get_id`, `sys_ppu_thread_once`, `sys_ppu_thread_exit`;
-- `sys_lwmutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock`;
-- `_sys_heap_create_heap`, `_sys_heap_malloc`, `_sys_heap_memalign`, `_sys_heap_free`,
-  `_sys_heap_delete_heap`;
-- `sys_time_get_system_time`, `sys_process_exit`;
-- `_sys_process_atexitspawn`, `_sys_process_at_Exitspawn`, `sys_prx_exitspawn_with_level`,
-  `sys_prx_register_library`, `_sys_spu_printf_initialize`, `_sys_spu_printf_finalize`. These
-  return `CELL_OK` and do nothing else.
+| Module | Imports |
+| --- | --- |
+| `sysPrxForUser` (all 23 imports) | `sys_initialize_tls` (per-thread TLS blocks laid out as RPCS3 does), `sys_ppu_thread_create`, `_get_id`, `_once`, `_exit`; `sys_lwmutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock`; `_sys_heap_create_heap`, `_malloc`, `_memalign`, `_free`, `_delete_heap`; `sys_time_get_system_time`, `sys_process_exit`; `_sys_process_atexitspawn`, `_sys_process_at_Exitspawn`, `sys_prx_exitspawn_with_level`, `sys_prx_register_library`, `_sys_spu_printf_initialize`, `_sys_spu_printf_finalize` (the last six return `CELL_OK` and do nothing else) |
+| `cellSysmodule` | `cellSysmoduleLoadModule`, `cellSysmoduleUnloadModule`: every module id succeeds, because the HLE functions are always available |
+| `cellSpurs` | `cellSpursInitializeWithAttribute2` and its attribute helper, `cellSpursGetSpuThreadGroupId`, `cellSpursFinalize`: a SPURS instance can be created and queried, but no SPU thread, workload or helper thread exists |
+| `cellGcmSys` | 26 imports: initialization (`_cellGcmInitBody`), configuration, IO mapping (`cellGcmMapMainMemory`, `cellGcmAddressToOffset`, `cellGcmUnmapEaIoAddress`), display buffers, flip mode and flip status, the vblank, flip and user handlers, tiles and zcull, the control register and the default command buffer callback; see "Fake RSX" |
+| `cellSysutil` | the callback pump (`cellSysutilRegisterCallback`, `_UnregisterCallback`, `_CheckCallback`), BGM playback status, `cellVideoOutConfigure`, `_GetState`, `_GetResolutionAvailability`, `cellAudioOutGetState`, the message dialog (`cellMsgDialogOpen2`, `_Close`, progress bar reset and increment) and save data (`cellSaveDataAutoLoad2`, `AutoSave2`, `ListLoad2`, `ListSave2`, `Delete2`) |
+| `cellGame` | `cellGameDataCheck`, `cellGameCreateGameData`, `cellGameContentPermit`, `cellGameContentErrorDialog` |
+| `sys_fs` | `cellFsOpen`, `cellFsSdataOpen`, `cellFsReadWithOffset`, `cellFsWriteWithOffset`, `cellFsClose`, `cellFsFstat`, `cellFsStat`, `cellFsMkdir`, `cellFsUnlink` |
+| `sys_io` | `cellPadInit`, `cellPadEnd`, `cellPadSetPortSetting`, `cellPadGetData`, `cellPadGetInfo2`, `cellPadSetActDirect` |
+| `sceNp`, `sceNpTrophy` | `sceNpInit`, `sceNpTerm`, `sceNpDrmIsAvailable`; the 10 trophy imports (`sceNpTrophyInit` to `sceNpTrophyUnlockTrophy`) |
 
-The executable has 166 imports; the other 143 (cellSysmodule, cellSysutil, cellGcmSys, cellSpurs
-and others) use the default handler.
+Video and audio out report what the game's `PARAM.SFO` allows (the `RESOLUTION` and
+`SOUND_FORMAT` attributes); a missing or unreadable file keeps the defaults.
+
+### Headless policy
+
+RPCS3 opens dialogs and waits for the user in several of these modules. `dal_game` has no user
+interface, so each module follows a documented policy that never blocks on a person:
+
+- **Message dialogs** (`cellMsgDialogOpen2`): the type and the text are logged. A dialog with
+  buttons answers itself after 200 ms: OK for an OK dialog, and the `--dialog-answer` value
+  (default yes) for a Yes/No dialog. A dialog without buttons stays open until
+  `cellMsgDialogClose`. The answer is delivered through the cellSysutil callback queue, so the
+  guest sees it from `cellSysutilCheckCallback`, as on the console.
+- **Save data**: a save lives in `/dev_hdd0/home/00000001/savedata/<dir name>/`. Error dialogs
+  are logged and their error code is returned, without a dialog object. A save list is never
+  shown; the entry is the one the game's list callback highlights, with RPCS3's fallbacks, and
+  without a choice the call returns `CELL_CANCEL`. `cellSaveDataDelete2` returns `CELL_CANCEL`.
+  Secure files are stored in plain text.
+- **Trophies**: no trophy pack is installed from the network and no notification is shown. The
+  pack is read for its trophy list, and the unlock state is kept as a text file in the trophy
+  directory under `/dev_hdd0/home/00000001`. The registration status callbacks run inside
+  `sceNpTrophyRegisterContext` instead of being spread over two seconds.
+- **cellSysutil callbacks**: they run on the guest thread that calls `cellSysutilCheckCallback`,
+  from a queue that the modules above feed. `CELL_SYSUTIL_REQUEST_EXITGAME` is not acted on.
+- **cellGame**: the content directories are created on the host through the VFS, under the
+  `--hdd-dir` directory.
+- **Input**: see `--pad`. A host keyboard or gamepad backend plugs in through a provider
+  interface (`runtime/src/hle/hle.h`); none is implemented.
 
 ### Default handlers
 
@@ -620,48 +683,131 @@ change nothing else. The first call of each distinct syscall is logged as
 counted. Returning success is a probe, not an implementation: guest code that depends on an
 output parameter reads whatever was in memory, so a default-handled call can lead to a later
 fault. The census shows which calls were default-handled, which is the work list for the next
-handlers.
+handlers. For each default-handled import the runtime also logs the argument registers that look
+like out-pointers (a nonzero 32-bit value that addresses committed memory outside the code), as
+`dal: default hle <module>::<name>: possible out-pointer r<N>=<address>`, and the census repeats the
+register list as `ptr r<N>,...`. These are hints for writing the handler, not facts: a register
+left over from an earlier call can look like a pointer too.
+
+### Virtual file system
+
+Guest paths map to host directories (`runtime/src/lv2/vfs.cpp`, following RPCS3's mount table):
+
+| Guest path | Host directory | Access |
+| --- | --- | --- |
+| `/dev_bdvd`, `/app_home` | the `--game-dir` directory | read-only |
+| `/dev_hdd0` | `<--hdd-dir>/dev_hdd0` | read and write |
+| `/dev_hdd1` | `<--hdd-dir>/dev_hdd1` | read and write |
+
+`..` components may not leave a device, and a guest cannot create entries directly under
+`/dev_hdd0` or `/dev_hdd0/game`. The directories that the console's system software keeps on hdd0
+(`game`, `home/00000001/savedata`, `home/00000001/trophy` and a few more) are created when
+`--hdd-dir` is given. Host names are matched by the host file system, which is case-insensitive on
+Windows. The `sys_fs_*` system calls and the `cellFs*` imports share one object table. The
+virtual root lists the mounted devices.
+
+### SDAT files
+
+The game reads several `.sdat` files (encrypted data containers) through `cellFsSdataOpen`. The
+tool `dal_sdat` decrypts them ahead of time and `dal_game --sdata-cache` serves the plain
+copies:
+
+```sh
+dal_sdat --keys <rpcs3-checkout>/rpcs3/Crypto --game-dir <game-dir> --out <cache-dir>
+dal_game --game-dir <game-dir> --sdata-cache <cache-dir> ...
+```
+
+- `--keys` is `key_vault.h` (or `key_vault.cpp`) of a local RPCS3 source checkout, or the
+  directory that holds it. The AES keys are read from it every time the tool runs and are never
+  stored in this repository or in the build output. Without a checkout the tool cannot run, and
+  the tests contain no key material.
+- `--game-dir` is searched recursively for `*.sdat`; each file is written under `--out` at its
+  path relative to the game directory. The tool verifies every block's AES-CMAC, so a wrong key
+  or a damaged file is an error (exit 1). It uses Windows CNG for AES and is built together with
+  the runtime (`dal_sdat`; its tests are the CTest entry `sdat_tests`).
+- The container layout and the block compression follow RPCS3's `Crypto/unedat.cpp` and
+  `Crypto/lz.cpp` (behaviour only; the code is independent).
+- With the CMake variable `DAL_RPCS3_CRYPTO_DIR` set (see "Building"), the build writes the cache
+  to `build/<preset>/sdata_cache` and the `game_boot` test passes `--sdata-cache` to `dal_game`.
+- When a file is missing from the cache, `cellFsSdataOpen` fails and the game shows its own error
+  dialog (auto-answered, see "Headless policy").
+
+### Fake RSX
+
+`cellGcmSys` initialization creates the RSX state and starts two things that stand in for the
+graphics hardware. Nothing is drawn: there is no GPU, no shader or texture handling and no window.
+
+- The RSX thread is a host thread without a guest context. It follows the `put` pointer that the
+  game writes into the control register, parses the FIFO (`runtime/src/rsx/fifo_parser.cpp`:
+  methods, increments, jumps, calls and returns, non-incrementing runs) and executes the
+  synchronization methods: semaphores and labels, reports and timestamps, `ref`, the flip
+  command and the user command. It then publishes `get`. Method semantics follow RPCS3's
+  `Emu/RSX/NV47/HW` sources. Every register write is counted for the census, and the thread
+  raises one vertical-blank event every 1/60 s.
+- `_gcm_intr_thread` is a guest service thread, created as in RPCS3. The RSX thread queues the
+  interrupts and this thread runs the handlers the game registered with
+  `cellGcmSetVBlankHandler`, `cellGcmSetFlipHandler` and `cellGcmSetUserHandler`, with the guest
+  lock held. A vblank is not queued while an earlier one is still waiting; flips and user
+  commands are never dropped.
+
+The method census (the `rsx` section of the census) lists the number of FIFO headers, the number
+of distinct methods and flips, how often each interrupt handler ran, and the count per method,
+named when the method has a known name. It is the work list for the drawing code: a method that
+the game writes often and that has no effect yet is a candidate for the first renderer.
 
 ### The `game_boot` test
 
 CTest registers `game_boot` only when `DAL_PPU_GENERATED_DIR`, `DAL_EBOOT_ELF` and
 `DAL_GAME_DIR` are all set (`-PpuDir`, `-EbootElf`, `-GameDir`); otherwise configuration prints
 that it is not registered. It runs `dal_game --game-dir <dir> --elf <elf>` with the arguments
-from the pin file, with a 60 s time limit, and passes when the output matches the milestone
-regular expression. The exit code is not checked: while the boot path is incomplete the run is
-expected to end in a fatal stop somewhere after the milestone, and a stop before the milestone
-leaves the pattern unmatched.
+from the pin file (the run keeps its game data in `build/<preset>/game_hdd`), with a 60 s time
+limit, and passes when the output matches the milestone regular expression. The exit code is not
+checked: the run ends at the 20 s watchdog or at a stop somewhere after the milestone, and a
+stop before the milestone leaves the pattern unmatched.
 
-The pin file `cmake/game_boot.cmake` has two lines:
+The pin file `cmake/game_boot.cmake` holds the arguments and two milestones:
 
 ```cmake
-set(DAL_GAME_BOOT_ARGS "--seconds 20")
-set(DAL_GAME_BOOT_MILESTONE "dal: first hle cellGcmSys::cellGcmGetTiledPitchSize")
+set(DAL_GAME_BOOT_ARGS "--seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
+set(DAL_GAME_BOOT_MILESTONE "\\[t 01000000\\] dal: first hle sceNpTrophy::sceNpTrophyGetTrophyUnlockState")
+set(DAL_GAME_BOOT_MILESTONE_NO_SDATA "\\[t 01000000\\] dal: first hle cellSysutil::cellMsgDialogOpen2")
 ```
 
-When a change lets the game get further, run `dal_game --game-dir <dir> --seconds 20`, take the
-last `dal: first ...` line that appears on every run and set `DAL_GAME_BOOT_MILESTONE` to it. If
-repeated runs differ, pin the latest line that all of them reach. Update only that file; the test
-then guards against regressions.
+A milestone is a `dal: first ...` line written by the main thread (thread id `01000000`), because
+a line from another thread can appear or not depending on scheduling. The first one applies when
+`DAL_RPCS3_CRYPTO_DIR` is set (the test also passes `--sdata-cache`), the second when it is not and
+the game stops at its error dialog for the missing `.sdat` file. When a change lets the game get
+further, run `dal_game --game-dir <dir> --seconds 20 --hdd-dir <empty-dir>` three times, take the
+last main-thread `dal: first ...` line that appears in every run, and set the matching milestone.
+Update only that file; the test then guards against regressions.
 
 ### Current state
 
-On the pinned executable the run loads, initializes thread-local storage, starts four more guest
-threads (all of which block as expected: an SPU printf server on an event queue, a timer thread,
-and two threads on event flags), calls into cellSysmodule, cellGcmSys, cellSpurs and cellSysutil
-through the default handler, and stops in the main thread with a guest fault (read from address 0,
-exit code 3) inside the game's assert helper. The cellGcmSys calls before it are still
-default-handled, which is the next thing to implement.
+On the pinned executable, with the `.sdat` cache, the run loads, initializes thread-local storage
+and starts the game's helper threads (21 guest threads over a 20 s run, 13 of them alive at the
+end). It initializes GCM and the fake RSX, completes the game-data handshake, loads its
+assets (the decrypted `.sdat` files and the texture files its decode threads open), reads the
+pad, registers the trophy context, runs the save-data load (a first boot finds no data, which the
+game accepts), and drives its frame loop: about 280000 FIFO headers and 679 flips in 20 s, with
+the vblank handler running at 60 Hz. The run ends at the watchdog (exit code 5) with the main
+thread waiting on an event flag. The `cellPngDec` and `cellAudio` imports it calls are still
+default-handled, and the game also imports `cellSail`, `cellPamf` and `cellAtrac`, which have no
+handler. The decoded images and the audio port that the game waits for never appear. Without the
+`.sdat` cache the game stops earlier, at its error dialog for the missing file.
 
 ### Not implemented
 
-- Most HLE modules: cellSysmodule, cellSysutil, cellGame, cellGcmSys, cellSpurs and the rest
-  use the default handler.
-- File system: the `sys_fs_*` system calls use the default handler, and there is no virtual file
-  system.
-- Graphics (RSX, video memory at `0xC0000000`), audio, input.
-- SPU and SPURS: SPU system calls use the default handler.
-- Priority scheduling, interrupt threads, savestates.
+- Graphics: the RSX consumes the command buffer but draws nothing; there is no GPU backend,
+  window or video output, and flips only advance the display state.
+- Audio: `cellAudio` and the mixer are default-handled, no sound is produced.
+- Image and media decoding: `cellPngDec`, `cellSail`, `cellPamf` and `cellAtrac` have no handler.
+- Input: only the `neutral` and `none` pad providers; no keyboard or gamepad backend.
+- SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are
+  not scheduled.
+- The remaining imports (61 of 166) use the default handler; see the census of a run.
+- SDAT decryption needs the keys from a local RPCS3 checkout at run time, so it only works on a
+  machine that has one.
+- Priority scheduling, lv2 interrupt threads, savestates.
 
 ## NID and syscall name tables
 
@@ -715,9 +861,10 @@ results are only trusted for the expected build.
 | Path | Contents |
 | --- | --- |
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
-| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `game_main.cpp`; see "Running the game") and runtime-side tests |
+| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `rsx`, `game_main.cpp`; see "Running the game") and runtime-side tests |
+| `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see "SDAT files" |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
-| `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestone |
+| `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
 | `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |

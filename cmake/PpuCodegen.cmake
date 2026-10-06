@@ -81,6 +81,9 @@ function(dal_ppu_add_generated_tree)
         VERBATIM)
       add_custom_target(sdata_cache ALL DEPENDS "${sdata_stamp}")
       list(APPEND boot_args --sdata-cache "${sdata_cache}")
+      set(boot_milestone "${DAL_GAME_BOOT_MILESTONE}")
+    else()
+      set(boot_milestone "${DAL_GAME_BOOT_MILESTONE_NO_SDATA}")
     endif()
 
     add_test(NAME game_boot
@@ -89,7 +92,7 @@ function(dal_ppu_add_generated_tree)
       TIMEOUT 60
       # Only the milestone is asserted: while boot HLE is incomplete the run is expected to stop
       # (often fatally) somewhere after it, and a stop before it leaves the pattern unmatched.
-      PASS_REGULAR_EXPRESSION "${DAL_GAME_BOOT_MILESTONE}")
+      PASS_REGULAR_EXPRESSION "${boot_milestone}")
   endif()
 endfunction()
 
