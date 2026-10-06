@@ -28,6 +28,7 @@
 #include "hle/hle.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_ppu_thread.h"
+#include "lv2/sys_spu.h"
 #include "lv2/syscalls.h"
 #include "lv2/sys_sync.h"
 
@@ -1340,7 +1341,12 @@ void testSpuAndSysmodule() {
   CHECK(syscallAs(*a, 128, queue_id_out, attr, 0, 2) == 0);
   const std::uint32_t queue = dalRead32(base, queue_id_out);
 
-  // sc 251: req 0 is invalid, an unknown queue is ESRCH, the port is the lowest requested bit.
+  // sc 251: req 0 is invalid, an unknown group or queue is ESRCH, the port is the lowest
+  // requested bit.
+  dal::resetSpuThreadGroups();
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, 4, spup) == err(dal::kCellEsrch));
+  CHECK(dal::createSpuThreadGroup() == 0x04000100);
+  CHECK(!dal::spuThreadGroupExists(0x04000101));
   dalWrite8(base, spup, 0xee);
   CHECK(syscallAs(*a, 251, 0x04000100, queue, 0, spup) == err(dal::kCellEinval));
   CHECK(syscallAs(*a, 251, 0x04000100, 0x8d000fff, 4, spup) == err(dal::kCellEsrch));
@@ -1355,7 +1361,7 @@ void testSpuAndSysmodule() {
 
   const std::string census = dal::formatCensus();
   CHECK(census.find("sc 169 sys_spu_initialize: 3 [impl]") != std::string::npos);
-  CHECK(census.find("sc 251 sys_spu_thread_group_connect_event_all_threads: 6 [impl]") !=
+  CHECK(census.find("sc 251 sys_spu_thread_group_connect_event_all_threads: 7 [impl]") !=
         std::string::npos);
 
   // cellSysmodule: any id succeeds; the first load and unload of each id is logged once.
@@ -1383,6 +1389,134 @@ void testSpuAndSysmodule() {
   CHECK(dal::formatCensus().find("cellSysmodule::cellSysmoduleLoadModule: 3 [impl]") !=
         std::string::npos);
 
+  dal::resetSpuThreadGroups();
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+void testSpurs() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::resetSpuThreadGroups();
+  dal::resetSpurs();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t attr = scratch, spurs = scratch + 0x4000, out = scratch + 0x8000;
+  const std::uint32_t queue_id_out = scratch + 0x8100, queue_attr = scratch + 0x8140;
+  const std::uint32_t spup = scratch + 0x8180;
+  constexpr std::uint32_t kErrNull = 0x80410711, kErrAlign = 0x80410710, kErrInval = 0x80410702;
+
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x95180230, "cellSpurs", "_cellSpursAttributeInitialize"},
+      {0x00800010, 0x30aa96c4, "cellSpurs", "cellSpursInitializeWithAttribute2"},
+      {0x00800020, 0x39c173fb, "cellSpurs", "cellSpursGetSpuThreadGroupId"},
+      {0x00800030, 0xca4c4600, "cellSpurs", "cellSpursFinalize"},
+  };
+  dal::installImports(imports, 4);
+  auto a = makeCaller(0x01000000);
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  DalPpuContext* ctx = &a->context();
+  const auto call = [&](std::uint32_t index, std::initializer_list<std::uint64_t> args) {
+    int reg = 3;
+    for (const std::uint64_t value : args) ctx->gpr[reg++] = value;
+    dalHleCall(ctx, base, index);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+
+  // _cellSpursAttributeInitialize: the struct is zeroed, then the seven fields are stored.
+  std::memset(base + attr, 0xaa, 512);
+  CHECK(call(0, {0, 1, 0x330000, 5, 100, 1000, 1}) == kErrNull);
+  CHECK(call(0, {attr + 4, 1, 0x330000, 5, 100, 1000, 1}) == kErrAlign);
+  CHECK(dalRead8(base, attr) == 0xaa);  // a rejected call writes nothing
+  CHECK(call(0, {attr, 1, 0x330000, 5, 100, 1000, 1}) == 0);
+  CHECK(dalRead32(base, attr + 0x00) == 1);
+  CHECK(dalRead32(base, attr + 0x04) == 0x330000);
+  CHECK(dalRead32(base, attr + 0x08) == 5);
+  CHECK(dalRead32(base, attr + 0x0c) == 100);
+  CHECK(dalRead32(base, attr + 0x10) == 1000);
+  CHECK(dalRead8(base, attr + 0x14) == 1);
+  CHECK(dalRead32(base, attr + 0x24) == 0 && dalRead32(base, attr + 0x28) == 0);
+  CHECK(dalRead8(base, attr + 0x1ff) == 0);
+  CHECK(call(0, {attr, 2, 0x330000, 6, 3, 4, 0}) == 0);
+  CHECK(dalRead8(base, attr + 0x14) == 0);
+
+  // cellSpursInitializeWithAttribute2: argument checks first.
+  CHECK(call(1, {spurs, 0}) == kErrNull);
+  CHECK(call(1, {spurs, attr + 4}) == kErrAlign);
+  CHECK(call(1, {0, attr}) == kErrNull);
+  CHECK(call(1, {spurs + 0x80 + 8, attr}) == kErrAlign);
+  CHECK(call(1, {spurs + 0x10, attr}) == kErrAlign);
+  dalWrite32(base, attr, 3);
+  CHECK(call(1, {spurs, attr}) == kErrInval);  // revision > 2
+  dalWrite32(base, attr, 2);
+  dalWrite32(base, attr + 0x24, 16);
+  CHECK(call(1, {spurs, attr}) == kErrInval);  // prefix longer than 15 bytes
+  dalWrite32(base, attr + 0x24, 3);
+  std::memcpy(base + attr + 0x15, "abc", 3);
+  dalWrite8(base, attr + 0x14, 1);  // exitIfNoWork
+  std::memset(base + spurs, 0x55, 0x2000);
+  CHECK(call(1, {spurs, attr}) == 0);
+
+  CHECK(dalRead32(base, spurs + 0xda0) == 2);          // revision
+  CHECK(dalRead32(base, spurs + 0xda4) == 0x330000);   // sdkVersion
+  CHECK(dalRead32(base, spurs + 0xd80) == 5);          // exit-if-no-work | second version
+  CHECK(dalRead32(base, spurs + 0xd84) == 3);          // spuPriority
+  CHECK(dalRead32(base, spurs + 0xd88) == 4);          // ppuPriority
+  CHECK(dalRead8(base, spurs + 0x76) == 6);            // nSpus
+  CHECK(dalRead8(base, spurs + 0x74) == 0xc0);         // 32 workloads | exit if no work
+  CHECK(dalRead8(base, spurs + 0xd9b) == 3);           // prefixSize
+  CHECK(std::memcmp(base + spurs + 0xd8c, "abc", 3) == 0);
+  CHECK(dalRead64(base, spurs + 0xd20) == 0xffffffffull);
+  CHECK(dalRead8(base, spurs + 0x1fff) == 0 && dalRead8(base, spurs + 0x500) == 0);  // zeroed
+  const std::uint32_t group = dalRead32(base, spurs + 0xd30);
+  CHECK(group == 0x04000100);
+  CHECK(dal::spuThreadGroupExists(group));
+  CHECK(countContaining(lines, "dal: spurs: initialized") == 1);
+
+  // cellSpursGetSpuThreadGroupId writes the id.
+  dalWrite32(base, out, 0);
+  CHECK(call(2, {spurs, 0}) == kErrNull);
+  CHECK(call(2, {0, out}) == kErrNull);
+  CHECK(call(2, {spurs + 8, out}) == kErrAlign);
+  CHECK(call(2, {spurs, out}) == 0);
+  CHECK(dalRead32(base, out) == group);
+
+  // sc 251 accepts the SPURS group id and rejects ids that were never handed out.
+  dalWrite32(base, queue_attr, 1);
+  dalWrite32(base, queue_attr + 4, 2);
+  CHECK(syscallAs(*a, 128, queue_id_out, queue_attr, 0, 2) == 0);
+  const std::uint32_t queue = dalRead32(base, queue_id_out);
+  CHECK(syscallAs(*a, 251, group, queue, 1, spup) == 0);
+  CHECK(syscallAs(*a, 251, group + 0x100, queue, 1, spup) == err(dal::kCellEsrch));
+
+  // A second instance gets the next id; finalize releases only its own group.
+  const std::uint32_t spurs2 = scratch + 0x2000;
+  CHECK(call(1, {spurs2, attr}) == 0);
+  CHECK(dalRead32(base, spurs2 + 0xd30) == group + 0x100);
+  CHECK(call(3, {0}) == kErrNull);
+  CHECK(call(3, {spurs2 + 8}) == kErrAlign);
+  CHECK(call(3, {spurs2}) == 0);
+  CHECK(!dal::spuThreadGroupExists(group + 0x100));
+  CHECK(dal::spuThreadGroupExists(group));
+  CHECK(call(3, {spurs}) == 0);
+  CHECK(!dal::spuThreadGroupExists(group));
+  CHECK(syscallAs(*a, 251, group, queue, 1, spup) == err(dal::kCellEsrch));
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("cellSpurs::cellSpursInitializeWithAttribute2: ") != std::string::npos);
+  CHECK(countContaining(lines, "dal: default hle") == 0);
+
+  dal::resetSpurs();
+  dal::resetSpuThreadGroups();
   p.main.free(scratch);
   dal::resetSyncObjects();
   dal::setLogSink({});
@@ -2050,6 +2184,7 @@ int main(int argc, char** argv) {
   testMutexAndCond();
   testEventObjects();
   testSpuAndSysmodule();
+  testSpurs();
   testLwmutex();
   testPpuThreads();
   testTimebase();

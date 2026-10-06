@@ -24,6 +24,12 @@ std::span<const HleEntry> sysPrxForUserHandlers();
 // Handlers of the cellSysmodule module.
 std::span<const HleEntry> cellSysmoduleHandlers();
 
+// Handlers of the cellSpurs module.
+std::span<const HleEntry> cellSpursHandlers();
+
+// Forgets every initialized SPURS object and releases its thread group. Intended for tests.
+void resetSpurs();
+
 // Resolves every import to a handler by (module, fnid); imports without one get the default
 // handler. A name that differs between the registry and the import table is a warning. Replaces
 // any earlier installation. Call before any guest thread runs.
