@@ -1,0 +1,66 @@
+#pragma once
+
+#include <cstdint>
+#include <format>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace dal {
+
+enum class LogLevel { Info, Warn, Error };
+
+// Returns the id of the guest thread running on the calling host thread, or nullopt on a host
+// thread. Registered by the thread layer so the logger does not depend on it.
+using GuestThreadIdFn = std::optional<std::uint32_t> (*)();
+
+void setGuestThreadIdProvider(GuestThreadIdFn fn);
+
+// Mirrors every line to `path` (truncated) in addition to stderr. Returns false when the file
+// cannot be opened; an empty path closes the current file.
+bool setLogFile(const std::string& path);
+
+// Replaces all output with `sink`, which receives each complete line without a trailing newline.
+// An empty function restores stderr and the log file. Intended for tests.
+void setLogSink(std::function<void(std::string_view)> sink);
+
+// Forgets which keys logOnce has seen. Intended for tests.
+void resetLogOnce();
+
+void logWrite(LogLevel level, std::string_view message);
+
+// Returns true the first time `key` is passed in.
+bool firstUse(std::string_view key);
+
+template <typename... Args>
+void logInfo(std::format_string<Args...> fmt, Args&&... args) {
+  logWrite(LogLevel::Info, std::format(fmt, std::forward<Args>(args)...));
+}
+
+template <typename... Args>
+void logWarn(std::format_string<Args...> fmt, Args&&... args) {
+  logWrite(LogLevel::Warn, std::format(fmt, std::forward<Args>(args)...));
+}
+
+template <typename... Args>
+void logError(std::format_string<Args...> fmt, Args&&... args) {
+  logWrite(LogLevel::Error, std::format(fmt, std::forward<Args>(args)...));
+}
+
+// Logs only the first time `key` is seen, so hot paths can report an unimplemented call without
+// flooding the output. The message is not formatted on later calls.
+template <typename... Args>
+void logOnce(LogLevel level, std::string_view key, std::format_string<Args...> fmt, Args&&... args) {
+  if (firstUse(key)) {
+    logWrite(level, std::format(fmt, std::forward<Args>(args)...));
+  }
+}
+
+template <typename... Args>
+void logOnce(std::string_view key, std::format_string<Args...> fmt, Args&&... args) {
+  logOnce(LogLevel::Info, key, fmt, std::forward<Args>(args)...);
+}
+
+}  // namespace dal

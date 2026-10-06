@@ -19,7 +19,8 @@ function(dal_ppu_codegen_options target)
 endfunction()
 
 # Adds the generated PPU tree and its link test when DAL_PPU_GENERATED_DIR is set. Call after
-# dal_ppu_stub is defined.
+# dal_ppu_stub is defined. dal_ppu_generated links no hook library; each consumer picks the stub
+# or the real runtime.
 set(DAL_PPU_GENERATED_DIR "" CACHE PATH "Output directory of 'ps3tool emit' (empty: no generated code)")
 
 function(dal_ppu_add_generated_tree)
@@ -43,7 +44,6 @@ function(dal_ppu_add_generated_tree)
   add_library(dal_ppu_generated STATIC ${DAL_PPU_GENERATED_SOURCES})
   dal_ppu_codegen_options(dal_ppu_generated)
   target_include_directories(dal_ppu_generated PUBLIC "${generated_dir}")
-  target_link_libraries(dal_ppu_generated PUBLIC dal_ppu_stub)
 
   add_executable(dal_ppu_link_test runtime/tests/ppu_link_test.cpp)
   target_compile_options(dal_ppu_link_test PRIVATE -march=x86-64-v3 -Wall -Wextra)

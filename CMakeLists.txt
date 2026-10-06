@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(cmake/CompilerChecks.cmake)
 include(cmake/PpuCodegen.cmake)
+include(cmake/Runtime.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -26,6 +27,7 @@ target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
 
 dal_ppu_add_generated_tree()
+dal_runtime_add_core()
 
 add_executable(dal_ppu_header_check runtime/tests/ppu_header_check.c)
 dal_ppu_codegen_options(dal_ppu_header_check)
