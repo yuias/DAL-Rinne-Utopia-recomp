@@ -63,6 +63,20 @@ void sysPpuThreadJoin(DalPpuContext* ctx, std::uint8_t* base);
 void sysPpuThreadSetPriority(DalPpuContext* ctx, std::uint8_t* base);
 void sysPpuThreadGetPriority(DalPpuContext* ctx, std::uint8_t* base);
 
+// Handlers defined in sys_fs.cpp.
+void sysFsOpen(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsRead(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsWrite(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsClose(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsOpendir(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsReaddir(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsClosedir(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsStat(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsFstat(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsMkdir(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsUnlink(DalPpuContext* ctx, std::uint8_t* base);
+void sysFsLseek(DalPpuContext* ctx, std::uint8_t* base);
+
 // Handlers defined in sys_spu.cpp.
 void sysSpuInitialize(DalPpuContext* ctx, std::uint8_t* base);
 void sysSpuThreadGroupConnectEventAllThreads(DalPpuContext* ctx, std::uint8_t* base);
@@ -121,14 +135,18 @@ constexpr SyscallEntry kSyscalls[] = {
     {352, "sys_memory_get_user_memory_size", sysMemoryGetUserMemorySize},
     {402, "sys_tty_read", sysTtyRead},
     {403, "sys_tty_write", sysTtyWrite},
-    {801, "sys_fs_open", nullptr},
-    {802, "sys_fs_read", nullptr},
-    {803, "sys_fs_write", nullptr},
-    {804, "sys_fs_close", nullptr},
-    {805, "sys_fs_opendir", nullptr},
-    {806, "sys_fs_readdir", nullptr},
-    {807, "sys_fs_closedir", nullptr},
-    {818, "sys_fs_lseek", nullptr},
+    {801, "sys_fs_open", sysFsOpen},
+    {802, "sys_fs_read", sysFsRead},
+    {803, "sys_fs_write", sysFsWrite},
+    {804, "sys_fs_close", sysFsClose},
+    {805, "sys_fs_opendir", sysFsOpendir},
+    {806, "sys_fs_readdir", sysFsReaddir},
+    {807, "sys_fs_closedir", sysFsClosedir},
+    {808, "sys_fs_stat", sysFsStat},
+    {809, "sys_fs_fstat", sysFsFstat},
+    {811, "sys_fs_mkdir", sysFsMkdir},
+    {814, "sys_fs_unlink", sysFsUnlink},
+    {818, "sys_fs_lseek", sysFsLseek},
     {988, nullptr, nullptr},
 };
 

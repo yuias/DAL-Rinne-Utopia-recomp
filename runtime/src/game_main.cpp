@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <string_view>
@@ -17,12 +18,14 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "lv2/vfs.h"
 
 namespace {
 
 struct Options {
   std::string game_dir;
   std::string elf;
+  std::string hdd_dir;
   std::string log_file;
   unsigned seconds = 0;
   bool strict = false;
@@ -52,6 +55,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.game_dir)) return false;
     } else if (arg == "--elf") {
       if (!value(opt.elf)) return false;
+    } else if (arg == "--hdd-dir") {
+      if (!value(opt.hdd_dir)) return false;
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
     } else if (arg == "--seconds") {
@@ -106,6 +111,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "error: cannot open log file %s\n", opt.log_file.c_str());
     return static_cast<int>(dal::ExitCode::Usage);
   }
+
+  dal::configureVfs(game_dir, opt.hdd_dir.empty()
+                                  ? std::nullopt
+                                  : std::optional<std::filesystem::path>(opt.hdd_dir));
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();

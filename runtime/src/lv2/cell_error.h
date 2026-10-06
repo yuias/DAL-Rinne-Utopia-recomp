@@ -27,7 +27,17 @@ inline constexpr std::uint32_t kCellEcanceled = 0x80010013;
 inline constexpr std::uint32_t kCellEexist = 0x80010014;
 inline constexpr std::uint32_t kCellEisconn = 0x80010015;
 inline constexpr std::uint32_t kCellEnotconn = 0x80010016;
+inline constexpr std::uint32_t kCellEisdir = 0x80010012;
+inline constexpr std::uint32_t kCellErofs = 0x80010026;
+inline constexpr std::uint32_t kCellEacces = 0x80010029;
+inline constexpr std::uint32_t kCellEbadf = 0x8001002A;
 inline constexpr std::uint32_t kCellEio = 0x8001002B;
+inline constexpr std::uint32_t kCellEmfile = 0x8001002C;
+inline constexpr std::uint32_t kCellEnotdir = 0x8001002E;
+inline constexpr std::uint32_t kCellEnametoolong = 0x80010034;
+inline constexpr std::uint32_t kCellEnotempty = 0x80010036;
+inline constexpr std::uint32_t kCellEfsspecific = 0x80010038;
+inline constexpr std::uint32_t kCellEnotmounted = 0x8001003A;
 
 // Synchronization object attributes.
 inline constexpr std::uint32_t kSyncFifo = 1;

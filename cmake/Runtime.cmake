@@ -38,11 +38,13 @@ function(dal_runtime_add_core)
     runtime/src/hle/hle.cpp
     runtime/src/hle/sys_prx_for_user.cpp
     runtime/src/lv2/sys_event.cpp
+    runtime/src/lv2/sys_fs.cpp
     runtime/src/lv2/sys_misc.cpp
     runtime/src/lv2/sys_mutex_cond.cpp
     runtime/src/lv2/sys_ppu_thread.cpp
     runtime/src/lv2/sys_spu.cpp
     runtime/src/lv2/syscalls.cpp
+    runtime/src/lv2/vfs.cpp
     runtime/src/rsx/fifo_parser.cpp
     runtime/src/rsx/gcm_interrupts.cpp
     runtime/src/rsx/rsx_state.cpp

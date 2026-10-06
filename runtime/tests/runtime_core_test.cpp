@@ -33,6 +33,7 @@
 #include "lv2/sys_ppu_thread.h"
 #include "lv2/sys_spu.h"
 #include "lv2/syscalls.h"
+#include "lv2/vfs.h"
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
@@ -526,7 +527,7 @@ void testSyscalls() {
   dal::resetLogOnce();
 
   const auto table = dal::syscallTable();
-  CHECK(table.size() == 57);  // the 53 census numbers plus the implemented 22, 41, 43 and 103
+  CHECK(table.size() == 61);  // the 53 census numbers plus the implemented 22, 41, 43 and 103
   bool sorted = true;
   for (std::size_t i = 1; i < table.size(); i++) sorted = sorted && table[i - 1].number < table[i].number;
   CHECK(sorted);
@@ -868,6 +869,256 @@ void testStartupSyscalls() {
   p.main.free(scratch);
   dal::setLogSink({});
   dal::resetCensus();
+}
+
+void testFileSystem() {
+  namespace stdfs = std::filesystem;
+  dal::setLogSink([](std::string_view) {});
+  dal::resetLogOnce();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t path_a = scratch;
+  const std::uint32_t buf = scratch + 0x2000;  // data buffer
+  const std::uint32_t out = scratch + 0x3000;  // fd / nread / pos
+  const std::uint32_t sb = scratch + 0x3100;   // CellFsStat
+  const std::uint32_t ent = scratch + 0x3200;  // CellFsDirent
+  const std::uint32_t big = scratch + 0x4000;
+
+  auto put = [&](std::uint32_t addr, std::string_view text) {
+    std::memcpy(base + addr, text.data(), text.size());
+    base[addr + text.size()] = 0;
+  };
+  auto open = [&](std::string_view path, std::uint64_t flags) {
+    put(path_a, path);
+    return syscall(801, path_a, flags, out);
+  };
+  auto fdOut = [&] { return dalRead32(base, out); };
+  auto hostFile = [](const stdfs::path& path, std::string_view data) {
+    stdfs::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << data;
+  };
+  auto hostRead = [](const stdfs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+  };
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_vfs_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  const stdfs::path game = root / "game";
+  hostFile(game / "b.txt", "0123456789");
+  hostFile(game / "PS3_GAME" / "USRDIR" / "a.bin", "usrdir");
+  stdfs::create_directories(game / "sub");
+
+  // Resolution rules.
+  dal::configureVfs(game, std::nullopt);
+  bool read_only = false;
+  const auto resolved = dal::resolveGuestPath("/dev_bdvd/sub/../b.txt", read_only);
+  CHECK(resolved && read_only && stdfs::equivalent(*resolved, game / "b.txt"));
+  CHECK(!dal::resolveGuestPath("/dev_bdvd/../b.txt", read_only));
+  CHECK(!dal::resolveGuestPath("/dev_bdvd/sub/../../x", read_only));
+  CHECK(!dal::resolveGuestPath("/dev_bdvd/a:b", read_only));
+  CHECK(!dal::resolveGuestPath("/dev_bdvd/NUL.txt", read_only));
+  CHECK(!dal::resolveGuestPath("/dev_hdd0/x", read_only));  // no hdd directory configured
+  CHECK(!dal::resolveGuestPath("/dev_usb000/x", read_only));
+  CHECK(!dal::resolveGuestPath("relative", read_only));
+
+  // open/read/lseek/close.
+  CHECK(open("/dev_bdvd/b.txt", 0) == 0);
+  const std::uint32_t fd = fdOut();
+  CHECK(fd == 3);
+  CHECK(syscall(802, fd, buf, 4, out) == 0 && dalRead64(base, out) == 4);
+  CHECK(std::memcmp(base + buf, "0123", 4) == 0);
+  CHECK(syscall(818, fd, 2, 0, out) == 0 && dalRead64(base, out) == 2);
+  CHECK(syscall(802, fd, buf, 3, out) == 0 && dalRead64(base, out) == 3);
+  CHECK(std::memcmp(base + buf, "234", 3) == 0);
+  CHECK(syscall(818, fd, static_cast<std::uint64_t>(-2), 2, out) == 0 && dalRead64(base, out) == 8);
+  CHECK(syscall(802, fd, buf, 100, out) == 0 && dalRead64(base, out) == 2);  // short read at the end
+  CHECK(syscall(802, fd, buf, 100, out) == 0 && dalRead64(base, out) == 0);
+  CHECK(syscall(818, fd, 0, 3, out) == err(dal::kCellEinval));
+  CHECK(syscall(818, fd, static_cast<std::uint64_t>(-100), 0, out) == err(dal::kCellEinval));
+  CHECK(syscall(802, fd, 0, 1, out) == err(dal::kCellEfault));
+  CHECK(syscall(802, fd, buf, 1, 0) == err(dal::kCellEfault));
+  CHECK(syscall(803, fd, buf, 1, out) == err(dal::kCellEbadf));  // opened read-only
+  // fstat reports a read-only regular file on the disc.
+  CHECK(syscall(809, fd, sb) == 0);
+  CHECK(dalRead32(base, sb) == 0100444 && dalRead32(base, sb + 4) == 0xFFFFFFFFu);
+  CHECK(dalRead64(base, sb + 36) == 10 && dalRead64(base, sb + 44) == 2048);
+  CHECK(syscall(804, fd) == 0);
+  CHECK(syscall(804, fd) == err(dal::kCellEbadf));
+  CHECK(syscall(802, fd, buf, 1, out) == err(dal::kCellEbadf) && dalRead64(base, out) == 0);
+
+  // Read-only enforcement on the disc.
+  CHECK(open("/dev_bdvd/b.txt", 1) == err(dal::kCellEperm));
+  CHECK(open("/dev_bdvd/b.txt", 02) == err(dal::kCellEperm));
+  CHECK(open("/dev_bdvd/new.bin", 0101) == err(dal::kCellEperm));
+  CHECK(open("/dev_bdvd/new.bin", 0) == err(dal::kCellEnoent));
+  CHECK(open("/dev_bdvd/b.txt", 03) == err(dal::kCellEinval));
+  put(path_a, "/dev_bdvd/x");
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellErofs));
+  put(path_a, "/dev_bdvd/b.txt");
+  CHECK(syscall(814, path_a) == err(dal::kCellErofs));
+  CHECK(stdfs::exists(game / "b.txt"));
+
+  // Path errors.
+  CHECK(open("/dev_bdvd/../b.txt", 0) == err(dal::kCellEnoent));
+  CHECK(open("b.txt", 0) == err(dal::kCellEnoent));
+  CHECK(open("/dev_usb000/b.txt", 0) == err(dal::kCellEnotmounted));
+  CHECK(open("/dev_bdvd", 0) == err(dal::kCellEisdir));
+  CHECK(open("/", 0) == err(dal::kCellEisdir));
+  CHECK(open("/dev_bdvd/b.txt/x", 0) == err(dal::kCellEnotdir));
+  CHECK(syscall(801, 0, 0, out) == err(dal::kCellEfault));
+  CHECK(!p.memory.isCommitted(0x0D000000, 1));
+  CHECK(syscall(801, 0x0D000000, 0, out) == err(dal::kCellEfault));
+  std::memset(base + big, 'a', 1100);
+  base[big] = '/';
+  base[big + 1100] = 0;
+  CHECK(syscall(801, big, 0, out) == err(dal::kCellEnametoolong));
+  CHECK(open("/dev_hdd0/x", 0) == err(dal::kCellEnoent));  // not configured
+  CHECK(open("/app_home/a.bin", 0) == 0);
+  const std::uint32_t app_fd = fdOut();
+  CHECK(syscall(802, app_fd, buf, 6, out) == 0 && std::memcmp(base + buf, "usrdir", 6) == 0);
+  CHECK(syscall(804, app_fd) == 0);
+
+  // stat.
+  put(path_a, "/dev_bdvd/b.txt");
+  CHECK(syscall(808, path_a, sb) == 0 && dalRead32(base, sb) == 0100444);
+  CHECK(dalRead64(base, sb + 36) == 10);
+  put(path_a, "/dev_bdvd/sub");
+  CHECK(syscall(808, path_a, sb) == 0 && dalRead32(base, sb) == 040555);
+  CHECK(dalRead64(base, sb + 36) == 2048);  // a directory reports its block size
+  put(path_a, "/dev_bdvd/b.txt/");
+  CHECK(syscall(808, path_a, sb) == err(dal::kCellEnotdir));
+  put(path_a, "/dev_bdvd/missing");
+  CHECK(syscall(808, path_a, sb) == err(dal::kCellEnoent));
+  put(path_a, "/");
+  CHECK(syscall(808, path_a, sb) == 0 && dalRead32(base, sb) == 040711);
+  put(path_a, "/dev_usb000");
+  CHECK(syscall(808, path_a, sb) == err(dal::kCellEnotmounted));
+
+  // opendir/readdir: ".", "..", then names in byte order; at the end nread is 0 and the entry is
+  // zeroed.
+  put(path_a, "/dev_bdvd");
+  CHECK(syscall(805, path_a, out) == 0);
+  const std::uint32_t dir = fdOut();
+  std::vector<std::string> names;
+  std::vector<int> types;
+  for (int i = 0; i < 10; i++) {
+    std::memset(base + ent, 0xEE, 258);
+    CHECK(syscall(806, dir, ent, out + 8) == 0);
+    if (dalRead64(base, out + 8) == 0) {
+      break;
+    }
+    CHECK(dalRead64(base, out + 8) == 258);
+    names.emplace_back(reinterpret_cast<const char*>(base + ent + 2), base[ent + 1]);
+    types.push_back(base[ent]);
+  }
+  CHECK((names == std::vector<std::string>{".", "..", "PS3_GAME", "b.txt", "sub"}));
+  CHECK((types == std::vector<int>{1, 1, 1, 2, 1}));
+  bool zeroed = true;
+  for (int i = 0; i < 258; i++) {
+    zeroed = zeroed && base[ent + i] == 0;
+  }
+  CHECK(zeroed);
+  CHECK(syscall(806, dir, ent, out + 8) == 0 && dalRead64(base, out + 8) == 0);  // stays at the end
+  CHECK(syscall(804, dir) == err(dal::kCellEbadf));  // a directory is not a file
+  CHECK(syscall(807, dir) == 0);
+  CHECK(syscall(807, dir) == err(dal::kCellEbadf));
+  CHECK(syscall(806, dir, ent, out + 8) == err(dal::kCellEbadf));
+  put(path_a, "/dev_bdvd/b.txt");
+  CHECK(syscall(805, path_a, out) == err(dal::kCellEnotdir));
+  put(path_a, "/dev_bdvd/missing");
+  CHECK(syscall(805, path_a, out) == err(dal::kCellEnoent));
+  put(path_a, "/");
+  CHECK(syscall(805, path_a, out) == 0);  // the virtual root lists the mounted devices
+  CHECK(syscall(807, fdOut()) == 0);
+
+  // Writable device.
+  const stdfs::path hdd = root / "hdd";
+  dal::configureVfs(game, hdd);
+  CHECK(stdfs::is_directory(hdd / "dev_hdd0") && stdfs::is_directory(hdd / "dev_hdd1"));
+  CHECK(open("/dev_hdd0/out.bin", 0101) == err(dal::kCellEacces));  // direct child of /dev_hdd0
+  CHECK(stdfs::is_directory(hdd / "dev_hdd0" / "game") && stdfs::is_directory(hdd / "dev_hdd0" / "tmp"));
+  put(path_a, "/dev_hdd0/game");
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellEexist));
+  put(path_a, "/dev_hdd0/newdir");
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellEacces));  // games cannot add to /dev_hdd0
+  put(path_a, "/dev_hdd0/game/NEWGAME");
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellEacces));
+  put(path_a, "/dev_hdd0/tmp/data");
+  CHECK(syscall(811, path_a, 0777) == 0);
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellEexist));
+  put(path_a, "/dev_hdd0/tmp/nope/x");
+  CHECK(syscall(811, path_a, 0777) == err(dal::kCellEnoent));
+
+  CHECK(open("/dev_hdd0/tmp/data/out.bin", 01101) == 0);  // WRONLY | CREAT | TRUNC
+  const std::uint32_t wfd = fdOut();
+  put(buf, "hello");
+  CHECK(syscall(803, wfd, buf, 5, out) == 0 && dalRead64(base, out) == 5);
+  CHECK(syscall(802, wfd, buf, 1, out) == err(dal::kCellEbadf));  // write-only
+  CHECK(syscall(804, wfd) == 0);
+  CHECK(hostRead(hdd / "dev_hdd0" / "tmp" / "data" / "out.bin") == "hello");
+  CHECK(open("/dev_hdd0/tmp/data/out.bin", 0201 | 0100) == err(dal::kCellEexist));  // CREAT | EXCL
+  CHECK(open("/dev_hdd0/tmp/data/out.bin", 02001) == 0);                           // WRONLY | APPEND
+  const std::uint32_t afd = fdOut();
+  put(buf, "!!");
+  CHECK(syscall(803, afd, buf, 2, out) == 0 && dalRead64(base, out) == 2);
+  CHECK(syscall(804, afd) == 0);
+  CHECK(hostRead(hdd / "dev_hdd0" / "tmp" / "data" / "out.bin") == "hello!!");
+  CHECK(open("/dev_hdd0/tmp/data/out.bin", 02) == 0);  // RDWR keeps the contents
+  const std::uint32_t rfd = fdOut();
+  CHECK(syscall(818, rfd, 1, 0, out) == 0);
+  put(buf, "E");
+  CHECK(syscall(803, rfd, buf, 1, out) == 0);
+  CHECK(syscall(818, rfd, 0, 0, out) == 0 && syscall(802, rfd, buf + 0x100, 16, out) == 0);
+  CHECK(dalRead64(base, out) == 7 && std::memcmp(base + buf + 0x100, "hEllo!!", 7) == 0);
+  CHECK(syscall(809, rfd, sb) == 0 && dalRead32(base, sb) == 0100666 && dalRead64(base, sb + 36) == 7);
+  CHECK(syscall(804, rfd) == 0);
+  CHECK(open("/dev_hdd0/tmp/data/out.bin", 01000) == 0);  // RDONLY | TRUNC empties it
+  CHECK(syscall(804, fdOut()) == 0);
+  CHECK(hostRead(hdd / "dev_hdd0" / "tmp" / "data" / "out.bin").empty());
+  put(path_a, "/dev_hdd0/tmp/data");
+  CHECK(syscall(814, path_a) == err(dal::kCellEisdir));
+  put(path_a, "/dev_hdd0/tmp/data/out.bin");
+  CHECK(syscall(814, path_a) == 0);
+  CHECK(syscall(814, path_a) == err(dal::kCellEnoent));
+  CHECK(!stdfs::exists(hdd / "dev_hdd0" / "tmp" / "data" / "out.bin"));
+  put(path_a, "/dev_hdd1/y");
+  CHECK(syscall(811, path_a, 0777) == 0);
+  put(path_a, "/dev_hdd1");
+  CHECK(syscall(805, path_a, out) == 0);
+  const std::uint32_t d1 = fdOut();
+  for (int i = 0; i < 3; i++) {
+    CHECK(syscall(806, d1, ent, out + 8) == 0 && dalRead64(base, out + 8) == 258);
+  }
+  // hdd1 repeats its last entry at the end instead of zeroing it.
+  CHECK(syscall(806, d1, ent, out + 8) == 0 && dalRead64(base, out + 8) == 0);
+  CHECK(base[ent + 1] == 1 && base[ent + 2] == 'y');
+  CHECK(syscall(807, d1) == 0);
+
+  // The id space: 252 objects starting at 3, then EMFILE.
+  std::vector<std::uint32_t> fds;
+  while (open("/dev_bdvd/b.txt", 0) == 0) {
+    fds.push_back(fdOut());
+  }
+  CHECK(fds.size() == 252 && fds.front() == 3 && fds.back() == 254);
+  CHECK(open("/dev_bdvd/b.txt", 0) == err(dal::kCellEmfile));
+  put(path_a, "/dev_bdvd");
+  CHECK(syscall(805, path_a, out) == err(dal::kCellEmfile));
+  CHECK(syscall(804, fds[1]) == 0);
+  CHECK(open("/dev_bdvd/b.txt", 0) == 0 && fdOut() == fds[1]);  // the lowest free id is reused
+  for (const std::uint32_t id : fds) {
+    syscall(804, id);
+  }
+
+  p.main.free(scratch);
+  stdfs::remove_all(root, ec);
+  dal::configureVfs({}, std::nullopt);
+  dal::setLogSink({});
 }
 
 void testSysPrxForUser() {
@@ -3030,6 +3281,7 @@ int main(int argc, char** argv) {
   testHleOutPointerHints();
   testHostFunctionsAndCallGuestFunction();
   testStartupSyscalls();
+  testFileSystem();
   testSysPrxForUser();
   testMutexAndCond();
   testEventObjects();

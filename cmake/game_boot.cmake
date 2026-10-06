@@ -1,2 +1,2 @@
-set(DAL_GAME_BOOT_ARGS "--seconds 20")
-set(DAL_GAME_BOOT_MILESTONE "dal: first sc 806 sys_fs_readdir")
+set(DAL_GAME_BOOT_ARGS "--seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
+set(DAL_GAME_BOOT_MILESTONE "dal: first hle sys_fs::cellFsClose")
