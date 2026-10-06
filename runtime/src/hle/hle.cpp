@@ -38,9 +38,6 @@ bool g_quiet = false;
 
 }  // namespace
 
-// Replaced by the sysPrxForUser handler file once it has handlers.
-std::span<const HleEntry> sysPrxForUserHandlers() { return {}; }
-
 void installImports(const DalImportInfo* imports, std::uint32_t count) {
   std::map<std::pair<std::string, std::uint32_t>, const HleEntry*> registry;
   for (const HleEntry& entry : sysPrxForUserHandlers()) {

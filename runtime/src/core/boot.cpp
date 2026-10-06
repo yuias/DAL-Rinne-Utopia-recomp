@@ -133,6 +133,11 @@ void bootMainThread(const LoadedExecutable& exe, std::string_view argv0) {
     fatal(FatalKind::Internal, "cannot allocate the primary stack");
   }
 
+  // RPCS3 charges the primary stack and the loaded segments to the default memory container
+  // (`ppu_load_exec`, "take(primary_stacksize + segs_size)"); the image range stands in for the
+  // segments, which are 64 KiB rounded.
+  p.user_memory_used = thread->stackSize() + (exe.image_end - kMainRegion.begin);
+
   // Argument block at the top of the stack: argv[] (u64 pointers), 0, envp[] (empty), 0, padding
   // to 16 bytes, then the strings. The environment is empty.
   constexpr std::uint32_t kArgc = 1, kEnvc = 0;

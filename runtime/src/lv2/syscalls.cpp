@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <format>
 #include <string_view>
 
@@ -13,12 +14,25 @@
 #include "lv2/cell_error.h"
 
 namespace dal {
+
+// Handlers defined in sys_misc.cpp.
+void sysProcessExit(DalPpuContext* ctx, std::uint8_t* base);
+void sysTtyRead(DalPpuContext* ctx, std::uint8_t* base);
+void sysTtyWrite(DalPpuContext* ctx, std::uint8_t* base);
+void sysTimerUsleep(DalPpuContext* ctx, std::uint8_t* base);
+void sysTimerSleep(DalPpuContext* ctx, std::uint8_t* base);
+void sysTimeGetTimebaseFrequency(DalPpuContext* ctx, std::uint8_t* base);
+void sysMemoryAllocate(DalPpuContext* ctx, std::uint8_t* base);
+void sysMemoryFree(DalPpuContext* ctx, std::uint8_t* base);
+void sysMemoryGetUserMemorySize(DalPpuContext* ctx, std::uint8_t* base);
+
 namespace {
 
 // The numbers the game's code issues (found by scanning the generated code for the r11 value in
 // front of each syscall site) plus the implemented ones. Names come from config/lv2_syscalls.json,
 // which mirrors RPCS3 `Emu/Cell/lv2/lv2.cpp`; 988 has none. Keep sorted by number.
 constexpr SyscallEntry kSyscalls[] = {
+    {22, "_sys_process_exit", sysProcessExit},
     {44, "sys_ppu_thread_join", nullptr},
     {47, "sys_ppu_thread_set_priority", nullptr},
     {48, "sys_ppu_thread_get_priority", nullptr},
@@ -47,9 +61,9 @@ constexpr SyscallEntry kSyscalls[] = {
     {137, "sys_event_port_disconnect", nullptr},
     {138, "sys_event_port_send", nullptr},
     {139, "sys_event_flag_get", nullptr},
-    {141, "sys_timer_usleep", nullptr},
-    {142, "sys_timer_sleep", nullptr},
-    {147, "sys_time_get_timebase_frequency", nullptr},
+    {141, "sys_timer_usleep", sysTimerUsleep},
+    {142, "sys_timer_sleep", sysTimerSleep},
+    {147, "sys_time_get_timebase_frequency", sysTimeGetTimebaseFrequency},
     {169, "sys_spu_initialize", nullptr},
     {181, "sys_spu_thread_write_ls", nullptr},
     {182, "sys_spu_thread_read_ls", nullptr},
@@ -58,11 +72,11 @@ constexpr SyscallEntry kSyscalls[] = {
     {192, "sys_spu_thread_disconnect_event", nullptr},
     {251, "sys_spu_thread_group_connect_event_all_threads", nullptr},
     {252, "sys_spu_thread_group_disconnect_event_all_threads", nullptr},
-    {348, "sys_memory_allocate", nullptr},
-    {349, "sys_memory_free", nullptr},
-    {352, "sys_memory_get_user_memory_size", nullptr},
-    {402, "sys_tty_read", nullptr},
-    {403, "sys_tty_write", nullptr},
+    {348, "sys_memory_allocate", sysMemoryAllocate},
+    {349, "sys_memory_free", sysMemoryFree},
+    {352, "sys_memory_get_user_memory_size", sysMemoryGetUserMemorySize},
+    {402, "sys_tty_read", sysTtyRead},
+    {403, "sys_tty_write", sysTtyWrite},
     {801, "sys_fs_open", nullptr},
     {802, "sys_fs_read", nullptr},
     {803, "sys_fs_write", nullptr},

@@ -33,6 +33,8 @@ function(dal_runtime_add_core)
     runtime/src/core/log.cpp
     runtime/src/core/threads.cpp
     runtime/src/hle/hle.cpp
+    runtime/src/hle/sys_prx_for_user.cpp
+    runtime/src/lv2/sys_misc.cpp
     runtime/src/lv2/syscalls.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_runtime_core PUBLIC

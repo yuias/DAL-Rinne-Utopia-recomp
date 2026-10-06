@@ -1,5 +1,6 @@
 // Self-checking unit tests for the runtime core library. No generated code is involved.
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -486,18 +488,19 @@ void testSyscalls() {
   dal::resetLogOnce();
 
   const auto table = dal::syscallTable();
-  CHECK(table.size() == 53);
+  CHECK(table.size() == 54);  // the 53 census numbers plus 22 (_sys_process_exit)
   bool sorted = true;
   for (std::size_t i = 1; i < table.size(); i++) sorted = sorted && table[i - 1].number < table[i].number;
   CHECK(sorted);
   const dal::SyscallEntry* usleep_entry = dal::findSyscall(141);
   CHECK(usleep_entry != nullptr && std::string_view(usleep_entry->name) == "sys_timer_usleep");
+  CHECK(usleep_entry != nullptr && usleep_entry->handler != nullptr);
   const dal::SyscallEntry* unnamed = dal::findSyscall(988);
   CHECK(unnamed != nullptr && unnamed->name == nullptr);
   CHECK(dal::findSyscall(999) == nullptr);
 
   auto ctx = std::make_unique<DalPpuContext>();
-  ctx->gpr[11] = 141;
+  ctx->gpr[11] = 44;  // sys_ppu_thread_join has no handler yet
   ctx->gpr[3] = 0x1234;
   dalSyscall(ctx.get(), nullptr, 0x10000);
   CHECK(ctx->gpr[3] == dal::kCellOk);
@@ -507,14 +510,14 @@ void testSyscalls() {
   dalSyscall(ctx.get(), nullptr, 0x10004);
   CHECK(ctx->gpr[3] == dal::kCellOk);
 
-  CHECK(countContaining(lines, "dal: first sc 141 sys_timer_usleep") == 1);
+  CHECK(countContaining(lines, "dal: first sc 44 sys_ppu_thread_join") == 1);
   CHECK(countContaining(lines, "dal: first sc 999 ?") == 1);
-  CHECK(countContaining(lines, "dal: default sc 141 sys_timer_usleep(0x1234") == 1);
+  CHECK(countContaining(lines, "dal: default sc 44 sys_ppu_thread_join(0x1234") == 1);
   CHECK(countContaining(lines, "dal: default sc 999 ?(0x1234") == 1);
 
   const std::string census = dal::formatCensus();
   CHECK(census.find("census: syscalls 3 calls, 2 distinct, 2 default-handled") != std::string::npos);
-  CHECK(census.find("  sc 141 sys_timer_usleep: 2 [default]") != std::string::npos);
+  CHECK(census.find("  sc 44 sys_ppu_thread_join: 2 [default]") != std::string::npos);
   CHECK(census.find("  sc 999 ?: 1 [default]") != std::string::npos);
 
   dal::setLogSink({});
@@ -580,6 +583,177 @@ void testHle() {
   CHECK(ctx->gpr[4] == 0);
   CHECK(ctx->gpr[2] == 0x1111);
   CHECK(ctx->lr == 0x2222);
+
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+// Issues a syscall through the dispatcher and returns r3.
+std::uint64_t syscall(std::uint32_t number, std::uint64_t r3 = 0, std::uint64_t r4 = 0,
+                      std::uint64_t r5 = 0, std::uint64_t r6 = 0) {
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[11] = number;
+  ctx->gpr[3] = r3;
+  ctx->gpr[4] = r4;
+  ctx->gpr[5] = r5;
+  ctx->gpr[6] = r6;
+  dalSyscall(ctx.get(), dal::process().memory.base(), 0x10000);
+  return ctx->gpr[3];
+}
+
+// lv2 errors reach the guest as sign-extended s32 values.
+constexpr std::uint64_t err(std::uint32_t code) {
+  return static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(code)));
+}
+
+void testStartupSyscalls() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+
+  // User memory size bookkeeping.
+  const std::uint32_t used_before = p.user_memory_used;
+  CHECK(syscall(352, scratch) == 0);
+  CHECK(dalRead32(base, scratch) == p.user_memory_total);
+  CHECK(dalRead32(base, scratch + 4) == p.user_memory_total - used_before);
+
+  // Allocation: 1 MiB pages by default and for 0x400, 64 KiB pages for 0x200.
+  CHECK(syscall(348, 0x100000, 0x400, scratch) == 0);
+  const std::uint32_t a = dalRead32(base, scratch);
+  CHECK(a >= dal::kUser1mRegion.begin && a < dal::kUser1mRegion.end && a % 0x100000 == 0);
+  CHECK(p.user_memory_used == used_before + 0x100000);
+  CHECK(syscall(352, scratch) == 0);
+  CHECK(dalRead32(base, scratch + 4) == p.user_memory_total - used_before - 0x100000);
+  CHECK(syscall(348, 0x200000, 0, scratch) == 0);
+  const std::uint32_t b = dalRead32(base, scratch);
+  CHECK(b >= dal::kUser1mRegion.begin && b != a);
+  CHECK(syscall(348, 0x30000, 0x200, scratch) == 0);
+  const std::uint32_t c = dalRead32(base, scratch);
+  CHECK(c >= dal::kUser64kRegion.begin && c < dal::kUser64kRegion.end && c % 0x10000 == 0);
+  dalWrite32(base, c, 0xdeadbeef);  // committed and writable
+
+  // Error cases leave the bookkeeping alone.
+  const std::uint32_t used = p.user_memory_used;
+  CHECK(syscall(348, 0, 0x400, scratch) == err(dal::kCellEalign));
+  CHECK(syscall(348, 0x100000, 0x123, scratch) == err(dal::kCellEinval));
+  CHECK(syscall(348, 0x10000, 0x400, scratch) == err(dal::kCellEalign));
+  CHECK(syscall(348, 0x180000, 0, scratch) == err(dal::kCellEalign));
+  CHECK(syscall(348, 0xF000000, 0x400, scratch) == err(dal::kCellEnomem));  // above the total
+  CHECK(syscall(348, 0x100000, 0x400, 0) == err(dal::kCellEfault));
+  CHECK(p.user_memory_used == used);
+
+  // Free: only allocation starts are accepted, once.
+  CHECK(syscall(349, a + 0x10000) == err(dal::kCellEinval));
+  CHECK(syscall(349, 0x1234) == err(dal::kCellEinval));
+  CHECK(syscall(349, a) == 0);
+  CHECK(syscall(349, a) == err(dal::kCellEinval));
+  CHECK(syscall(349, b) == 0);
+  CHECK(syscall(349, c) == 0);
+  CHECK(p.user_memory_used == used_before);
+  CHECK(syscall(348, 0x100000, 0x400, scratch) == 0 && dalRead32(base, scratch) == a);  // reuse
+  CHECK(syscall(349, a) == 0);
+
+  // tty: writes to channels outside 0..15 are dropped but still reported; reads fail.
+  CHECK(syscall(403, 16, scratch + 0x100, 5, scratch) == 0);
+  CHECK(dalRead32(base, scratch) == 5);
+  CHECK(syscall(403, 0, scratch + 0x100, 0, scratch) == 0);
+  CHECK(dalRead32(base, scratch) == 0);
+  CHECK(syscall(403, 0, scratch + 0x100, 5, 0) == err(dal::kCellEfault));
+  CHECK(syscall(402, 0, scratch + 0x100, 4, scratch) == err(dal::kCellEio));
+
+  // Time base and sleeps (the sleeps wait on the guest lock, which the caller holds).
+  CHECK(syscall(147) == dal::kTimebaseFrequency);
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(syscall(141, 20000) == 0);
+    CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(15));
+    CHECK(syscall(141, 0) == 0);  // yield
+    CHECK(syscall(142, 0) == 0);
+  }
+
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+void testSysPrxForUser() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+
+  constexpr const char* kModule = "sysPrxForUser";
+  const DalImportInfo imports[] = {
+      {0x00800000, 0xb2fcf2c8, kModule, "_sys_heap_create_heap"},
+      {0x00800010, 0xaede4b03, kModule, "_sys_heap_delete_heap"},
+      {0x00800020, 0x35168520, kModule, "_sys_heap_malloc"},
+      {0x00800030, 0x44265c08, kModule, "_sys_heap_memalign"},
+      {0x00800040, 0x8a561d92, kModule, "_sys_heap_free"},
+      {0x00800050, 0x744680a2, kModule, "sys_initialize_tls"},
+      {0x00800060, 0x8461e528, kModule, "sys_time_get_system_time"},
+      {0x00800070, 0x45fe2fce, kModule, "_sys_spu_printf_initialize"},
+      {0x00800080, 0x12345678, kModule, "sys_unknown"},
+  };
+  dal::installImports(imports, 9);
+  CHECK(countContaining(lines, "dal: hle: 9 imports, 8 with handlers") == 1);
+  CHECK(countContaining(lines, "is registered as") == 0);
+
+  auto call = [&](std::uint32_t index, std::uint64_t r3 = 0, std::uint64_t r4 = 0,
+                  std::uint64_t r5 = 0) {
+    auto ctx = std::make_unique<DalPpuContext>();
+    ctx->gpr[3] = r3;
+    ctx->gpr[4] = r4;
+    ctx->gpr[5] = r5;
+    dalHleCall(ctx.get(), base, index);
+    return ctx->gpr[3];
+  };
+
+  // Heap: ids start at 1; blocks are 64 KiB aligned and come from the main region.
+  CHECK(call(0, 0x1000) == 1);
+  CHECK(call(0, 0x1000) == 2);
+  const std::uint64_t block = call(2, 1, 0x100);
+  CHECK(block != 0 && block % 0x10000 == 0);
+  CHECK(block >= dal::kMainRegion.begin && block < dal::kMainRegion.end);
+  const std::uint64_t aligned = call(3, 1, 0x40000, 0x10);
+  CHECK(aligned != 0 && aligned % 0x40000 == 0);
+  const std::uint64_t small_align = call(3, 1, 0x10, 0x10);
+  CHECK(small_align != 0 && small_align % 0x10000 == 0);
+  CHECK(call(4, 1, block) == 0);
+  CHECK(call(2, 1, 0x100) == block);  // the freed block is reused
+  CHECK(call(4, 1, block) == 0);
+  CHECK(call(4, 1, aligned) == 0);
+  CHECK(call(4, 1, small_align) == 0);
+  CHECK(call(1, 2) == 0);
+  CHECK(call(0, 0x1000) == 2);  // the deleted id is free again
+
+  // sys_initialize_tls is a no-op once r13 is set (the boot did it natively).
+  {
+    auto ctx = std::make_unique<DalPpuContext>();
+    ctx->gpr[13] = 0x00123456;
+    ctx->gpr[3] = 0x01000000;
+    ctx->gpr[4] = 0x0010245c;
+    ctx->gpr[5] = 4;
+    ctx->gpr[6] = 0x110;
+    dalHleCall(ctx.get(), base, 5);
+    CHECK(ctx->gpr[13] == 0x00123456);
+    CHECK(ctx->gpr[3] == 0x01000000);
+    CHECK(countContaining(lines, "dal: tls:") == 0);
+  }
+
+  const std::uint64_t t0 = call(6);
+  CHECK(t0 != 0 && call(6) >= t0);
+  CHECK(call(7, 0x55) == 0);
+  CHECK(call(8, 0x55) == 0);
+  CHECK(dal::sysPrxForUserHandlers().size() == 14);
 
   dal::setLogSink({});
   dal::resetCensus();
@@ -878,6 +1052,8 @@ int main(int argc, char** argv) {
   testCensus();
   testSyscalls();
   testHle();
+  testStartupSyscalls();
+  testSysPrxForUser();
   testTimebase();
   testGuestLockFifo();
   testReservationAndDcbz();
