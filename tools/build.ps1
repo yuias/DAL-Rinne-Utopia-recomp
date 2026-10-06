@@ -6,6 +6,7 @@ param(
     [switch]$Clean,
     [switch]$Test,
     [string]$EbootElf,
+    [string]$PpuDir,
     [string]$LlvmBin = $env:DAL_LLVM_BIN
 )
 
@@ -35,6 +36,12 @@ $clangVersion = & clang --version
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $clangVersion | Select-Object -First 1
 
+# Resolved against the caller's location, before Push-Location. The directory need not exist:
+# CMake reports a missing one with the emit command to run.
+if ($PpuDir) {
+    $PpuDir = [System.IO.Path]::GetFullPath($PpuDir, $PWD.ProviderPath)
+}
+
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
     if ($Clean) {
@@ -46,11 +53,18 @@ try {
     if ($EbootElf) {
         $configureArgs += "-DDAL_EBOOT_ELF=$((Resolve-Path -LiteralPath $EbootElf).Path)"
     }
+    if ($PpuDir) {
+        $configureArgs += "-DDAL_PPU_GENERATED_DIR=$PpuDir"
+    }
     & cmake @configureArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    $buildTimer = [System.Diagnostics.Stopwatch]::StartNew()
     & cmake --build --preset $Preset
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $buildExit = $LASTEXITCODE
+    $buildTimer.Stop()
+    "build: {0:N1} s" -f $buildTimer.Elapsed.TotalSeconds
+    if ($buildExit -ne 0) { exit $buildExit }
 
     if ($Test) {
         & ctest --preset $Preset

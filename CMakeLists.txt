@@ -25,6 +25,8 @@ add_library(dal_ppu_stub STATIC runtime/src/ppu_stub_runtime.cpp)
 target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
 
+dal_ppu_add_generated_tree()
+
 add_executable(dal_ppu_header_check runtime/tests/ppu_header_check.c)
 dal_ppu_codegen_options(dal_ppu_header_check)
 target_link_libraries(dal_ppu_header_check PRIVATE dal_ppu_stub)
