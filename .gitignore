@@ -31,3 +31,16 @@ CMakeUserPresets.json
 
 # Claude Code
 .claude/
+
+# Generated analysis output and user-supplied game binaries
+/generated/
+/game/
+*.elf
+*.self
+*.sprx
+*.prx
+*.sdat
+*.edat
+EBOOT.BIN
+__pycache__/
+*.pyc
