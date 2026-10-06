@@ -472,8 +472,28 @@ class RealCoverageTest(unittest.TestCase):
 
     def test_stdout_has_the_coverage_lines(self):
         prefixes = [ln.split(":")[0] for ln in self.stdout.splitlines()]
-        self.assertEqual(prefixes[-4:], ["coverage", "ghidra extents", "ghidra code not owned",
-                                         "elapsed"])
+        self.assertEqual(prefixes[-5:], ["coverage", "ghidra extents", "ghidra code not owned",
+                                         "syscalls", "elapsed"])
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file() and _COMMITTED_SUMMARY.is_file(),
+                     "DAL_EBOOT_ELF and config/ghidra_summary.json are required")
+class RealSyscallCfgTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _, cls.stdout, _, report = _recover_result()
+        cls.syscalls = report["syscalls"]
+
+    def test_census_total_and_the_site_the_probe_cannot_resolve(self):
+        sc = self.syscalls
+        self.assertEqual(sc["sites"] + sc["sites_outside_text"], 217)
+        self.assertIn("0x000c7eec", sc["cfg_only"])
+        self.assertEqual(sc["probe_disagreements"], [])
+        self.assertNotIn("0x000c7eec", [u["addr"] for u in sc["unresolved"]])
+
+    def test_stdout_line(self):
+        line = next(ln for ln in self.stdout.splitlines() if ln.startswith("syscalls:"))
+        self.assertIn("%d sites in .text" % self.syscalls["sites"], line)
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),

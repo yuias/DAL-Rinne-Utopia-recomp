@@ -21,8 +21,10 @@ from .jumptab import JumpTable, UnresolvedJump, make_reader, recover_jump_tables
 from .nids import DEFAULT_SYSCALLS, load_syscall_table
 from .partition import PartitionResult, partition
 from .ppu_flow import CodeImage
+from .probe import resolve_syscall_number
 from .seeds import (ImportThunk, SeedCensus, check_thunk_slots, collect_recovery_seeds,
                     find_import_thunks, prologue_candidates)
+from .syscall_cfg import count_sites_outside_text, resolve_syscalls
 
 SCHEMA = 1
 GENERATOR = "ps3tool recover"
@@ -213,6 +215,50 @@ def _partition_section(result: PartitionResult, census: SeedCensus,
     }
 
 
+def _syscalls_section(image: CodeImage, elf: ElfFile, text_range: tuple[int, int],
+                      result: PartitionResult, tables: dict[int, JumpTable],
+                      names: dict[int, str]) -> dict:
+    sites = resolve_syscalls(image, result.functions, tables)
+    outside = count_sites_outside_text(elf, text_range)
+    resolved = [s for s in sites if s.number is not None]
+    disagreements, probe_only, cfg_only = [], [], []
+    for site in sites:
+        probe = resolve_syscall_number(image.words, (site.addr - image.start) // 4)
+        if probe is not None and site.number is not None:
+            if probe != site.number:
+                disagreements.append({"addr": _hex(site.addr), "probe": probe,
+                                      "cfg": site.number})
+        elif probe is not None:
+            probe_only.append({"addr": _hex(site.addr), "probe": probe,
+                               "reason": site.reason})
+        elif site.number is not None:
+            cfg_only.append(site)
+    by_number = Counter(s.number for s in resolved)
+    return {
+        "sites": len(sites),
+        "sites_outside_text": outside,
+        "in_functions": sum(1 for s in sites if s.function is not None),
+        "resolved": len(resolved),
+        "distinct_numbers": len(by_number),
+        "by_number": {str(n): {"count": c, "name": names.get(n)}
+                      for n, c in sorted(by_number.items())},
+        "unresolved": [{"addr": _hex(s.addr), "function": _hex(s.function), "reason": s.reason}
+                       for s in sites if s.number is None],
+        "probe_disagreements": disagreements,
+        "probe_only": probe_only,
+        "cfg_only": _hex_list(s.addr for s in cfg_only),
+        "names": {_hex(s.addr): {"number": s.number, "name": names.get(s.number)}
+                  for s in cfg_only},
+    }
+
+
+def _syscalls_line(doc: dict) -> str:
+    return ("syscalls: %d sites in .text, %d outside, %d in functions, %d resolved by CFG, "
+            "%d unresolved, %d disagree with probe"
+            % (doc["sites"], doc["sites_outside_text"], doc["in_functions"], doc["resolved"],
+               len(doc["unresolved"]), len(doc["probe_disagreements"])))
+
+
 def _stdout_lines(census: SeedCensus, thunks_doc: dict, jt_doc: dict, part_doc: dict,
                   prologue: bool) -> list[str]:
     counts = census.counts
@@ -269,12 +315,12 @@ def _run(args: argparse.Namespace) -> int:
         extra = _load_extra_seeds(DEFAULT_EXTRA_SEEDS)
 
     nid_table = resolve_nid_table(args.nids)
-    # Validated here so a bad path fails before the long run; names are attached by the
-    # syscall pass.
+    # Loaded before the long run so a bad path fails early.
+    syscall_names: dict[int, str] = {}
     if args.syscalls is not None:
-        load_syscall_table(Path(args.syscalls))
+        syscall_names = load_syscall_table(Path(args.syscalls))
     elif DEFAULT_SYSCALLS.is_file():
-        load_syscall_table(DEFAULT_SYSCALLS)
+        syscall_names = load_syscall_table(DEFAULT_SYSCALLS)
     else:
         print("note: syscall table %s not found; syscall names are not resolved"
               % DEFAULT_SYSCALLS, file=sys.stderr)
@@ -311,6 +357,12 @@ def _run(args: argparse.Namespace) -> int:
         if ghidra is not None:
             report["ghidra"] = ghidra
         cov_lines = coverage_lines(coverage, ghidra)
+        try:
+            report["syscalls"] = _syscalls_section(image, elf, text_range, result, tables,
+                                                   syscall_names)
+        except ElfError as e:
+            raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
+        cov_lines.append(_syscalls_line(report["syscalls"]))
     report_path = Path(args.report) if args.report else DEFAULT_REPORT
     _write_text(report_path,
                 json.dumps(report, indent=2, sort_keys=False, ensure_ascii=False) + "\n")
