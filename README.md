@@ -7,11 +7,13 @@ This repository contains no game data. No executables, keys, or decrypted binari
 included or accepted by version control; you supply your own `EBOOT.elf`, and all tool
 output is written to ignored directories.
 
-Current state: build scaffold, a small runtime stub, analysis tools for the PPU executable
-(ELF summary, SPU probe, disassembler, Ghidra cross-check, NID and syscall name tables,
-function recovery), and an emitter that turns the recovered functions into C source. The
-generated code builds and links against a stub runtime; no game code runs yet. See
-"Emitting C" for what is and is not implemented.
+Current state: build scaffold, analysis tools for the PPU executable (ELF summary, SPU probe,
+disassembler, Ghidra cross-check, NID and syscall name tables, function recovery), an emitter
+that turns the recovered functions into C source, and a runtime skeleton (`dal_game`) that
+loads the executable, runs it through the generated code on real guest threads and stops at the
+first missing piece with a census of what the game asked for. Most of the system API is not
+implemented yet, so the game does not get past early start-up. See "Emitting C" and "Running
+the game" for what is and is not implemented.
 
 ## Prerequisites
 
@@ -41,7 +43,7 @@ The tools work on the decrypted PPU executable, not on `EBOOT.BIN`.
 ## Building
 
 ```powershell
-pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [-EbootElf <path>] [-PpuDir <dir>] [-LlvmBin <dir>]
+pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [-EbootElf <path>] [-PpuDir <dir>] [-GameDir <dir>] [-LlvmBin <dir>]
 ```
 
 - `-Preset` selects the CMake preset (`debug` by default, or `release`). Build output goes
@@ -49,14 +51,19 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
 - `-Clean` removes that preset's build directory before configuring.
 - `-Test` runs CTest after the build: a runtime version check, a `musttail` support
   check, the contract header check (`ppu_header_check`), the semantics harness
-  (`ppu_semantics`), the Python unit tests, and, with `-PpuDir`, the link check of the
-  generated code (`ppu_link`).
+  (`ppu_semantics`), the runtime core unit tests (`runtime_core`), the Python unit tests, and,
+  with `-PpuDir`, the link check of the generated code (`ppu_link`). With `-PpuDir`,
+  `-EbootElf` and `-GameDir` together it also runs `game_boot`; see "Running the game".
 - `-EbootElf <path>` passes the decrypted ELF to the tests so the checks against the real
   executable run instead of being skipped.
 - `-PpuDir <dir>` compiles the C tree written by `emit --out <dir>` into the static library
   `dal_ppu_generated` and builds `dal_ppu_link_test`. It sets the CMake cache variable
   `DAL_PPU_GENERATED_DIR`. A relative path is resolved against the current directory. If the
   directory has no `sources.cmake`, configuration fails and prints the `emit` command to run.
+  It also builds the executable `dal_game`.
+- `-GameDir <dir>` sets the CMake cache variable `DAL_GAME_DIR`, the game directory (the one
+  that contains `PS3_GAME`) that the `game_boot` test passes to `dal_game`. A relative path is
+  resolved against the current directory.
 - `-LlvmBin <dir>` puts a specific LLVM `bin` directory first on `PATH`. It defaults to the
   `DAL_LLVM_BIN` environment variable. Use it when the clang bundled with Visual Studio is
   too old or when clang is not on `PATH`.
@@ -70,6 +77,7 @@ Examples:
 pwsh -NoProfile -File tools/build.ps1 -Preset debug -Clean -Test
 pwsh -NoProfile -File tools/build.ps1 -Preset release -Test -EbootElf game/EBOOT.elf
 pwsh -NoProfile -File tools/build.ps1 -Preset release -PpuDir generated/ppu -Test
+pwsh -NoProfile -File tools/build.ps1 -PpuDir generated/ppu -EbootElf game/EBOOT.elf -GameDir <game-dir> -Test
 ```
 
 CMake options for generated code (also usable with `cmake` directly):
@@ -389,8 +397,9 @@ they follow.
 `runtime/src/ppu_stub_runtime.cpp` (library `dal_ppu_stub`) implements the hooks only far
 enough to link and test generated code: dispatch works, and every hook that would need the
 system (HLE calls, unknown targets, unhandled words, traps) prints a message and exits with
-an error status. Syscalls only set `r3` to 0. `ppu_stub.h` holds test-only additions. There is no runtime that loads or
-runs the game yet.
+an error status. Syscalls only set `r3` to 0. `ppu_stub.h` holds test-only additions. The stub
+is only for the link check, the header check and the semantics harness; the runtime that runs the
+game is described in "Running the game".
 
 ### Semantics harness
 
@@ -440,9 +449,219 @@ Every instruction word in the code range of the pinned ELF has an emitter handle
   position is used.
 - `fres`, `frsqrte` and the vector estimate instructions return exactly computed results,
   which lie within the architected estimate error, not the hardware estimate values.
-- There is no runtime. Import calls, lv2 syscalls, threads, memory allocation and loading the
-  game are not implemented; the stub runtime exits on import calls and returns 0 from
-  syscalls.
+- The stub runtime does not implement import calls, lv2 syscalls, threads or memory
+  allocation: it exits on import calls and returns 0 from syscalls. The runtime in `dal_game`
+  implements a subset; see "Running the game".
+
+## Running the game
+
+`dal_game` loads the decrypted `EBOOT.elf` into a 4 GiB guest address space, sets up the main
+PPU thread the way RPCS3 does and calls the entry function through the generated code. It is
+built only when `DAL_PPU_GENERATED_DIR` is set (`-PpuDir`), because it links the generated
+functions. The runtime core (`dal_runtime_core`, everything under `runtime/src/core`,
+`runtime/src/lv2` and `runtime/src/hle`) does not reference generated symbols and is always
+built, together with its unit tests (`runtime_core`). Only `runtime/src/game_main.cpp` passes the
+generated tables to the core. The executable is checked against the SHA-256 that the generated
+code was emitted from.
+
+```sh
+dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE] [--quiet-hle] [--load-only]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--game-dir DIR` | Required. The game directory, the one that contains `PS3_GAME`. It must exist. Nothing is read from it yet apart from the default ELF location. |
+| `--elf PATH` | The decrypted executable. Default: `DIR/PS3_GAME/USRDIR/EBOOT.elf`. |
+| `--seconds N` | Watchdog: stop after `N` seconds. 0 (the default) disables it. |
+| `--strict` | Treat a jump to an address that is not a recovered function as a fatal error (see "Dispatch"). |
+| `--log FILE` | Also write every log line to `FILE`, which is truncated. |
+| `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
+| `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
+
+Game paths are command-line arguments only; no tracked file contains one. The build wrapper takes
+them as `-EbootElf` and `-GameDir` for the tests (CMake cache variables `DAL_EBOOT_ELF` and
+`DAL_GAME_DIR`).
+
+### Exit codes and stop lines
+
+Every run ends with one stop line on stderr and a census (below), then exits:
+
+| Code | Meaning | Stop line |
+| --- | --- | --- |
+| 0 | The guest called `sys_process_exit` or `_sys_process_exit` (also `--load-only` after loading) | `dal: stop: process exit status N` |
+| 2 | Usage error: bad option, missing `--game-dir`, game directory missing, log file not writable | `error: ...` (usage text) |
+| 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved | `dal: stop: fatal <kind>: ...` |
+| 4 | Load error: file missing, not a PPU executable, or SHA-256 different from the one in the generated code | `error: ...` |
+| 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
+| 6 | Stall: every live guest thread has been in an indefinite wait for at least 2 seconds | `dal: stop: stall (N threads blocked)` |
+| 7 | All guest threads ended without a process exit | `dal: stop: no guest threads left` |
+
+A fatal stop also prints the registers and the call trace (the most recent function entries) of
+the faulting guest thread. The runtime never calls `abort`: the CRT and Windows error dialogs are
+disabled, so a run always ends with an exit code, also when it is started from a script.
+
+### Logging
+
+Log lines go to stderr, and to `--log FILE` when given, one line each. The logger is a thin layer
+over spdlog (the `externals/spdlog` submodule, built as a static library with `std::format`
+instead of the bundled fmt); spdlog types do not appear in the runtime's own headers. A line is
+prefixed with `[host]` or with `[t XXXXXXXX]`, the id of the guest thread that wrote it, followed
+by `warn: ` or `error: ` for those levels. Output from the guest itself (`sys_tty_write`) goes to
+stdout, unprefixed.
+
+### Census
+
+On every stop the runtime prints what the game did, sorted by count and then by name:
+
+```
+census: syscalls 18 calls, 14 distinct, 2 default-handled
+  sc 141 sys_timer_usleep: 1 [impl]
+  sc 169 sys_spu_initialize: 1 [default]
+census: hle 118 calls, 21 distinct, 10 default-handled
+  sysPrxForUser::sys_lwmutex_lock: 29 [impl]
+  cellSysmodule::cellSysmoduleLoadModule: 15 [default]
+census: unknown targets 0 distinct
+census: threads 5 created, 5 live
+  0x01000000 main_thread: running
+  0x01000001 _SPU_printf_server: blocked in sys_event_queue_receive
+```
+
+`[impl]` marks a call that an implemented handler served and `[default]` one that the default
+handler took (see below). An unknown target is printed as `0x<target> from 0x<site>: count`.
+Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
+each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
+the game runs; these lines are the progress markers that `game_boot` checks.
+
+### Memory map
+
+The guest space is one reservation of 4 GiB plus a guard area, big-endian, accessed only through
+the `dalRead*` and `dalWrite*` helpers. Pages are committed on demand by the allocators below. An
+access to an uncommitted page raises a fault that the runtime turns into a fatal stop with the
+guest address and the access kind.
+
+| Range | Use |
+| --- | --- |
+| `0x00010000..0x10000000` | Main region: the ELF image (committed at its segment addresses), per-thread TLS blocks and the heap handlers' allocations. 64 KiB granularity. |
+| `0x10000000..0x20000000` | Not used yet (left free for the RSX context). |
+| `0x20000000..0x30000000` | User memory with 1 MiB pages (`sys_memory_allocate` with flags 0x400 or 0). |
+| `0x30000000..0x40000000` | User memory with 64 KiB pages (`sys_memory_allocate` with flags 0x200). |
+| `0xD0000000..0xE0000000` | Thread stacks, 4 KiB pages, with an uncommitted 4 KiB guard page on each side of every stack. |
+
+The primary stack size from the executable's process parameters is clamped as RPCS3 does (the
+game's 0x8000 becomes 0x10000). The argument block (`argv`, `envp`, strings) sits at the top of
+the stack. `sys_memory_get_user_memory_size` reports a 0xD500000 container. The timebase runs at
+79.8 MHz, scaled from the host performance counter.
+
+### Dispatch
+
+`dalRegisterFuncs` builds a flat table indexed by guest address from the generated function
+mappings, so a computed jump or an indirect call costs one lookup. A target that is not in the
+table is an unknown target: the first occurrence of each (target, call site) pair is logged with
+the call trace and counted in the census. With `--strict` it is a fatal stop. Without it the
+dispatch returns, which acts like a callee that returned immediately, so the run goes on and the
+census lists every such target.
+
+### Threads
+
+Each guest thread is a host thread (16 MiB host stack) with its own context. All guest code runs
+under one global guest lock, a FIFO ticket lock, so guest threads never run in parallel. A thread
+gives up the lock only in `dalYield` (called from loop hooks, when another thread is waiting), in
+a blocking wait and when it exits. Blocking system calls (mutex, condition variable, event flag,
+event queue, sleep, join) wait on host condition variables with the guest lock, and record what
+they wait for for the census and for stall detection.
+
+Priority scheduling is deferred. Runnable threads get the lock in arrival order, and
+`sys_ppu_thread_set_priority` and `sys_ppu_thread_get_priority` only store and return the value.
+Thread ids start at `0x01000000`. Interrupt threads are not implemented.
+
+The host main thread is the supervisor. After boot it checks every 100 ms for the watchdog, a
+stall and the absence of live guest threads.
+
+### Implemented system calls
+
+Everything else goes to the default handler. Behaviour follows the RPCS3 handler of the same
+name; struct layouts and error codes are restated from its headers.
+
+| Group | Calls |
+| --- | --- |
+| Process | `_sys_process_exit` (22) |
+| TTY | `sys_tty_write` (403); `sys_tty_read` (402) returns `CELL_EIO` |
+| Time | `sys_timer_usleep` (141), `sys_timer_sleep` (142), `sys_time_get_timebase_frequency` (147) |
+| Memory | `sys_memory_allocate` (348), `sys_memory_free` (349), `sys_memory_get_user_memory_size` (352) |
+| Mutex and condition variable | `sys_mutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock` (100-104); `sys_cond_create`, `_destroy`, `_wait`, `_signal`, `_signal_all` (105-109) |
+| Event flag | `sys_event_flag_create` (82), `_destroy` (83), `_wait` (85), `_set` (87), `_clear` (118), `_cancel` (132), `_get` (139) |
+| Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138) |
+| Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48) |
+
+### Implemented imports
+
+Imports are matched to handlers by module and FNID. All 23 `sysPrxForUser` imports of the
+executable have handlers:
+
+- `sys_initialize_tls` (per-thread TLS blocks laid out as RPCS3 does), `sys_ppu_thread_create`,
+  `sys_ppu_thread_get_id`, `sys_ppu_thread_once`, `sys_ppu_thread_exit`;
+- `sys_lwmutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock`;
+- `_sys_heap_create_heap`, `_sys_heap_malloc`, `_sys_heap_memalign`, `_sys_heap_free`,
+  `_sys_heap_delete_heap`;
+- `sys_time_get_system_time`, `sys_process_exit`;
+- `_sys_process_atexitspawn`, `_sys_process_at_Exitspawn`, `sys_prx_exitspawn_with_level`,
+  `sys_prx_register_library`, `_sys_spu_printf_initialize`, `_sys_spu_printf_finalize`. These
+  return `CELL_OK` and do nothing else.
+
+The executable has 166 imports; the other 143 (cellSysmodule, cellSysutil, cellGcmSys, cellSpurs
+and others) use the default handler.
+
+### Default handlers
+
+A system call without a handler, and an import without one, return 0 (`CELL_OK`) in `r3` and
+change nothing else. The first call of each distinct syscall is logged as
+`dal: default sc <number> <name>(r3..r6)`, and the first 8 calls of each import as
+`dal: default hle <module>::<name>(r3..r8)` (none with `--quiet-hle`); later calls are only
+counted. Returning success is a probe, not an implementation: guest code that depends on an
+output parameter reads whatever was in memory, so a default-handled call can lead to a later
+fault. The census shows which calls were default-handled, which is the work list for the next
+handlers.
+
+### The `game_boot` test
+
+CTest registers `game_boot` only when `DAL_PPU_GENERATED_DIR`, `DAL_EBOOT_ELF` and
+`DAL_GAME_DIR` are all set (`-PpuDir`, `-EbootElf`, `-GameDir`); otherwise configuration prints
+that it is not registered. It runs `dal_game --game-dir <dir> --elf <elf>` with the arguments
+from the pin file, with a 60 s time limit, and passes when the output matches the milestone
+regular expression. The exit code is not checked: while the boot path is incomplete the run is
+expected to end in a fatal stop somewhere after the milestone, and a stop before the milestone
+leaves the pattern unmatched.
+
+The pin file `cmake/game_boot.cmake` has two lines:
+
+```cmake
+set(DAL_GAME_BOOT_ARGS "--seconds 20")
+set(DAL_GAME_BOOT_MILESTONE "dal: first hle cellGcmSys::cellGcmGetTiledPitchSize")
+```
+
+When a change lets the game get further, run `dal_game --game-dir <dir> --seconds 20`, take the
+last `dal: first ...` line that appears on every run and set `DAL_GAME_BOOT_MILESTONE` to it. If
+repeated runs differ, pin the latest line that all of them reach. Update only that file; the test
+then guards against regressions.
+
+### Current state
+
+On the pinned executable the run loads, initializes thread-local storage, starts four more guest
+threads (all of which block as expected: an SPU printf server on an event queue, a timer thread,
+and two threads on event flags), calls into cellSysmodule, cellGcmSys, cellSpurs and cellSysutil
+through the default handler, and stops in the main thread with a guest fault (read from address 0,
+exit code 3) inside the game's assert helper. The cellGcmSys calls before it are still
+default-handled, which is the next thing to implement.
+
+### Not implemented
+
+- Most HLE modules: cellSysmodule, cellSysutil, cellGame, cellGcmSys, cellSpurs and the rest
+  use the default handler.
+- File system: the `sys_fs_*` system calls use the default handler, and there is no virtual file
+  system.
+- Graphics (RSX, video memory at `0xC0000000`), audio, input.
+- SPU and SPURS: SPU system calls use the default handler.
+- Priority scheduling, interrupt threads, savestates.
 
 ## NID and syscall name tables
 
@@ -496,7 +715,9 @@ results are only trusted for the expected build.
 | Path | Contents |
 | --- | --- |
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
-| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`) and runtime-side tests |
+| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `game_main.cpp`; see "Running the game") and runtime-side tests |
+| `externals/spdlog` | spdlog submodule used by the runtime logger |
+| `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestone |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
 | `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |
