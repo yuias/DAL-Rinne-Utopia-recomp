@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "dal/ppu_context.h"
+#include "dal/ppu_stub.h"
 
 // Generated code defines these. They are weak so that targets without generated code still link;
 // dalHleCall then reports the bare index.
@@ -29,7 +30,11 @@ std::vector<DalFuncMapping>& funcTable() {
 
 // std::abort raises a modal "Debug Error!" dialog in debug CRT builds, which stalls unattended test
 // runs; exit with a status code instead.
+const char* g_label = nullptr;
+
 [[noreturn]] void fatalExit() {
+    if (g_label != nullptr) std::fprintf(stderr, "dal: while running %s\n", g_label);
+    std::fflush(stdout);
     std::fflush(stderr);
     std::_Exit(3);
 }
@@ -37,6 +42,10 @@ std::vector<DalFuncMapping>& funcTable() {
 }  // namespace
 
 extern "C" {
+
+void dalStubResetFuncs(void) { funcTable().clear(); }
+
+void dalStubSetLabel(const char* label) { g_label = label; }
 
 void dalRegisterFuncs(const DalFuncMapping* mappings, uint32_t count) {
     std::vector<DalFuncMapping>& table = funcTable();

@@ -52,3 +52,67 @@ function(dal_ppu_add_generated_tree)
   add_test(NAME ppu_link COMMAND dal_ppu_link_test)
   set_tests_properties(ppu_link PROPERTIES PASS_REGULAR_EXPRESSION "ppu link ok")
 endfunction()
+
+# Semantics harness: hand-written cases are generated into C (tools/tests/ppu_semantics), compiled
+# like emitted code and run natively. Needs Python3_EXECUTABLE and dal_ppu_stub.
+function(dal_ppu_add_semantics_harness)
+  set(gen_dir "${CMAKE_BINARY_DIR}/ppu_semantics")
+  set(gen_stamp "${gen_dir}/generate.stamp")
+
+  # The generator rewrites its outputs only when their content changes, so the custom command is
+  # tracked through a stamp instead of the outputs; otherwise touching an input without changing
+  # the result would leave the command out of date forever.
+  file(GLOB gen_inputs CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/tools/ps3recomp/*.py"
+    "${CMAKE_SOURCE_DIR}/tools/tests/ppc_asm.py"
+    "${CMAKE_SOURCE_DIR}/tools/tests/ppu_semantics/*.py")
+  add_custom_command(
+    OUTPUT "${gen_stamp}"
+    BYPRODUCTS "${gen_dir}/ppu_semantics_cases.h" "${gen_dir}/ppu_semantics_cases.c"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${gen_dir}"
+    COMMAND ${Python3_EXECUTABLE} -B -m tests.ppu_semantics.gen --out "${gen_dir}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${gen_stamp}"
+    DEPENDS ${gen_inputs}
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/tools"
+    COMMENT "Generating PPU semantics cases"
+    VERBATIM)
+  add_custom_target(dal_ppu_semantics_gen DEPENDS "${gen_stamp}")
+
+  add_executable(dal_ppu_semantics
+    runtime/tests/ppu_semantics_main.c
+    "${gen_dir}/ppu_semantics_cases.c")
+  set_source_files_properties("${gen_dir}/ppu_semantics_cases.c" PROPERTIES GENERATED TRUE)
+  add_dependencies(dal_ppu_semantics dal_ppu_semantics_gen)
+  dal_ppu_codegen_options(dal_ppu_semantics)
+  target_include_directories(dal_ppu_semantics PRIVATE "${gen_dir}")
+  target_link_libraries(dal_ppu_semantics PRIVATE dal_ppu_stub)
+
+  # Instrumentation can make a musttail site uncompilable, so the probe contains one with the
+  # generated signature. Trap mode needs no sanitizer runtime library.
+  cmake_push_check_state()
+  set(CMAKE_REQUIRED_FLAGS
+    "-Werror -fsanitize=undefined -fsanitize-trap=undefined -fpatchable-function-entry=8")
+  check_c_source_compiles("
+typedef struct Ctx { int x; } Ctx;
+typedef void Fn(Ctx* __restrict ctx, unsigned char* __restrict base);
+void g(Ctx* __restrict ctx, unsigned char* __restrict base) { (void)base; ctx->x += 1; }
+void f(Ctx* __restrict ctx, unsigned char* __restrict base) {
+    Fn* fn = g;
+    __attribute__((musttail)) return fn(ctx, base);
+}
+int main(void) { return 0; }
+" DAL_HAVE_UBSAN_TRAP_MUSTTAIL)
+  cmake_pop_check_state()
+  if(DAL_HAVE_UBSAN_TRAP_MUSTTAIL)
+    target_compile_options(dal_ppu_semantics PRIVATE
+      -fsanitize=undefined -fsanitize-trap=undefined)
+    message(STATUS "DAL: semantics harness UBSan-trap: on")
+  else()
+    message(STATUS "DAL: semantics harness UBSan-trap: off (probe failed)")
+  endif()
+
+  add_test(NAME ppu_semantics COMMAND dal_ppu_semantics)
+  set_tests_properties(ppu_semantics PROPERTIES
+    PASS_REGULAR_EXPRESSION "ppu semantics: [0-9]+ passed, 0 failed"
+    TIMEOUT 120)
+endfunction()

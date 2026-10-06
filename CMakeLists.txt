@@ -44,6 +44,7 @@ set_tests_properties(ppu_header_check PROPERTIES
   PASS_REGULAR_EXPRESSION "ppu header ok")
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+dal_ppu_add_semantics_harness()
 set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
 
 add_test(NAME tools_unittest
