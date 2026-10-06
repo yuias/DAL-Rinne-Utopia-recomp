@@ -7,12 +7,14 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import disasm, ghidra_diff, ghidra_summary, info, nids, probe
+from ps3recomp import cell, disasm, ghidra_diff, ghidra_summary, info, nids, probe, seeds
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
+from ps3recomp.ppu_flow import CodeImage
 
 _ELF_PATH = os.environ.get("DAL_EBOOT_ELF")
 _GHIDRA_JSON = os.environ.get("DAL_GHIDRA_JSON")
+_COMMITTED_SUMMARY = ghidra_summary.REPO_ROOT / "config" / "ghidra_summary.json"
 
 _IMPORT_COUNTS = [
     ("sys_io", 6), ("cellAtrac", 15), ("cellAudio", 11), ("sys_fs", 9),
@@ -283,6 +285,42 @@ class RealGhidraSummaryTest(unittest.TestCase):
         stray = [hex(a) for a in outside if not (a < start and a >= 0x10200
                                                  or end <= a < 0xDE410)]
         self.assertEqual(stray, [])
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file() and _COMMITTED_SUMMARY.is_file(),
+                     "DAL_EBOOT_ELF and config/ghidra_summary.json are required")
+class RealSeedsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.elf = ElfFile.from_path(_ELF_PATH)
+        cls.text = cell.find_text_range(cls.elf)
+        cls.image = CodeImage.from_elf(cls.elf, cls.text)
+        cls.thunks = seeds.find_import_thunks(
+            cls.elf, nids.load_nid_table(nids.DEFAULT_NIDS))
+        summary = ghidra_summary.load_summary(_COMMITTED_SUMMARY)
+        cls.census = seeds.collect_recovery_seeds(
+            cls.elf, cls.image, summary, cls.thunks, jump_table_targets=set(), extra=[],
+            prologue=False)
+
+    def test_anchor_counts(self):
+        counts = self.census.counts
+        expected = {"opd": 854, "opd_not_ghidra": 0, "bl_targets_in_text": 1697,
+                    "bl_targets_not_ghidra": 139, "bl_targets_thunk": 161, "thunks": 166,
+                    "union_ghidra_bl_opd": 2688}
+        self.assertEqual({k: counts[k] for k in expected}, expected)
+
+    def test_thunks_load_their_slots(self):
+        self.assertEqual(seeds.check_thunk_slots(self.elf, self.thunks), [])
+
+    def test_stub_range_is_executable_and_outside_text(self):
+        start, end = seeds.stub_range(self.thunks)
+        self.assertTrue(any(s.p_vaddr <= start and end <= s.p_vaddr + s.p_filesz
+                            for s in self.elf.exec_segments()))
+        self.assertTrue(end <= self.text[0] or start >= self.text[1])
+
+    def test_every_seed_starts_on_a_decodable_word_in_text(self):
+        for seed in self.census.seeds:
+            self.assertTrue(self.image.valid(seed.addr), hex(seed.addr))
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
