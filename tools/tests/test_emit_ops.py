@@ -530,5 +530,45 @@ class VmxPermTest(unittest.TestCase):
                          ["ctx->vr[3] = dalVperm(ctx->vr[1], ctx->vr[2], ctx->vr[4]);"])
 
 
+class VmxIntTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["vmx_int"]) - set(load_handlers())), [])
+
+    def test_modulo_forms_are_lane_arithmetic_on_the_unsigned_view(self):
+        self.assertEqual(body(asm.encode("vadduwm", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u32 = ctx->vr[1].u32 + ctx->vr[2].u32;"])
+        self.assertEqual(body(asm.encode("vsubuhm", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u16 = ctx->vr[1].u16 - ctx->vr[2].u16;"])
+
+    def test_saturating_forms_receive_the_context(self):
+        for name in ("vaddubs", "vaddsws", "vsubshs", "vsubuws"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[1], ctx->vr[2]);" % name.capitalize()],
+                             name)
+
+    def test_min_max_and_compare_pick_the_signedness_view(self):
+        self.assertEqual(body(asm.encode("vmaxsh", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].s16 = __builtin_elementwise_max(ctx->vr[1].s16, ctx->vr[2].s16);"])
+        self.assertEqual(body(asm.encode("vminub", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u8 = __builtin_elementwise_min(ctx->vr[1].u8, ctx->vr[2].u8);"])
+        self.assertEqual(body(asm.encode("vcmpgtsb", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u8 = (DalU8x16)(ctx->vr[1].s8 > ctx->vr[2].s8);"])
+        self.assertEqual(body(asm.encode("vcmpequw", vD=3, vA=1, vB=2))[0],
+                         ["ctx->vr[3].u32 = (DalU32x4)(ctx->vr[1].u32 == ctx->vr[2].u32);"])
+
+    def test_only_the_record_form_updates_cr6(self):
+        plain, _ = body(asm.encode("vcmpgtuh", vD=3, vA=1, vB=2))
+        record, _ = body(asm.encode("vcmpgtuh", vD=3, vA=1, vB=2, Rc_vc=1))
+        self.assertFalse(any("dalSetCr6" in line for line in plain))
+        self.assertEqual(record[1:], ["dalSetCr6(ctx, ctx->vr[3]);"])
+
+    def test_carry_and_average_call_their_helpers(self):
+        for name in ("vaddcuw", "vsubcuw", "vavgub", "vavgsw"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx->vr[1], ctx->vr[2]);" % name.capitalize()], name)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -319,3 +319,66 @@ DAL_FORCEINLINE void dalMtvscr(DalPpuContext* ctx, DalVr v) {
     ctx->vscr_nj = (vscr >> 16) & 1;
     ctx->vscr_sat = vscr & 1;
 }
+
+// Integer add/subtract with saturation. SAT is set when any lane clamps, i.e. when the clamped result
+// differs from the wrapped one (RPCS3 `VADDSBS` etc. compare the same two values). The wrapped sum
+// is formed on the unsigned view because signed vector overflow is not defined.
+#define DAL_VMX_SATURATE(fn, builtin, op, view, uview)                                         \
+    DAL_FORCEINLINE DalVr fn(DalPpuContext* ctx, DalVr a, DalVr b) {                           \
+        DalVr v;                                                                               \
+        v.view = builtin(a.view, b.view);                                                      \
+        dalSetSat(ctx, __builtin_reduce_or(v.uview != (a.uview op b.uview)));                  \
+        return v;                                                                              \
+    }
+
+DAL_VMX_SATURATE(dalVaddubs, __builtin_elementwise_add_sat, +, u8, u8)
+DAL_VMX_SATURATE(dalVadduhs, __builtin_elementwise_add_sat, +, u16, u16)
+DAL_VMX_SATURATE(dalVadduws, __builtin_elementwise_add_sat, +, u32, u32)
+DAL_VMX_SATURATE(dalVaddsbs, __builtin_elementwise_add_sat, +, s8, u8)
+DAL_VMX_SATURATE(dalVaddshs, __builtin_elementwise_add_sat, +, s16, u16)
+DAL_VMX_SATURATE(dalVaddsws, __builtin_elementwise_add_sat, +, s32, u32)
+DAL_VMX_SATURATE(dalVsububs, __builtin_elementwise_sub_sat, -, u8, u8)
+DAL_VMX_SATURATE(dalVsubuhs, __builtin_elementwise_sub_sat, -, u16, u16)
+DAL_VMX_SATURATE(dalVsubuws, __builtin_elementwise_sub_sat, -, u32, u32)
+DAL_VMX_SATURATE(dalVsubsbs, __builtin_elementwise_sub_sat, -, s8, u8)
+DAL_VMX_SATURATE(dalVsubshs, __builtin_elementwise_sub_sat, -, s16, u16)
+DAL_VMX_SATURATE(dalVsubsws, __builtin_elementwise_sub_sat, -, s32, u32)
+#undef DAL_VMX_SATURATE
+
+// vaddcuw: 1 where the unsigned sum carries out of 32 bits (b > ~a); vsubcuw: 1 where a - b does not
+// borrow, i.e. a >= b (RPCS3 `VADDCUW`, `VSUBCUW`).
+DAL_FORCEINLINE DalVr dalVaddcuw(DalVr a, DalVr b) {
+    DalVr v;
+    v.u32 = (DalU32x4)(b.u32 > ~a.u32) & 1u;
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVsubcuw(DalVr a, DalVr b) {
+    DalVr v;
+    v.u32 = (DalU32x4)(a.u32 >= b.u32) & 1u;
+    return v;
+}
+
+// Averages round up: (a + b + 1) >> 1 as (a | b) - ((a ^ b) >> 1), which cannot overflow. The shift
+// is arithmetic for the signed forms (RPCS3 `VAVGSB` etc.).
+#define DAL_VMX_AVERAGE(fn, view, uview, utype)                                                \
+    DAL_FORCEINLINE DalVr fn(DalVr a, DalVr b) {                                               \
+        DalVr v;                                                                               \
+        v.uview = (a.uview | b.uview) - (utype)((a.view ^ b.view) >> 1);                       \
+        return v;                                                                              \
+    }
+
+DAL_VMX_AVERAGE(dalVavgub, u8, u8, DalU8x16)
+DAL_VMX_AVERAGE(dalVavguh, u16, u16, DalU16x8)
+DAL_VMX_AVERAGE(dalVavguw, u32, u32, DalU32x4)
+DAL_VMX_AVERAGE(dalVavgsb, s8, u8, DalU8x16)
+DAL_VMX_AVERAGE(dalVavgsh, s16, u16, DalU16x8)
+DAL_VMX_AVERAGE(dalVavgsw, s32, u32, DalU32x4)
+#undef DAL_VMX_AVERAGE
+
+// vcmp*. with Rc=1: CR6 = {all lanes true, 0, no lane true, 0} (RPCS3 `ppu_cr_set(ppu, 6, ...)`).
+DAL_FORCEINLINE void dalSetCr6(DalPpuContext* ctx, DalVr result) {
+    uint64_t all = result.u64[0] & result.u64[1];
+    uint64_t any = result.u64[0] | result.u64[1];
+    dalSetCrField(ctx, 6, ((uint32_t)(all == ~0ull) << 3) | ((uint32_t)(any == 0) << 1));
+}
