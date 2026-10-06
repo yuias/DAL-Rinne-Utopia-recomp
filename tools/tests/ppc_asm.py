@@ -1,8 +1,11 @@
 """Tiny PPC encoder for tests: each function returns one big-endian instruction word.
 
 Operand order follows assembler syntax (`lwz(rd, d, ra)` is `lwz rD,d(rA)`). Branch helpers
-take the instruction address and the target, and compute the displacement.
+take the instruction address and the target, and compute the displacement. `encode` builds any
+word of the decoder's opcode table from named fields.
 """
+
+from ps3recomp import ppu
 
 
 def _d_form(primary: int, rt: int, ra: int, imm: int) -> int:
@@ -241,3 +244,89 @@ def stvrx(vs: int, ra: int, rb: int) -> int:
 
 def stvrxl(vs: int, ra: int, rb: int) -> int:
     return _x_form(935, vs, ra, rb)
+
+
+# Fields whose value is stored as separate bit pieces: (value bit offset, IBM first bit, last bit).
+_PIECES: dict[str, tuple[tuple[int, int, int], ...]] = {
+    "SH64": ((0, 16, 20), (5, 30, 30)),
+    "MB64": ((0, 21, 25), (5, 26, 26)),
+    # The two five-bit halves of the SPR/TBR number are swapped in the encoding.
+    "SPR": ((0, 11, 15), (5, 16, 20)),
+    "TBR": ((0, 11, 15), (5, 16, 20)),
+}
+_SIGNED_FIELDS = frozenset({"SIMM", "D", "DS", "BD", "LI", "SIMM5"})
+_BYTE_OFFSET_FIELDS = frozenset({"DS", "BD", "LI"})      # given in bytes, stored divided by 4
+_FLAG_FIELDS = {"rc": "Rc", "oe": "OE", "lk": "LK", "aa": "AA", "rc_vc": "Rc_vc"}
+_FLAG_IBM_BIT = {"Rc": 31, "LK": 31, "AA": 30, "OE": 21, "Rc_vc": 21}
+
+_SPECS: dict[str, ppu.OpSpec] = {}
+
+
+def _spec_named(name: str) -> ppu.OpSpec:
+    if not _SPECS:
+        for spec in ppu.ALL_OPS:
+            if spec.name in _SPECS:
+                raise ValueError("duplicate mnemonic %r in the opcode table" % spec.name)
+            _SPECS[spec.name] = spec
+    try:
+        return _SPECS[name]
+    except KeyError:
+        raise ValueError("unknown mnemonic %r" % name) from None
+
+
+def operand_fields(spec: ppu.OpSpec) -> tuple[str, ...]:
+    """Field names of a spec's operands; pseudo-operands such as `D(rA)` count as two."""
+    names: list[str] = []
+    for operand in spec.operands:
+        names.extend(operand.replace(")", "").split("("))
+    return tuple(names)
+
+
+def field_range(name: str) -> tuple[int, int]:
+    """Inclusive range of values `encode` accepts for a field (byte offsets for DS/BD/LI)."""
+    width = sum(b - a + 1 for _, a, b in _PIECES.get(name) or ((0, *ppu.FIELD_BITS[name][0]),))
+    if name in _SIGNED_FIELDS:
+        low, high = -(1 << (width - 1)), (1 << (width - 1)) - 1
+        if name in _BYTE_OFFSET_FIELDS:
+            return low * 4, high * 4
+        return low, high
+    return 0, (1 << width) - 1
+
+
+def encode(name: str, **fields: int) -> int:
+    """Build the word of mnemonic `name`; omitted operand fields are 0.
+
+    Operands use the decoder's values: sign-extended fields (`SIMM`, `D`, `SIMM5`) may be negative,
+    `DS`/`BD`/`LI` are byte offsets (multiples of 4), `SPR`/`TBR` are the plain register numbers.
+    Flags are `Rc`, `OE`, `LK`, `AA` and `Rc_vc`, allowed only where the mnemonic has them.
+    """
+    spec = _spec_named(name)
+    allowed = set(operand_fields(spec))
+    allowed.update(_FLAG_FIELDS[flag] for flag in spec.flags)
+    # strict_match, not match: it also carries the fixed bits of sc, stwcx. and stdcx.
+    word = spec.strict_match
+    used = spec.strict_mask
+    for field_name, value in fields.items():
+        if field_name not in allowed:
+            raise ValueError("%s has no field %r" % (name, field_name))
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s.%s: value must be an int" % (name, field_name))
+        if field_name in _FLAG_IBM_BIT:
+            low, high = 0, 1
+            pieces = ((0, _FLAG_IBM_BIT[field_name], _FLAG_IBM_BIT[field_name]),)
+        else:
+            low, high = field_range(field_name)
+            pieces = _PIECES.get(field_name) or ((0, *ppu.FIELD_BITS[field_name][0]),)
+        if not low <= value <= high:
+            raise ValueError("%s.%s: %d is outside %d..%d" % (name, field_name, value, low, high))
+        if field_name in _BYTE_OFFSET_FIELDS:
+            if value % 4:
+                raise ValueError("%s.%s: %d is not a multiple of 4" % (name, field_name, value))
+            value //= 4
+        for shift, first, last in pieces:
+            mask = ((1 << (last - first + 1)) - 1) << (31 - last)
+            if used & mask & ~spec.strict_mask and field_name not in _FLAG_IBM_BIT:
+                raise ValueError("%s.%s overlaps another field" % (name, field_name))
+            used |= mask
+            word = word & ~mask | ((value >> shift) << (31 - last)) & mask
+    return word
