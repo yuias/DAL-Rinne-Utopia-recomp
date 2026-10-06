@@ -39,6 +39,7 @@
 #include "lv2/sys_spu.h"
 #include "lv2/syscalls.h"
 #include "lv2/vfs.h"
+#include "lv2/vfs_config.h"
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
@@ -1996,6 +1997,334 @@ void testCellFs() {
   put(path_a, "/dev_hdd0/tmp/x.sdat");  // only the game directory is mapped
   CHECK(call(SdataOpen, path_a, 0, out) == err(dal::kCellEnoent));
   dal::configureSdataCache(std::nullopt);
+
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  stdfs::remove_all(root, ec);
+  dal::configureVfs({}, std::nullopt);
+}
+
+// Parsing, composition and installation of the VFS configuration file, and file overrides through
+// the guest-facing open calls.
+void testVfsConfig() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_vfs_config_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  auto hostFile = [](const stdfs::path& path, std::string_view data) {
+    stdfs::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << data;
+  };
+  const stdfs::path cfg = root / "cfg";
+  hostFile(cfg / "game" / "PS3_GAME" / "USRDIR" / "Exi.sdat", "encrypted");
+  hostFile(cfg / "game" / "b.txt", "0123456789");
+  hostFile(cfg / "plain" / "Exi.bin", "plain-bytes");
+  hostFile(cfg / "plain" / "other.txt", "other");
+  hostFile(root / "cache" / "PS3_GAME" / "USRDIR" / "Exi.sdat", "from-cache");
+
+  // A full file: relative host paths resolve against the base directory.
+  const auto full = dal::parseVfsConfig(R"({
+    "version": 1,
+    "game_dir": "game",
+    "hdd_dir": "hdd",
+    "sdata_cache": "../cache",
+    "mounts": {"/dev_usb000": {"host": "usb", "block_size": 4096},
+               "/dev_hdd2": {"host": "hdd2", "read_only": true}},
+    "files": {"/dev_bdvd/PS3_GAME/USRDIR/Exi.sdat": "plain/Exi.bin",
+              "/dev_hdd0/tmp/w.bin": {"host": "plain/w.bin", "read_only": false},
+              "/dev_bdvd/other.txt": {"host": "plain/other.txt"}}
+  })", cfg);
+  CHECK(full.has_value());
+  if (full) {
+    CHECK(full->warnings.empty());
+    CHECK(full->mounts.size() == 6);
+    auto find = [&](std::string_view name) -> const dal::VfsMount* {
+      for (const dal::VfsMount& m : full->mounts) {
+        if (m.name == name) return &m;
+      }
+      return nullptr;
+    };
+    const dal::VfsMount* bdvd = find("dev_bdvd");
+    const dal::VfsMount* app = find("app_home");
+    const dal::VfsMount* hdd0 = find("dev_hdd0");
+    const dal::VfsMount* usb = find("dev_usb000");
+    const dal::VfsMount* hdd2 = find("dev_hdd2");
+    CHECK(bdvd && bdvd->read_only && bdvd->host == cfg / "game");
+    CHECK(app && app->read_only && app->host == cfg / "game" / "PS3_GAME" / "USRDIR");
+    CHECK(hdd0 && !hdd0->read_only && hdd0->host == cfg / "hdd" / "dev_hdd0");
+    CHECK(usb && !usb->read_only && usb->block_size == 4096u && usb->host == cfg / "usb");
+    CHECK(hdd2 && hdd2->read_only && !hdd2->block_size);
+    CHECK(full->sdata_cache == root / "cache");
+    CHECK(full->files.size() == 3);
+    for (const dal::VfsFileOverride& f : full->files) {
+      if (f.guest == "/dev_bdvd/PS3_GAME/USRDIR/Exi.sdat") {
+        CHECK(f.read_only && f.host == cfg / "plain" / "Exi.bin");
+      } else if (f.guest == "/dev_hdd0/tmp/w.bin") {
+        CHECK(!f.read_only);
+      }
+    }
+  }
+
+  // Unknown keys warn and do not fail.
+  const auto unknown = dal::parseVfsConfig(R"({"version": 1, "colour": 1,
+      "mounts": {"/dev_usb000": {"host": "usb", "mode": "x"}},
+      "files": {"/dev_bdvd/a": {"host": "a", "extra": 1}}})", cfg);
+  CHECK(unknown.has_value() && unknown->warnings.size() == 3);
+  if (unknown) {
+    CHECK(unknown->warnings[0].find("colour") != std::string::npos);
+  }
+  CHECK(dal::parseVfsConfig(R"({"version": 1})", cfg).has_value());
+
+  // Errors, each with a message that names the problem.
+  auto expectError = [&](std::string_view text, std::string_view needle) {
+    const auto parsed = dal::parseVfsConfig(text, cfg);
+    CHECK(!parsed.has_value());
+    if (parsed) {
+      std::printf("  expected an error containing \"%.*s\"\n", static_cast<int>(needle.size()), needle.data());
+    } else {
+      const bool found = parsed.error().find(needle) != std::string::npos;
+      CHECK(found);
+      if (!found) {
+        std::printf("  error was: %s\n", parsed.error().c_str());
+      }
+    }
+  };
+  expectError("{", "invalid JSON");
+  expectError("[]", "top level");
+  expectError(R"({})", "\"version\" is missing");
+  expectError(R"({"version": 2})", "unsupported");
+  expectError(R"({"version": "1"})", "unsupported");
+  expectError(R"({"version": 1, "mounts": []})", "\"mounts\" must be an object");
+  expectError(R"({"version": 1, "mounts": {"dev_usb000": {"host": "x"}}})", "not absolute");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000/": {"host": "x"}}})", "not normalised");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000/../x": {"host": "x"}}})", "not normalised");
+  expectError(R"({"version": 1, "mounts": {"/dev_hdd0/game": {"host": "x"}}})", "overlap");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000": {}}})", "\"host\" is missing");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000": {"host": ""}}})", "empty");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000": {"host": "x", "read_only": 1}}})", "read_only");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000": {"host": "x", "block_size": 1000}}})", "block_size");
+  expectError(R"({"version": 1, "mounts": {"/dev_usb000": {"host": "x"}, "/dev_usb000": {"host": "y"}}})",
+              "duplicate key");
+  expectError(R"({"version": 1, "game_dir": "g", "mounts": {"/dev_bdvd": {"host": "x"}}})", "mounted twice");
+  expectError(R"({"version": 1, "hdd_dir": "g", "mounts": {"/dev_hdd1": {"host": "x"}}})", "mounted twice");
+  expectError(R"({"version": 1, "files": {"/dev_bdvd": "x"}})", "at least 2");
+  expectError(R"({"version": 1, "files": {"/dev_bdvd/a/./b": "x"}})", "not normalised");
+  expectError(R"({"version": 1, "files": {"dev_bdvd/a": "x"}})", "not absolute");
+  expectError(R"({"version": 1, "files": {"/dev_bdvd/a": 3}})", "host path string");
+  expectError(R"({"version": 1, "files": {"/dev_bdvd/a": "x", "/dev_bdvd/a/b": "y"}})", "below");
+  expectError(R"({"version": 1, "sdata_cache": 4})", "path string");
+
+  // Composition: command-line options win over the file, which wins over the defaults.
+  const auto parsed_base = dal::parseVfsConfig(R"({"version": 1, "game_dir": "game", "hdd_dir": "hdd",
+      "sdata_cache": "../cache", "mounts": {"/dev_hdd2": {"host": "hdd2"}}})", cfg);
+  CHECK(parsed_base.has_value());
+  const dal::VfsConfigFile* file = parsed_base ? &*parsed_base : nullptr;
+  auto hostOf = [](const dal::VfsLayout& layout, std::string_view name) {
+    for (const dal::VfsMount& m : layout.mounts) {
+      if (m.name == name) return m.host;
+    }
+    return stdfs::path();
+  };
+  const auto from_file = dal::composeVfsLayout(file, {});
+  CHECK(from_file.has_value());
+  if (from_file) {
+    CHECK(hostOf(*from_file, "dev_bdvd") == cfg / "game");
+    CHECK(hostOf(*from_file, "dev_hdd1") == cfg / "hdd" / "dev_hdd1");
+    CHECK(from_file->sdata_cache == root / "cache");
+  }
+  dal::VfsCliOptions cli;
+  cli.game_dir = cfg / "plain";
+  cli.hdd_dir = root / "cli_hdd";
+  cli.sdata_cache = root / "cli_cache";
+  const auto merged = dal::composeVfsLayout(file, cli);
+  CHECK(merged.has_value());
+  if (merged) {
+    CHECK(merged->mounts.size() == 5);  // the options replaced four mounts, the extra one stays
+    CHECK(hostOf(*merged, "dev_bdvd") == *cli.game_dir);
+    CHECK(hostOf(*merged, "app_home") == *cli.game_dir / "PS3_GAME" / "USRDIR");
+    CHECK(hostOf(*merged, "dev_hdd0") == *cli.hdd_dir / "dev_hdd0");
+    CHECK(hostOf(*merged, "dev_hdd2") == cfg / "hdd2");
+    CHECK(merged->sdata_cache == cli.sdata_cache);
+  }
+  // Without a file the options alone give the default layout.
+  dal::VfsCliOptions game_only;
+  game_only.game_dir = cfg / "game";
+  const auto only_cli = dal::composeVfsLayout(nullptr, game_only);
+  CHECK(only_cli.has_value() && only_cli->mounts.size() == 2 && !only_cli->sdata_cache);
+  CHECK(dal::composeVfsLayout(nullptr, {}).has_value());  // no mounts at all is valid here
+  // A game directory without PS3_GAME/USRDIR still composes: the derived /app_home may be absent.
+  CHECK(!stdfs::exists(cfg / "plain" / "PS3_GAME"));
+  dal::VfsCliOptions bare_game;
+  bare_game.game_dir = cfg / "plain";
+  CHECK(dal::composeVfsLayout(nullptr, bare_game).has_value());
+
+  // Host checks: a read-only mount and an override file must exist; writable mounts may not overlap.
+  auto composeError = [&](std::string_view text, std::string_view needle) {
+    const auto parsed = dal::parseVfsConfig(text, cfg);
+    CHECK(parsed.has_value());
+    if (!parsed) return;
+    const auto composed = dal::composeVfsLayout(&*parsed, {});
+    CHECK(!composed.has_value());
+    CHECK(!composed && composed.error().find(needle) != std::string::npos);
+  };
+  composeError(R"({"version": 1, "game_dir": "missing"})", "does not exist");
+  composeError(R"({"version": 1, "mounts": {"/app_home": {"host": "plain/none"}}})", "does not exist");
+  composeError(R"({"version": 1, "files": {"/dev_bdvd/a": "plain/missing"}})", "does not exist");
+  composeError(R"({"version": 1, "files": {"/dev_bdvd/a": "plain"}})", "not a regular file");
+  composeError(R"({"version": 1, "files": {"/dev_bdvd/a": {"host": "nodir/f", "read_only": false}}})",
+               "does not exist");
+  composeError(R"({"version": 1, "mounts": {"/dev_usb000": {"host": "usb"}, "/dev_usb001": {"host": "usb/inner"}}})",
+               "overlap");
+  composeError(R"({"version": 1, "mounts": {"/dev_hdd0": {"host": "plain"}, "/dev_bdvd": {"host": "plain"}}})",
+               "overlap");
+  // Two read-only mounts may share a directory.
+  const auto shared = dal::parseVfsConfig(
+      R"({"version": 1, "mounts": {"/dev_bdvd": {"host": "game"}, "/app_home": {"host": "game/PS3_GAME/USRDIR"}}})",
+      cfg);
+  CHECK(shared && dal::composeVfsLayout(&*shared, {}).has_value());
+
+  // loadVfsConfig reads a file and resolves against its directory; errors name the file.
+  hostFile(cfg / "vfs.json", R"({"version": 1, "game_dir": "game"})");
+  const auto loaded = dal::loadVfsConfig(cfg / "vfs.json");
+  CHECK(loaded && loaded->mounts.size() == 2 && loaded->mounts[0].host == cfg / "game");
+  const auto no_file = dal::loadVfsConfig(cfg / "none.json");
+  CHECK(!no_file && no_file.error().find("none.json") != std::string::npos);
+  hostFile(cfg / "bad.json", R"({"version": 9})");
+  const auto bad_file = dal::loadVfsConfig(cfg / "bad.json");
+  CHECK(!bad_file && bad_file.error().find("bad.json") != std::string::npos);
+
+  // Install a file's layout and use it through the guest-facing calls.
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t path_a = scratch, buf = scratch + 0x2000, out = scratch + 0x3000,
+                      sb = scratch + 0x3100, arg = scratch + 0x3200;
+  enum Import : std::uint32_t { Read, Close, Open, Stat, Write, SdataOpen, Fstat, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x0d5b4a14, "sys_fs", "cellFsReadWithOffset"},
+      {0x00800010, 0x2cb51f0d, "sys_fs", "cellFsClose"},
+      {0x00800020, 0x718bf5f8, "sys_fs", "cellFsOpen"},
+      {0x00800030, 0x7de6dced, "sys_fs", "cellFsStat"},
+      {0x00800040, 0x8cb722d5, "sys_fs", "cellFsWriteWithOffset"},
+      {0x00800050, 0xb1840b53, "sys_fs", "cellFsSdataOpen"},
+      {0x00800060, 0xef3efa34, "sys_fs", "cellFsFstat"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                  std::uint64_t d = 0, std::uint64_t e = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    ctx->gpr[6] = d;
+    ctx->gpr[7] = e;
+    dalHleCall(ctx.get(), base, which);
+    return ctx->gpr[3];
+  };
+  auto put = [&](std::uint32_t addr, std::string_view text) {
+    std::memcpy(base + addr, text.data(), text.size());
+    base[addr + text.size()] = 0;
+  };
+  // Reads up to 64 bytes from the start of the open file `fd`.
+  auto readAll = [&](std::uint32_t fd) {
+    CHECK(call(Read, fd, 0, buf, 64, out + 0x40) == 0);  // `out` keeps the fd
+    return std::string(reinterpret_cast<const char*>(base + buf), dalRead64(base, out + 0x40));
+  };
+
+  hostFile(cfg / "layout.json", R"({
+    "version": 1, "game_dir": "game", "hdd_dir": "hdd", "sdata_cache": "../cache",
+    "mounts": {"/dev_usb000": {"host": "usb", "block_size": 1024}},
+    "files": {"/dev_bdvd/PS3_GAME/USRDIR/Exi.sdat": "plain/Exi.bin",
+              "/dev_bdvd/b.txt": "plain/other.txt",
+              "/dev_hdd0/tmp/w.bin": {"host": "plain/w.bin", "read_only": false}}
+  })");
+  const auto layout_file = dal::loadVfsConfig(cfg / "layout.json");
+  CHECK(layout_file.has_value());
+  const auto layout = layout_file ? dal::composeVfsLayout(&*layout_file, {})
+                                  : std::expected<dal::VfsLayout, std::string>(std::unexpected("no file"));
+  CHECK(layout.has_value());
+  if (layout) {
+    dal::configureVfs(*layout);
+    CHECK(stdfs::is_directory(cfg / "hdd" / "dev_hdd0" / "game") && stdfs::is_directory(cfg / "usb"));
+
+    // The sdata open serves the override, not the cache copy at the same path.
+    dalWrite32(base, out, 0xDEADBEEF);
+    put(path_a, "/dev_bdvd/PS3_GAME/USRDIR/Exi.sdat");
+    CHECK(call(SdataOpen, path_a, 0, out) == 0);
+    const std::uint32_t sfd = dalRead32(base, out);
+    CHECK(readAll(sfd) == "plain-bytes");
+    CHECK(call(Fstat, sfd, sb) == 0 && dalRead64(base, sb + 36) == 11 && dalRead32(base, sb) == 0100444);
+    CHECK(call(Close, sfd) == 0);
+    // So does a plain open of the same path and the sdata marker of cellFsOpen.
+    CHECK(call(Open, path_a, 0, out, 0, 0) == 0 && readAll(dalRead32(base, out)) == "plain-bytes");
+    CHECK(call(Close, dalRead32(base, out)) == 0);
+    dalWrite32(base, arg, 0x180);
+    dalWrite32(base, arg + 4, 0x10);
+    CHECK(call(Open, path_a, 0, out, arg, 8) == 0 && readAll(dalRead32(base, out)) == "plain-bytes");
+    CHECK(call(Close, dalRead32(base, out)) == 0);
+    CHECK(call(Stat, path_a, sb) == 0 && dalRead64(base, sb + 36) == 11);
+    // A spelling that normalises to the same guest path matches too.
+    put(path_a, "/dev_bdvd/PS3_GAME//USRDIR/./Exi.sdat");
+    CHECK(call(SdataOpen, path_a, 0, out) == 0 && readAll(dalRead32(base, out)) == "plain-bytes");
+    CHECK(call(Close, dalRead32(base, out)) == 0);
+    // /app_home is another guest path: no override there, so the cache copy is served.
+    put(path_a, "/app_home/Exi.sdat");
+    CHECK(call(SdataOpen, path_a, 0, out) == 0 && readAll(dalRead32(base, out)) == "from-cache");
+    CHECK(call(Close, dalRead32(base, out)) == 0);
+
+    // An override on a path the game directory also has wins over it, read-only.
+    put(path_a, "/dev_bdvd/b.txt");
+    CHECK(call(Open, path_a, 0, out, 0, 0) == 0);
+    const std::uint32_t over_fd = dalRead32(base, out);
+    CHECK(readAll(over_fd) == "other");
+    CHECK(call(Write, over_fd, 0, buf, 1, out) == err(dal::kCellEbadf));
+    CHECK(call(Close, over_fd) == 0);
+    CHECK(call(Open, path_a, 1, out, 0, 0) == err(dal::kCellEperm));  // write-only on a read-only file
+
+    // A writable override is created and written at the host path it names.
+    put(path_a, "/dev_hdd0/tmp/w.bin");
+    CHECK(call(Open, path_a, 0102, out, 0, 0) == 0);  // RDWR | CREAT
+    const std::uint32_t w_fd = dalRead32(base, out);
+    put(buf, "written");
+    CHECK(call(Write, w_fd, 0, buf, 7, out) == 0 && dalRead64(base, out) == 7);
+    CHECK(call(Close, w_fd) == 0);
+    {
+      std::ifstream in(cfg / "plain" / "w.bin", std::ios::binary);
+      CHECK(std::string(std::istreambuf_iterator<char>(in), {}) == "written");
+    }
+    CHECK(!stdfs::exists(cfg / "hdd" / "dev_hdd0" / "tmp" / "w.bin"));
+
+    // Mounts from the file: an extra device with its block size; overrides report their mount's.
+    hostFile(cfg / "usb" / "f.bin", "usb");
+    put(path_a, "/dev_usb000/f.bin");
+    CHECK(call(Stat, path_a, sb) == 0 && dalRead64(base, sb + 44) == 1024);
+    put(path_a, "/dev_bdvd/b.txt");
+    CHECK(call(Stat, path_a, sb) == 0 && dalRead64(base, sb + 44) == 2048);
+    const dal::VfsResolution marked = dal::resolveVfs("/dev_bdvd/b.txt/");
+    CHECK(marked.file_override && marked.dir_only);
+    CHECK(!dal::resolveVfs("/dev_usb000/f.bin").file_override);
+    CHECK(dal::resolveVfs("/dev_usb001/x").status == dal::VfsStatus::NotMounted);
+    const std::vector<std::string> names = dal::vfsMountNames();
+    CHECK(std::ranges::find(names, "dev_usb000") != names.end() && names.size() == 5);
+
+    // Dropping the overrides brings back the cache copy for the same path.
+    dal::VfsLayout without_files = *layout;
+    without_files.files.clear();
+    dal::configureVfs(std::move(without_files));
+    put(path_a, "/dev_bdvd/PS3_GAME/USRDIR/Exi.sdat");
+    CHECK(call(SdataOpen, path_a, 0, out) == 0 && readAll(dalRead32(base, out)) == "from-cache");
+    CHECK(call(Close, dalRead32(base, out)) == 0);
+  }
 
   p.main.free(scratch);
   dal::setLogSink({});
@@ -5377,6 +5706,7 @@ int main(int argc, char** argv) {
   testParamSfo();
   testCellGame();
   testCellFs();
+  testVfsConfig();
   testSceNpAndTrophy();
   testCellSysutil();
   testVideoAndAudioOut();

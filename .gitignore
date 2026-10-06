@@ -32,6 +32,9 @@ CMakeUserPresets.json
 # Claude Code
 .claude/
 
+# User-local VFS configurations (real host paths)
+*.local.json
+
 # Generated analysis output and user-supplied game binaries
 /generated/
 /game/

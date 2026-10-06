@@ -72,6 +72,7 @@ struct FsObject {
 
   bool is_dir = false;
   VfsDevice device = VfsDevice::None;
+  VfsDeviceInfo info = {512, true};
   bool read_only = false;
   HANDLE file = INVALID_HANDLE_VALUE;
   std::int32_t flags = 0;
@@ -219,9 +220,8 @@ std::int64_t toUnixTime(const FILETIME& ft) {
   return static_cast<std::int64_t>(value.QuadPart / 10000000ull) - kEpochDiffSeconds;
 }
 
-FsStat makeStat(bool is_dir, bool read_only, VfsDevice device, std::uint64_t size,
+FsStat makeStat(bool is_dir, bool read_only, const VfsDeviceInfo& info, std::uint64_t size,
                 const FILETIME& atime, const FILETIME& mtime, const FILETIME& ctime) {
-  const VfsDeviceInfo info = vfsDeviceInfo(device);
   FsStat out;
   out.mode = is_dir ? (kSIfDir | 0777) : (kSIfReg | 0666);
   if (read_only) {
@@ -312,6 +312,7 @@ std::uint32_t openFile(std::string_view path, std::int32_t flags, std::uint32_t&
   object->file = handle;
   object->flags = flags;
   object->device = res.device;
+  object->info = res.info;
   object->read_only = res.read_only;
   fd = addObject(std::move(object));
   return fd != 0 ? kCellOk : kCellEmfile;
@@ -326,6 +327,7 @@ std::uint32_t openDirectory(std::string_view path, std::uint32_t& fd) {
   auto object = std::make_shared<FsObject>();
   object->is_dir = true;
   object->device = res.device;
+  object->info = res.info;
   object->read_only = res.read_only;
 
   if (res.device == VfsDevice::Root) {
@@ -429,7 +431,7 @@ constexpr std::uint64_t kArgEdata = 2;
 
 // Opens an sdata container file. The runtime does not decrypt: it serves a copy decrypted ahead
 // of time (tools/dal_sdat) from the --sdata-cache directory, which holds each file at its path
-// relative to the game directory. Without such a copy the file is reported missing.
+// relative to the game directory, or a file override. Without either the file is reported missing.
 std::uint32_t openSdata(std::string_view path, std::uint32_t& fd) {
   const VfsResolution res = resolveVfs(path);
   if (res.device == VfsDevice::Root) {
@@ -438,7 +440,7 @@ std::uint32_t openSdata(std::string_view path, std::uint32_t& fd) {
   if (res.status != VfsStatus::Ok) {
     return vfsError(res.status);
   }
-  const std::optional<stdfs::path> cached = sdataCacheHostPath(res);
+  const std::optional<stdfs::path> cached = sdataHostPath(res);
   if (!cached) {
     logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path), "dal: fs: sdata open not supported: {}", path);
     return kCellEnoent;
@@ -448,12 +450,13 @@ std::uint32_t openSdata(std::string_view path, std::uint32_t& fd) {
                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
     logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path),
-            "dal: fs: no decrypted copy of sdata file {} in the sdata cache", path);
+            "dal: fs: no readable decrypted copy of sdata file {}", path);
     return kCellEnoent;
   }
   auto object = std::make_shared<FsObject>();
   object->file = handle;
   object->device = res.device;
+  object->info = res.info;
   object->read_only = true;
   fd = addObject(std::move(object));
   return fd != 0 ? kCellOk : kCellEmfile;
@@ -510,7 +513,7 @@ std::uint32_t fsStatPath(std::string_view guest_path, FsStat& out) {
     return kCellEnotdir;
   }
   const std::uint64_t size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-  out = makeStat(is_dir, res.read_only, res.device, size, data.ftLastAccessTime,
+  out = makeStat(is_dir, res.read_only, res.info, size, data.ftLastAccessTime,
                  data.ftLastWriteTime, data.ftCreationTime);
   return kCellOk;
 }
@@ -525,7 +528,7 @@ std::uint32_t fsStatFd(std::uint32_t fd, FsStat& out) {
     return kCellEio;
   }
   const std::uint64_t size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-  out = makeStat(false, object->read_only, object->device, size, info.ftLastAccessTime,
+  out = makeStat(false, object->read_only, object->info, size, info.ftLastAccessTime,
                  info.ftLastWriteTime, info.ftCreationTime);
   return kCellOk;
 }

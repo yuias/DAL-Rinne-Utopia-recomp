@@ -28,11 +28,26 @@ function(dal_runtime_add_lodepng)
   target_include_directories(lodepng PUBLIC ${CMAKE_SOURCE_DIR}/externals/lodepng)
 endfunction()
 
+# nlohmann/json is header-only; its INTERFACE target supplies the include path. SystemInclude
+# keeps its headers out of the project's warning flags.
+function(dal_runtime_add_nlohmann_json)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/json/CMakeLists.txt)
+    message(FATAL_ERROR
+      "DAL: externals/json is missing or empty. Run: git submodule update --init")
+  endif()
+  set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+  set(JSON_Install OFF CACHE BOOL "" FORCE)
+  set(JSON_SystemInclude ON CACHE BOOL "" FORCE)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/json
+    ${CMAKE_BINARY_DIR}/externals/json EXCLUDE_FROM_ALL)
+endfunction()
+
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
   dal_runtime_add_lodepng()
+  dal_runtime_add_nlohmann_json()
 
   add_library(dal_runtime_core STATIC
     runtime/src/core/boot.cpp
@@ -67,6 +82,7 @@ function(dal_runtime_add_core)
     runtime/src/lv2/sys_spu.cpp
     runtime/src/lv2/syscalls.cpp
     runtime/src/lv2/vfs.cpp
+    runtime/src/lv2/vfs_config.cpp
     runtime/src/rsx/fifo_parser.cpp
     runtime/src/rsx/gcm_interrupts.cpp
     runtime/src/rsx/rsx_state.cpp
@@ -80,6 +96,8 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
   target_link_libraries(dal_runtime_core PRIVATE lodepng)
+  # PRIVATE as well: JSON types stay inside vfs_config.cpp.
+  target_link_libraries(dal_runtime_core PRIVATE nlohmann_json::nlohmann_json)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
   target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)

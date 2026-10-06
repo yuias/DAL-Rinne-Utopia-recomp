@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <system_error>
 
@@ -15,15 +17,52 @@
 namespace dal {
 namespace {
 
-struct VfsState {
-  std::filesystem::path game_dir;
-  std::optional<std::filesystem::path> hdd0;
-  std::optional<std::filesystem::path> hdd1;
+struct MountEntry {
+  std::string name;
+  VfsDevice device = VfsDevice::Other;
+  std::filesystem::path host;
+  bool read_only = false;
+  VfsDeviceInfo info = {};
 };
 
+struct FileEntry {
+  std::filesystem::path host;
+  bool read_only = true;
+  VfsDevice device = VfsDevice::Other;
+  VfsDeviceInfo info = {};
+};
+
+struct VfsState {
+  std::vector<MountEntry> mounts;
+  std::map<std::string, FileEntry, std::less<>> files;
+  std::optional<std::filesystem::path> sdata_cache;
+
+  const MountEntry* findMount(std::string_view name) const {
+    for (const MountEntry& mount : mounts) {
+      if (mount.name == name) {
+        return &mount;
+      }
+    }
+    return nullptr;
+  }
+};
+
+// Readers take a snapshot of the pointer, so a resolution never copies the tables.
 std::mutex g_mutex;
-VfsState g_state;
-std::optional<std::filesystem::path> g_sdata_cache;
+std::shared_ptr<const VfsState> g_state = std::make_shared<const VfsState>();
+
+std::shared_ptr<const VfsState> snapshot() {
+  const std::lock_guard lock(g_mutex);
+  return g_state;
+}
+
+VfsDevice deviceForName(std::string_view name) {
+  if (name == "dev_bdvd") return VfsDevice::Bdvd;
+  if (name == "app_home") return VfsDevice::AppHome;
+  if (name == "dev_hdd0") return VfsDevice::Hdd0;
+  if (name == "dev_hdd1") return VfsDevice::Hdd1;
+  return VfsDevice::Other;
+}
 
 // Components the host would interpret instead of treating them as plain names.
 bool isHostSafeName(std::string_view name) {
@@ -71,52 +110,94 @@ bool endsWithDirMarker(std::string_view guest) {
 
 }  // namespace
 
-void configureVfs(std::filesystem::path game_dir, std::optional<std::filesystem::path> hdd_dir) {
-  VfsState state;
-  state.game_dir = std::move(game_dir);
-  if (hdd_dir) {
-    state.hdd0 = *hdd_dir / "dev_hdd0";
-    state.hdd1 = *hdd_dir / "dev_hdd1";
-    std::error_code ec;
-    std::filesystem::create_directories(*state.hdd1, ec);
-    for (const std::string_view sub : kHdd0Skeleton) {
-      if (!ec) {
-        std::filesystem::create_directories(*state.hdd0 / sub, ec);
+void configureVfs(VfsLayout layout) {
+  auto state = std::make_shared<VfsState>();
+  std::error_code ec;
+  for (VfsMount& mount : layout.mounts) {
+    MountEntry entry;
+    entry.name = std::move(mount.name);
+    entry.device = deviceForName(entry.name);
+    entry.info = vfsDeviceInfo(entry.device);
+    if (mount.block_size) {
+      entry.info.block_size = *mount.block_size;
+    }
+    entry.read_only = mount.read_only;
+    entry.host = std::move(mount.host);
+    if (!entry.read_only) {
+      std::filesystem::create_directories(entry.host, ec);
+      if (entry.device == VfsDevice::Hdd0) {
+        for (const std::string_view sub : kHdd0Skeleton) {
+          if (!ec) {
+            std::filesystem::create_directories(entry.host / sub, ec);
+          }
+        }
+      }
+      if (ec) {
+        logWarn("dal: fs: cannot create the directories of /{}: {}", entry.name, ec.message());
+        ec.clear();
       }
     }
-    if (ec) {
-      logWarn("dal: fs: cannot create the hdd directories: {}", ec.message());
-    }
+    state->mounts.push_back(std::move(entry));
   }
+  for (VfsFileOverride& file : layout.files) {
+    FileEntry entry;
+    entry.host = std::move(file.host);
+    entry.read_only = file.read_only;
+    // The device of a file is its first guest component; an unmounted one is just "other".
+    const size_t slash = file.guest.find('/', 1);
+    const MountEntry* mount = state->findMount(std::string_view(file.guest).substr(1, slash - 1));
+    entry.device = mount != nullptr ? mount->device : VfsDevice::Other;
+    entry.info = mount != nullptr ? mount->info : vfsDeviceInfo(VfsDevice::Other);
+    state->files[std::move(file.guest)] = std::move(entry);
+  }
+  state->sdata_cache = std::move(layout.sdata_cache);
   const std::lock_guard lock(g_mutex);
   g_state = std::move(state);
 }
 
-void configureSdataCache(std::optional<std::filesystem::path> cache_dir) {
-  const std::lock_guard lock(g_mutex);
-  g_sdata_cache = std::move(cache_dir);
+std::vector<VfsMount> gameDirMounts(const std::filesystem::path& game_dir) {
+  return {{"dev_bdvd", game_dir, true, std::nullopt},
+          {"app_home", game_dir / "PS3_GAME" / "USRDIR", true, std::nullopt}};
 }
 
-std::optional<std::filesystem::path> sdataCacheHostPath(const VfsResolution& res) {
-  if (res.status != VfsStatus::Ok || (res.device != VfsDevice::Bdvd && res.device != VfsDevice::AppHome)) {
-    return std::nullopt;
-  }
-  std::filesystem::path game_dir;
-  std::filesystem::path cache_dir;
-  {
-    const std::lock_guard lock(g_mutex);
-    if (!g_sdata_cache) {
-      return std::nullopt;
+std::vector<VfsMount> hddDirMounts(const std::filesystem::path& hdd_dir) {
+  return {{"dev_hdd0", hdd_dir / "dev_hdd0", false, std::nullopt},
+          {"dev_hdd1", hdd_dir / "dev_hdd1", false, std::nullopt}};
+}
+
+void configureVfs(std::filesystem::path game_dir, std::optional<std::filesystem::path> hdd_dir) {
+  VfsLayout layout;
+  layout.mounts = gameDirMounts(game_dir);
+  if (hdd_dir) {
+    for (VfsMount& mount : hddDirMounts(*hdd_dir)) {
+      layout.mounts.push_back(std::move(mount));
     }
-    game_dir = g_state.game_dir;
-    cache_dir = *g_sdata_cache;
   }
-  // res.host is built from game_dir by plain appends, so the relative path is exact.
-  const std::filesystem::path relative = res.host.lexically_relative(game_dir);
-  if (relative.empty() || relative == "." || *relative.begin() == "..") {
+  configureVfs(std::move(layout));
+}
+
+void configureSdataCache(std::optional<std::filesystem::path> cache_dir) {
+  const std::lock_guard lock(g_mutex);
+  auto state = std::make_shared<VfsState>(*g_state);
+  state->sdata_cache = std::move(cache_dir);
+  g_state = std::move(state);
+}
+
+std::optional<std::filesystem::path> sdataHostPath(const VfsResolution& res) {
+  if (res.status != VfsStatus::Ok) {
     return std::nullopt;
   }
-  return cache_dir / relative;
+  if (res.file_override) {
+    return res.host;
+  }
+  if (res.disc_path.empty()) {
+    return std::nullopt;
+  }
+  const auto state = snapshot();
+  if (!state->sdata_cache) {
+    return std::nullopt;
+  }
+  return *state->sdata_cache / res.disc_path;
 }
 
 VfsResolution resolveVfs(std::string_view guest) {
@@ -160,36 +241,41 @@ VfsResolution resolveVfs(std::string_view guest) {
     return result;
   }
   const std::string_view device_name = parts.front();
+  const auto state = snapshot();
 
-  VfsState state;
-  {
-    const std::lock_guard lock(g_mutex);
-    state = g_state;
-  }
-
-  std::filesystem::path root;
-  if (device_name == "dev_bdvd") {
-    result.device = VfsDevice::Bdvd;
-    result.read_only = true;
-    root = state.game_dir;
-  } else if (device_name == "app_home") {
-    result.device = VfsDevice::AppHome;
-    result.read_only = true;
-    root = state.game_dir / "PS3_GAME" / "USRDIR";
-  } else if (device_name == "dev_hdd0" || device_name == "dev_hdd1") {
-    result.device = device_name == "dev_hdd0" ? VfsDevice::Hdd0 : VfsDevice::Hdd1;
-    const auto& configured = result.device == VfsDevice::Hdd0 ? state.hdd0 : state.hdd1;
-    if (!configured) {
-      logOnce("vfs-no-hdd-dir", "dal: fs: {} used without --hdd-dir", std::string(device_name));
-      result.status = VfsStatus::NotFound;
+  // An override names one exact guest path and wins over any mount.
+  if (!state->files.empty()) {
+    std::string key;
+    for (const std::string_view part : parts) {
+      key += '/';
+      key += part;
+    }
+    const auto it = state->files.find(key);
+    if (it != state->files.end()) {
+      result.status = VfsStatus::Ok;
+      result.device = it->second.device;
+      result.info = it->second.info;
+      result.host = it->second.host;
+      result.read_only = it->second.read_only;
+      result.file_override = true;
       return result;
     }
-    root = *configured;
-  } else {
-    return result;
   }
 
-  result.host = std::move(root);
+  const MountEntry* mount = state->findMount(device_name);
+  if (mount == nullptr) {
+    if (device_name == "dev_hdd0" || device_name == "dev_hdd1") {
+      logOnce("vfs-no-hdd-dir", "dal: fs: {} used without an hdd mount (--hdd-dir or the VFS config)",
+              std::string(device_name));
+      result.status = VfsStatus::NotFound;
+    }
+    return result;
+  }
+  result.device = mount->device;
+  result.read_only = mount->read_only;
+  result.info = mount->info;
+
+  result.host = mount->host;
   try {
     for (size_t i = 1; i < parts.size(); i++) {
       if (!isHostSafeName(parts[i])) {
@@ -209,6 +295,14 @@ VfsResolution resolveVfs(std::string_view guest) {
   result.protected_parent =
       result.device == VfsDevice::Hdd0 &&
       (parts.size() == 2 || (parts.size() == 3 && parts[1] == "game"));
+  if (result.device == VfsDevice::Bdvd || result.device == VfsDevice::AppHome) {
+    if (result.device == VfsDevice::AppHome) {
+      result.disc_path = std::filesystem::path("PS3_GAME") / "USRDIR";
+    }
+    for (size_t i = 1; i < parts.size(); i++) {
+      result.disc_path = appendUtf8(std::move(result.disc_path), parts[i]);
+    }
+  }
   return result;
 }
 
@@ -222,11 +316,9 @@ std::optional<std::filesystem::path> resolveGuestPath(std::string_view guest, bo
 }
 
 std::vector<std::string> vfsMountNames() {
-  const std::lock_guard lock(g_mutex);
-  std::vector<std::string> names{"dev_bdvd", "app_home"};
-  if (g_state.hdd0) {
-    names.emplace_back("dev_hdd0");
-    names.emplace_back("dev_hdd1");
+  std::vector<std::string> names;
+  for (const MountEntry& mount : snapshot()->mounts) {
+    names.push_back(mount.name);
   }
   return names;
 }
@@ -240,6 +332,8 @@ VfsDeviceInfo vfsDeviceInfo(VfsDevice device) {
     case VfsDevice::Bdvd:
     case VfsDevice::AppHome:  // reflects the mount point of the boot ELF's directory
       return {2048, true};
+    case VfsDevice::Other:
+      return {4096, false};
     case VfsDevice::Root:
     case VfsDevice::None:
       break;

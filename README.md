@@ -23,7 +23,7 @@ game" for what is and is not implemented.
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
-- git, with the submodules initialised: `git submodule update --init` (spdlog and lodepng under `externals/`;
+- git, with the submodules initialised: `git submodule update --init` (spdlog, lodepng and nlohmann/json under `externals/`;
   clone with `--recurse-submodules` to do it in one step)
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
@@ -473,15 +473,16 @@ generated tables to the core. The executable is checked against the SHA-256 that
 code was emitted from.
 
 ```sh
-dal_game --game-dir DIR [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR] [--seconds N] [--strict]
-         [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
+dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
+         [--seconds N] [--strict] [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
          [--png-dump DIR]
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--game-dir DIR` | Required. The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home`, `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. |
-| `--elf PATH` | The decrypted executable. Default: `DIR/PS3_GAME/USRDIR/EBOOT.elf`. |
+| `--game-dir DIR` | The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home` (`DIR/PS3_GAME/USRDIR`), `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. Required unless `--vfs-config` mounts `/dev_bdvd` (the executable can also come from `--elf`). `DIR/PS3_GAME/USRDIR` need not exist. |
+| `--vfs-config FILE` | A JSON file that describes the virtual file system. The options `--game-dir`, `--hdd-dir` and `--sdata-cache` override the matching parts of it. See "VFS configuration file". |
+| `--elf PATH` | The decrypted executable. Default: `PS3_GAME/USRDIR/EBOOT.elf` on `/dev_bdvd` (`DIR/PS3_GAME/USRDIR/EBOOT.elf`, or where the configuration puts it). |
 | `--hdd-dir DIR` | Host directory behind `/dev_hdd0` and `/dev_hdd1` (`DIR/dev_hdd0`, `DIR/dev_hdd1`; created on demand). Without it the hdd devices do not resolve and the game cannot create its game data or save files. |
 | `--sdata-cache DIR` | Directory of decrypted `.sdat` files, each at its path relative to the game directory, as written by `dal_sdat`. Without it `cellFsSdataOpen` fails. See "SDAT files". |
 | `--seconds N` | Watchdog: stop after `N` seconds. 0 (the default) disables it. |
@@ -493,9 +494,10 @@ dal_game --game-dir DIR [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR] [--seco
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 
-Game paths are command-line arguments only; no tracked file contains one. The build wrapper takes
-them as `-EbootElf` and `-GameDir` for the tests (CMake cache variables `DAL_EBOOT_ELF` and
-`DAL_GAME_DIR`).
+No tracked file contains a game path: they are command-line arguments or live in a user-local
+VFS configuration (`config/vfs.example.json` shows the format with placeholders). The build
+wrapper takes them as `-EbootElf` and `-GameDir` for the tests (CMake cache variables
+`DAL_EBOOT_ELF` and `DAL_GAME_DIR`).
 
 ### Exit codes and stop lines
 
@@ -504,9 +506,9 @@ Every run ends with one stop line on stderr and a census (below), then exits:
 | Code | Meaning | Stop line |
 | --- | --- | --- |
 | 0 | The guest called `sys_process_exit` or `_sys_process_exit` (also `--load-only` after loading) | `dal: stop: process exit status N` |
-| 2 | Usage error: bad option, missing `--game-dir`, game directory missing, log file not writable | `error: ...` (usage text) |
+| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file not writable | `error: ...` (usage text) |
 | 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved | `dal: stop: fatal <kind>: ...` |
-| 4 | Load error: file missing, not a PPU executable, or SHA-256 different from the one in the generated code | `error: ...` |
+| 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
 | 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
 | 6 | Stall: every live guest thread has been in an indefinite wait for at least 2 seconds | `dal: stop: stall (N threads blocked)` |
 | 7 | All guest threads ended without a process exit | `dal: stop: no guest threads left` |
@@ -716,12 +718,74 @@ Guest paths map to host directories (`runtime/src/lv2/vfs.cpp`, following RPCS3'
 | `/dev_hdd0` | `<--hdd-dir>/dev_hdd0` | read and write |
 | `/dev_hdd1` | `<--hdd-dir>/dev_hdd1` | read and write |
 
+The table is the layout the command-line options produce. A VFS configuration file can change it
+(other host directories, more devices, single-file overrides).
+
 `..` components may not leave a device, and a guest cannot create entries directly under
 `/dev_hdd0` or `/dev_hdd0/game`. The directories that the console's system software keeps on hdd0
 (`game`, `home/00000001/savedata`, `home/00000001/trophy` and a few more) are created when
-`--hdd-dir` is given. Host names are matched by the host file system, which is case-insensitive on
+`/dev_hdd0` is mounted writable (`--hdd-dir` does). Host names are matched by the host file system, which is case-insensitive on
 Windows. The `sys_fs_*` system calls and the `cellFs*` imports share one object table. The
 virtual root lists the mounted devices.
+
+#### VFS configuration file
+
+`--vfs-config FILE` reads a JSON file (strict JSON, no comments) that replaces the fixed layout
+above. `config/vfs.example.json` is a tracked example with placeholder paths; keep real
+configurations out of the repository (`*.local.json` is git-ignored, for example
+`config/vfs.local.json`).
+
+```json
+{
+  "version": 1,
+  "game_dir": "/path/to/game",
+  "hdd_dir": "/path/to/hdd",
+  "sdata_cache": "/path/to/sdata_cache",
+  "mounts": {
+    "/dev_usb000": {"host": "usb_stick", "read_only": false, "block_size": 4096}
+  },
+  "files": {
+    "/dev_bdvd/PS3_GAME/USRDIR/example.sdat": "/path/to/decrypted/example.sdat",
+    "/dev_hdd0/tmp/scratch.bin": {"host": "scratch.bin", "read_only": false}
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `version` | Required, the integer `1`. Any other value is an error. |
+| `game_dir` | Shorthand for `--game-dir`: mounts `/dev_bdvd` and `/app_home` (`<game_dir>/PS3_GAME/USRDIR`), both read-only. |
+| `hdd_dir` | Shorthand for `--hdd-dir`: mounts `/dev_hdd0` and `/dev_hdd1` (`<hdd_dir>/dev_hdd0`, `<hdd_dir>/dev_hdd1`), both writable. |
+| `sdata_cache` | Shorthand for `--sdata-cache`. |
+| `mounts` | Object from a device root (one component, such as `/dev_usb000`) to `{"host": PATH, "read_only": BOOL, "block_size": N}`. `host` is required. `read_only` defaults to `true` for `/dev_bdvd` and `/app_home` and to `false` for every other device. `block_size` is the block size that `cellFsStat` reports (a power of two from 512 to 1048576); the default depends on the device. The host directory of a writable mount is created when missing. |
+| `files` | Object from an exact guest file path to a host file, either `"PATH"` (read-only) or `{"host": PATH, "read_only": BOOL}`. An override is checked before the mounts and serves the host file for `cellFsOpen`, `cellFsStat` and `cellFsSdataOpen`; for an sdata open it replaces the cache copy, so it must be an already decrypted file. A read-only override must exist; a writable one is created on open when its directory exists. |
+
+Rules:
+
+- Relative host paths resolve against the directory of the configuration file, not the working
+  directory.
+- Guest paths must be absolute and normalised: no empty, `.` or `..` component and no trailing
+  `/`. A mount point is a single component; a nested one (`/dev_hdd0/game`) is rejected as
+  overlapping its device. A `files` key needs at least two components and may not lie below
+  another `files` key. Override keys match the guest path case-sensitively, after the path the
+  guest passes is normalised.
+- Each device can be mounted once: `game_dir` together with a `/dev_bdvd` or `/app_home` mount,
+  or `hdd_dir` together with a `/dev_hdd0` or `/dev_hdd1` mount, is a duplicate. Repeated keys
+  in one JSON object are errors. A writable mount may not share or contain the host directory
+  of another mount (two read-only mounts may share one). Devices that are not listed stay
+  unmounted; an explicit `/dev_bdvd` mount does not imply `/app_home`.
+- Unknown keys are ignored with a `vfs config: ... unknown key` warning.
+- An invalid file, a missing read-only host directory or override file, or an overlap stops the
+  run with exit code 4 and a one-line message that names the key.
+- Overrides are not added to directory listings: `cellFsOpendir` lists what the host directory
+  holds.
+
+Precedence is command-line option, then configuration file, then default. `--game-dir` replaces
+the `/dev_bdvd` and `/app_home` mounts of the file (not other mounts), `--hdd-dir` replaces
+`/dev_hdd0` and `/dev_hdd1`, and `--sdata-cache` replaces `sdata_cache`. `files` have no
+command-line form. Without `--elf`, the executable and `PARAM.SFO` are looked up through the VFS
+(`/dev_bdvd/PS3_GAME/...`), so the `/dev_bdvd` mount of the file, and a `files` override of those
+paths, applies.
 
 ### SDAT files
 
@@ -748,6 +812,8 @@ dal_game --game-dir <game-dir> --sdata-cache <cache-dir> ...
   to `build/<preset>/sdata_cache` and the `game_boot` test passes `--sdata-cache` to `dal_game`.
 - When a file is missing from the cache, `cellFsSdataOpen` fails and the game shows its own error
   dialog (auto-answered, see "Headless policy").
+- A `files` entry of the VFS configuration for the sdata path (for example
+  `/dev_bdvd/PS3_GAME/USRDIR/Exi_DAL.sdat`) serves that host file instead of the cache copy.
 
 ### Fake RSX
 
@@ -882,6 +948,7 @@ results are only trusted for the expected build.
 | `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see "SDAT files" |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/lodepng` | lodepng submodule, the PNG codec behind `cellPngDec` |
+| `externals/json` | nlohmann/json submodule (v3.12.0, header-only), used only to parse the VFS configuration |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
@@ -892,6 +959,7 @@ results are only trusted for the expected build.
 | `tools/tests/ppu_semantics/` | Semantics harness cases and the C generator; see "Semantics harness" |
 | `runtime/include/dal/` | Contract header and inline helpers for generated code |
 | `config/target.json` | Pinned size and hashes of the target executable |
+| `config/vfs.example.json` | Example VFS configuration for `dal_game --vfs-config`, placeholder paths only; see "VFS configuration file" |
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |
 | `config/ghidra_summary.json`, `config/extra_seeds.json`, `config/functions.json` | Ghidra summary, extra function starts and the recovered function database; see "Function recovery" |
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |

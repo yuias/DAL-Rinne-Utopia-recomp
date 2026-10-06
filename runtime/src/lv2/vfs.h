@@ -12,11 +12,20 @@
 
 namespace dal {
 
-enum class VfsDevice { None, Root, Bdvd, AppHome, Hdd0, Hdd1 };
+// Other: a device the VFS configuration mounts under a name the console does not define here.
+enum class VfsDevice { None, Root, Bdvd, AppHome, Hdd0, Hdd1, Other };
 
 // NotMounted: the device is unknown. NotFound: the device exists but the path cannot be mapped
-// (it leaves the device root, names a host-reserved file, or the hdd directory is not configured).
+// (it leaves the device root, names a host-reserved file, or the hdd devices are not mounted).
 enum class VfsStatus { Ok, NotMounted, NotFound };
+
+// Block size and uid/gid policy of a device (RPCS3 lv2_fs_mount_point).
+struct VfsDeviceInfo {
+  std::uint32_t block_size;
+  bool no_uid_gid;
+};
+// The defaults of a device; a mount may override the block size.
+VfsDeviceInfo vfsDeviceInfo(VfsDevice device);
 
 struct VfsResolution {
   VfsStatus status = VfsStatus::NotMounted;
@@ -27,20 +36,57 @@ struct VfsResolution {
   bool dir_only = false;
   // Direct children of /dev_hdd0 and of /dev_hdd0/game: a game may not create entries there.
   bool protected_parent = false;
+  // `host` comes from a file override, not from the device root.
+  bool file_override = false;
+  VfsDeviceInfo info = {512, true};
+  // Path below the game directory for /dev_bdvd and /app_home (app_home is PS3_GAME/USRDIR);
+  // empty for other devices and for file overrides.
+  std::filesystem::path disc_path;
 };
 
-// Maps /dev_bdvd and /app_home onto `game_dir` (read-only) and /dev_hdd0, /dev_hdd1 onto
-// `<hdd_dir>/dev_hdd0` and `<hdd_dir>/dev_hdd1`. Without an hdd directory the hdd devices fail
-// to resolve. Intended to be called before guest code runs; tests may call it again.
+// One device root: `name` is the guest device without the leading '/' (for example "dev_bdvd").
+struct VfsMount {
+  std::string name;
+  std::filesystem::path host;
+  bool read_only = false;
+  std::optional<std::uint32_t> block_size;
+};
+
+// Serves `host` for the exact guest path `guest` (normalised, case-sensitive), ahead of the mounts.
+struct VfsFileOverride {
+  std::string guest;
+  std::filesystem::path host;
+  bool read_only = true;
+};
+
+struct VfsLayout {
+  std::vector<VfsMount> mounts;
+  std::vector<VfsFileOverride> files;
+  // Directory holding decrypted copies of the game's sdata files, each at its path relative to
+  // the game directory. nullopt means sdata files can only come from a file override.
+  std::optional<std::filesystem::path> sdata_cache;
+};
+
+// Installs `layout`. Writable mounts get their host directory created, and /dev_hdd0 the
+// directories the console's system software keeps there. Intended to be called before guest code
+// runs; tests may call it again. The layout is not validated here (see vfs_config.h).
+void configureVfs(VfsLayout layout);
+
+// Shorthand: /dev_bdvd and /app_home (PS3_GAME/USRDIR) onto `game_dir` (read-only) and /dev_hdd0,
+// /dev_hdd1 onto `<hdd_dir>/dev_hdd0` and `<hdd_dir>/dev_hdd1`. Without an hdd directory the hdd
+// devices fail to resolve. Clears file overrides and the sdata cache.
 void configureVfs(std::filesystem::path game_dir, std::optional<std::filesystem::path> hdd_dir);
 
-// Directory holding decrypted copies of the game's sdata files, each at its path relative to the
-// game directory. nullopt (the default) means sdata files cannot be opened.
+// The mounts configureVfs(game_dir, hdd_dir) installs; also what --game-dir and --hdd-dir mean.
+std::vector<VfsMount> gameDirMounts(const std::filesystem::path& game_dir);
+std::vector<VfsMount> hddDirMounts(const std::filesystem::path& hdd_dir);
+
+// Changes the sdata cache of the installed layout (nullopt: none).
 void configureSdataCache(std::optional<std::filesystem::path> cache_dir);
 
-// The cache file standing in for the sdata file `res` names; nullopt when no cache is configured
-// or `res` is not under the game directory (/dev_bdvd, /app_home).
-std::optional<std::filesystem::path> sdataCacheHostPath(const VfsResolution& res);
+// The host file standing in for the sdata file `res` names: the override file, or the cache file
+// at the same path below the game directory. nullopt when neither exists in the configuration.
+std::optional<std::filesystem::path> sdataHostPath(const VfsResolution& res);
 
 // `guest` must be an absolute guest path. "." components and empty components are dropped and
 // ".." pops one component; a ".." that would pop the device itself fails with NotFound.
@@ -55,13 +101,6 @@ std::optional<std::filesystem::path> resolveGuestPath(std::string_view guest, bo
 
 // Names of the mounted devices without the leading '/', for listing the virtual root.
 std::vector<std::string> vfsMountNames();
-
-// Block size and uid/gid policy of a device (RPCS3 lv2_fs_mount_point).
-struct VfsDeviceInfo {
-  std::uint32_t block_size;
-  bool no_uid_gid;
-};
-VfsDeviceInfo vfsDeviceInfo(VfsDevice device);
 
 // Host-side result of stat/fstat; times are seconds since the Unix epoch.
 struct FsStat {

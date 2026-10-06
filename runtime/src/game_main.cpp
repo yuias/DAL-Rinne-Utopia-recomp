@@ -21,6 +21,7 @@
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
 #include "lv2/vfs.h"
+#include "lv2/vfs_config.h"
 
 namespace {
 
@@ -29,6 +30,7 @@ struct Options {
   std::string elf;
   std::string hdd_dir;
   std::string sdata_cache;
+  std::string vfs_config;
   std::string png_dump;
   std::string log_file;
   std::string dialog_answer;
@@ -40,8 +42,9 @@ struct Options {
 
 void printUsage() {
   std::fputs(
-      "usage: dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE]\n"
-      "                [--hdd-dir DIR] [--sdata-cache DIR] [--quiet-hle] [--load-only]\n"
+      "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
+      "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
+      "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n",
       stderr);
 }
@@ -65,6 +68,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.hdd_dir)) return false;
     } else if (arg == "--sdata-cache") {
       if (!value(opt.sdata_cache)) return false;
+    } else if (arg == "--vfs-config") {
+      if (!value(opt.vfs_config)) return false;
     } else if (arg == "--png-dump") {
       if (!value(opt.png_dump)) return false;
     } else if (arg == "--log") {
@@ -101,8 +106,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       return false;
     }
   }
-  if (opt.game_dir.empty()) {
-    std::fputs("error: --game-dir is required\n", stderr);
+  if (opt.game_dir.empty() && opt.vfs_config.empty()) {
+    std::fputs("error: --game-dir or --vfs-config is required\n", stderr);
     return false;
   }
   return true;
@@ -110,8 +115,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
 
 // Video and audio out report what the game's PARAM.SFO allows. A missing or broken file keeps the
 // defaults of gameParamSfo().
-void loadGameParamSfo(const std::filesystem::path& game_dir) {
-  auto sfo = dal::readParamSfoFile(game_dir / "PS3_GAME" / "PARAM.SFO");
+void loadGameParamSfo() {
+  bool read_only = false;
+  const auto sfo_path = dal::resolveGuestPath("/dev_bdvd/PS3_GAME/PARAM.SFO", read_only);
+  if (!sfo_path) {
+    dal::logWarn("dal: sfo: /dev_bdvd is not mounted; using the defaults");
+    return;
+  }
+  auto sfo = dal::readParamSfoFile(*sfo_path);
   if (!sfo) {
     dal::logWarn("dal: sfo: {}; using the defaults", sfo.error());
     return;
@@ -139,25 +150,56 @@ int main(int argc, char** argv) {
   }
 
   std::error_code ec;
-  const std::filesystem::path game_dir(opt.game_dir);
-  if (!std::filesystem::is_directory(game_dir, ec)) {
-    std::fprintf(stderr, "error: game directory %s does not exist\n", opt.game_dir.c_str());
-    return static_cast<int>(dal::ExitCode::Usage);
+  dal::VfsCliOptions cli;
+  if (!opt.game_dir.empty()) {
+    const std::filesystem::path game_dir(opt.game_dir);
+    if (!std::filesystem::is_directory(game_dir, ec)) {
+      std::fprintf(stderr, "error: game directory %s does not exist\n", opt.game_dir.c_str());
+      return static_cast<int>(dal::ExitCode::Usage);
+    }
+    cli.game_dir = game_dir;
   }
-  const std::filesystem::path elf_path =
-      opt.elf.empty() ? game_dir / "PS3_GAME" / "USRDIR" / "EBOOT.elf"
-                      : std::filesystem::path(opt.elf);
+  if (!opt.hdd_dir.empty()) {
+    cli.hdd_dir = std::filesystem::path(opt.hdd_dir);
+  }
+  if (!opt.sdata_cache.empty()) {
+    cli.sdata_cache = std::filesystem::path(opt.sdata_cache);
+  }
 
   if (!opt.log_file.empty() && !dal::setLogFile(opt.log_file)) {
     std::fprintf(stderr, "error: cannot open log file %s\n", opt.log_file.c_str());
     return static_cast<int>(dal::ExitCode::Usage);
   }
 
-  dal::configureVfs(game_dir, opt.hdd_dir.empty()
-                                  ? std::nullopt
-                                  : std::optional<std::filesystem::path>(opt.hdd_dir));
-  if (!opt.sdata_cache.empty()) {
-    dal::configureSdataCache(std::filesystem::path(opt.sdata_cache));
+  // Precedence: command-line options, then the configuration file, then the defaults.
+  std::optional<dal::VfsConfigFile> vfs_file;
+  if (!opt.vfs_config.empty()) {
+    auto loaded = dal::loadVfsConfig(std::filesystem::path(opt.vfs_config));
+    if (!loaded) {
+      dal::logError("vfs config: {}", loaded.error());
+      return static_cast<int>(dal::ExitCode::LoadError);
+    }
+    for (const std::string& warning : loaded->warnings) {
+      dal::logWarn("vfs config: {}", warning);
+    }
+    vfs_file = std::move(*loaded);
+  }
+  auto layout = dal::composeVfsLayout(vfs_file ? &*vfs_file : nullptr, cli);
+  if (!layout) {
+    dal::logError("vfs: {}", layout.error());
+    return static_cast<int>(dal::ExitCode::LoadError);
+  }
+  dal::configureVfs(std::move(*layout));
+
+  std::filesystem::path elf_path(opt.elf);
+  if (opt.elf.empty()) {
+    bool read_only = false;
+    const auto default_elf = dal::resolveGuestPath("/dev_bdvd/PS3_GAME/USRDIR/EBOOT.elf", read_only);
+    if (!default_elf) {
+      dal::logError("no executable: pass --elf or --game-dir, or mount /dev_bdvd in the VFS config");
+      return static_cast<int>(dal::ExitCode::LoadError);
+    }
+    elf_path = *default_elf;
   }
 
   if (!opt.png_dump.empty()) {
@@ -165,7 +207,7 @@ int main(int argc, char** argv) {
     dal::setPngDumpDirectory(std::filesystem::path(opt.png_dump));
   }
 
-  loadGameParamSfo(game_dir);
+  loadGameParamSfo();
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();
