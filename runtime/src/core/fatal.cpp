@@ -6,6 +6,7 @@
 #include <format>
 #include <string>
 
+#include "core/guest_memory.h"
 #include "core/log.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -46,6 +47,19 @@ void enterStop() {
   std::_Exit(static_cast<int>(code));
 }
 
+// True when [addr, addr + 8) is 8-byte aligned, inside the stack region and committed readable
+// host memory. An aligned 8-byte range never crosses a page, so one query is enough.
+bool readableStackWord(const std::uint8_t* base, std::uint64_t addr) {
+  if ((addr & 7) != 0 || addr < kStackRegion.begin || addr + 8 > kStackRegion.end) {
+    return false;
+  }
+  MEMORY_BASIC_INFORMATION info;
+  if (VirtualQuery(base + addr, &info, sizeof info) != sizeof info || info.State != MEM_COMMIT) {
+    return false;
+  }
+  return (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+}
+
 void dumpContext(const DalPpuContext& ctx) {
   logInfo("registers:");
   for (int row = 0; row < 32; row += 4) {
@@ -67,9 +81,45 @@ void dumpContext(const DalPpuContext& ctx) {
       line.clear();
     }
   }
+
+  // The trace ring only holds function entries; the stack gives the call sites. The live LR is
+  // frame 0 (it is the return address when the stop happens in a leaf or an HLE call).
+  logInfo("guest stack:");
+  logInfo("  frame 0: lr {:#010x} in fn {:#010x}", static_cast<std::uint32_t>(ctx.lr),
+          findOwningFunction(static_cast<std::uint32_t>(ctx.lr)));
+  GuestFrame frames[kMaxGuestFrames];
+  const std::size_t n = walkGuestStack(ctx, process().memory.base(), frames, kMaxGuestFrames);
+  for (std::size_t i = 0; i < n; i++) {
+    logInfo("  frame {}: lr {:#010x} in fn {:#010x}", i + 1, frames[i].lr, frames[i].function);
+  }
 }
 
 }  // namespace
+
+std::size_t walkGuestStack(const DalPpuContext& ctx, const std::uint8_t* base, GuestFrame* out,
+                           std::size_t max_frames) {
+  if (base == nullptr) {
+    return 0;
+  }
+  std::uint64_t sp = ctx.gpr[1];
+  std::size_t count = 0;
+  while (count < max_frames && readableStackWord(base, sp)) {
+    const std::uint64_t back_chain = dalRead64(base, static_cast<std::uint32_t>(sp));
+    // The stack grows down, so a valid chain strictly ascends; this also rules out cycles.
+    if (back_chain <= sp || !readableStackWord(base, back_chain) ||
+        !readableStackWord(base, back_chain + 16)) {
+      break;
+    }
+    const std::uint64_t lr = dalRead64(base, static_cast<std::uint32_t>(back_chain + 16));
+    if (lr == 0 || lr > 0xFFFFFFFFull) {
+      break;
+    }
+    out[count++] = {static_cast<std::uint32_t>(lr),
+                    findOwningFunction(static_cast<std::uint32_t>(lr))};
+    sp = back_chain;
+  }
+  return count;
+}
 
 std::string_view fatalKindName(FatalKind kind) {
   switch (kind) {

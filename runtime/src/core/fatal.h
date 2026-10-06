@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 #include "dal/ppu_context.h"
@@ -25,6 +27,27 @@ enum class FatalKind {
 };
 
 std::string_view fatalKindName(FatalKind kind);
+
+// One caller frame recovered from the guest stack. `function` is 0 when no function owns `lr`.
+struct GuestFrame {
+  std::uint32_t lr;
+  std::uint32_t function;
+};
+
+inline constexpr std::size_t kMaxGuestFrames = 16;
+
+// Entry of the function that owns `addr`: the greatest registered entry <= addr. Functions have no
+// recorded size, so an address in padding or in unregistered code maps to the preceding function.
+// Returns 0 when `addr` is outside the registered span (which ends at the last entry's slot, so
+// addresses inside the last function's body are not found).
+std::uint32_t findOwningFunction(std::uint32_t addr);
+
+// Walks the PPC64 ELF back chain starting at ctx.gpr[1] and stores the saved LR of each caller
+// frame (`*(back_chain + 16)`). Stops on a null, misaligned, non-ascending or non-committed link, or
+// after `max_frames`. Guest memory is only read after checking that it is committed stack, so a
+// corrupt chain cannot fault. Returns the number of frames written.
+std::size_t walkGuestStack(const DalPpuContext& ctx, const std::uint8_t* base, GuestFrame* out,
+                           std::size_t max_frames);
 
 // Registered by the census code so this file does not depend on it. Called exactly once, on the
 // way out of every stop path. Without a printer nothing is printed.

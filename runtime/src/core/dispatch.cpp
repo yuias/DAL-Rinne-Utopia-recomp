@@ -38,6 +38,23 @@ std::string recentTrace(const DalPpuContext* ctx) {
 
 }  // namespace
 
+namespace dal {
+
+std::uint32_t findOwningFunction(std::uint32_t addr) {
+  if (!insideSpan(addr)) {
+    return 0;
+  }
+  // The table is dense (one slot per instruction), so walk back to the nearest populated slot.
+  for (std::uint32_t slot = (addr - g_span_begin) / 4 + 1; slot-- > 0;) {
+    if (g_table[slot] != nullptr) {
+      return g_span_begin + slot * 4;
+    }
+  }
+  return 0;
+}
+
+}  // namespace dal
+
 extern "C" {
 
 void dalRegisterFuncs(const DalFuncMapping* mappings, uint32_t count) {

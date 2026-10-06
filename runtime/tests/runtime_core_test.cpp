@@ -1645,6 +1645,60 @@ void testUnsortedTableChild() {
                     "0x00010210 (unsorted or duplicate)"));
 }
 
+void testGuestStackWalk() {
+  std::unique_ptr<dal::GuestMemory> memory(newMemory());
+  dal::RegionAllocator stack(*memory, dal::kStackRegion);
+  const std::uint32_t lo = stack.allocate(0x1000, 0x1000);
+  std::uint8_t* base = memory->base();
+
+  const DalFuncMapping mappings[] = {
+      {0x10200, testFuncA}, {0x10210, testFuncB}, {0x10300, testFuncA}};
+  dalRegisterFuncs(mappings, 3);
+  CHECK(dal::findOwningFunction(0x10200) == 0x10200);
+  CHECK(dal::findOwningFunction(0x1020c) == 0x10200);
+  CHECK(dal::findOwningFunction(0x10214) == 0x10210);
+  CHECK(dal::findOwningFunction(0x101fc) == 0);
+  CHECK(dal::findOwningFunction(0x10304) == 0);  // past the last entry's slot
+
+  // Chain sp0 -> sp1 -> sp2 -> 0. The LR for the frame at spN is saved at (back chain + 16).
+  const std::uint32_t sp0 = lo + 0x100, sp1 = lo + 0x200, sp2 = lo + 0x300;
+  dalWrite64(base, sp0, sp1);
+  dalWrite64(base, sp1, sp2);
+  dalWrite64(base, sp1 + 16, 0x10214);  // return into the middle of fn 0x10210
+  dalWrite64(base, sp2, 0);
+  dalWrite64(base, sp2 + 16, 0x10208);
+
+  DalPpuContext ctx{};
+  ctx.gpr[1] = sp0;
+  dal::GuestFrame frames[dal::kMaxGuestFrames];
+  std::size_t n = dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames);
+  CHECK(n == 2);
+  if (n == 2) {
+    CHECK(frames[0].lr == 0x10214 && frames[0].function == 0x10210);
+    CHECK(frames[1].lr == 0x10208 && frames[1].function == 0x10200);
+  }
+
+  CHECK(dal::walkGuestStack(ctx, base, frames, 1) == 1);
+
+  // A cycle, a link that does not ascend, a link outside the stack region, a link into an
+  // uncommitted page and a misaligned link all end the walk without touching bad memory.
+  dalWrite64(base, sp2, sp0);
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 2);
+  // The first frame is still good; only the link behind it is bad.
+  dalWrite64(base, sp1, 0x00010000);
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 1);
+  dalWrite64(base, sp1, lo + 0x1000);  // the guard page above the allocation
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 1);
+  dalWrite64(base, sp1, sp1 + 4);
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 1);
+  dalWrite64(base, sp0, 0x00010000);
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 0);
+  ctx.gpr[1] = 0;
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 0);
+  ctx.gpr[1] = 0x1'0000'0000ull + sp0;
+  CHECK(dal::walkGuestStack(ctx, base, frames, dal::kMaxGuestFrames) == 0);
+}
+
 // Children: each ends the process through the stop path under test.
 
 int strictDispatchChild() {
@@ -1745,6 +1799,7 @@ int main(int argc, char** argv) {
   testTimebase();
   testGuestLockFifo();
   testReservationAndDcbz();
+  testGuestStackWalk();
   testFaultChild();
   testOverflowChild();
   testStopChild();
