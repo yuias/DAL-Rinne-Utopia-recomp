@@ -41,6 +41,7 @@ void enterStop() {
     printer();
   }
   std::fflush(stdout);
+  flushLog();
   std::fflush(stderr);
   std::_Exit(static_cast<int>(code));
 }

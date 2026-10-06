@@ -31,6 +31,10 @@ void resetLogOnce();
 
 void logWrite(LogLevel level, std::string_view message);
 
+// Flushes every active output. Lines are already flushed as they are written; this is for paths
+// that end the process.
+void flushLog();
+
 // Returns true the first time `key` is passed in.
 bool firstUse(std::string_view key);
 

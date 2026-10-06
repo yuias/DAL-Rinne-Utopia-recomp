@@ -19,6 +19,8 @@ generated code builds and links against a stub runtime; no game code runs yet. S
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
+- git, with the submodules initialised: `git submodule update --init` (spdlog under `externals/`;
+  clone with `--recurse-submodules` to do it in one step)
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
 - Optional, for `ghidra-export` only: Ghidra 12.x and a JDK 21 (see below). `recover` does
