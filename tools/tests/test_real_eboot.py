@@ -7,8 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import (cell, disasm, emit, ghidra_diff, ghidra_summary, info, jumptab, nids,
-                       probe, recover, seeds)
+from ps3recomp import (cell, disasm, emit, emit_core, ghidra_diff, ghidra_summary, info,
+                       jumptab, nids, probe, recover, seeds)
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
 from ps3recomp.ppu_flow import CodeImage
@@ -582,9 +582,12 @@ class RealEmitTest(unittest.TestCase):
         self.assertEqual((self.report["functions"], self.report["import_trampolines"],
                           self.report["edges"]["switches"]), (2531, 166, 14))
 
-    def test_every_non_control_word_is_unhandled_without_group_modules(self):
-        control = self.census["by_group"]["control"]["words"]
-        self.assertEqual(self.report["unhandled"]["total"], self.census["words"] - control)
+    def test_unhandled_words_are_those_without_a_handler(self):
+        handled = set(emit_core.load_handlers())
+        expected = sum(count for group, entry in self.census["by_group"].items()
+                       if group != "control" for name, count in entry["mnemonics"]
+                       if name not in handled)
+        self.assertEqual(self.report["unhandled"]["total"], expected)
 
     def test_no_dynamic_targets(self):
         self.assertEqual(self.report["dynamic_targets"], [])
