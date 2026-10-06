@@ -194,5 +194,164 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual([i.mnemonic for i in insns], ["ori", "bclr", None])
 
 
+
+def _x_form(rt, ra, rb, xo, low=0):
+    return 0x7C000000 | rt << 21 | ra << 16 | rb << 11 | xo << 1 | low
+
+
+class StrictStructureTest(unittest.TestCase):
+    def test_masks_consistent(self):
+        for spec in ALL_OPS:
+            with self.subTest(spec=spec.name):
+                self.assertEqual(spec.strict_mask & spec.mask, spec.mask)
+                self.assertEqual(spec.strict_match & ~spec.strict_mask & 0xFFFFFFFF, 0)
+                self.assertEqual(spec.strict_match & spec.mask, spec.match)
+                self.assertIs(decode(spec.strict_match, strict=True).spec, spec)
+
+    def test_operand_names_have_field_bits(self):
+        names = set()
+        for spec in ALL_OPS:
+            for operand in spec.operands:
+                names.update(operand.replace(")", "").split("("))
+        self.assertLessEqual(names, set(ppu.FIELD_BITS))
+        self.assertEqual(set(ppu.FIELD_BITS), set(ppu.FIELDS))
+
+    def test_field_bits_match_extractors(self):
+        # Flipping a bit changes the extracted value exactly when the bit is listed.
+        word = 0x5A3CA5C3
+        for name, extract in ppu.FIELDS.items():
+            for ibm_bit in range(32):
+                flipped = word ^ (1 << (31 - ibm_bit))
+                listed = any(a <= ibm_bit <= b for a, b in ppu.FIELD_BITS[name])
+                with self.subTest(field=name, bit=ibm_bit):
+                    self.assertEqual(extract(word) != extract(flipped), listed)
+
+    def test_exceptions_name_real_specs(self):
+        names = {spec.name for spec in ALL_OPS}
+        self.assertLessEqual(set(ppu.STRICT_EXCEPTIONS), names)
+
+    def test_replaced_spec_recomputes_strict_masks(self):
+        # mfocrf is built with dataclasses.replace() on mask/match.
+        mfocrf = next(s for s in ALL_OPS if s.name == "mfocrf")
+        mfcr = next(s for s in ALL_OPS if s.name == "mfcr")
+        self.assertTrue(mfocrf.strict_match & 1 << 20)
+        self.assertFalse(mfcr.strict_match & 1 << 20)
+        self.assertTrue(mfcr.strict_mask & 1 << 20)
+
+
+class StrictDecodeTest(unittest.TestCase):
+    def assertStrictOk(self, word, mnemonic):
+        self.assertEqual(decode(word, strict=True).mnemonic, mnemonic, "%08x" % word)
+
+    def assertStrictRejected(self, word, mnemonic):
+        # The word decodes without strict mode but is rejected with it.
+        self.assertEqual(decode(word).mnemonic, mnemonic, "%08x" % word)
+        self.assertIsNone(decode(word, strict=True).spec, "%08x" % word)
+
+    def test_sc_is_exactly_one_word(self):
+        self.assertStrictOk(0x44000002, "sc")
+        self.assertStrictRejected(0x47616D65, "sc")
+        self.assertStrictRejected(0x44000022, "sc")  # LEV = 1
+        self.assertStrictRejected(0x44A00000, "sc")
+        self.assertStrictRejected(0x44000003, "sc")
+        self.assertStrictRejected(0x44000000, "sc")
+
+    def test_stwcx_stdcx_dot_is_part_of_encoding(self):
+        self.assertStrictOk(0x7C60492D, "stwcx.")
+        self.assertStrictRejected(0x7C60492C, "stwcx.")
+        self.assertStrictOk(_x_form(3, 0, 9, 214, 1), "stdcx.")
+        self.assertStrictRejected(_x_form(3, 0, 9, 214), "stdcx.")
+
+    def test_unused_flag_bit_is_reserved(self):
+        self.assertStrictOk(_x_form(3, 4, 5, 23), "lwzx")
+        self.assertStrictRejected(_x_form(3, 4, 5, 23, 1), "lwzx")
+        self.assertStrictOk(_x_form(3, 4, 5, 75), "mulhw")
+        self.assertStrictOk(_x_form(3, 4, 5, 75, 1), "mulhw.")
+        self.assertStrictRejected(_x_form(3, 4, 5, 75) | 1 << 10, "mulhw")  # OE bit
+
+    def test_unused_operand_field_is_reserved(self):
+        fmul = 0xFC000000 | 1 << 21 | 2 << 16 | 4 << 6 | 25 << 1
+        self.assertStrictOk(fmul, "fmul")
+        self.assertStrictRejected(fmul | 3 << 11, "fmul")  # frB
+        frsqrte = 0xFC000000 | 1 << 21 | 2 << 11 | 26 << 1
+        self.assertStrictOk(frsqrte, "frsqrte")
+        self.assertStrictRejected(frsqrte | 3 << 16, "frsqrte")  # frA
+        self.assertStrictRejected(frsqrte | 3 << 6, "frsqrte")  # frC
+        self.assertStrictRejected(0xFFE00000, "fcmpu")  # bits 9-10
+
+    def test_cmp_reserved_bit_9(self):
+        cmpw = _x_form(0, 3, 4, 0)
+        self.assertStrictOk(cmpw, "cmp")
+        self.assertStrictOk(cmpw | 1 << 21, "cmp")  # L
+        self.assertStrictRejected(cmpw | 1 << 22, "cmp")
+
+    def test_branch_hint_bits(self):
+        self.assertStrictOk(0x4E800020, "bclr")
+        self.assertStrictOk(0x4E800820, "bclr")  # BH
+        self.assertStrictOk(0x4E801820, "bclr")
+        self.assertStrictRejected(0x4E808020, "bclr")  # bit 16
+        self.assertStrictOk(0x4E800420, "bcctr")
+        self.assertStrictRejected(0x4E808420, "bcctr")
+
+    def test_invalid_bo_values_are_not_reserved_bits(self):
+        # BO = 21 has a set "z" bit; that is an invalid operand value, not a reserved bit.
+        self.assertStrictOk(0x40000000 | 21 << 21, "bc")
+
+    def test_mfocrf_mtocrf(self):
+        self.assertStrictOk(0x7C000026, "mfcr")
+        self.assertStrictOk(0x7C102026, "mfocrf")
+        self.assertStrictOk(0x7D908120, "mtocrf")
+        self.assertStrictOk(0x7C0FF120, "mtcrf")
+        # Multi-bit FXM is undefined rather than reserved, so it is accepted.
+        self.assertStrictOk(0x7C1FF026, "mfocrf")
+
+    def test_ocrf_with_reserved_bit_does_not_fall_back_to_plain_form(self):
+        for word, name in ((0x7C102026 | 1 << 11, "mfocrf"), (0x7D908120 | 1 << 11, "mtocrf")):
+            with self.subTest(word="%08x" % word):
+                self.assertStrictRejected(word, name)
+        # With bit 11 clear, FXM-like bits in mfcr and bit 20 in mtcrf are reserved too.
+        self.assertStrictRejected(0x7C002026, "mfcr")
+        self.assertStrictRejected(0x7C0FF120 | 1 << 11, "mtcrf")
+
+    def test_cache_hint_fields(self):
+        self.assertStrictOk(_x_form(0, 3, 4, 278), "dcbt")
+        self.assertStrictOk(_x_form(16, 3, 4, 278), "dcbt")  # TH
+        self.assertStrictOk(_x_form(16, 3, 4, 246), "dcbtst")
+        self.assertStrictOk(_x_form(0, 3, 4, 54), "dcbst")
+        self.assertStrictRejected(_x_form(16, 3, 4, 54), "dcbst")
+
+    def test_data_stream_bits(self):
+        self.assertStrictOk(0x7E00066C, "dss")  # dssall
+        self.assertStrictOk(0x7C00066C, "dss")
+        self.assertStrictRejected(0x7C00066C | 1 << 24, "dss")  # bit 7
+        self.assertStrictOk(_x_form(16, 3, 4, 342), "dst")  # T
+        self.assertStrictRejected(_x_form(8, 3, 4, 342), "dst")  # bit 7
+
+    def test_vector_reserved_fields(self):
+        vspltisw = 0x101F038C
+        self.assertStrictOk(vspltisw, "vspltisw")
+        self.assertStrictRejected(vspltisw | 1 << 11, "vspltisw")  # vB
+        vsldoi = 0x1022192C
+        self.assertStrictOk(vsldoi, "vsldoi")
+        self.assertStrictRejected(vsldoi | 1 << 10, "vsldoi")  # bit 21
+
+    def test_canonical_cases_are_strict_ok(self):
+        for word, _, mnemonic, _ in INT_CASES + FP_CASES + VMX_CASES:
+            with self.subTest(word="%08x" % word):
+                self.assertEqual(decode(word).mnemonic, mnemonic)
+                self.assertIsNotNone(decode(word, strict=True).spec)
+
+    def test_non_strict_ignores_reserved_bits(self):
+        for word in (0x47616D65, 0x44A00000, 0xFFE00000):
+            self.assertIsNotNone(decode(word).spec)
+            self.assertIs(decode(word).spec, decode(word, strict=False).spec)
+
+    def test_decode_range_strict(self):
+        data = struct.pack(">3I", 0x44000002, 0x47616D65, 0x4E800020)
+        self.assertEqual([i.mnemonic for i in decode_range(data, 0)], ["sc", "sc", "bclr"])
+        self.assertEqual([i.mnemonic for i in decode_range(data, 0, strict=True)],
+                         ["sc", None, "bclr"])
+
+
 if __name__ == "__main__":
     unittest.main()
