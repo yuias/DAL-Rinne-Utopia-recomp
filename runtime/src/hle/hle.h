@@ -27,6 +27,16 @@ std::span<const HleEntry> cellSysmoduleHandlers();
 // Handlers of the cellSpurs module.
 std::span<const HleEntry> cellSpursHandlers();
 
+// Handlers of the cellGcmSys module.
+std::span<const HleEntry> cellGcmSysHandlers();
+
+// The body of _cellGcmInitBody with a selectable local memory size (the import always passes the
+// console's 0xF900000). Commits the RSX areas, maps the IO area and writes the context, control
+// register and configuration. Returns kCellOk or a CellGcmError code. Intended for tests; the
+// state is released with resetRsxState.
+std::uint32_t gcmInitBody(std::uint8_t* base, std::uint32_t context_pp, std::uint32_t cmd_size,
+                          std::uint32_t io_size, std::uint32_t io_address, std::uint32_t local_size);
+
 // Forgets every initialized SPURS object and releases its thread group. Intended for tests.
 void resetSpurs();
 

@@ -31,6 +31,7 @@
 #include "lv2/sys_spu.h"
 #include "lv2/syscalls.h"
 #include "lv2/sys_sync.h"
+#include "rsx/rsx_state.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1397,6 +1398,204 @@ void testSpuAndSysmodule() {
   dal::resetLogOnce();
 }
 
+void testCellGcmSys() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetRsxState();
+  dal::resetHostFunctions();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  const std::uint32_t area = p.user1m.allocate(0x400000, 0x100000);
+  CHECK(scratch != 0 && area != 0 && (area & 0xfffff) == 0);
+  const std::uint32_t out = scratch, config = scratch + 0x100, stack = scratch + 0x9000;
+  const std::uint32_t io_ea = area, io_size = 0x100000, local_size = 0x200000;
+  constexpr std::uint32_t kFailure = 0x802100ff, kNoIoPageTable = 0x80210001, kInval = 0x80010002;
+
+  enum Import : std::uint32_t {
+    TiledPitch, InitBody, AddressToOffset, Func15, TimeStamp, CommandWords, SegmentWords, FifoSize,
+    MapMain, ControlRegister, GetConfig, UnmapEa, ImportCount
+  };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x055bd74d, "cellGcmSys", "cellGcmGetTiledPitchSize"},
+      {0x00800010, 0x15bae46b, "cellGcmSys", "_cellGcmInitBody"},
+      {0x00800020, 0x21ac3697, "cellGcmSys", "cellGcmAddressToOffset"},
+      {0x00800030, 0x3a33c1fd, "cellGcmSys", "_cellGcmFunc15"},
+      {0x00800040, 0x5a41c10f, "cellGcmSys", "cellGcmGetTimeStamp"},
+      {0x00800050, 0x5e2ee0f0, "cellGcmSys", "cellGcmGetDefaultCommandWordSize"},
+      {0x00800060, 0x8cdf8c70, "cellGcmSys", "cellGcmGetDefaultSegmentWordSize"},
+      {0x00800070, 0x9ba451e4, "cellGcmSys", "cellGcmSetDefaultFifoSize"},
+      {0x00800080, 0xa114ec67, "cellGcmSys", "cellGcmMapMainMemory"},
+      {0x00800090, 0xa547adde, "cellGcmSys", "cellGcmGetControlRegister"},
+      {0x008000a0, 0xe315a0b2, "cellGcmSys", "cellGcmGetConfiguration"},
+      {0x008000b0, 0xefd00f54, "cellGcmSys", "cellGcmUnmapEaIoAddress"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto a = makeCaller(0x01000000);
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  DalPpuContext* ctx = &a->context();
+  ctx->gpr[1] = stack;
+  const auto call = [&](std::uint32_t index, std::initializer_list<std::uint64_t> args) {
+    int reg = 3;
+    for (const std::uint64_t value : args) ctx->gpr[reg++] = value;
+    dalHleCall(ctx, base, index);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  const auto offsetOf = [&](std::uint32_t address, std::uint32_t& offset) {
+    dalWrite32(base, out, 0xdeadbeef);
+    const std::uint32_t result = call(AddressToOffset, {address, out});
+    offset = dalRead32(base, out);
+    return result;
+  };
+
+  // Before initialisation the configuration is zero and nothing is mappable.
+  std::memset(base + config, 0xaa, 0x20);
+  call(GetConfig, {config});
+  CHECK(dalRead32(base, config) == 0 && dalRead32(base, config + 8) == 0 && dalRead32(base, config + 0x14) == 0);
+  std::uint32_t offset = 0;
+  CHECK(offsetOf(0xc0000000, offset) == kFailure && offset == 0xdeadbeef);
+  CHECK(call(TiledPitch, {0x1400}) == 0x1400);
+
+  // A failing init releases what it committed and can be retried.
+  CHECK(dal::gcmInitBody(base, out, 0x10000, io_size, io_ea + 0x1000, local_size) == kFailure);
+  CHECK(!dal::rsxState().initialized && !p.memory.isCommitted(dal::kRsxDeviceAddr, 4));
+  CHECK(dal::gcmInitBody(base, out, 0x10000, io_size, 0x2f000000, local_size) == kFailure);  // uncommitted
+
+  CHECK(dal::gcmInitBody(base, out, 0x10000, io_size, io_ea, local_size) == 0);
+  CHECK(dal::gcmInitBody(base, out, 0x10000, io_size, io_ea, local_size) == kFailure);  // second init
+  const dal::RsxState& state = dal::rsxState();
+  const std::uint32_t callback = state.wrap_callback;
+  CHECK(callback != 0);
+  CHECK(dalRead32(base, out) == 0x10000000);
+  CHECK(dalRead32(base, 0x10000000) == io_ea + 0x1000);
+  CHECK(dalRead32(base, 0x10000004) == io_ea + 0x8000 - 4);
+  CHECK(dalRead32(base, 0x10000008) == io_ea + 0x1000);
+  CHECK(dalRead32(base, 0x1000000c) == callback);
+  CHECK(dalRead32(base, 0x10000030) == 1);
+  CHECK(dalRead32(base, 0x10100040) == 0x1000 && dalRead32(base, 0x10100044) == 0x1000);
+  CHECK(dalRead32(base, 0x10100048) == 0xffffffff);
+  CHECK(dalRead32(base, 0x10200008) == local_size && dalRead32(base, 0x10200010) == 500000000);
+  CHECK(dalRead32(base, 0x1020002c) == 0x1000 && dalRead32(base, 0x10200034) == 0x1400);
+  CHECK(dalRead32(base, 0x10300000) == 0x1337c0d3 && dalRead32(base, 0x1030000c) == 0x1337f001);
+  CHECK(dalRead32(base, 0x10300ffc) == 0x1337f001);
+  CHECK(dalRead64(base, 0x10301000) == ~std::uint64_t{0} && dalRead64(base, 0x10301008) == 0);
+  CHECK(dalRead64(base, 0x10301400) == ~std::uint64_t{0} && dalRead32(base, 0x10301408) == 0);
+  CHECK(dalRead32(base, 0x1030140c) == 0xffffffff);
+  CHECK(p.memory.isCommitted(0xc0000000, local_size) && !p.memory.isCommitted(0xc0000000 + local_size, 0x1000));
+
+  std::memset(base + config, 0xaa, 0x20);
+  call(GetConfig, {config});
+  CHECK(dalRead32(base, config + 0x00) == 0xc0000000 && dalRead32(base, config + 0x04) == io_ea);
+  CHECK(dalRead32(base, config + 0x08) == local_size && dalRead32(base, config + 0x0c) == io_size);
+  CHECK(dalRead32(base, config + 0x10) == 650000000 && dalRead32(base, config + 0x14) == 500000000);
+  CHECK(dalRead8(base, config + 0x18) == 0xaa);
+
+  CHECK(call(ControlRegister, {}) == 0x10100040);
+  CHECK(call(CommandWords, {}) == 0x400 && call(SegmentWords, {}) == 0x100);
+  CHECK(call(FifoSize, {0x20000, 0x1000}) == 0);
+  ctx->gpr[3] = 0x1234;
+  call(Func15, {0x10000000});
+  CHECK(ctx->gpr[3] == 0x10000000);  // void: r3 is not written
+  CHECK(call(TimeStamp, {0}) == 0xffffffff && ctx->gpr[3] == ~std::uint64_t{0});
+  CHECK(call(TimeStamp, {2047}) == 0xffffffff);
+  CHECK(call(TimeStamp, {2048}) == 0 && ctx->gpr[3] == 0);
+
+  // cellGcmGetTiledPitchSize
+  CHECK(call(TiledPitch, {0}) == 0 && call(TiledPitch, {1}) == 0x200);
+  CHECK(call(TiledPitch, {0x200}) == 0x200 && call(TiledPitch, {0x201}) == 0x300);
+  CHECK(call(TiledPitch, {0x1400}) == 0x1400 && call(TiledPitch, {0x10000}) == 0x10000);
+  CHECK(call(TiledPitch, {0x10001}) == 0);
+
+  // The IO area mapped at init: io page 0. cellGcmMapMainMemory takes the first free pages.
+  CHECK(offsetOf(io_ea + 8, offset) == 0 && offset == 8);
+  const std::uint32_t ea1 = io_ea + 0x100000, ea2 = io_ea + 0x200000;
+  dalWrite32(base, out, 0);
+  CHECK(call(MapMain, {ea1, 0x100000, out}) == 0 && dalRead32(base, out) == 0x100000);
+  CHECK(call(MapMain, {ea2, 0x200000, out}) == 0 && dalRead32(base, out) == 0x200000);
+  CHECK(offsetOf(ea1 + 0x1234, offset) == 0 && offset == 0x101234);
+  CHECK(offsetOf(ea2 + 0x1fffff, offset) == 0 && offset == 0x3fffff);
+  std::uint32_t ea = 0;
+  CHECK(dal::rsxIoToEa(0x101234, ea) && ea == ea1 + 0x1234);
+  CHECK(!dal::rsxIoToEa(0x400000, ea) && !dal::rsxIoToEa(0x10000000, ea));
+
+  // Rejected mappings write nothing.
+  dalWrite32(base, out, 0xdeadbeef);
+  CHECK(call(MapMain, {ea1, 0, out}) == kFailure);
+  CHECK(call(MapMain, {ea1 + 0x1000, 0x100000, out}) == kFailure);
+  CHECK(call(MapMain, {ea1, 0x180000, out}) == kFailure);
+  CHECK(call(MapMain, {0x2f000000, 0x100000, out}) == kInval);  // not committed guest memory
+  CHECK(call(MapMain, {ea1, 0x10000000, out}) == kNoIoPageTable);
+  CHECK(dalRead32(base, out) == 0xdeadbeef);
+
+  // Local memory, unmapped addresses and the end of the local range.
+  CHECK(offsetOf(0xc0000000, offset) == 0 && offset == 0);
+  CHECK(offsetOf(0xc0000000 + local_size - 4, offset) == 0 && offset == local_size - 4);
+  CHECK(offsetOf(0xc0000000 + local_size, offset) == kFailure && offset == 0xdeadbeef);
+  CHECK(offsetOf(0xcff00000, offset) == kFailure);
+  CHECK(offsetOf(0x00010000, offset) == kFailure);
+
+  // cellGcmUnmapEaIoAddress frees the whole mapping that starts at the page of `ea` (low bits are
+  // ignored); an address inside a larger mapping is not its start.
+  CHECK(call(UnmapEa, {ea2 + 0x100000}) == kFailure);
+  CHECK(call(UnmapEa, {ea2 + 0x1234}) == 0);
+  CHECK(offsetOf(ea2, offset) == kFailure && offsetOf(ea2 + 0x100000, offset) == kFailure);
+  CHECK(call(UnmapEa, {ea2}) == kFailure);
+  CHECK(call(UnmapEa, {0xc0000000}) == kFailure);
+  CHECK(call(UnmapEa, {ea1}) == 0);
+  CHECK(call(MapMain, {ea2 + 0x100000, 0x100000, out}) == 0 && dalRead32(base, out) == 0x100000);
+  CHECK(offsetOf(ea2 + 0x100000, offset) == 0 && offset == 0x100000);
+
+  // The wrap callback flushes put, jumps to the next fragment and wraps around after the last.
+  const std::uint32_t context = dal::kRsxDeviceAddr;
+  const auto wrap = [&] { return dal::callGuestFunction(ctx, base, callback, {context, 0}); };
+  dalWrite32(base, context + 8, io_ea + 0x1010);
+  dalWrite32(base, 0x10100044, 0x1000);
+  CHECK(wrap() == 0);
+  CHECK(dalRead32(base, 0x10100040) == 0x1010);
+  CHECK(dalRead32(base, io_ea + 0x1010) == (0x20000000 | 0x8000));
+  CHECK(dalRead32(base, context) == io_ea + 0x8000 && dalRead32(base, context + 8) == io_ea + 0x8000);
+  CHECK(dalRead32(base, context + 4) == io_ea + 0x10000 - 4);
+  CHECK(ctx->gpr[1] == stack);
+
+  dalWrite32(base, 0x10100044, 0x9000);  // the consumer is past the new fragment
+  dalWrite32(base, context + 8, io_ea + 0x8040);
+  CHECK(wrap() == 0);
+  CHECK(dalRead32(base, 0x10100040) == 0x8040);
+  CHECK(dalRead32(base, io_ea + 0x8040) == (0x20000000 | 0x1000));
+  CHECK(dalRead32(base, context) == io_ea + 0x1000 && dalRead32(base, context + 8) == io_ea + 0x1000);
+  CHECK(dalRead32(base, context + 4) == io_ea + 0x8000 - 4);
+
+  // With get inside the new fragment the callback waits until the consumer moves it.
+  dalWrite32(base, 0x10100044, 0x8010);
+  dalWrite32(base, context + 8, io_ea + 0x1020);
+  std::thread consumer([] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::lock_guard<dal::GuestLock> lock(dal::guestLock());
+    dalWrite32(dal::process().memory.base(), 0x10100044, 0x1020);
+    dal::rsxGetAdvanced().notify_all();
+  });
+  const auto started = std::chrono::steady_clock::now();
+  CHECK(wrap() == 0);
+  CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(80));
+  CHECK(dalRead32(base, context) == io_ea + 0x8000);
+  consumer.join();
+
+  CHECK(countContaining(lines, "dal: default hle") == 0);
+  CHECK(dal::formatCensus().find("cellGcmSys::cellGcmMapMainMemory: 8 [impl]") != std::string::npos);
+
+  dal::resetRsxState();
+  CHECK(!p.memory.isCommitted(0xc0000000, 4) && !dal::rsxState().initialized);
+  dal::resetHostFunctions();
+  p.user1m.free(area);
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testSpurs() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -2185,6 +2384,7 @@ int main(int argc, char** argv) {
   testEventObjects();
   testSpuAndSysmodule();
   testSpurs();
+  testCellGcmSys();
   testLwmutex();
   testPpuThreads();
   testTimebase();

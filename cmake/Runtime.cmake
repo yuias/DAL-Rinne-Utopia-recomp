@@ -32,6 +32,7 @@ function(dal_runtime_add_core)
     runtime/src/core/guest_memory.cpp
     runtime/src/core/log.cpp
     runtime/src/core/threads.cpp
+    runtime/src/hle/cell_gcm_sys.cpp
     runtime/src/hle/cell_spurs.cpp
     runtime/src/hle/cell_sysmodule.cpp
     runtime/src/hle/hle.cpp
@@ -41,7 +42,8 @@ function(dal_runtime_add_core)
     runtime/src/lv2/sys_mutex_cond.cpp
     runtime/src/lv2/sys_ppu_thread.cpp
     runtime/src/lv2/sys_spu.cpp
-    runtime/src/lv2/syscalls.cpp)
+    runtime/src/lv2/syscalls.cpp
+    runtime/src/rsx/rsx_state.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_runtime_core PUBLIC
     ${CMAKE_SOURCE_DIR}/runtime/src
