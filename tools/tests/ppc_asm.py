@@ -62,6 +62,14 @@ def blr() -> int:
     return bclr(20, 0)
 
 
+def bl(addr: int, target: int) -> int:
+    return b(addr, target, lk=True)
+
+
+def blrl() -> int:
+    return bclr(20, 0, lk=True)
+
+
 def bctr() -> int:
     return bcctr(20, 0)
 
