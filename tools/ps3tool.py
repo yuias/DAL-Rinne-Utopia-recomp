@@ -7,6 +7,7 @@ import sys
 COMMANDS = {
     "info": "info",
     "probe": "probe",
+    "disasm": "disasm",
 }
 
 

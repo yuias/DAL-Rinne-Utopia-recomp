@@ -3,10 +3,12 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import info, probe
+from ps3recomp import disasm, info, probe
+from ps3recomp.elf import ElfFile
 
 _ELF_PATH = os.environ.get("DAL_EBOOT_ELF")
 
@@ -103,6 +105,59 @@ class RealEbootProbeTest(unittest.TestCase):
         spurs = [i for i in imports if i["name"] == "cellSpurs"]
         self.assertEqual(len(spurs), 1)
         self.assertEqual(spurs[0]["num_func"], 4)
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
+                     "DAL_EBOOT_ELF is not set or does not name an existing file")
+class RealEbootDisasmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.code_segment = ElfFile.from_path(_ELF_PATH).exec_segments()[0]
+
+    @staticmethod
+    def _run(*args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = disasm.main([_ELF_PATH, *args])
+        return code, out.getvalue()
+
+    @staticmethod
+    def _top_unknown(doc: dict) -> str:
+        return ", ".join("(%d, 0x%03x)x%d" % (u["primary"], u["xo_21_30"], u["count"])
+                         for u in doc["top_unknown_patterns"][:5])
+
+    def _stats(self, *args):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "stats.json"
+            started = time.monotonic()
+            code, _ = self._run("--stats", *args, "--json", str(out_path))
+            elapsed = time.monotonic() - started
+            self.assertEqual(code, 0)
+            return json.loads(out_path.read_text(encoding="utf-8")), elapsed
+
+    def test_entry_listing_decodes(self):
+        code, out = self._run("--entry", "--count", "32")
+        lines = out.splitlines()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(lines), 32)
+        for line in lines[:8]:
+            self.assertNotIn(".long", line)
+
+    def test_stats_whole_code_segment(self):
+        doc, elapsed = self._stats()
+        self.assertEqual(doc["total_words"], self.code_segment.p_filesz // 4)
+        self.assertLess(elapsed, 30, "stats took %.1f s" % elapsed)
+        self.assertGreater(doc["decoded_pct"], 90,
+                           "decoded %.2f%% (%d of %d); top unknown: %s"
+                           % (doc["decoded_pct"], doc["decoded"], doc["total_words"],
+                              self._top_unknown(doc)))
+
+    def test_stats_text_range(self):
+        doc, _ = self._stats("--start", "0x10230", "--end", "0xdcf2c")
+        self.assertGreater(doc["decoded_pct"], 99,
+                           "decoded %.2f%% (%d of %d); top unknown: %s"
+                           % (doc["decoded_pct"], doc["decoded"], doc["total_words"],
+                              self._top_unknown(doc)))
 
 
 if __name__ == "__main__":
