@@ -67,10 +67,12 @@ FifoStatus FifoParser::run(std::uint32_t& get, std::uint32_t put, std::uint32_t 
       continue;
     }
 
+    const std::uint32_t header_get = get;
     get += 4;
     const std::uint32_t count = (word >> kFifoCountShift) & kFifoCountMask;
     if (count == 0) continue;  // NOP
     ++headers_;
+    command_get_ = header_get;
     remaining_ = count;
     method_ = word & kFifoMethodMask;
     increment_ = (word & kFifoNonIncrementMask) != kFifoNonIncrement;

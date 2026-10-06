@@ -44,7 +44,8 @@ function(dal_runtime_add_core)
     runtime/src/lv2/sys_spu.cpp
     runtime/src/lv2/syscalls.cpp
     runtime/src/rsx/fifo_parser.cpp
-    runtime/src/rsx/rsx_state.cpp)
+    runtime/src/rsx/rsx_state.cpp
+    runtime/src/rsx/rsx_thread.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_runtime_core PUBLIC
     ${CMAKE_SOURCE_DIR}/runtime/src

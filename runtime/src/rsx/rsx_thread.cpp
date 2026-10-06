@@ -1,0 +1,421 @@
+#include "rsx/rsx_thread.h"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstring>
+#include <format>
+#include <string>
+#include <thread>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include "core/guest_memory.h"
+#include "core/log.h"
+#include "core/threads.h"
+#include "dal/ppu_context.h"
+#include "rsx/rsx_state.h"
+
+namespace dal {
+namespace {
+
+// CellGcmControl field offsets.
+constexpr std::uint32_t kControlPut = 0x00;
+constexpr std::uint32_t kControlGet = 0x04;
+constexpr std::uint32_t kControlRef = 0x08;
+
+// Context DMA object names (RPCS3 `Emu/RSX/gcm_enums.h`) and their values after a context reset.
+constexpr std::uint32_t kDmaSemaphoreRw = 0x66606660;
+constexpr std::uint32_t kDmaSemaphoreR = 0x66616661;
+constexpr std::uint32_t kDmaDeviceRw = 0x56616660;
+constexpr std::uint32_t kDmaDeviceR = 0x56616661;
+constexpr std::uint32_t kDmaReportLocal = 0x66626660;
+constexpr std::uint32_t kDmaReportMain = 0xBAD68000;
+
+constexpr std::uint32_t kSemaphoreAreaSize = 0x1000;  // RsxReports::semaphore[1024]
+constexpr std::uint32_t kDeviceAreaSize = 0x100000;
+constexpr std::uint32_t kReportAreaSize = 2048 * 16;
+constexpr std::uint32_t kReportMainIoBase = 0x0E000000;  // the main-memory report window in IO space
+constexpr std::uint32_t kReportMainSize = 0x1000000;
+constexpr std::uint32_t kReportSize = 16;
+constexpr std::uint32_t kFlipSemaphoreOffset = 0x10;  // the label the flip command clears
+constexpr std::uint32_t kDeviceReadyOffset = 0x30;
+constexpr std::uint64_t kFlipTimeOffsetUs = 1000000;
+
+constexpr std::uint32_t kMethodCount = 0x4000;  // 16-bit register offsets, 4 bytes apart
+constexpr std::uint32_t kPumpBudgetWords = 4096;
+
+// Names of the registers the consumer interprets. The census prints hex for the others.
+struct MethodName {
+  std::uint32_t method;
+  const char* name;
+};
+constexpr MethodName kMethodNames[] = {
+    {kMethodNv406eSetReference, "NV406E_SET_REFERENCE"},
+    {kMethodNv406eSetContextDmaSemaphore, "NV406E_SET_CONTEXT_DMA_SEMAPHORE"},
+    {kMethodNv406eSemaphoreOffset, "NV406E_SEMAPHORE_OFFSET"},
+    {kMethodNv406eSemaphoreAcquire, "NV406E_SEMAPHORE_ACQUIRE"},
+    {kMethodNv406eSemaphoreRelease, "NV406E_SEMAPHORE_RELEASE"},
+    {kMethodNv4097SetContextDmaSemaphore, "NV4097_SET_CONTEXT_DMA_SEMAPHORE"},
+    {kMethodNv4097SetContextDmaReport, "NV4097_SET_CONTEXT_DMA_REPORT"},
+    {kMethodNv4097GetReport, "NV4097_GET_REPORT"},
+    {kMethodNv4097SetSemaphoreOffset, "NV4097_SET_SEMAPHORE_OFFSET"},
+    {kMethodNv4097BackEndWriteSemaphoreRelease, "NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE"},
+    {kMethodNv4097TextureReadSemaphoreRelease, "NV4097_TEXTURE_READ_SEMAPHORE_RELEASE"},
+    {kMethodGcmFlipHead, "GCM_FLIP_HEAD"},
+    {kMethodGcmFlipHead + 4, "GCM_FLIP_HEAD"},
+    {kMethodGcmSetUserCommand, "GCM_SET_USER_COMMAND"},
+    {kMethodGcmSetUserCommand + 4, "GCM_SET_USER_COMMAND"},
+    {kMethodGcmFlipCommand, "GCM_FLIP_COMMAND"},
+};
+
+std::string methodName(std::uint32_t method) {
+  for (const MethodName& entry : kMethodNames) {
+    if (entry.method == method) return entry.name;
+  }
+  return {};
+}
+
+std::atomic<void (*)(RsxInterrupt, std::uint32_t)> g_hook{nullptr};
+
+void signalInterrupt(RsxInterrupt kind, std::uint32_t arg) {
+  if (auto hook = g_hook.load()) hook(kind, arg);
+}
+
+}  // namespace
+
+void setRsxInterruptHook(void (*hook)(RsxInterrupt kind, std::uint32_t arg)) { g_hook.store(hook); }
+
+RsxConsumer::RsxConsumer(std::uint8_t* base)
+    : base_(base), method_counts_(std::make_unique<std::atomic<std::uint64_t>[]>(kMethodCount)) {
+  resetDmaRegisters();
+}
+
+void RsxConsumer::resetDmaRegisters() {
+  dma_406e_ = kDmaSemaphoreR;
+  dma_semaphore_ = kDmaSemaphoreRw;
+  dma_report_ = kDmaReportLocal;
+}
+
+bool RsxConsumer::readIo(std::uint32_t io, std::uint32_t& word) {
+  std::uint32_t ea = 0;
+  if (!rsxIoToEa(io, ea)) return false;
+  word = dalRead32(base_, ea);
+  return true;
+}
+
+bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
+  if (!execute(method, value)) return false;
+  // Counted on completion, so a write retried while waiting is counted once.
+  method_counts_[(method >> 2) & (kMethodCount - 1)].fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+bool RsxConsumer::execute(std::uint32_t method, std::uint32_t value) {
+  switch (method) {
+    case kMethodNv406eSetReference:
+      dalWrite32(base_, kRsxControlAddr + kControlRef, value);
+      return true;
+    case kMethodNv406eSetContextDmaSemaphore:
+      dma_406e_ = value;
+      return true;
+    case kMethodNv406eSemaphoreOffset:
+      offset_406e_ = value;
+      return true;
+    case kMethodNv406eSemaphoreAcquire:
+      return acquire(value);
+    case kMethodNv406eSemaphoreRelease:
+      releaseNv406e(value);
+      return true;
+    case kMethodNv4097SetContextDmaSemaphore:
+      dma_semaphore_ = value;
+      return true;
+    case kMethodNv4097SetContextDmaReport:
+      dma_report_ = value;
+      return true;
+    case kMethodNv4097SetSemaphoreOffset:
+      offset_4097_ = value;
+      return true;
+    case kMethodNv4097BackEndWriteSemaphoreRelease:
+      releaseNv4097(value, true);
+      return true;
+    case kMethodNv4097TextureReadSemaphoreRelease:
+      releaseNv4097(value, false);
+      return true;
+    case kMethodNv4097GetReport:
+      getReport(value);
+      return true;
+    case kMethodGcmSetUserCommand:
+    case kMethodGcmSetUserCommand + 4:  // two registers share the handler
+      userCommand(value);
+      return true;
+    case kMethodGcmFlipCommand:
+      return flip(value);
+    default:
+      return true;
+  }
+}
+
+bool RsxConsumer::resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size,
+                          std::uint32_t& ea) const {
+  switch (location) {
+    case kDmaSemaphoreRw:
+    case kDmaSemaphoreR:
+      if (offset >= kSemaphoreAreaSize || size > kSemaphoreAreaSize - offset) return false;
+      ea = kRsxLabelAddr + offset;
+      return true;
+    case kDmaDeviceRw:
+    case kDmaDeviceR:
+      if (offset >= kDeviceAreaSize || size > kDeviceAreaSize - offset) return false;
+      ea = kRsxDeviceAddr + offset;
+      return true;
+    case kDmaReportLocal:
+      if (offset >= kReportAreaSize || size > kReportAreaSize - offset) return false;
+      ea = kRsxLabelAddr + kRsxReportsReportOffset + offset;
+      return true;
+    case kDmaReportMain: {
+      std::uint32_t mapped = 0;
+      if (offset >= kReportMainSize || !rsxIoToEa(kReportMainIoBase + offset, mapped)) return false;
+      if (!process().memory.isCommitted(mapped, size)) return false;
+      ea = mapped;
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+bool RsxConsumer::acquire(std::uint32_t value) {
+  std::uint32_t ea = 0;
+  if (!resolve(offset_406e_, dma_406e_, 4, ea)) {
+    // RPCS3 throws here; waiting forever on an address that cannot hold a label helps nobody.
+    logOnce("rsx-acquire-bad-address", "dal: rsx: semaphore acquire at offset {:#x} in DMA {:#010x} is not addressable, ignored",
+            offset_406e_, dma_406e_);
+    return true;
+  }
+  return dalRead32(base_, ea) == value;
+}
+
+void RsxConsumer::releaseNv406e(std::uint32_t value) {
+  if (offset_406e_ % 4 != 0) {
+    logOnce("rsx-release-unaligned", "dal: rsx: NV406E semaphore release at unaligned offset {:#x} ignored", offset_406e_);
+    return;
+  }
+  std::uint32_t ea = 0;
+  if (!resolve(offset_406e_, dma_406e_, 4, ea) || (ea >> 28) != (kRsxLabelAddr >> 28)) {
+    logOnce("rsx-release-bad-address", "dal: rsx: NV406E semaphore release at offset {:#x} in DMA {:#010x} ignored",
+            offset_406e_, dma_406e_);
+    return;
+  }
+  // The flip handshake word reads back 1 even though no display queue command set it.
+  if (ea == kRsxDeviceAddr + kDeviceReadyOffset && value == 0) value = 1;
+  dalWrite32(base_, ea, value);
+}
+
+void RsxConsumer::releaseNv4097(std::uint32_t value, bool swizzle) {
+  if (offset_4097_ % 16 != 0) {
+    logOnce("rsx-label-unaligned", "dal: rsx: NV4097 semaphore release at unaligned offset {:#x} ignored", offset_4097_);
+    return;
+  }
+  std::uint32_t ea = 0;
+  if (!resolve(offset_4097_, dma_semaphore_, 4, ea) || (ea >> 28) != (kRsxLabelAddr >> 28)) {
+    logOnce("rsx-label-bad-address", "dal: rsx: NV4097 semaphore release at offset {:#x} in DMA {:#010x} ignored",
+            offset_4097_, dma_semaphore_);
+    return;
+  }
+  // The back-end release swaps the red and blue bytes of the value.
+  if (swizzle) value = (value & 0xFF00FF00) | ((value & 0xFF) << 16) | ((value >> 16) & 0xFF);
+  dalWrite32(base_, ea, value);
+}
+
+void RsxConsumer::getReport(std::uint32_t value) {
+  const std::uint32_t offset = value & 0xFFFFFF;
+  std::uint32_t ea = 0;
+  if (!resolve(offset, dma_report_, kReportSize, ea)) {
+    logOnce("rsx-report-bad-address", "dal: rsx: NV4097_GET_REPORT {:#010x} in DMA {:#010x} ignored", value, dma_report_);
+    return;
+  }
+  // No zpass or zcull statistics are gathered; only the timer is real.
+  const std::uint64_t now_ns = systemTimeUs() * 1000;
+  last_timestamp_ns_ = std::max(now_ns, last_timestamp_ns_ + 1);
+  dalWrite64(base_, ea, last_timestamp_ns_);
+  dalWrite32(base_, ea + 8, 0);
+  dalWrite32(base_, ea + 12, 0);
+}
+
+bool RsxConsumer::flip(std::uint32_t buffer) {
+  RsxState& state = rsxState();
+  // With vsync the flip completes on the first VBlank after it was reached.
+  if (state.requested_vsync) {
+    if (!flip_armed_) {
+      flip_armed_ = true;
+      flip_vblank_ = state.vblank_count;
+      return false;
+    }
+    if (state.vblank_count == flip_vblank_) return false;
+  }
+  flip_armed_ = false;
+
+  if (flips_.fetch_add(1, std::memory_order_relaxed) == 0) {
+    logInfo("dal: rsx: first flip of buffer {}: put={:#x} get={:#x} parser={:#x}", buffer,
+            dalRead32(base_, kRsxControlAddr + kControlPut), dalRead32(base_, kRsxControlAddr + kControlGet),
+            get_);
+  }
+  state.flip_status = kRsxFlipStatusDone;
+  const std::uint64_t now = systemTimeUs();
+  state.last_flip_time = now > kFlipTimeOffsetUs ? now - kFlipTimeOffsetUs : 0;
+  std::memset(base_ + kRsxLabelAddr + kFlipSemaphoreOffset, 0, 16);
+  // RPCS3 resets the method registers on every flip; the context DMA objects are the ones that matter.
+  resetDmaRegisters();
+  signalInterrupt(RsxInterrupt::Flip, 1);
+  return true;
+}
+
+void RsxConsumer::userCommand(std::uint32_t cause) {
+  user_commands_.fetch_add(1, std::memory_order_relaxed);
+  if (g_hook.load() == nullptr) {
+    logOnce(std::format("rsx-user-command-{}", cause), "dal: rsx: pending user command cause {}", cause);
+    return;
+  }
+  signalInterrupt(RsxInterrupt::User, cause);
+}
+
+void RsxConsumer::vblankTick() {
+  rsxState().vblank_count++;
+  signalInterrupt(RsxInterrupt::VBlank, 1);
+}
+
+void RsxConsumer::publishGet(std::uint32_t get) {
+  if (get_known_ && get == published_get_) return;
+  published_get_ = get;
+  get_known_ = true;
+  dalWrite32(base_, kRsxControlAddr + kControlGet, get);
+  rsxGetAdvanced().notify_all();
+}
+
+FifoStatus RsxConsumer::pump(std::uint32_t max_words) {
+  if (faulted_) return FifoStatus::Fault;
+  if (!get_known_) {
+    get_ = dalRead32(base_, kRsxControlAddr + kControlGet);
+    published_get_ = get_;
+    get_known_ = true;
+  }
+  const std::uint32_t put = dalRead32(base_, kRsxControlAddr + kControlPut);
+  const FifoStatus status = parser_.run(get_, put, max_words, *this);
+  // The guest sees `get` at the start of an unfinished command (a semaphore wait, a flip waiting
+  // for VBlank), so "get == put" means the work is really done. The wrap callback only needs get
+  // to leave the fragment it is about to refill, which this also guarantees.
+  publishGet(parser_.commandGet(get_));
+  headers_.store(parser_.headersParsed(), std::memory_order_relaxed);
+  last_status_ = status;
+  if (status == FifoStatus::Idle) {
+    idle_put_ = put & ~3u;
+    if (flips_.load(std::memory_order_relaxed) != 0) {
+      logOnce("rsx-idle-after-flip", "dal: rsx: command buffer drained after the first flip: put={:#x} get={:#x}", put,
+              published_get_);
+    }
+  }
+  if (status == FifoStatus::Fault) {
+    faulted_ = true;
+    logError("dal: rsx: command fifo fault, no more commands are consumed: {} (get {:#x}, put {:#x})",
+             parser_.lastFault(), get_, put);
+  }
+  return status;
+}
+
+bool RsxConsumer::hasWork(std::uint32_t put) const {
+  if (faulted_) return false;
+  return last_status_ != FifoStatus::Idle || (put & ~3u) != idle_put_;
+}
+
+RsxCensus RsxConsumer::census() const {
+  RsxCensus result;
+  result.headers = headers_.load(std::memory_order_relaxed);
+  result.flips = flips_.load(std::memory_order_relaxed);
+  for (std::uint32_t i = 0; i < kMethodCount; i++) {
+    const std::uint64_t count = method_counts_[i].load(std::memory_order_relaxed);
+    if (count != 0) result.methods.push_back({i << 2, count, methodName(i << 2)});
+  }
+  return result;
+}
+
+namespace {
+
+RsxConsumer* g_consumer = nullptr;
+
+RsxCensus consumerCensus() { return g_consumer != nullptr ? g_consumer->census() : RsxCensus{}; }
+
+// A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
+// system tick and make the VBlank rate irregular.
+class Sleeper {
+ public:
+  Sleeper() { timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS); }
+  ~Sleeper() {
+    if (timer_ != nullptr) CloseHandle(timer_);
+  }
+  void sleep(std::chrono::microseconds duration) {
+    if (duration.count() <= 0) return;
+    if (timer_ == nullptr) return std::this_thread::sleep_for(duration);
+    LARGE_INTEGER due;
+    due.QuadPart = -10 * duration.count();  // relative, in 100 ns units
+    if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
+      WaitForSingleObject(timer_, INFINITE);
+    } else {
+      std::this_thread::sleep_for(duration);
+    }
+  }
+
+ private:
+  HANDLE timer_ = nullptr;
+};
+
+void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
+  using Clock = std::chrono::steady_clock;
+  constexpr auto kPeriod = std::chrono::microseconds(kRsxVBlankPeriodUs);
+  constexpr auto kPollInterval = std::chrono::milliseconds(1);
+  Sleeper sleeper;
+  // The put word is the one guest word read without the lock: aligned, and a stale value only
+  // delays work until the next pass.
+  std::atomic_ref<std::uint32_t> put_word(*reinterpret_cast<std::uint32_t*>(base + kRsxControlAddr + kControlPut));
+
+  auto next_tick = Clock::now() + kPeriod;
+  for (;;) {
+    const auto before = Clock::now();
+    sleeper.sleep(std::chrono::duration_cast<std::chrono::microseconds>(std::min<Clock::duration>(next_tick - before, kPollInterval)));
+
+    const auto now = Clock::now();
+    const bool tick = now >= next_tick;
+    if (tick) {
+      next_tick += kPeriod;
+      if (next_tick <= now) next_tick = now + kPeriod;  // no burst after a long pause
+    }
+    const std::uint32_t put = std::byteswap(put_word.load(std::memory_order_relaxed));
+    if (!tick && !consumer->hasWork(put)) continue;
+
+    bool pending_tick = tick;
+    FifoStatus status;
+    do {
+      std::lock_guard<GuestLock> lock(guestLock());
+      if (pending_tick) {
+        consumer->vblankTick();
+        pending_tick = false;
+      }
+      status = consumer->pump(kPumpBudgetWords);
+    } while (status == FifoStatus::Budget);
+  }
+}
+
+}  // namespace
+
+void startRsxThread(std::uint8_t* base) {
+  if (g_consumer != nullptr) return;
+  // Leaked: the thread runs until the process ends.
+  g_consumer = new RsxConsumer(base);
+  setRsxCensusProvider(&consumerCensus);
+  std::thread(consumerLoop, g_consumer, base).detach();
+}
+
+}  // namespace dal

@@ -21,7 +21,9 @@
 #include "hle/hle.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_sync.h"
+#include "rsx/fifo_parser.h"
 #include "rsx/rsx_state.h"
+#include "rsx/rsx_thread.h"
 
 namespace dal {
 namespace {
@@ -66,18 +68,13 @@ constexpr std::uint32_t kCoreFrequency = 500000000;
 // last word of every fragment are reserved (the word holds the jump to the next fragment).
 constexpr std::uint32_t kFragmentSize = 0x8000;
 constexpr std::uint32_t kFragmentReserved = 0x1000;
-constexpr std::uint32_t kJumpCommand = 0x20000000;  // RSX_METHOD_OLD_JUMP_CMD
 
 // Initial control register: the first command is written at IO offset 0x1000, and the reference
 // value is all ones until the game writes one.
 constexpr std::uint32_t kControlStart = 0x1000;
 constexpr std::uint32_t kControlRefInitial = 0xffffffff;
 
-// Method headers are `method | (argument count << 18)`; the methods are byte offsets of the RSX
-// method registers (RPCS3 `GCM_FLIP_COMMAND`, `NV406E_SEMAPHORE_OFFSET`, `rsx::make_command`).
-constexpr std::uint32_t kFlipCommandMethod = 0xfeac;
-constexpr std::uint32_t kSemaphoreOffsetMethod = 0x0064;
-constexpr std::uint32_t kMethodCountShift = 18;
+// Method headers are `method | (argument count << 18)` (RPCS3 `rsx::make_command`).
 constexpr std::uint32_t kMaxDisplayId = 7;
 constexpr std::uint64_t kFlipTimeOffsetUs = 1000000;
 
@@ -116,7 +113,7 @@ void writeCommand(std::uint8_t* base, std::uint32_t context, std::uint32_t metho
   std::uint32_t current = dalRead32(base, context + kContextCurrent);
   requireCommitted(current, bytes, "command buffer");
   const std::uint32_t start = current;
-  dalWrite32(base, current, method | (static_cast<std::uint32_t>(args.size()) << kMethodCountShift));
+  dalWrite32(base, current, method | (static_cast<std::uint32_t>(args.size()) << kFifoCountShift));
   current += 4;
   for (const std::uint32_t arg : args) {
     dalWrite32(base, current, arg);
@@ -153,7 +150,7 @@ void gcmCallback(DalPpuContext* ctx, std::uint8_t* base) {
   }
 
   const std::uint32_t jump_target = toOffset(next_begin);
-  dalWrite32(base, current, kJumpCommand | jump_target);
+  dalWrite32(base, current, kFifoOldJump | jump_target);
   dalWrite32(base, context + kContextBegin, next_begin);
   dalWrite32(base, context + kContextCurrent, next_begin);
   dalWrite32(base, context + kContextEnd, next_end);
@@ -175,7 +172,11 @@ void gcmCallback(DalPpuContext* ctx, std::uint8_t* base) {
 
 // _cellGcmInitBody(context**, cmdSize, ioSize, ioAddress)
 void gcmInitBodyHandler(DalPpuContext* ctx, std::uint8_t* base) {
-  setResultCode(ctx, gcmInitBody(base, argU32(ctx, 0), argU32(ctx, 1), argU32(ctx, 2), argU32(ctx, 3), kRsxLocalSize));
+  const std::uint32_t result =
+      gcmInitBody(base, argU32(ctx, 0), argU32(ctx, 1), argU32(ctx, 2), argU32(ctx, 3), kRsxLocalSize);
+  // Only the import starts the consumer: tests call gcmInitBody and drive the control register by hand.
+  if (result == kCellOk) startRsxThread(base);
+  setResultCode(ctx, result);
 }
 
 // cellGcmGetConfiguration(CellGcmConfig*)
@@ -295,7 +296,7 @@ void writeFlipCommand(std::uint8_t* base, std::uint32_t context, std::uint32_t i
     logError("dal: gcm: {}: display buffer id {} is out of range, nothing written", name, id);
     return;
   }
-  writeCommand(base, context, kFlipCommandMethod, {id});
+  writeCommand(base, context, kMethodGcmFlipCommand, {id});
 }
 
 // _cellGcmSetFlipCommand(context*, id): void
@@ -310,7 +311,7 @@ void gcmSetFlipCommand(DalPpuContext* ctx, std::uint8_t* base) {
 void gcmSetFlipCommandWithWaitLabel(DalPpuContext* ctx, std::uint8_t* base) {
   const std::uint32_t context = argU32(ctx, 0);
   requireCommitted(context, kContextSize, "command buffer context");
-  writeCommand(base, context, kSemaphoreOffsetMethod, {argU32(ctx, 2) * 0x10, argU32(ctx, 3)});
+  writeCommand(base, context, kMethodNv406eSemaphoreOffset, {argU32(ctx, 2) * 0x10, argU32(ctx, 3)});
   writeFlipCommand(base, context, argU32(ctx, 1), "_cellGcmSetFlipCommandWithWaitLabel");
 }
 

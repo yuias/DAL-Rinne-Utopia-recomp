@@ -35,6 +35,7 @@
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/rsx_state.h"
+#include "rsx/rsx_thread.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1632,6 +1633,166 @@ void testFifoParser() {
   }
 }
 
+std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>> g_interrupts;
+void recordInterrupt(dal::RsxInterrupt kind, std::uint32_t arg) { g_interrupts.emplace_back(kind, arg); }
+
+dal::RsxCensus fakeRsxCensus() {
+  return {120, 3, {{0x1d6c, 5, "NV4097_SET_SEMAPHORE_OFFSET"}, {0x1808, 9, ""}, {0x1800, 5, ""}}};
+}
+
+void testRsxConsumer() {
+  using dal::FifoStatus;
+  using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetRsxState();
+  dal::setRsxInterruptHook(nullptr);
+  g_interrupts.clear();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  const std::uint32_t area = p.user1m.allocate(0x400000, 0x100000);
+  CHECK(scratch != 0 && area != 0);
+  CHECK(dal::gcmInitBody(base, scratch, 0x10000, 0x100000, area, 0x200000) == 0);
+
+  constexpr std::uint32_t kControl = 0x10100040, kLabels = 0x10300000, kDevice = 0x10000000;
+  constexpr std::uint32_t kStart = 0x1000;
+  dal::RsxConsumer consumer(base);
+  std::uint32_t at = kStart;
+  const auto emit = [&](std::uint32_t method, std::initializer_list<std::uint32_t> args) {
+    dalWrite32(base, area + at, method | (static_cast<std::uint32_t>(args.size()) << 18));
+    at += 4;
+    for (const std::uint32_t arg : args) {
+      dalWrite32(base, area + at, arg);
+      at += 4;
+    }
+  };
+  const auto run = [&] {
+    dalWrite32(base, kControl, at);
+    return consumer.pump(100);
+  };
+  const auto label = [&](std::uint32_t offset) { return dalRead32(base, kLabels + offset); };
+
+  // Back-end release swaps the red and blue bytes, texture-read release stores the value as is;
+  // an unaligned offset is ignored.
+  emit(dal::kMethodNv4097SetSemaphoreOffset, {0x20});
+  emit(dal::kMethodNv4097BackEndWriteSemaphoreRelease, {0x11223344});
+  CHECK(run() == FifoStatus::Idle);
+  CHECK(label(0x20) == 0x11443322);
+  CHECK(dalRead32(base, kControl + 4) == at);  // get follows put
+  emit(dal::kMethodNv4097SetSemaphoreOffset, {0x40});
+  emit(dal::kMethodNv4097TextureReadSemaphoreRelease, {0xAABBCCDD});
+  emit(dal::kMethodNv4097SetSemaphoreOffset, {0x14});
+  emit(dal::kMethodNv4097TextureReadSemaphoreRelease, {0x99});
+  CHECK(run() == FifoStatus::Idle);
+  CHECK(label(0x40) == 0xAABBCCDD && label(0x14) == 0x1337BABE);
+  CHECK(countContaining(lines, "unaligned offset 0x14") == 1);
+  CHECK(!consumer.hasWork(at) && consumer.hasWork(at + 4));
+
+  // The reference value goes to the control register.
+  emit(dal::kMethodNv406eSetReference, {0x1234});
+  CHECK(run() == FifoStatus::Idle && dalRead32(base, kControl + 8) == 0x1234);
+
+  // An acquire that is not satisfied keeps get at its header; it completes once the label matches.
+  const std::uint32_t acquire_at = at;
+  emit(dal::kMethodNv406eSemaphoreOffset, {0x80, 0x5555});
+  CHECK(run() == FifoStatus::Waiting);
+  CHECK(dalRead32(base, kControl + 4) == acquire_at && consumer.hasWork(at));
+  CHECK(run() == FifoStatus::Waiting);
+  dalWrite32(base, kLabels + 0x80, 0x5555);
+  CHECK(run() == FifoStatus::Idle && dalRead32(base, kControl + 4) == at);
+
+  // NV406E release writes through the semaphore DMA; a zero into the device ready word becomes 1.
+  emit(dal::kMethodNv406eSemaphoreOffset, {0x84});
+  emit(dal::kMethodNv406eSemaphoreRelease, {0x777});
+  dalWrite32(base, kDevice + 0x30, 5);
+  emit(dal::kMethodNv406eSetContextDmaSemaphore, {0x56616661});
+  emit(dal::kMethodNv406eSemaphoreOffset, {0x30});
+  emit(dal::kMethodNv406eSemaphoreRelease, {0});
+  CHECK(run() == FifoStatus::Idle);
+  CHECK(label(0x84) == 0x777 && dalRead32(base, kDevice + 0x30) == 1);
+
+  // Reports carry an increasing timer in nanoseconds and a zero value.
+  emit(dal::kMethodNv4097GetReport, {0x00000010});
+  CHECK(run() == FifoStatus::Idle);
+  const std::uint32_t report = kLabels + 0x1400;
+  const std::uint64_t first = dalRead64(base, report + 0x10);
+  CHECK(first != 0 && dalRead32(base, report + 0x18) == 0 && dalRead32(base, report + 0x1c) == 0);
+  CHECK(dalRead64(base, report + 0x20) == 0xFFFFFFFFFFFFFFFF);
+  emit(dal::kMethodNv4097GetReport, {0x00000020});
+  CHECK(run() == FifoStatus::Idle && dalRead64(base, report + 0x20) > first);
+
+  // A flip with vsync waits for a VBlank; it clears the flip label and notifies the hook.
+  dal::RsxState& state = dal::rsxState();
+  state.flip_status = dal::kRsxFlipStatusWaiting;
+  dalWrite32(base, kLabels + 0x10, 0x1111);
+  dal::setRsxInterruptHook(&recordInterrupt);
+  emit(dal::kMethodGcmFlipCommand, {1});
+  CHECK(run() == FifoStatus::Waiting && consumer.census().flips == 0);
+  CHECK(state.flip_status == dal::kRsxFlipStatusWaiting && label(0x10) == 0x1111);
+  consumer.vblankTick();
+  CHECK(state.vblank_count == 1);
+  CHECK(consumer.pump(100) == FifoStatus::Idle);
+  CHECK(consumer.census().flips == 1 && state.flip_status == dal::kRsxFlipStatusDone && label(0x10) == 0);
+  CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::VBlank, 1}, {dal::RsxInterrupt::Flip, 1}}));
+  CHECK(countContaining(lines, "dal: rsx: first flip") == 1);
+  // Without vsync it completes at once.
+  state.requested_vsync = false;
+  emit(dal::kMethodGcmFlipCommand, {2});
+  CHECK(run() == FifoStatus::Idle && consumer.census().flips == 2);
+
+  // User commands reach the hook; without one they are only logged.
+  g_interrupts.clear();
+  emit(dal::kMethodGcmSetUserCommand, {7});
+  emit(dal::kMethodGcmSetUserCommand + 4, {9});
+  CHECK(run() == FifoStatus::Idle);
+  CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::User, 7}, {dal::RsxInterrupt::User, 9}}));
+  dal::setRsxInterruptHook(nullptr);
+  emit(dal::kMethodGcmSetUserCommand, {3});
+  CHECK(run() == FifoStatus::Idle);
+  CHECK(countContaining(lines, "pending user command cause 3") == 1);
+
+  // The census counts completed writes by register: the waiting flip counts once.
+  const dal::RsxCensus census = consumer.census();
+  const auto countOf = [&](std::uint32_t method) -> std::uint64_t {
+    for (const auto& m : census.methods) {
+      if (m.method == method) return m.count;
+    }
+    return 0;
+  };
+  CHECK(countOf(dal::kMethodGcmFlipCommand) == 2 && countOf(dal::kMethodGcmSetUserCommand) == 2);
+  CHECK(countOf(dal::kMethodNv4097SetSemaphoreOffset) == 3 && countOf(dal::kMethodNv4097GetReport) == 2);
+  CHECK(countOf(0x1234) == 0 && census.headers > 10);
+
+  // A jump into unmapped IO space faults once; after that nothing is consumed.
+  dalWrite32(base, area + at, 0x20000000 | 0x0F000000);
+  at += 4;
+  CHECK(run() == FifoStatus::Fault && consumer.faulted());
+  CHECK(countContaining(lines, "command fifo fault") == 1);
+  CHECK(run() == FifoStatus::Fault && countContaining(lines, "command fifo fault") == 1);
+  CHECK(!consumer.hasWork(at + 4));
+
+  // The census section is printed only while a provider is registered.
+  CHECK(dal::formatCensus().find("census: rsx") == std::string::npos);
+  dal::setRsxCensusProvider(&fakeRsxCensus);
+  const std::string text = dal::formatCensus();
+  CHECK(text.find("census: rsx 120 headers, 3 distinct methods, 3 flips\n"
+                  "  method 0x1808: 9\n"
+                  "  method 0x1800: 5\n"
+                  "  method 0x1d6c NV4097_SET_SEMAPHORE_OFFSET: 5\n") != std::string::npos);
+
+  dal::setRsxInterruptHook(nullptr);
+  dal::resetRsxState();
+  p.user1m.free(area);
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testCellGcmSys() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -2723,6 +2884,7 @@ int main(int argc, char** argv) {
   testSpurs();
   testCellGcmSys();
   testFifoParser();
+  testRsxConsumer();
   testLwmutex();
   testPpuThreads();
   testTimebase();

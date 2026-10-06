@@ -28,6 +28,7 @@ struct CensusState {
   std::unordered_map<std::string, CallStat> hle;
   std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> unknown_targets;
   ThreadCensusFn thread_fn = nullptr;
+  RsxCensusFn rsx_fn = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -137,10 +138,17 @@ void setThreadCensusProvider(ThreadCensusFn fn) {
   s.thread_fn = fn;
 }
 
+void setRsxCensusProvider(RsxCensusFn fn) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.rsx_fn = fn;
+}
+
 std::string formatCensus() {
   CensusState& s = state();
   std::string out;
   ThreadCensusFn thread_fn = nullptr;
+  RsxCensusFn rsx_fn = nullptr;
   {
     std::lock_guard lock(s.mutex);
 
@@ -182,6 +190,19 @@ std::string formatCensus() {
       out += std::format("\n  {:#010x} from {:#010x}: {}", key.first, key.second, count);
     }
     thread_fn = s.thread_fn;
+    rsx_fn = s.rsx_fn;
+  }
+
+  if (rsx_fn != nullptr) {
+    RsxCensus rsx = rsx_fn();
+    std::ranges::sort(rsx.methods, [](const RsxMethodCount& a, const RsxMethodCount& b) {
+      return std::tie(b.count, a.method) < std::tie(a.count, b.method);
+    });
+    out += std::format("\ncensus: rsx {} headers, {} distinct methods, {} flips", rsx.headers,
+                       rsx.methods.size(), rsx.flips);
+    for (const RsxMethodCount& m : rsx.methods) {
+      out += std::format("\n  method {:#x}{}{}: {}", m.method, m.name.empty() ? "" : " ", m.name, m.count);
+    }
   }
 
   // The provider takes its own locks, so it runs outside ours.
@@ -220,6 +241,7 @@ void resetCensus() {
   s.hle.clear();
   s.unknown_targets.clear();
   s.thread_fn = nullptr;
+  s.rsx_fn = nullptr;
 }
 
 }  // namespace dal

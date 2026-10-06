@@ -76,6 +76,9 @@ class FifoParser {
   std::uint64_t headersParsed() const { return headers_; }
   // Forgets a pending method, the call slot and the fault.
   void reset();
+  // Where the guest-visible get register may point after a run that ended with `get`: the header
+  // of an unfinished command, so the guest never sees a command as consumed before it completed.
+  std::uint32_t commandGet(std::uint32_t get) const { return (remaining_ != 0 || pending_) ? command_get_ : get; }
 
  private:
   FifoStatus fail(std::string message);
@@ -83,6 +86,7 @@ class FifoParser {
   // Arguments of the current method still to be read, and the register the next one goes to.
   std::uint32_t remaining_ = 0;
   std::uint32_t method_ = 0;
+  std::uint32_t command_get_ = 0;  // IO offset of the current command's header
   bool increment_ = true;
   // A write the sink refused, retried first on the next run.
   bool pending_ = false;

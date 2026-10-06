@@ -43,6 +43,24 @@ struct ThreadCensusEntry {
 using ThreadCensusFn = std::vector<ThreadCensusEntry> (*)();
 void setThreadCensusProvider(ThreadCensusFn fn);
 
+// What the RSX consumer counted: one entry per distinct register written through the FIFO.
+struct RsxMethodCount {
+  std::uint32_t method = 0;  // byte offset of the register
+  std::uint64_t count = 0;
+  std::string name;  // empty when the register has no known name
+};
+
+struct RsxCensus {
+  std::uint64_t headers = 0;
+  std::uint64_t flips = 0;
+  std::vector<RsxMethodCount> methods;
+};
+
+// Registered by the RSX consumer; the section is printed only while a provider is set. The provider
+// runs without the census lock and may be called from any thread.
+using RsxCensusFn = RsxCensus (*)();
+void setRsxCensusProvider(RsxCensusFn fn);
+
 // The census as text, one line per element, no trailing newline. Entries are sorted by count
 // (descending) and then by name. In the syscall and HLE headers "default-handled" is the number of
 // distinct entries that used the default handler.
