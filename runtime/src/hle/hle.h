@@ -33,6 +33,18 @@ std::span<const HleEntry> cellGameHandlers();
 // Forgets the outstanding cellGameDataCheck state. Intended for tests.
 void resetCellGame();
 
+// Handlers of the sceNp module.
+std::span<const HleEntry> sceNpHandlers();
+
+// Forgets the sceNp init state. Intended for tests.
+void resetSceNp();
+
+// Handlers of the sceNpTrophy module.
+std::span<const HleEntry> sceNpTrophyHandlers();
+
+// Forgets the trophy init state, contexts and handles. Intended for tests.
+void resetSceNpTrophy();
+
 // Handlers of the sys_fs module (cellFs*).
 std::span<const HleEntry> cellFsHandlers();
 

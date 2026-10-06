@@ -39,6 +39,8 @@ function(dal_runtime_add_core)
     runtime/src/hle/cell_spurs.cpp
     runtime/src/hle/cell_sysmodule.cpp
     runtime/src/hle/hle.cpp
+    runtime/src/hle/sce_np.cpp
+    runtime/src/hle/sce_np_trophy.cpp
     runtime/src/hle/sys_prx_for_user.cpp
     runtime/src/lv2/sys_event.cpp
     runtime/src/lv2/sys_fs.cpp

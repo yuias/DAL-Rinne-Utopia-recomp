@@ -2002,6 +2002,233 @@ void testCellFs() {
   dal::configureVfs({}, std::nullopt);
 }
 
+struct TrophyCallbackCall {
+  std::uint32_t context, status;
+  std::int32_t completed, total;
+  std::uint32_t arg;
+};
+std::vector<TrophyCallbackCall> g_trophy_callbacks;
+std::uint64_t g_trophy_callback_result = 0;
+
+DAL_PPU_FUNC(trophyStatusCallback) {
+  (void)base;
+  g_trophy_callbacks.push_back({static_cast<std::uint32_t>(ctx->gpr[3]),
+                                static_cast<std::uint32_t>(ctx->gpr[4]),
+                                static_cast<std::int32_t>(ctx->gpr[5]),
+                                static_cast<std::int32_t>(ctx->gpr[6]),
+                                static_cast<std::uint32_t>(ctx->gpr[7])});
+  ctx->gpr[3] = g_trophy_callback_result;
+}
+
+void testSceNpAndTrophy() {
+  namespace stdfs = std::filesystem;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetHostFunctions();
+  dal::resetSceNp();
+  dal::resetSceNpTrophy();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t out = scratch, comm_id = scratch + 0x100, comm_sign = scratch + 0x200,
+                      path_addr = scratch + 0x300, flags = scratch + 0x400;
+
+  // A trophy pack with one entry, the trophy config: a platinum trophy (id 0) and three others
+  // that link to it.
+  const std::string config =
+      "<trophyconf version=\"1.1\">\n"
+      " <trophy id=\"000\" hidden=\"no\" ttype=\"P\" pid=\"-1\"/>\n"
+      " <trophy id=\"001\" hidden=\"no\" ttype=\"B\" pid=\"000\"/>\n"
+      " <trophy id=\"002\" hidden=\"no\" ttype=\"S\" pid=\"000\">\n  <name>x</name>\n </trophy>\n"
+      " <trophy id=\"003\" hidden=\"no\" ttype=\"G\" pid=\"000\"/>\n"
+      "</trophyconf>\n";
+  std::vector<std::uint8_t> trp(128, 0);
+  const auto put32 = [&](std::size_t at, std::uint32_t v) {
+    for (int i = 0; i < 4; i++) trp[at + i] = static_cast<std::uint8_t>(v >> (24 - 8 * i));
+  };
+  put32(0, 0xDCA24D00);
+  put32(4, 1);
+  put32(12, static_cast<std::uint32_t>(128 + config.size()));  // file size (low word)
+  put32(16, 1);
+  put32(20, 64);
+  std::memcpy(&trp[64], "TROPCONF.SFM", 12);
+  put32(64 + 36, 128);                                         // entry offset (low word)
+  put32(64 + 44, static_cast<std::uint32_t>(config.size()));  // entry size (low word)
+  trp.insert(trp.end(), config.begin(), config.end());
+
+  const stdfs::path root =
+      stdfs::temp_directory_path() / ("dal_trophy_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  const stdfs::path game = root / "game";
+  stdfs::create_directories(game / "PS3_GAME" / "TROPDIR" / "NPWR00001_00");
+  std::ofstream(game / "PS3_GAME" / "TROPDIR" / "NPWR00001_00" / "TROPHY.TRP", std::ios::binary)
+      .write(reinterpret_cast<const char*>(trp.data()), static_cast<std::streamsize>(trp.size()));
+  std::ofstream(game / "drm.bin", std::ios::binary) << "data";
+  dal::configureVfs(game, root / "hdd");
+
+  enum Import : std::uint32_t {
+    Register, CreateHandle, DiskSpace, DestroyContext, Init, DestroyHandle, Unlock, Term,
+    UnlockState, CreateContext, NpInit, NpTerm, NpDrm, ImportCount
+  };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x1197b52c, "sceNpTrophy", "sceNpTrophyRegisterContext"},
+      {0x00800010, 0x1c25470d, "sceNpTrophy", "sceNpTrophyCreateHandle"},
+      {0x00800020, 0x370136fe, "sceNpTrophy", "sceNpTrophyGetRequiredDiskSpace"},
+      {0x00800030, 0x3741ecc7, "sceNpTrophy", "sceNpTrophyDestroyContext"},
+      {0x00800040, 0x39567781, "sceNpTrophy", "sceNpTrophyInit"},
+      {0x00800050, 0x623cd2dc, "sceNpTrophy", "sceNpTrophyDestroyHandle"},
+      {0x00800060, 0x8ceedd21, "sceNpTrophy", "sceNpTrophyUnlockTrophy"},
+      {0x00800070, 0xa7fabf4d, "sceNpTrophy", "sceNpTrophyTerm"},
+      {0x00800080, 0xb3ac3478, "sceNpTrophy", "sceNpTrophyGetTrophyUnlockState"},
+      {0x00800090, 0xe3bf9a28, "sceNpTrophy", "sceNpTrophyCreateContext"},
+      {0x008000a0, 0xbd28fdbf, "sceNp", "sceNpInit"},
+      {0x008000b0, 0x4885aa18, "sceNp", "sceNpTerm"},
+      {0x008000c0, 0xad218faf, "sceNp", "sceNpDrmIsAvailable"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  CHECK(p.memory.commit(0x4f0000, 0x10000));
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                  std::uint64_t d = 0, std::uint64_t e = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    ctx->gpr[6] = d;
+    ctx->gpr[7] = e;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kNotInit = 0x80022902, kNotSupported = 0x80022903, kInvalidArg = 0x80022906,
+                          kNotRegistered = 0x80022904, kUnknownContext = 0x8002290a,
+                          kInvalidId = 0x80022920, kPlatinum = 0x80022914, kAlready = 0x80022915,
+                          kAlreadyInit = 0x80022901, kBadCommId = 0x80022918;
+
+  // sceNp.
+  CHECK(call(NpTerm) == 0x8002aa01);
+  CHECK(call(NpInit, 0, 0x1000) == 0x8002aa03);
+  CHECK(call(NpInit, 0x1000, 0) == 0x8002aa03);
+  CHECK(call(NpInit, 0x1ffff, 0x1000) == 0x8002aa0f);
+  CHECK(call(NpInit, 0x20000, 0x1000) == 0);
+  CHECK(call(NpInit, 0x20000, 0x1000) == 0x8002aa02);
+  CHECK(call(NpTerm) == 0);
+  CHECK(call(NpDrm, 0, 0) == 0x80029502);
+  std::memcpy(base + path_addr, "/dev_bdvd/drm.bin", 18);
+  CHECK(call(NpDrm, 0, path_addr) == 0);
+  std::memcpy(base + path_addr, "/dev_bdvd/none.bin", 19);
+  CHECK(call(NpDrm, 0, path_addr) == dal::kCellEnoent);
+
+  // Init and the tables.
+  CHECK(call(CreateHandle, out) == kNotInit);
+  CHECK(call(Init, 0, 0, 0xffffffff, 1) == kNotSupported);
+  CHECK(call(Init, 0, 0, 0xffffffff, 0) == 0);
+  CHECK(call(Init, 0, 0, 0xffffffff, 0) == kAlreadyInit);
+  CHECK(call(CreateHandle, 0) == kInvalidArg);
+  CHECK(call(CreateHandle, out) == 0 && dalRead32(base, out) == 1);
+  CHECK(call(CreateHandle, out) == 0 && dalRead32(base, out) == 2);
+  CHECK(call(DestroyHandle, 2) == 0 && call(DestroyHandle, 2) == 0x80022911);
+  CHECK(call(DestroyHandle, 9) == kInvalidArg);
+
+  std::memcpy(base + comm_id, "NPWR00001\0", 10);
+  base[comm_id + 10] = 0;
+  dalWrite32(base, comm_sign, 0xB9DDE13B);
+  dalWrite16(base, comm_sign + 4, 0x100);
+  CHECK(call(CreateContext, out, comm_id, 0) == kInvalidArg);
+  CHECK(call(CreateContext, out, comm_id, comm_sign, 2) == kNotSupported);
+  base[comm_sign + 8] = 1;
+  CHECK(call(CreateContext, out, comm_id, comm_sign) == kBadCommId);
+  base[comm_sign + 8] = 0;
+  CHECK(call(CreateContext, out, comm_id, comm_sign) == 0 && dalRead32(base, out) == 1);
+
+  // Required space is the pack minus its header and entry table; bad ids are rejected.
+  CHECK(call(DiskSpace, 1, 1, 0) == kInvalidArg);
+  CHECK(call(DiskSpace, 0, 0, out) == kInvalidArg);
+  CHECK(call(DiskSpace, 1, 3, out) == 0x80022911);
+  CHECK(call(DiskSpace, 1, 1, out) == 0 && dalRead64(base, out) == config.size());
+
+  // Unlocking needs a registered context; read-only state without an install is empty.
+  CHECK(call(Unlock, 1, 1, 1, 0) == kNotRegistered);
+  CHECK(call(UnlockState, 1, 1, flags, out) == kNotRegistered);
+
+  // Registration: the install question, then the progress events in order.
+  const std::uint32_t cb = dal::registerHostFunction("trophyStatusCallback", trophyStatusCallback);
+  g_trophy_callbacks.clear();
+  g_trophy_callback_result = static_cast<std::uint64_t>(-1);  // refuse the install
+  CHECK(call(Register, 1, 1, 0, 0, 0) == kInvalidArg);
+  CHECK(call(Register, 1, 1, cb, 0x1234, 2) == kNotSupported);
+  CHECK(call(Register, 1, 1, cb, 0x1234, 0) == 0x8002290f);
+  CHECK(g_trophy_callbacks.size() == 1);
+  CHECK(g_trophy_callbacks[0].context == 1 && g_trophy_callbacks[0].status == 1 &&
+        g_trophy_callbacks[0].completed == 0 && g_trophy_callbacks[0].total == 0 &&
+        g_trophy_callbacks[0].arg == 0x1234);
+  CHECK(!stdfs::exists(root / "hdd" / "dev_hdd0" / "home" / "00000001" / "trophy" / "NPWR00001_00"));
+
+  g_trophy_callbacks.clear();
+  g_trophy_callback_result = 0;
+  CHECK(call(Register, 1, 1, cb, 0x1234, 0) == 0);
+  std::vector<TrophyCallbackCall> expected = {{1, 1, 0, 0, 0x1234}};
+  const auto expect_run = [&](std::uint32_t status, std::int32_t total) {
+    for (std::int32_t i = 0; i <= total; i++) expected.push_back({1, status, i, total, 0x1234});
+  };
+  expect_run(5, 3);  // 4 trophies: progress count 3, finalize max(3, 9) - 5 = 4
+  expect_run(6, 3);
+  expect_run(7, 4);
+  expect_run(8, 0);
+  CHECK(g_trophy_callbacks.size() == expected.size());
+  bool same = g_trophy_callbacks.size() == expected.size();
+  for (std::size_t i = 0; same && i < expected.size(); i++) {
+    const auto& a = g_trophy_callbacks[i];
+    const auto& b = expected[i];
+    same = a.context == b.context && a.status == b.status && a.completed == b.completed &&
+           a.total == b.total && a.arg == b.arg;
+  }
+  CHECK(same);
+  const stdfs::path trophy_dir = root / "hdd" / "dev_hdd0" / "home" / "00000001" / "trophy" / "NPWR00001_00";
+  CHECK(stdfs::exists(trophy_dir / "TROPCONF.SFM"));
+
+  // Installed: no disk space needed, and the next registration starts from the installed status.
+  CHECK(call(DiskSpace, 1, 1, out) == 0 && dalRead64(base, out) == 0);
+  g_trophy_callbacks.clear();
+  CHECK(call(Register, 1, 1, cb, 0, 0) == 0 && g_trophy_callbacks[0].status == 3);
+
+  // Unlock state and the platinum link.
+  CHECK(call(UnlockState, 1, 1, flags, out) == 0 && dalRead32(base, out) == 4 &&
+        dalRead32(base, flags) == 0);
+  dalWrite32(base, out, 0x55555555);
+  CHECK(call(Unlock, 1, 1, 4, out) == kInvalidId);
+  CHECK(call(Unlock, 1, 1, 0xffffffff, out) == kInvalidId);
+  CHECK(call(Unlock, 1, 1, 0, out) == kPlatinum);
+  CHECK(call(Unlock, 1, 1, 1, out) == 0 && dalRead32(base, out) == 0xffffffff);
+  CHECK(call(Unlock, 1, 1, 1, out) == kAlready);
+  CHECK(call(Unlock, 1, 1, 2, out) == 0 && dalRead32(base, out) == 0xffffffff);
+  CHECK(call(Unlock, 1, 1, 3, out) == 0 && dalRead32(base, out) == 0);  // completes the platinum
+  CHECK(call(UnlockState, 1, 1, flags, out) == 0 && dalRead32(base, flags) == 0xf);
+  CHECK(stdfs::exists(trophy_dir / "UNLOCKED.TXT"));
+
+  // The unlock state survives a restart (Term, Init, new context, register).
+  CHECK(call(Term) == 0 && call(Term) == kNotInit);
+  CHECK(call(UnlockState, 1, 1, flags, out) == kNotInit);
+  CHECK(call(Init, 0, 0, 0xffffffff, 0) == 0);
+  CHECK(call(UnlockState, 1, 1, flags, out) == kUnknownContext);
+  CHECK(call(CreateHandle, out) == 0 && call(CreateContext, out, comm_id, comm_sign) == 0);
+  CHECK(call(Register, 1, 1, cb, 0, 0) == 0);
+  CHECK(call(UnlockState, 1, 1, flags, out) == 0 && dalRead32(base, flags) == 0xf);
+  CHECK(call(DestroyContext, 1) == 0 && call(DestroyContext, 1) == kUnknownContext);
+
+  dal::resetSceNpTrophy();
+  dal::resetSceNp();
+  dal::resetHostFunctions();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  stdfs::remove_all(root, ec);
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -3605,6 +3832,7 @@ int main(int argc, char** argv) {
   testParamSfo();
   testCellGame();
   testCellFs();
+  testSceNpAndTrophy();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();
