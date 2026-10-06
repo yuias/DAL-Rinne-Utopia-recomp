@@ -75,7 +75,8 @@ def classify(insn: Insn, kind: str, mnemonic: str | None,
     return result, None
 
 
-def diff_words(raw: bytes, start: int, entries: list[dict], top: int, examples: int) -> dict:
+def diff_words(raw: bytes, start: int, entries: list[dict], top: int, examples: int,
+               strict: bool = False) -> dict:
     """Compare the ELF words `raw` (loaded at `start`) with the matching export entries."""
     kinds: Counter = Counter()
     categories: Counter = Counter()
@@ -96,7 +97,7 @@ def diff_words(raw: bytes, start: int, entries: list[dict], top: int, examples: 
         addr = start + 4 * i
         entry = entries[i]
         kind, mnemonic, operands = entry["kind"], entry["mnemonic"], entry["operands"]
-        insn = decode(word, addr)
+        insn = decode(word, addr, strict)
         category, pseudo_counter = classify(insn, kind, mnemonic, operands)
         kinds[kind] += 1
         categories[category] += 1
@@ -211,9 +212,9 @@ def _run(args: argparse.Namespace) -> int:
         "schema": SCHEMA,
         "input": {"elf": str(args.elf), "ghidra_json": str(args.ghidra), "sha256": sha256},
         "range": {"start": "0x%08x" % start, "end": "0x%08x" % end},
-        "strict": False,
+        "strict": args.strict,
     }
-    report.update(diff_words(raw, start, entries, args.top, args.examples))
+    report.update(diff_words(raw, start, entries, args.top, args.examples, args.strict))
     _print_report(report)
     out_path = Path(args.output) if args.output else DEFAULT_OUTPUT
     _write_json(out_path, report)
@@ -233,6 +234,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="first address to compare (default: start of the export's text)")
     parser.add_argument("--end", type=_addr_arg, metavar="ADDR",
                         help="end address, exclusive (default: end of the export's text)")
+    parser.add_argument("--strict", action="store_true",
+                        help="decode with reserved-bit checking (see disasm --strict)")
     parser.add_argument("-o", "--output", metavar="OUT",
                         help="report JSON path (default: generated/analysis/ghidra_diff.json)")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP, metavar="N",

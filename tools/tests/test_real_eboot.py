@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ps3recomp import disasm, ghidra_diff, info, probe
 from ps3recomp.elf import ElfFile
+from ps3recomp.ppu import decode_range
 
 _ELF_PATH = os.environ.get("DAL_EBOOT_ELF")
 _GHIDRA_JSON = os.environ.get("DAL_GHIDRA_JSON")
@@ -159,6 +160,23 @@ class RealEbootDisasmTest(unittest.TestCase):
                            % (doc["decoded_pct"], doc["decoded"], doc["total_words"],
                               self._top_unknown(doc)))
 
+    def test_strict_sc_count(self):
+        # Only the 217 lv2 call sites (0x44000002) are valid `sc` words; the rest of the
+        # 504 non-strict `sc` hits are ASCII or float data.
+        elf = ElfFile.from_path(_ELF_PATH)
+        seg = self.code_segment
+        data = elf.read_va(seg.p_vaddr, seg.p_filesz // 4 * 4)
+        strict_sc = sum(1 for insn in decode_range(data, seg.p_vaddr, strict=True)
+                        if insn.spec is not None and insn.spec.name == "sc")
+        self.assertEqual(strict_sc, 217)
+
+    def test_stats_strict_block(self):
+        doc, _ = self._stats()
+        strict = doc["strict"]
+        self.assertEqual(strict["decoded"] + strict["rejected"], doc["decoded"])
+        self.assertGreater(strict["rejected"], 0)
+        self.assertEqual(strict["top_rejected"][0]["mnemonic"], "sc")
+
     def test_stats_text_range(self):
         doc, _ = self._stats("--start", "0x10230", "--end", "0xdcf2c")
         self.assertGreater(doc["decoded_pct"], 99,
@@ -184,6 +202,26 @@ class RealGhidraDiffTest(unittest.TestCase):
         top = ["%s: %s -> %s x%d" % (key, p["ours"], p["ghidra"], p["count"])
                for key in ghidra_diff.BUG_CATEGORIES for p in report["pairs"][key][:5]]
         self.assertEqual(bugs, 0, "%d words differ; top pairs: %s" % (bugs, "; ".join(top)))
+
+    def _run_diff(self, *args):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "diff.json"
+            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
+                code = ghidra_diff.main([_ELF_PATH, "--ghidra", _GHIDRA_JSON,
+                                         "-o", str(out_path), *args])
+            self.assertEqual(code, 0)
+            return json.loads(out_path.read_text(encoding="utf-8"))
+
+    def test_strict_rejects_no_ghidra_code_word(self):
+        lax = self._run_diff()
+        strict = self._run_diff("--strict")
+        self.assertIs(strict["strict"], True)
+        self.assertEqual(strict["categories"]["ghidra_code_we_unknown"],
+                         lax["categories"]["ghidra_code_we_unknown"],
+                         "strict mode rejects words Ghidra analysed as code; top pairs: %s"
+                         % strict["pairs"]["ghidra_code_we_unknown"][:5])
+        for key in ("mnemonic_mismatch", "operand_mismatch"):
+            self.assertEqual(strict["categories"][key], lax["categories"][key])
 
 
 if __name__ == "__main__":

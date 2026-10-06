@@ -13,7 +13,7 @@ from . import cell
 from .elf import ElfError, ElfFile
 from .info import (DEFAULT_CONFIG, EXIT_IO, EXIT_NOT_PPU_ELF, CliError, load_config,
                    parse_ppu_elf, read_input, reject_encrypted)
-from .ppu import bits, decode_range
+from .ppu import bits, decode, decode_range
 from .ppu_format import format_insn
 
 EXIT_BAD_ADDRESS = 5
@@ -22,6 +22,7 @@ DEFAULT_ENTRY_COUNT = 32
 SCHEMA = 1
 TOP_MNEMONICS = 30
 TOP_UNKNOWN = 20
+TOP_REJECTED = 20
 
 
 def _load_default_config() -> dict | None:
@@ -61,25 +62,35 @@ def _read_range(elf: ElfFile, start: int, end: int) -> bytes:
         raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
 
-def list_range(elf: ElfFile, start: int, end: int, raw: bool) -> list[str]:
+def list_range(elf: ElfFile, start: int, end: int, raw: bool,
+               strict: bool = False) -> list[str]:
     data = _read_range(elf, start, end)
     return ["0x%08x: %08x  %s" % (insn.addr, insn.word, format_insn(insn, simplify=not raw))
-            for insn in decode_range(data, start)]
+            for insn in decode_range(data, start, strict)]
 
 
 def compute_stats(elf: ElfFile, ranges: list[tuple[int, int]]) -> dict:
     mnemonics: Counter = Counter()
     unknown: Counter = Counter()
+    rejected: Counter = Counter()
     total = decoded = 0
     for start, end in ranges:
         for insn in decode_range(_read_range(elf, start, end), start):
             total += 1
-            if insn.spec is None:
+            spec = insn.spec
+            if spec is None:
                 unknown[(bits(insn.word, 0, 5), bits(insn.word, 21, 30))] += 1
-            else:
-                decoded += 1
-                mnemonics[insn.spec.name] += 1
+                continue
+            decoded += 1
+            mnemonics[spec.name] += 1
+            # The non-strict hit already tells whether strict mode accepts the word; only a
+            # rejected word needs a second walk, to see whether a less specific spec takes it.
+            if (insn.word & spec.strict_mask != spec.strict_match
+                    and decode(insn.word, insn.addr, True).spec is None):
+                rejected[spec.name] += 1
     unknown_count = total - decoded
+    rejected_count = sum(rejected.values())
+    strict_decoded = decoded - rejected_count
     return {
         "schema": SCHEMA,
         "ranges": [{"start": "0x%08x" % s, "end": "0x%08x" % e} for s, e in ranges],
@@ -92,6 +103,13 @@ def compute_stats(elf: ElfFile, ranges: list[tuple[int, int]]) -> dict:
                           for name, n in mnemonics.most_common(TOP_MNEMONICS)],
         "top_unknown_patterns": [{"primary": p, "xo_21_30": xo, "count": n}
                                  for (p, xo), n in unknown.most_common(TOP_UNKNOWN)],
+        "strict": {
+            "decoded": strict_decoded,
+            "decoded_pct": round(100.0 * strict_decoded / total, 4) if total else 0.0,
+            "rejected": rejected_count,
+            "top_rejected": [{"mnemonic": name, "count": n}
+                             for name, n in rejected.most_common(TOP_REJECTED)],
+        },
     }
 
 
@@ -106,6 +124,12 @@ def _print_stats(stats: dict) -> None:
     print("top unknown patterns (primary, bits 21-30):")
     for item in stats["top_unknown_patterns"]:
         print("  %2d, 0x%03x   %d" % (item["primary"], item["xo_21_30"], item["count"]))
+    strict = stats["strict"]
+    print("strict decoded: %d (%.2f%%)" % (strict["decoded"], strict["decoded_pct"]))
+    print("strict rejected: %d" % strict["rejected"])
+    print("top strict-rejected mnemonics:")
+    for item in strict["top_rejected"]:
+        print("  %-12s %d" % (item["mnemonic"], item["count"]))
 
 
 def _write_json(path: Path, doc: dict) -> None:
@@ -152,7 +176,7 @@ def _run(args: argparse.Namespace) -> int:
         start = args.start
         end = args.end if args.end is not None else start + 4 * args.count
 
-    for line in list_range(elf, start, end, args.raw):
+    for line in list_range(elf, start, end, args.raw, args.strict):
         print(line)
     return 0
 
@@ -162,7 +186,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="ps3tool.py disasm",
         description="Disassemble PPU code in a decrypted PS3 ELF, or report decode coverage.",
         usage="%(prog)s ELF (--start ADDR (--count N | --end ADDR) | --entry [--count N] | "
-              "--stats [--start ADDR --end ADDR [--json OUT]]) [--raw]",
+              "--stats [--start ADDR --end ADDR [--json OUT]]) [--raw] [--strict]",
         epilog="modes:\n"
                "  range:  disasm ELF --start ADDR (--count N | --end ADDR) [--raw]\n"
                "  entry:  disasm ELF --entry [--count N]    (default count: %d)\n"
@@ -182,6 +206,10 @@ def _parser() -> argparse.ArgumentParser:
                              "[--start, --end)) and print coverage statistics")
     parser.add_argument("--raw", action="store_true",
                         help="print raw mnemonics (no simplified forms)")
+    parser.add_argument("--strict", action="store_true",
+                        help="print words with reserved bits set as .long (listing modes; "
+                             "--stats always reports strict coverage, so the flag is "
+                             "redundant there)")
     parser.add_argument("--json", metavar="OUT",
                         help="with --stats, also write the statistics as JSON to OUT")
     return parser

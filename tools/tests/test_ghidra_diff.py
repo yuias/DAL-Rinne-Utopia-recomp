@@ -315,6 +315,21 @@ class DiffCliTest(unittest.TestCase):
             "agree": 2, "mnemonic_mismatch": 1, "operand_mismatch": 1, "ghidra_bad": 1,
             "we_unknown": 1})
 
+    def test_strict_rejects_reserved_bits(self):
+        # mtspr with reserved bit 31 set: decoded non-strictly, unknown in strict mode.
+        self.words = [0x7C0803A7]
+        self.rows = [("code", "mtspr", "LR,r0")]
+        self.data = build_elf(self.words)
+        code, _, err = self.run_diff(None, "--strict")
+        self.assertEqual((code, err), (0, ""))
+        report = self.report()
+        self.assertIs(report["strict"], True)
+        self.assertEqual(report["categories"]["ghidra_code_we_unknown"], 1)
+        code, _, _ = self.run_diff()
+        self.assertEqual(code, 0)
+        self.assertIs(self.report()["strict"], False)
+        self.assertEqual(self.report()["categories"]["ghidra_code_we_unknown"], 0)
+
     def test_stdout(self):
         _, out, _ = self.run_diff()
         self.assertIn("total words: 11\n", out)

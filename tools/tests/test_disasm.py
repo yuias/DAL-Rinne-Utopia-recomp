@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,35 @@ class ListingTest(DisasmTestBase):
     def test_unknown_word_is_long(self):
         _, out, _ = self.run_disasm("--start", "0x1001c", "--count", "1")
         self.assertEqual(out.splitlines(), ["0x0001001c: 00000000  .long 0x00000000"])
+
+
+def reserved_bit_elf() -> bytes:
+    # mtspr with the reserved bit 31 set: decodes non-strictly, rejected by strict mode.
+    elf = fx.build_ps3_fixture()
+    original = struct.pack(">I", 0x7C0803A6)
+    assert elf.count(original) == 1
+    return elf.replace(original, struct.pack(">I", 0x7C0803A7))
+
+
+class StrictListingTest(DisasmTestBase):
+    def test_strict_listing_prints_long(self):
+        data = reserved_bit_elf()
+        _, lax, _ = self.run_disasm("--start", "0x10014", "--count", "1", "--raw", data=data)
+        self.assertEqual(lax.splitlines(), ["0x00010014: 7c0803a7  mtspr 8,r0"])
+        code, strict, _ = self.run_disasm("--start", "0x10014", "--count", "1", "--strict")
+        self.assertEqual(code, 0)
+        self.assertEqual(strict.splitlines(), ["0x00010014: 7c0803a7  .long 0x7c0803a7"])
+
+    def test_strict_listing_keeps_valid_words(self):
+        code, out, _ = self.run_disasm("--entry", "--count", "7", "--strict")
+        self.assertEqual(code, 0)
+        self.assertNotIn(".long", out)
+
+    def test_strict_with_stats_is_accepted(self):
+        _, plain, _ = self.run_disasm("--stats")
+        code, out, _ = self.run_disasm("--stats", "--strict")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, plain)
 
 
 class RangeErrorTest(DisasmTestBase):
@@ -123,6 +153,28 @@ class StatsTest(DisasmTestBase):
         self.assertEqual(doc["top_unknown_patterns"],
                          [{"primary": 0, "xo_21_30": 0, "count": 1}])
         self.assertIn("stdu", [m["mnemonic"] for m in doc["top_mnemonics"]])
+
+    def test_strict_block_canonical_fixture(self):
+        out_path = self.tmp / "stats.json"
+        code, out, _ = self.run_disasm("--stats", "--json", str(out_path))
+        self.assertEqual(code, 0)
+        strict = json.loads(out_path.read_text(encoding="utf-8"))["strict"]
+        self.assertEqual(strict, {"decoded": 7, "decoded_pct": 87.5, "rejected": 0,
+                                  "top_rejected": []})
+        self.assertIn("strict decoded: 7 (87.50%)\n", out)
+
+    def test_strict_block_counts_reserved_bit_word(self):
+        data = reserved_bit_elf()
+        out_path = self.tmp / "stats.json"
+        code, out, _ = self.run_disasm("--stats", "--json", str(out_path), data=data)
+        self.assertEqual(code, 0)
+        doc = json.loads(out_path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["decoded"], 7)
+        self.assertEqual(doc["strict"]["decoded"], 6)
+        self.assertEqual(doc["strict"]["rejected"], 1)
+        self.assertEqual(doc["strict"]["top_rejected"], [{"mnemonic": "mtspr", "count": 1}])
+        self.assertRegex(out, r"strict decoded: 6 ")
+        self.assertRegex(out, r"  mtspr\s+1\n")
 
 
 class ErrorTest(DisasmTestBase):
