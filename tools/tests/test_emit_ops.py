@@ -363,5 +363,73 @@ class SysTest(unittest.TestCase):
                          ["ctx->cr[6] = 1;"])
 
 
+class FpTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["fp"]) - set(load_handlers())), [])
+
+    def test_single_precision_rounds_the_double_result(self):
+        self.assertEqual(body(asm.encode("fadds", frD=4, frA=1, frB=2))[0],
+                         ["ctx->fpr[4].f64 = (double)(float)(ctx->fpr[1].f64 + ctx->fpr[2].f64);"])
+        self.assertEqual(body(asm.encode("fadd", frD=4, frA=1, frB=2))[0],
+                         ["ctx->fpr[4].f64 = ctx->fpr[1].f64 + ctx->fpr[2].f64;"])
+        self.assertEqual(body(asm.encode("fmuls", frD=4, frA=1, frC=2))[0],
+                         ["ctx->fpr[4].f64 = (double)(float)(ctx->fpr[1].f64 * ctx->fpr[2].f64);"])
+
+    def test_multiply_add_forms_use_the_fused_builtin(self):
+        fields = {"frD": 4, "frA": 1, "frC": 2, "frB": 3}
+        a, b, c = "ctx->fpr[1].f64", "ctx->fpr[3].f64", "ctx->fpr[2].f64"
+        expected = {
+            "fmadd": "ctx->fpr[4].f64 = __builtin_fma(%s, %s, %s);" % (a, c, b),
+            "fmsub": "ctx->fpr[4].f64 = __builtin_fma(%s, %s, -%s);" % (a, c, b),
+            "fnmadd": "ctx->fpr[4].f64 = -__builtin_fma(%s, %s, %s);" % (a, c, b),
+            "fnmsub": "ctx->fpr[4].f64 = -__builtin_fma(%s, %s, -%s);" % (a, c, b),
+            "fmadds": "ctx->fpr[4].f64 = (double)(float)(__builtin_fma(%s, %s, %s));" % (a, c, b),
+        }
+        for name, line in expected.items():
+            self.assertEqual(body(asm.encode(name, **fields))[0], [line], name)
+
+    def test_sign_operations_work_on_the_bit_pattern(self):
+        self.assertEqual(body(asm.encode("fneg", frD=4, frB=1))[0],
+                         ["ctx->fpr[4].u64 = ctx->fpr[1].u64 ^ 0x8000000000000000ull;"])
+        self.assertEqual(body(asm.encode("fabs", frD=4, frB=1))[0],
+                         ["ctx->fpr[4].u64 = ctx->fpr[1].u64 & 0x7fffffffffffffffull;"])
+        self.assertEqual(body(asm.encode("fnabs", frD=4, frB=1))[0],
+                         ["ctx->fpr[4].u64 = ctx->fpr[1].u64 | 0x8000000000000000ull;"])
+        self.assertEqual(body(asm.encode("fmr", frD=4, frB=1))[0],
+                         ["ctx->fpr[4].u64 = ctx->fpr[1].u64;"])
+
+    def test_integer_conversions_go_through_the_saturating_helpers(self):
+        for name, helper in (("fctiw", "dalFctiw"), ("fctiwz", "dalFctiwz"),
+                             ("fctid", "dalFctid"), ("fctidz", "dalFctidz")):
+            self.assertEqual(body(asm.encode(name, frD=4, frB=1))[0],
+                             ["ctx->fpr[4].u64 = %s(ctx->fpr[1].f64);" % helper], name)
+        self.assertEqual(body(asm.encode("fcfid", frD=4, frB=1))[0],
+                         ["ctx->fpr[4].f64 = (double)(int64_t)ctx->fpr[1].u64;"])
+
+    def test_compares_write_the_selected_field(self):
+        for name in ("fcmpu", "fcmpo"):
+            self.assertEqual(body(asm.encode(name, crfD=3, frA=1, frB=2))[0],
+                             ["dalFcmp(ctx, 3, ctx->fpr[1].f64, ctx->fpr[2].f64);"], name)
+
+    def test_record_form_copies_fpscr_to_cr1(self):
+        lines, _ = body(asm.encode("fadd", frD=4, frA=1, frB=2, Rc=1))
+        self.assertEqual(lines[-1], "dalRecordFp(ctx);")
+        lines, _ = body(asm.encode("fadd", frD=4, frA=1, frB=2))
+        self.assertFalse(any("dalRecordFp" in line for line in lines))
+
+    def test_fpscr_moves_call_the_runtime_hooks(self):
+        self.assertEqual(body(asm.encode("mffs", frD=1))[0], ["ctx->fpr[1].u64 = dalMffs(ctx);"])
+        self.assertEqual(body(asm.encode("mtfsf", FM=0xFF, frB=1))[0],
+                         ["dalMtfsf(ctx, 0xffu, ctx->fpr[1].u64);"])
+        self.assertEqual(body(asm.encode("mtfsfi", crfD=3, IMM_fp=9))[0],
+                         ["dalMtfsf(ctx, 0x10u, (uint64_t)9u << 16);"])
+        self.assertEqual(body(asm.encode("mtfsb0", crbD=5))[0], ["dalMtfsb(ctx, 5, 0);"])
+        self.assertEqual(body(asm.encode("mtfsb1", crbD=5))[0], ["dalMtfsb(ctx, 5, 1);"])
+        self.assertEqual(body(asm.encode("mcrfs", crfD=1, crfS=4))[0],
+                         ["dalSetCrField(ctx, 1, (uint32_t)(dalMffs(ctx) >> 12) & 15u);"])
+
+
 if __name__ == "__main__":
     unittest.main()
