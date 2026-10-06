@@ -101,6 +101,9 @@ struct ProcessSyncObjects {
 const ProcessSyncObjects& processSyncObjects();
 void createProcessSyncObjects(std::uint8_t* base);
 
+// True while the event queue `id` exists (sys_event.cpp).
+bool eventQueueExists(std::uint32_t id);
+
 // Forgets every event flag, event queue and event port (sys_event.cpp).
 void resetEventObjects();
 

@@ -21,6 +21,9 @@ struct HleEntry {
 // Handlers of the sysPrxForUser module.
 std::span<const HleEntry> sysPrxForUserHandlers();
 
+// Handlers of the cellSysmodule module.
+std::span<const HleEntry> cellSysmoduleHandlers();
+
 // Resolves every import to a handler by (module, fnid); imports without one get the default
 // handler. A name that differs between the registry and the import table is a warning. Replaces
 // any earlier installation. Call before any guest thread runs.

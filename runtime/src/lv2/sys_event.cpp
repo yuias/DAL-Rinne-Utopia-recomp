@@ -140,6 +140,8 @@ std::uint32_t arg32(const DalPpuContext* ctx, int reg) {
 
 }  // namespace
 
+bool eventQueueExists(std::uint32_t id) { return g_queues.find(id) != nullptr; }
+
 void resetEventObjects() {
   g_flags = IdMap<EventFlag>(kEventFlagIdBase, kSyncIdStep);
   g_queues = IdMap<EventQueue>(kEventQueueIdBase, kSyncIdStep);

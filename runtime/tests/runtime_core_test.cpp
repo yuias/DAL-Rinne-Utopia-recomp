@@ -530,7 +530,7 @@ void testSyscalls() {
   CHECK(dal::findSyscall(999) == nullptr);
 
   auto ctx = std::make_unique<DalPpuContext>();
-  ctx->gpr[11] = 169;  // sys_spu_initialize has no handler
+  ctx->gpr[11] = 181;  // sys_spu_thread_write_ls has no handler
   ctx->gpr[3] = 0x1234;
   dalSyscall(ctx.get(), nullptr, 0x10000);
   CHECK(ctx->gpr[3] == dal::kCellOk);
@@ -540,14 +540,14 @@ void testSyscalls() {
   dalSyscall(ctx.get(), nullptr, 0x10004);
   CHECK(ctx->gpr[3] == dal::kCellOk);
 
-  CHECK(countContaining(lines, "dal: first sc 169 sys_spu_initialize") == 1);
+  CHECK(countContaining(lines, "dal: first sc 181 sys_spu_thread_write_ls") == 1);
   CHECK(countContaining(lines, "dal: first sc 999 ?") == 1);
-  CHECK(countContaining(lines, "dal: default sc 169 sys_spu_initialize(0x1234") == 1);
+  CHECK(countContaining(lines, "dal: default sc 181 sys_spu_thread_write_ls(0x1234") == 1);
   CHECK(countContaining(lines, "dal: default sc 999 ?(0x1234") == 1);
 
   const std::string census = dal::formatCensus();
   CHECK(census.find("census: syscalls 3 calls, 2 distinct, 2 default-handled") != std::string::npos);
-  CHECK(census.find("  sc 169 sys_spu_initialize: 2 [default]") != std::string::npos);
+  CHECK(census.find("  sc 181 sys_spu_thread_write_ls: 2 [default]") != std::string::npos);
   CHECK(census.find("  sc 999 ?: 1 [default]") != std::string::npos);
 
   dal::setLogSink({});
@@ -1314,6 +1314,82 @@ void testEventObjects() {
   dal::resetCensus();
 }
 
+void testSpuAndSysmodule() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t queue_id_out = scratch, attr = scratch + 0x40, spup = scratch + 0x80;
+
+  auto a = makeCaller(0x01000000);
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+
+  // sys_spu_initialize: more than 5 raw SPUs is invalid.
+  CHECK(syscallAs(*a, 169, 6, 5) == 0);
+  CHECK(syscallAs(*a, 169, 6, 6) == err(dal::kCellEinval));
+  CHECK(syscallAs(*a, 169, 0, 0) == 0);
+
+  dalWrite32(base, attr, 1);      // protocol FIFO
+  dalWrite32(base, attr + 4, 2);  // SPU queue
+  CHECK(syscallAs(*a, 128, queue_id_out, attr, 0, 2) == 0);
+  const std::uint32_t queue = dalRead32(base, queue_id_out);
+
+  // sc 251: req 0 is invalid, an unknown queue is ESRCH, the port is the lowest requested bit.
+  dalWrite8(base, spup, 0xee);
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, 0, spup) == err(dal::kCellEinval));
+  CHECK(syscallAs(*a, 251, 0x04000100, 0x8d000fff, 4, spup) == err(dal::kCellEsrch));
+  CHECK(dalRead8(base, spup) == 0xee);
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, 4, spup) == 0);
+  CHECK(dalRead8(base, spup) == 2);
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, 0x28, spup) == 0);
+  CHECK(dalRead8(base, spup) == 3);
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, std::uint64_t{1} << 63, spup) == 0);
+  CHECK(dalRead8(base, spup) == 63);
+  CHECK(syscallAs(*a, 251, 0x04000100, queue, 4, 0) == err(dal::kCellEfault));
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("sc 169 sys_spu_initialize: 3 [impl]") != std::string::npos);
+  CHECK(census.find("sc 251 sys_spu_thread_group_connect_event_all_threads: 6 [impl]") !=
+        std::string::npos);
+
+  // cellSysmodule: any id succeeds; the first load and unload of each id is logged once.
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x32267a31, "cellSysmodule", "cellSysmoduleLoadModule"},
+      {0x00800010, 0x112a5ee9, "cellSysmodule", "cellSysmoduleUnloadModule"},
+  };
+  dal::installImports(imports, 2);
+  DalPpuContext* ctx = &a->context();
+  for (int i = 0; i < 2; i++) {
+    ctx->gpr[3] = 0xf;
+    dalHleCall(ctx, base, 0);
+    CHECK(ctx->gpr[3] == 0);
+  }
+  ctx->gpr[3] = 0x10001;  // only the low 16 bits are the id
+  dalHleCall(ctx, base, 0);
+  CHECK(ctx->gpr[3] == 0);
+  ctx->gpr[3] = 0xf;
+  dalHleCall(ctx, base, 1);
+  CHECK(ctx->gpr[3] == 0);
+  CHECK(countContaining(lines, "dal: sysmodule: load 0x000f") == 1);
+  CHECK(countContaining(lines, "dal: sysmodule: load 0x0001") == 1);
+  CHECK(countContaining(lines, "dal: sysmodule: unload 0x000f") == 1);
+  CHECK(countContaining(lines, "dal: default hle") == 0);
+  CHECK(dal::formatCensus().find("cellSysmodule::cellSysmoduleLoadModule: 3 [impl]") !=
+        std::string::npos);
+
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testLwmutex() {
   dal::setLogSink([](std::string_view) {});
   dal::resetCensus();
@@ -1973,6 +2049,7 @@ int main(int argc, char** argv) {
   testSysPrxForUser();
   testMutexAndCond();
   testEventObjects();
+  testSpuAndSysmodule();
   testLwmutex();
   testPpuThreads();
   testTimebase();

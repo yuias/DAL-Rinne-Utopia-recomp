@@ -63,6 +63,10 @@ void sysPpuThreadJoin(DalPpuContext* ctx, std::uint8_t* base);
 void sysPpuThreadSetPriority(DalPpuContext* ctx, std::uint8_t* base);
 void sysPpuThreadGetPriority(DalPpuContext* ctx, std::uint8_t* base);
 
+// Handlers defined in sys_spu.cpp.
+void sysSpuInitialize(DalPpuContext* ctx, std::uint8_t* base);
+void sysSpuThreadGroupConnectEventAllThreads(DalPpuContext* ctx, std::uint8_t* base);
+
 namespace {
 
 // The numbers the game's code issues (found by scanning the generated code for the r11 value in
@@ -104,13 +108,13 @@ constexpr SyscallEntry kSyscalls[] = {
     {141, "sys_timer_usleep", sysTimerUsleep},
     {142, "sys_timer_sleep", sysTimerSleep},
     {147, "sys_time_get_timebase_frequency", sysTimeGetTimebaseFrequency},
-    {169, "sys_spu_initialize", nullptr},
+    {169, "sys_spu_initialize", sysSpuInitialize},
     {181, "sys_spu_thread_write_ls", nullptr},
     {182, "sys_spu_thread_read_ls", nullptr},
     {190, "sys_spu_thread_write_spu_mb", nullptr},
     {191, "sys_spu_thread_connect_event", nullptr},
     {192, "sys_spu_thread_disconnect_event", nullptr},
-    {251, "sys_spu_thread_group_connect_event_all_threads", nullptr},
+    {251, "sys_spu_thread_group_connect_event_all_threads", sysSpuThreadGroupConnectEventAllThreads},
     {252, "sys_spu_thread_group_disconnect_event_all_threads", nullptr},
     {348, "sys_memory_allocate", sysMemoryAllocate},
     {349, "sys_memory_free", sysMemoryFree},
