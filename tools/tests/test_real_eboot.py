@@ -21,6 +21,15 @@ _IMPORT_COUNTS = [
     ("cellSysutil", 18), ("sceNp", 3), ("sysPrxForUser", 23),
 ]
 
+_VERIFIED_NAMES = [
+    ("cellSpurs", "cellSpursInitializeWithAttribute2"),
+    ("cellSpurs", "cellSpursGetSpuThreadGroupId"),
+    ("cellSpurs", "_cellSpursAttributeInitialize"),
+    ("cellSpurs", "cellSpursFinalize"),
+    ("cellSail", "cellSailPlayerBoot"),
+    ("cellAtrac", "cellAtracDecode"),
+]
+
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
                      "DAL_EBOOT_ELF is not set or does not name an existing file")
@@ -82,6 +91,18 @@ class RealEbootInfoTest(unittest.TestCase):
         self.assertEqual(sum(len(m["functions"]) for m in imports), 166)
         self.assertEqual([(m["name"], len(m["functions"])) for m in imports],
                          _IMPORT_COUNTS)
+
+    def test_import_names(self):
+        by_module = {m["name"]: {f["name"] for f in m["functions"]}
+                     for m in self.doc["imports"]}
+        for module, name in _VERIFIED_NAMES:
+            with self.subTest(module=module, name=name):
+                self.assertIn(name, by_module[module])
+
+    def test_no_unresolved_imports(self):
+        unresolved = [(m["name"], f["fnid"]) for m in self.doc["imports"]
+                      for f in m["functions"] if f["name"] is None]
+        self.assertEqual(unresolved, [])
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
@@ -227,14 +248,7 @@ class RealGhidraDiffTest(unittest.TestCase):
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
                      "DAL_EBOOT_ELF is not set or does not name an existing file")
 class RealEbootNidTest(unittest.TestCase):
-    _VERIFIED = [
-        ("cellSpurs", "cellSpursInitializeWithAttribute2"),
-        ("cellSpurs", "cellSpursGetSpuThreadGroupId"),
-        ("cellSpurs", "_cellSpursAttributeInitialize"),
-        ("cellSpurs", "cellSpursFinalize"),
-        ("cellSail", "cellSailPlayerBoot"),
-        ("cellAtrac", "cellAtracDecode"),
-    ]
+    _VERIFIED = _VERIFIED_NAMES
 
     @classmethod
     def setUpClass(cls):

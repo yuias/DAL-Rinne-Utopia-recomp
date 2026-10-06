@@ -9,8 +9,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ps3recomp import info
+from ps3recomp import info, nids
 
 from tests import elf_fixture as fx
 from tests.elf_fixture import FixtureSegment, build_elf32_be
@@ -207,6 +208,67 @@ class PinTest(InfoTestBase):
             self.assertRegex(config[key]["sha256"], r"^[0-9a-f]{64}$")
         # The config must stay path-free.
         self.assertNotRegex(info.DEFAULT_CONFIG.read_text(encoding="utf-8"), r"[A-Za-z]:[\\/]")
+
+
+class ImportNamesTest(InfoTestBase):
+    def write_nids(self, modules) -> Path:
+        path = self.tmp / "nids.json"
+        path.write_text(json.dumps({"schema": 1, "modules": modules}), encoding="utf-8")
+        return path
+
+    def test_named_and_unresolved(self):
+        nids = self.write_nids({"cellSpurs": {"0x%08x" % fx.PS3_FNIDS[2]: "cellSpursNamed"}})
+        code, stdout, err = self.run_info("--no-verify", "--nids", str(nids))
+        self.assertEqual(code, 0, err)
+        names = [f["name"] for m in self.load_output()["imports"] for f in m["functions"]]
+        self.assertEqual(names, [None, None, "cellSpursNamed"])
+        lines = stdout.splitlines()
+        self.assertIn("imports:  2 modules, 3 functions, 1 named", lines)
+        self.assertEqual([ln for ln in lines if ln.startswith("unresolved import:")],
+                         ["unresolved import: cellSysutil 0x%08x" % fx.PS3_FNIDS[0],
+                          "unresolved import: cellSysutil 0x%08x" % fx.PS3_FNIDS[1]])
+
+    def test_global_fallback_for_other_module(self):
+        nids = self.write_nids({"cellOther": {"0x%08x" % fx.PS3_FNIDS[0]: "cellSharedName"}})
+        self.run_info("--no-verify", "--nids", str(nids))
+        sysutil = self.load_output()["imports"][0]["functions"]
+        self.assertEqual([f["name"] for f in sysutil], ["cellSharedName", None])
+
+    def test_default_missing_is_a_note(self):
+        with mock.patch.object(info, "DEFAULT_NIDS", self.tmp / "missing_nids.json"):
+            code, stdout, err = self.run_info("--no-verify")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertIn("note:", err)
+        names = [f["name"] for m in self.load_output()["imports"] for f in m["functions"]]
+        self.assertEqual(names, [None, None, None])
+        self.assertIn("0 named", stdout)
+
+    def test_default_table_is_used(self):
+        nids = self.write_nids({"cellSpurs": {"0x%08x" % fx.PS3_FNIDS[2]: "cellSpursNamed"}})
+        with mock.patch.object(info, "DEFAULT_NIDS", nids):
+            code, _, err = self.run_info("--no-verify")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.load_output()["imports"][1]["functions"][0]["name"],
+                         "cellSpursNamed")
+
+    def test_explicit_missing_exits_1(self):
+        code, _, err = self.run_info("--no-verify", "--nids", str(self.tmp / "missing.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertFalse(self.out_path.exists())
+
+    def test_invalid_table_exits_1(self):
+        bad = self.tmp / "bad.json"
+        bad.write_text("{", encoding="utf-8")
+        code, _, err = self.run_info("--no-verify", "--nids", str(bad))
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err)
+
+    def test_committed_table_loads(self):
+        table = nids.load_nid_table(nids.DEFAULT_NIDS)
+        self.assertEqual(table.lookup("cellSpurs", nids.compute_nid("cellSpursFinalize")),
+                         "cellSpursFinalize")
 
 
 class RejectionTest(InfoTestBase):

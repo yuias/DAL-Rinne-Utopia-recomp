@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import cell
 from .elf import EM_PPC64, ELFCLASS64, PF_R, PF_W, PF_X, ElfError, ElfFile, is_self
+from .nids import DEFAULT_NIDS, NidTable, load_nid_table
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "config" / "target.json"
@@ -121,14 +122,20 @@ def _prx_param_json(prx: dict | None) -> dict | None:
     }
 
 
-def _import_json(mod: cell.ImportModule) -> dict:
+def _import_json(mod: cell.ImportModule, nid_table: NidTable | None) -> dict:
+    module_name = None if mod.unknown_layout else mod.name
+
+    def func_name(fnid: int) -> str | None:
+        return None if nid_table is None else nid_table.lookup(module_name or "", fnid)
+
     out = {
         "entry_addr": _hex(mod.entry_addr),
-        "name": None if mod.unknown_layout else mod.name,
+        "name": module_name,
         "version": _hex(mod.version),
         "attributes": _hex(mod.attributes),
-        "functions": [{"fnid": _hex(f.fnid), "slot_addr": _hex(f.slot_addr),
-                       "slot_value": _hex(f.slot_value)} for f in mod.functions],
+        "functions": [{"fnid": _hex(f.fnid), "name": func_name(f.fnid),
+                       "slot_addr": _hex(f.slot_addr), "slot_value": _hex(f.slot_value)}
+                      for f in mod.functions],
         "variables": [{"vnid": _hex(vnid), "vstub": _hex(vstub)}
                       for vnid, vstub in mod.variables],
         "num_tlsvar": mod.num_tlsvar,
@@ -158,7 +165,8 @@ def _export_json(mod: cell.ExportModule) -> dict:
     return out
 
 
-def build_summary(elf: ElfFile, path: str, size: int, sha256: str, pin: str) -> dict:
+def build_summary(elf: ElfFile, path: str, size: int, sha256: str, pin: str,
+                  nid_table: NidTable | None = None) -> dict:
     entry = cell.parse_entry(elf)
     prx = cell.parse_prx_param(elf)
     imports = cell.parse_imports(elf, prx) if prx is not None else []
@@ -190,7 +198,7 @@ def build_summary(elf: ElfFile, path: str, size: int, sha256: str, pin: str) -> 
             "count": len(opd),
             "toc_values": [_hex(t) for t in sorted({toc for _func, toc in opd})],
         },
-        "imports": [_import_json(m) for m in imports],
+        "imports": [_import_json(m, nid_table) for m in imports],
         "exports": [_export_json(m) for m in exports],
     }
 
@@ -238,6 +246,16 @@ def parse_ppu_elf(data: bytes) -> ElfFile:
     return elf
 
 
+def resolve_nid_table(nids_arg: str | None) -> NidTable | None:
+    if nids_arg is not None:
+        return load_nid_table(Path(nids_arg))
+    if not DEFAULT_NIDS.is_file():
+        print("note: NID table %s not found; import names are not resolved" % DEFAULT_NIDS,
+              file=sys.stderr)
+        return None
+    return load_nid_table(DEFAULT_NIDS)
+
+
 def _run(args: argparse.Namespace) -> int:
     data = read_input(args.elf)
 
@@ -246,6 +264,7 @@ def _run(args: argparse.Namespace) -> int:
 
     reject_encrypted(data, sha256, config)
     elf = parse_ppu_elf(data)
+    nid_table = resolve_nid_table(args.nids)
 
     pin = "skipped"
     if config is not None:
@@ -259,7 +278,7 @@ def _run(args: argparse.Namespace) -> int:
             pin = "verified" if pinned == sha256 else "mismatch"
 
     try:
-        summary = build_summary(elf, args.elf, len(data), sha256, pin)
+        summary = build_summary(elf, args.elf, len(data), sha256, pin, nid_table)
     except ElfError as e:
         raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
@@ -278,8 +297,13 @@ def _run(args: argparse.Namespace) -> int:
     print("entry:    func=%s toc=%s (%s)" % (entry["func"], entry["toc"], entry["kind"]))
     print("segments: %d" % len(summary["segments"]))
     print("sections: %d" % len(summary["sections"]))
-    print("imports:  %d modules, %d functions"
-          % (len(summary["imports"]), sum(len(m["functions"]) for m in summary["imports"])))
+    import_funcs = [(m["name"], f) for m in summary["imports"] for f in m["functions"]]
+    print("imports:  %d modules, %d functions, %d named"
+          % (len(summary["imports"]), len(import_funcs),
+             sum(1 for _module, f in import_funcs if f["name"] is not None)))
+    for module, f in import_funcs:
+        if f["name"] is None:
+            print("unresolved import: %s %s" % (module or "<unknown>", f["fnid"]))
     print("exports:  %d functions"
           % sum(len(m["functions"]) for m in summary["exports"]))
     print("output:   %s" % out_path)
@@ -299,6 +323,8 @@ def _parser() -> argparse.ArgumentParser:
                         "(default: generated/analysis/eboot_info.json)")
     parser.add_argument("--target-config", default=str(DEFAULT_CONFIG),
                         help="target pin file (default: config/target.json)")
+    parser.add_argument("--nids", help="FNID -> name table "
+                        "(default: config/nids.json; names stay null if it is missing)")
     parser.add_argument("--no-verify", action="store_true",
                         help="skip the SHA-256 pin check")
     return parser
