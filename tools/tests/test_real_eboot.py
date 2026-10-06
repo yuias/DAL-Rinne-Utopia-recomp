@@ -7,10 +7,11 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import disasm, info, probe
+from ps3recomp import disasm, ghidra_diff, info, probe
 from ps3recomp.elf import ElfFile
 
 _ELF_PATH = os.environ.get("DAL_EBOOT_ELF")
+_GHIDRA_JSON = os.environ.get("DAL_GHIDRA_JSON")
 
 _IMPORT_COUNTS = [
     ("sys_io", 6), ("cellAtrac", 15), ("cellAudio", 11), ("sys_fs", 9),
@@ -164,6 +165,25 @@ class RealEbootDisasmTest(unittest.TestCase):
                            "decoded %.2f%% (%d of %d); top unknown: %s"
                            % (doc["decoded_pct"], doc["decoded"], doc["total_words"],
                               self._top_unknown(doc)))
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file()
+                     and _GHIDRA_JSON and Path(_GHIDRA_JSON).is_file(),
+                     "DAL_EBOOT_ELF and DAL_GHIDRA_JSON must name existing files")
+class RealGhidraDiffTest(unittest.TestCase):
+    def test_no_decoder_bug_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "diff.json"
+            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
+                code = ghidra_diff.main([_ELF_PATH, "--ghidra", _GHIDRA_JSON,
+                                         "-o", str(out_path)])
+            self.assertEqual(code, 0)
+            report = json.loads(out_path.read_text(encoding="utf-8"))
+        categories = report["categories"]
+        bugs = sum(categories[k] for k in ghidra_diff.BUG_CATEGORIES)
+        top = ["%s: %s -> %s x%d" % (key, p["ours"], p["ghidra"], p["count"])
+               for key in ghidra_diff.BUG_CATEGORIES for p in report["pairs"][key][:5]]
+        self.assertEqual(bugs, 0, "%d words differ; top pairs: %s" % (bugs, "; ".join(top)))
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ def _operand(insn: Insn, name: str) -> str:
         return _hex(insn.field(name))
     if name == "UIMM":
         return f"{insn.field(name):#x}"
+    if name == "FXM":
+        # mfocrf reads one CR field; print it as crN when exactly one mask bit is set.
+        fxm = insn.field(name)
+        return f"cr{8 - fxm.bit_length()}" if fxm.bit_count() == 1 else str(fxm)
     if name in _BRANCH_TARGET:
         return _target(insn, name)
     return str(insn.field(name))

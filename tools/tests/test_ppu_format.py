@@ -29,6 +29,8 @@ CASES = [
     (0x7C642A15, 0x10000, "add. r3,r4,r5", SAME),
     (0x7C642E14, 0x10000, "addo r3,r4,r5", SAME),
     (0x7C000026, 0x10000, "mfcr r0", SAME),
+    (0x7C102026, 0xA0068, "mfocrf r0,cr6", SAME),
+    (0x7D908120, 0x95C5C, "mtocrf 8,r12", SAME),
     (0x7C0004AC, 0x10000, "sync 0", "sync"),
     (0x7C2004AC, 0x10000, "sync 1", "lwsync"),
     (0x4C00012C, 0x10000, "isync", SAME),
@@ -126,6 +128,11 @@ class SimplifyRulesTest(unittest.TestCase):
         self.check(0x7C0A02A6, "mfspr r0,10")
         self.check(0x7C0FF120, "mtcr r0")
         self.check(0x7C0FE120, "mtcrf 254,r0")
+        # Bit 11 set selects the single-field forms; they never become mtcr.
+        self.check(0x7C1FF120, "mtocrf 255,r0")
+        self.check(0x7C180026, "mfocrf r0,cr0")
+        self.check(0x7C1FF026, "mfocrf r0,255")
+        self.check(0x7C0FF026, "mfcr r0")
         self.check(0x7C4004AC, "sync 2")
         self.check(0x4C000020 | 2 << 21, "bclr 2,0")
 

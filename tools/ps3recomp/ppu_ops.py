@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .ppu import OpSpec, op
 
 OPS: list[OpSpec] = []
@@ -88,6 +90,12 @@ _rows("X", 31, "sync:598", "L_sync")
 _rows("X", 31, "eieio:854")
 _rows("X", 31, "mfcr:19", "rD")
 _rows("XFX", 31, "mtcrf:144", "CRM,rS")
+# mfocrf/mtocrf are mfcr/mtcrf with bit 11 set. Their rows have one more mask bit, so the
+# lookup tries them first; the plain rows keep matching words with bit 11 clear.
+_OCRF_BIT = 1 << (31 - 11)
+for _name, _xo, _operands in (("mfocrf", 19, ("rD", "FXM")), ("mtocrf", 144, ("CRM", "rS"))):
+    _spec = op(_name, "XFX", 31, _xo, _operands)
+    OPS.append(replace(_spec, mask=_spec.mask | _OCRF_BIT, match=_spec.match | _OCRF_BIT))
 _rows("XFX", 31, "mfspr:339", "rD,SPR")
 _rows("XFX", 31, "mtspr:467", "SPR,rS")
 _rows("XFX", 31, "mftb:371", "rD,TBR")
