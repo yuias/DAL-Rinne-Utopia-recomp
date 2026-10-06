@@ -7,6 +7,7 @@ param(
     [switch]$Test,
     [string]$EbootElf,
     [string]$PpuDir,
+    [string]$GameDir,
     [string]$LlvmBin = $env:DAL_LLVM_BIN
 )
 
@@ -41,6 +42,9 @@ $clangVersion | Select-Object -First 1
 if ($PpuDir) {
     $PpuDir = [System.IO.Path]::GetFullPath($PpuDir, $PWD.ProviderPath)
 }
+if ($GameDir) {
+    $GameDir = [System.IO.Path]::GetFullPath($GameDir, $PWD.ProviderPath)
+}
 
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
@@ -55,6 +59,9 @@ try {
     }
     if ($PpuDir) {
         $configureArgs += "-DDAL_PPU_GENERATED_DIR=$PpuDir"
+    }
+    if ($GameDir) {
+        $configureArgs += "-DDAL_GAME_DIR=$GameDir"
     }
     & cmake @configureArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

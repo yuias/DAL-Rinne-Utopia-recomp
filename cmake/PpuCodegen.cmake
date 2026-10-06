@@ -22,6 +22,7 @@ endfunction()
 # dal_ppu_stub is defined. dal_ppu_generated links no hook library; each consumer picks the stub
 # or the real runtime.
 set(DAL_PPU_GENERATED_DIR "" CACHE PATH "Output directory of 'ps3tool emit' (empty: no generated code)")
+set(DAL_GAME_DIR "" CACHE PATH "Game directory for the game_boot test (empty: test not registered)")
 
 function(dal_ppu_add_generated_tree)
   if(DAL_PPU_GENERATED_DIR STREQUAL "")
@@ -51,6 +52,26 @@ function(dal_ppu_add_generated_tree)
 
   add_test(NAME ppu_link COMMAND dal_ppu_link_test)
   set_tests_properties(ppu_link PROPERTIES PASS_REGULAR_EXPRESSION "ppu link ok")
+
+  # Only game_main.cpp references the generated tables, so the runtime core builds without them.
+  # The stub supplies the CPU hooks until the runtime core provides its own.
+  add_executable(dal_game runtime/src/game_main.cpp)
+  target_compile_options(dal_game PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core dal_ppu_stub)
+
+  # Pins how far the game gets; updated by whoever moves the milestone.
+  include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")
+  if(DAL_EBOOT_ELF STREQUAL "" OR DAL_GAME_DIR STREQUAL "")
+    message(STATUS "DAL: game_boot test not registered (DAL_EBOOT_ELF or DAL_GAME_DIR is empty)")
+  else()
+    separate_arguments(boot_args UNIX_COMMAND "${DAL_GAME_BOOT_ARGS}")
+    add_test(NAME game_boot
+      COMMAND dal_game --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}" ${boot_args})
+    set_tests_properties(game_boot PROPERTIES
+      TIMEOUT 60
+      PASS_REGULAR_EXPRESSION "${DAL_GAME_BOOT_MILESTONE}"
+      FAIL_REGULAR_EXPRESSION "dal: stop: fatal")
+  endif()
 endfunction()
 
 # Semantics harness: hand-written cases are generated into C (tools/tests/ppu_semantics), compiled

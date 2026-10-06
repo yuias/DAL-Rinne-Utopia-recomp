@@ -4,6 +4,7 @@ include_guard(GLOBAL)
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   add_library(dal_runtime_core STATIC
+    runtime/src/core/elf_loader.cpp
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_memory.cpp
     runtime/src/core/log.cpp)

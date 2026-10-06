@@ -26,6 +26,8 @@ add_library(dal_ppu_stub STATIC runtime/src/ppu_stub_runtime.cpp)
 target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
 
+set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
+
 dal_ppu_add_generated_tree()
 dal_runtime_add_core()
 
@@ -47,7 +49,6 @@ set_tests_properties(ppu_header_check PROPERTIES
 
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 dal_ppu_add_semantics_harness()
-set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
 
 add_test(NAME tools_unittest
   COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/tests -t tools

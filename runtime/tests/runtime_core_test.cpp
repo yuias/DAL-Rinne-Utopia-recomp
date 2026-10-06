@@ -3,12 +3,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "core/elf_loader.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
@@ -238,6 +242,105 @@ void testProcessSingleton() {
   CHECK(!p.strict);
 }
 
+// Builds a minimal big-endian ELF64 in memory: two PT_LOAD (the second with bss), PT_TLS and a
+// process parameter block inside the first segment.
+std::vector<std::uint8_t> syntheticElf(std::uint16_t machine) {
+  std::vector<std::uint8_t> elf(0x320, 0);
+  auto put = [&](std::size_t at, std::uint64_t value, int size) {
+    for (int i = 0; i < size; i++) {
+      elf[at + i] = static_cast<std::uint8_t>(value >> (8 * (size - 1 - i)));
+    }
+  };
+  std::memcpy(elf.data(), "\x7f" "ELF", 4);
+  elf[4] = 2;
+  elf[5] = 2;
+  put(18, machine, 2);
+  put(24, 0x10080, 8);  // e_entry: the function descriptor
+  put(32, 64, 8);
+  put(54, 56, 2);
+  put(56, 4, 2);
+
+  auto phdr = [&](int index, std::uint32_t type, std::uint32_t flags, std::uint64_t offset,
+                  std::uint64_t vaddr, std::uint64_t filesz, std::uint64_t memsz) {
+    const std::size_t at = 64 + 56 * index;
+    put(at, type, 4);
+    put(at + 4, flags, 4);
+    put(at + 8, offset, 8);
+    put(at + 16, vaddr, 8);
+    put(at + 24, vaddr, 8);
+    put(at + 32, filesz, 8);
+    put(at + 40, memsz, 8);
+  };
+  phdr(0, 1, 0x400005, 0x200, 0x10000, 0x100, 0x100);
+  phdr(1, 1, 0x600006, 0x300, 0x30000, 0x20, 0x1000);
+  phdr(2, 7, 4, 0x300, 0x30000, 4, 0x10);
+  phdr(3, 0x60000001, 0, 0x2c0, 0x100c0, 0x20, 0x20);
+
+  put(0x280, 0x10010, 4);  // descriptor at 0x10080: code address, then TOC
+  put(0x284, 0x18000, 4);
+  put(0x2c0, 0x20, 4);  // process parameter block
+  put(0x2c4, 0x13bcc5f6, 4);
+  put(0x2cc, 0x00430001, 4);
+  put(0x2d0, 1001, 4);
+  put(0x2d4, 0x8000, 4);
+  put(0x2d8, 0x100000, 4);
+  put(0x2dc, 7, 4);
+  put(0x300, 0xcafef00d, 4);  // first word of the data segment
+  return elf;
+}
+
+std::filesystem::path writeTempFile(const char* name, const std::vector<std::uint8_t>& bytes) {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      (std::string("dal_runtime_test_") + std::to_string(GetCurrentProcessId()) + name);
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  return path;
+}
+
+void testElfLoader() {
+  dal::setLogSink([](std::string_view) {});
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+
+  const auto bad_path = writeTempFile("_bad.elf", syntheticElf(62));
+  const auto bad = dal::loadExecutable(bad_path);
+  std::filesystem::remove(bad_path);
+  CHECK(!bad.has_value());
+  if (!bad) {
+    CHECK(bad.error().find("e_machine") != std::string::npos);
+  }
+
+  const auto path = writeTempFile("_ok.elf", syntheticElf(21));
+  const auto loaded = dal::loadExecutable(path);
+  std::filesystem::remove(path);
+  dal::setLogSink({});
+
+  CHECK(loaded.has_value());
+  if (!loaded) {
+    std::fprintf(stderr, "load error: %s\n", loaded.error().c_str());
+    return;
+  }
+  const dal::LoadedExecutable& exe = *loaded;
+  CHECK(exe.entry_opd == 0x10080);
+  CHECK(exe.entry_func == 0x10010);
+  CHECK(exe.entry_toc == 0x18000);
+  CHECK(exe.tls_vaddr == 0x30000 && exe.tls_filesz == 4 && exe.tls_memsz == 0x10);
+  CHECK(exe.sdk_version == 0x00430001);
+  CHECK(exe.primary_prio == 1001);
+  CHECK(exe.primary_stacksize == 0x8000);
+  CHECK(exe.malloc_pagesize == 0x100000);
+  CHECK(exe.ppc_seg == 7);
+  CHECK(exe.image_end == 0x40000);
+  CHECK(exe.sha256.size() == 64);
+
+  const std::uint8_t* base = p.memory.base();
+  CHECK(dalRead32(base, 0x30000) == 0xcafef00d);
+  CHECK(dalRead32(base, 0x30020) == 0 && dalRead32(base, 0x30ffc) == 0);  // bss
+  // The image range is taken, so the first free block starts after it.
+  CHECK(p.main.allocate(0x10000, 0x10000) == 0x40000);
+}
+
 struct ChildResult {
   DWORD exit_code = 0xFFFFFFFF;
   std::string output;
@@ -386,6 +489,7 @@ int main(int argc, char** argv) {
   testAllocatorMarkUsedAndExhaustion();
   testStackGuards();
   testProcessSingleton();
+  testElfLoader();
   testFaultChild();
   testOverflowChild();
   testStopChild();
