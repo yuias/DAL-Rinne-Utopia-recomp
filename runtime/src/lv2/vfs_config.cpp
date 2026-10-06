@@ -3,22 +3,24 @@
 #include "lv2/vfs_config.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <fstream>
-#include <functional>
 #include <initializer_list>
 #include <iterator>
+#include <memory>
+#include <optional>
 #include <set>
 #include <system_error>
 #include <utility>
 
-#include <nlohmann/json.hpp>
+#include <yyjson.h>
 
 namespace dal {
 namespace {
 
-using Json = nlohmann::json;
+using Json = const yyjson_val*;
 namespace stdfs = std::filesystem;
 
 template <typename... Args>
@@ -26,13 +28,38 @@ std::unexpected<std::string> fail(std::format_string<Args...> fmt, Args&&... arg
   return std::unexpected(std::format(fmt, std::forward<Args>(args)...));
 }
 
-void warnUnknownKeys(const Json& object, std::initializer_list<std::string_view> known,
-                     std::string_view where, std::vector<std::string>& warnings) {
-  for (auto it = object.begin(); it != object.end(); ++it) {
-    if (std::ranges::find(known, it.key()) == known.end()) {
-      warnings.push_back(std::format("{}: unknown key \"{}\" ignored", where, it.key()));
+std::string_view stringOf(Json value) {
+  return {yyjson_get_str(value), yyjson_get_len(value)};
+}
+
+const char* typeName(Json value) {
+  if (yyjson_is_null(value)) return "null";
+  if (yyjson_is_obj(value)) return "object";
+  if (yyjson_is_arr(value)) return "array";
+  if (yyjson_is_str(value)) return "string";
+  if (yyjson_is_bool(value)) return "boolean";
+  return "number";
+}
+
+// Calls fn(key, value) for each member in document order; stops when fn returns false.
+template <typename Fn>
+void forEachMember(Json object, Fn&& fn) {
+  yyjson_obj_iter it = yyjson_obj_iter_with(object);
+  while (yyjson_val* key = yyjson_obj_iter_next(&it)) {
+    if (!fn(stringOf(key), static_cast<Json>(yyjson_obj_iter_get_val(key)))) {
+      return;
     }
   }
+}
+
+void warnUnknownKeys(Json object, std::initializer_list<std::string_view> known,
+                     std::string_view where, std::vector<std::string>& warnings) {
+  forEachMember(object, [&](std::string_view key, Json) {
+    if (std::ranges::find(known, key) == known.end()) {
+      warnings.push_back(std::format("{}: unknown key \"{}\" ignored", where, key));
+    }
+    return true;
+  });
 }
 
 // The guest path must be absolute and already normalised: no empty, "." or ".." component, no
@@ -62,12 +89,12 @@ std::expected<size_t, std::string> checkGuestPath(std::string_view path, size_t 
   return parts;
 }
 
-std::expected<stdfs::path, std::string> hostPath(const Json& value, std::string_view where,
+std::expected<stdfs::path, std::string> hostPath(Json value, std::string_view where,
                                                  const stdfs::path& base_dir) {
-  if (!value.is_string()) {
-    return fail("{}: expected a path string, got {}", where, value.type_name());
+  if (!yyjson_is_str(value)) {
+    return fail("{}: expected a path string, got {}", where, typeName(value));
   }
-  const std::string& text = value.get_ref<const std::string&>();
+  const std::string_view text = stringOf(value);
   if (text.empty()) {
     return fail("{}: the path is empty", where);
   }
@@ -88,19 +115,18 @@ bool defaultReadOnly(std::string_view name) {
   return name == "dev_bdvd" || name == "app_home";
 }
 
-std::expected<bool, std::string> readOnlyFlag(const Json& object, std::string_view where,
-                                              bool fallback) {
-  const auto it = object.find("read_only");
-  if (it == object.end()) {
+std::expected<bool, std::string> readOnlyFlag(Json object, std::string_view where, bool fallback) {
+  const Json flag = yyjson_obj_get(object, "read_only");
+  if (flag == nullptr) {
     return fallback;
   }
-  if (!it->is_boolean()) {
+  if (!yyjson_is_bool(flag)) {
     return fail("{}: read_only must be true or false", where);
   }
-  return it->get<bool>();
+  return yyjson_get_bool(flag);
 }
 
-std::expected<VfsMount, std::string> parseMount(const std::string& key, const Json& value,
+std::expected<VfsMount, std::string> parseMount(std::string_view key, Json value,
                                                 const stdfs::path& base_dir,
                                                 std::vector<std::string>& warnings) {
   const std::string where = std::format("mounts[\"{}\"]", key);
@@ -113,18 +139,18 @@ std::expected<VfsMount, std::string> parseMount(const std::string& key, const Js
                 "\"/dev_hdd0\"",
                 where);
   }
-  if (!value.is_object()) {
+  if (!yyjson_is_obj(value)) {
     return fail("{}: expected an object with \"host\"", where);
   }
   warnUnknownKeys(value, {"host", "read_only", "block_size"}, where, warnings);
 
   VfsMount mount;
-  mount.name = key.substr(1);
-  const auto host = value.find("host");
-  if (host == value.end()) {
+  mount.name = std::string(key.substr(1));
+  const Json host = yyjson_obj_get(value, "host");
+  if (host == nullptr) {
     return fail("{}: \"host\" is missing", where);
   }
-  auto path = hostPath(*host, where + ".host", base_dir);
+  auto path = hostPath(host, where + ".host", base_dir);
   if (!path) {
     return std::unexpected(path.error());
   }
@@ -134,11 +160,11 @@ std::expected<VfsMount, std::string> parseMount(const std::string& key, const Js
     return std::unexpected(read_only.error());
   }
   mount.read_only = *read_only;
-  if (const auto block = value.find("block_size"); block != value.end()) {
-    if (!block->is_number_unsigned()) {
+  if (const Json block = yyjson_obj_get(value, "block_size"); block != nullptr) {
+    if (!yyjson_is_uint(block)) {
       return fail("{}: block_size must be a positive integer", where);
     }
-    const std::uint64_t size = block->get<std::uint64_t>();
+    const std::uint64_t size = yyjson_get_uint(block);
     if (size < 512 || size > (1u << 20) || (size & (size - 1)) != 0) {
       return fail("{}: block_size must be a power of two from 512 to 1048576", where);
     }
@@ -147,7 +173,7 @@ std::expected<VfsMount, std::string> parseMount(const std::string& key, const Js
   return mount;
 }
 
-std::expected<VfsFileOverride, std::string> parseFileOverride(const std::string& key, const Json& value,
+std::expected<VfsFileOverride, std::string> parseFileOverride(std::string_view key, Json value,
                                                               const stdfs::path& base_dir,
                                                               std::vector<std::string>& warnings) {
   const std::string where = std::format("files[\"{}\"]", key);
@@ -156,8 +182,8 @@ std::expected<VfsFileOverride, std::string> parseFileOverride(const std::string&
     return fail("{}: {}", where, parts.error());
   }
   VfsFileOverride file;
-  file.guest = key;
-  if (value.is_string()) {
+  file.guest = std::string(key);
+  if (yyjson_is_str(value)) {
     auto path = hostPath(value, where, base_dir);
     if (!path) {
       return std::unexpected(path.error());
@@ -165,15 +191,15 @@ std::expected<VfsFileOverride, std::string> parseFileOverride(const std::string&
     file.host = std::move(*path);
     return file;
   }
-  if (!value.is_object()) {
+  if (!yyjson_is_obj(value)) {
     return fail("{}: expected a host path string or an object with \"host\"", where);
   }
   warnUnknownKeys(value, {"host", "read_only"}, where, warnings);
-  const auto host = value.find("host");
-  if (host == value.end()) {
+  const Json host = yyjson_obj_get(value, "host");
+  if (host == nullptr) {
     return fail("{}: \"host\" is missing", where);
   }
-  auto path = hostPath(*host, where + ".host", base_dir);
+  auto path = hostPath(host, where + ".host", base_dir);
   if (!path) {
     return std::unexpected(path.error());
   }
@@ -186,33 +212,38 @@ std::expected<VfsFileOverride, std::string> parseFileOverride(const std::string&
   return file;
 }
 
-// Object keys that appear twice in one object: nlohmann/json keeps the last silently.
-struct DuplicateKeyGuard {
-  std::vector<std::set<std::string>> objects;
-  std::string duplicate;
-
-  bool operator()(int, Json::parse_event_t event, Json& parsed) {
-    switch (event) {
-      case Json::parse_event_t::object_start:
-        objects.emplace_back();
-        break;
-      case Json::parse_event_t::object_end:
-        if (!objects.empty()) {
-          objects.pop_back();
-        }
-        break;
-      case Json::parse_event_t::key:
-        if (!objects.empty() && !objects.back().insert(parsed.get<std::string>()).second &&
-            duplicate.empty()) {
-          duplicate = parsed.get<std::string>();
-        }
-        break;
-      default:
-        break;
+// yyjson keeps duplicate object keys; a key that appears twice in one object is an error. Walks
+// every object in the document with an explicit stack, so nesting depth cannot overflow.
+std::optional<std::string> findDuplicateKey(Json root) {
+  std::vector<Json> pending{root};
+  std::vector<std::string_view> keys;
+  while (!pending.empty()) {
+    const Json node = pending.back();
+    pending.pop_back();
+    const size_t first_child = pending.size();
+    if (yyjson_is_obj(node)) {
+      keys.clear();
+      forEachMember(node, [&](std::string_view key, Json value) {
+        keys.push_back(key);
+        if (yyjson_is_obj(value) || yyjson_is_arr(value)) pending.push_back(value);
+        return true;
+      });
+      std::ranges::sort(keys);
+      const auto dup = std::ranges::adjacent_find(keys);
+      if (dup != keys.end()) {
+        return std::string(*dup);
+      }
+    } else if (yyjson_is_arr(node)) {
+      yyjson_arr_iter it = yyjson_arr_iter_with(node);
+      while (yyjson_val* value = yyjson_arr_iter_next(&it)) {
+        if (yyjson_is_obj(value) || yyjson_is_arr(value)) pending.push_back(value);
+      }
     }
-    return true;
+    // The stack pops from the back: reverse the children so they are visited in document order.
+    std::reverse(pending.begin() + static_cast<std::ptrdiff_t>(first_child), pending.end());
   }
-};
+  return std::nullopt;
+}
 
 void replaceMounts(std::vector<VfsMount>& mounts, std::vector<VfsMount> replacement) {
   std::erase_if(mounts, [&](const VfsMount& m) {
@@ -237,19 +268,27 @@ bool isInside(const stdfs::path& inner, const stdfs::path& outer) {
 
 }  // namespace
 
-std::expected<VfsConfigFile, std::string> parseVfsConfig(std::string_view text,
+std::expected<VfsConfigFile, std::string> parseVfsConfig(std::string_view json_text,
                                                          const stdfs::path& base_dir) {
-  DuplicateKeyGuard guard;
-  Json root;
-  try {
-    root = Json::parse(text.begin(), text.end(), std::ref(guard));
-  } catch (const Json::exception& e) {
-    return fail("invalid JSON: {}", e.what());
+  // The input is not modified without YYJSON_READ_INSITU; the API just has no const overload.
+  // A UTF-8 BOM is skipped, as Windows editors write one.
+  yyjson_read_err read_err;
+  const std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(
+      yyjson_read_opts(const_cast<char*>(json_text.data()), json_text.size(), YYJSON_READ_ALLOW_BOM,
+                       nullptr, &read_err),
+      &yyjson_doc_free);
+  if (!doc) {
+    const std::string_view before = json_text.substr(0, std::min(read_err.pos, json_text.size()));
+    const auto line = 1 + std::ranges::count(before, '\n');
+    const size_t column = before.size() - (before.rfind('\n') + 1);  // npos + 1 wraps to 0
+    return fail("invalid JSON: {} at line {}, column {} (byte {})", read_err.msg, line, column + 1,
+                read_err.pos);
   }
-  if (!guard.duplicate.empty()) {
-    return fail("duplicate key \"{}\" in an object", guard.duplicate);
+  const Json root = yyjson_doc_get_root(doc.get());
+  if (const auto duplicate = findDuplicateKey(root)) {
+    return fail("duplicate key \"{}\" in an object", *duplicate);
   }
-  if (!root.is_object()) {
+  if (!yyjson_is_obj(root)) {
     return fail("the top level must be an object");
   }
 
@@ -257,13 +296,17 @@ std::expected<VfsConfigFile, std::string> parseVfsConfig(std::string_view text,
   warnUnknownKeys(root, {"version", "game_dir", "hdd_dir", "sdata_cache", "mounts", "files"}, "top level",
                   config.warnings);
 
-  const auto version = root.find("version");
-  if (version == root.end()) {
+  const Json version = yyjson_obj_get(root, "version");
+  if (version == nullptr) {
     return fail("\"version\" is missing (current version: {})", kVfsConfigVersion);
   }
-  if (!version->is_number_integer() || version->get<std::int64_t>() != kVfsConfigVersion) {
-    return fail("unsupported \"version\" {} (this build reads version {})", version->dump(),
-                kVfsConfigVersion);
+  const bool version_ok = yyjson_is_uint(version) ? yyjson_get_uint(version) == kVfsConfigVersion
+                                                  : yyjson_is_sint(version) && yyjson_get_sint(version) == kVfsConfigVersion;
+  if (!version_ok) {
+    const std::unique_ptr<char, decltype(&std::free)> dumped(
+        yyjson_val_write(version, YYJSON_WRITE_NOFLAG, nullptr), &std::free);
+    return fail("unsupported \"version\" {} (this build reads version {})",
+                dumped ? dumped.get() : typeName(version), kVfsConfigVersion);
   }
 
   // Shorthands expand to the mounts the matching command-line options create.
@@ -273,38 +316,44 @@ std::expected<VfsConfigFile, std::string> parseVfsConfig(std::string_view text,
       origin.emplace_back(std::string(source), std::move(mount));
     }
   };
-  if (const auto it = root.find("game_dir"); it != root.end()) {
-    const auto path = hostPath(*it, "game_dir", base_dir);
+  if (const Json it = yyjson_obj_get(root, "game_dir")) {
+    const auto path = hostPath(it, "game_dir", base_dir);
     if (!path) {
       return std::unexpected(path.error());
     }
     add(gameDirMounts(*path), "game_dir");
   }
-  if (const auto it = root.find("hdd_dir"); it != root.end()) {
-    const auto path = hostPath(*it, "hdd_dir", base_dir);
+  if (const Json it = yyjson_obj_get(root, "hdd_dir")) {
+    const auto path = hostPath(it, "hdd_dir", base_dir);
     if (!path) {
       return std::unexpected(path.error());
     }
     add(hddDirMounts(*path), "hdd_dir");
   }
-  if (const auto it = root.find("sdata_cache"); it != root.end()) {
-    auto path = hostPath(*it, "sdata_cache", base_dir);
+  if (const Json it = yyjson_obj_get(root, "sdata_cache")) {
+    auto path = hostPath(it, "sdata_cache", base_dir);
     if (!path) {
       return std::unexpected(path.error());
     }
     config.sdata_cache = std::move(*path);
   }
 
-  if (const auto it = root.find("mounts"); it != root.end()) {
-    if (!it->is_object()) {
+  if (const Json it = yyjson_obj_get(root, "mounts")) {
+    if (!yyjson_is_obj(it)) {
       return fail("\"mounts\" must be an object");
     }
-    for (auto m = it->begin(); m != it->end(); ++m) {
-      auto mount = parseMount(m.key(), m.value(), base_dir, config.warnings);
+    std::optional<std::string> error;
+    forEachMember(it, [&](std::string_view key, Json value) {
+      auto mount = parseMount(key, value, base_dir, config.warnings);
       if (!mount) {
-        return std::unexpected(mount.error());
+        error = std::move(mount.error());
+        return false;
       }
       origin.emplace_back("mounts", std::move(*mount));
+      return true;
+    });
+    if (error) {
+      return std::unexpected(std::move(*error));
     }
   }
   for (size_t i = 0; i < origin.size(); i++) {
@@ -319,18 +368,24 @@ std::expected<VfsConfigFile, std::string> parseVfsConfig(std::string_view text,
     config.mounts.push_back(std::move(mount));
   }
 
-  if (const auto it = root.find("files"); it != root.end()) {
-    if (!it->is_object()) {
+  if (const Json it = yyjson_obj_get(root, "files")) {
+    if (!yyjson_is_obj(it)) {
       return fail("\"files\" must be an object");
     }
     std::set<std::string> keys;
-    for (auto f = it->begin(); f != it->end(); ++f) {
-      auto file = parseFileOverride(f.key(), f.value(), base_dir, config.warnings);
+    std::optional<std::string> error;
+    forEachMember(it, [&](std::string_view key, Json value) {
+      auto file = parseFileOverride(key, value, base_dir, config.warnings);
       if (!file) {
-        return std::unexpected(file.error());
+        error = std::move(file.error());
+        return false;
       }
       keys.insert(file->guest);
       config.files.push_back(std::move(*file));
+      return true;
+    });
+    if (error) {
+      return std::unexpected(std::move(*error));
     }
     // A file cannot also be a directory that holds another override.
     for (const std::string& key : keys) {

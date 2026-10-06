@@ -52,18 +52,22 @@ function(dal_runtime_add_libpng)
     ${CMAKE_BINARY_DIR}/externals/libpng EXCLUDE_FROM_ALL)
 endfunction()
 
-# nlohmann/json is header-only; its INTERFACE target supplies the include path. SystemInclude
-# keeps its headers out of the project's warning flags.
-function(dal_runtime_add_nlohmann_json)
-  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/json/CMakeLists.txt)
+# yyjson is built as a static library from its own CMake, so its C sources compile with the
+# project's default flags (no -Werror). Tests, docs and install rules stay off. SYSTEM keeps its
+# header out of the warnings of the translation units that include it.
+function(dal_runtime_add_yyjson)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/yyjson/CMakeLists.txt)
     message(FATAL_ERROR
-      "DAL: externals/json is missing or empty. Run: git submodule update --init")
+      "DAL: externals/yyjson is missing or empty. Run: git submodule update --init")
   endif()
-  set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-  set(JSON_Install OFF CACHE BOOL "" FORCE)
-  set(JSON_SystemInclude ON CACHE BOOL "" FORCE)
-  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/json
-    ${CMAKE_BINARY_DIR}/externals/json EXCLUDE_FROM_ALL)
+  set(YYJSON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(YYJSON_BUILD_FUZZER OFF CACHE BOOL "" FORCE)
+  set(YYJSON_BUILD_MISC OFF CACHE BOOL "" FORCE)
+  set(YYJSON_BUILD_DOC OFF CACHE BOOL "" FORCE)
+  set(YYJSON_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/yyjson
+    ${CMAKE_BINARY_DIR}/externals/yyjson EXCLUDE_FROM_ALL)
+  set_target_properties(yyjson PROPERTIES SYSTEM ON)
 endfunction()
 
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
@@ -71,7 +75,7 @@ endfunction()
 function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
-  dal_runtime_add_nlohmann_json()
+  dal_runtime_add_yyjson()
 
   add_library(dal_runtime_core STATIC
     runtime/src/core/boot.cpp
@@ -121,7 +125,7 @@ function(dal_runtime_add_core)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
   target_link_libraries(dal_runtime_core PRIVATE png_static)
   # PRIVATE as well: JSON types stay inside vfs_config.cpp.
-  target_link_libraries(dal_runtime_core PRIVATE nlohmann_json::nlohmann_json)
+  target_link_libraries(dal_runtime_core PRIVATE yyjson)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
   target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)

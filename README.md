@@ -23,7 +23,7 @@ game" for what is and is not implemented.
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
-- git, with the submodules initialised: `git submodule update --init` (spdlog, libpng, zlib and nlohmann/json under `externals/`;
+- git, with the submodules initialised: `git submodule update --init` (spdlog, libpng, zlib and yyjson under `externals/`;
   clone with `--recurse-submodules` to do it in one step)
 - Ninja
 - Python 3.10 or newer (the analysis tools use only the standard library)
@@ -949,7 +949,7 @@ results are only trusted for the expected build.
 | `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see "SDAT files" |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
-| `externals/json` | nlohmann/json submodule (v3.12.0, header-only), used only to parse the VFS configuration |
+| `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used only to parse the VFS configuration |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
