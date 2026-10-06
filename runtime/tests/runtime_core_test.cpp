@@ -1,5 +1,6 @@
 // Self-checking unit tests for the runtime core library. No generated code is involved.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include "hle/hle.h"
 #include "lv2/cell_error.h"
 #include "lv2/syscalls.h"
+#include "lv2/sys_sync.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -488,7 +490,7 @@ void testSyscalls() {
   dal::resetLogOnce();
 
   const auto table = dal::syscallTable();
-  CHECK(table.size() == 54);  // the 53 census numbers plus 22 (_sys_process_exit)
+  CHECK(table.size() == 55);  // the 53 census numbers plus 22 (_sys_process_exit) and 103
   bool sorted = true;
   for (std::size_t i = 1; i < table.size(); i++) sorted = sorted && table[i - 1].number < table[i].number;
   CHECK(sorted);
@@ -753,11 +755,296 @@ void testSysPrxForUser() {
   CHECK(t0 != 0 && call(6) >= t0);
   CHECK(call(7, 0x55) == 0);
   CHECK(call(8, 0x55) == 0);
-  CHECK(dal::sysPrxForUserHandlers().size() == 14);
+  CHECK(dal::sysPrxForUserHandlers().size() == 19);
 
   dal::setLogSink({});
   dal::resetCensus();
   dal::resetLogOnce();
+}
+
+// A guest thread object that is not registered or started: it only gives a syscall caller an id.
+std::unique_ptr<dal::GuestThread> makeCaller(std::uint32_t id) {
+  return std::make_unique<dal::GuestThread>(id, dal::GuestThreadParams{}, 0, 0);
+}
+
+std::uint64_t syscallAs(dal::GuestThread& caller, std::uint32_t number, std::uint64_t r3 = 0,
+                        std::uint64_t r4 = 0, std::uint64_t r5 = 0) {
+  DalPpuContext* ctx = &caller.context();
+  ctx->gpr[11] = number;
+  ctx->gpr[3] = r3;
+  ctx->gpr[4] = r4;
+  ctx->gpr[5] = r5;
+  dalSyscall(ctx, dal::process().memory.base(), 0x10000);
+  return ctx->gpr[3];
+}
+
+void testMutexAndCond() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t id_out = scratch, attr = scratch + 0x40, cond_out = scratch + 8;
+
+  auto a = makeCaller(0x01000000);
+  auto b = makeCaller(0x01000001);
+  auto setMutexAttr = [&](std::uint32_t protocol, std::uint32_t recursive) {
+    dalWrite32(base, attr, protocol);
+    dalWrite32(base, attr + 4, recursive);
+  };
+
+  // Recursive mutex: the count survives nested locks, only the owner may unlock.
+  setMutexAttr(2, 0x10);
+  CHECK(syscallAs(*a, 100, id_out, attr) == 0);
+  const std::uint32_t m = dalRead32(base, id_out);
+  CHECK(m == 0x85000000);
+  CHECK(syscallAs(*a, 102, m, 0) == 0);
+  CHECK(syscallAs(*a, 102, m, 0) == 0);
+  CHECK(syscallAs(*a, 103, m) == 0);
+  CHECK(syscallAs(*b, 103, m) == err(dal::kCellEbusy));
+  CHECK(syscallAs(*b, 104, m) == err(dal::kCellEperm));
+  CHECK(syscallAs(*a, 101, m) == err(dal::kCellEbusy));
+  CHECK(syscallAs(*a, 104, m) == 0);
+  CHECK(syscallAs(*a, 104, m) == 0);
+  CHECK(syscallAs(*b, 104, m) == err(dal::kCellEperm));  // still owned
+  CHECK(syscallAs(*a, 104, m) == 0);
+  CHECK(syscallAs(*a, 104, m) == err(dal::kCellEperm));  // now free
+  CHECK(syscallAs(*a, 101, m) == 0);
+  CHECK(syscallAs(*a, 101, m) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 102, m, 0) == err(dal::kCellEsrch));
+
+  // A non-recursive mutex reports a relock as a deadlock.
+  setMutexAttr(1, 0x20);
+  CHECK(syscallAs(*a, 100, id_out, attr) == 0);
+  const std::uint32_t plain = dalRead32(base, id_out);
+  CHECK(plain == 0x85000100);
+  CHECK(syscallAs(*a, 102, plain, 0) == 0);
+  CHECK(syscallAs(*a, 102, plain, 0) == err(dal::kCellEdeadlk));
+  CHECK(syscallAs(*a, 103, plain) == err(dal::kCellEdeadlk));
+  CHECK(syscallAs(*a, 104, plain) == 0);
+
+  setMutexAttr(9, 0x20);
+  CHECK(syscallAs(*a, 100, id_out, attr) == err(dal::kCellEinval));
+  setMutexAttr(1, 0x21);
+  CHECK(syscallAs(*a, 100, id_out, attr) == err(dal::kCellEinval));
+  CHECK(syscallAs(*a, 100, 0, attr) == err(dal::kCellEfault));
+
+  // Condition variable: the mutex must be held, and a timed-out wait still hands it back.
+  CHECK(syscallAs(*a, 105, cond_out, 0x85000fff, attr) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 105, cond_out, plain, attr) == 0);
+  const std::uint32_t c = dalRead32(base, cond_out);
+  CHECK(c == 0x86000000);
+  CHECK(syscallAs(*a, 107, c, 0) == err(dal::kCellEperm));   // mutex not held
+  CHECK(syscallAs(*a, 101, plain) == err(dal::kCellEperm));  // bound to a condition variable
+  CHECK(syscallAs(*a, 108, c) == 0);                         // no waiters: dropped
+  CHECK(syscallAs(*a, 109, c) == 0);
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    CHECK(syscallAs(*a, 102, plain, 0) == 0);
+    CHECK(syscallAs(*a, 107, c, 1000) == err(dal::kCellEtimedout));
+    CHECK(syscallAs(*b, 103, plain) == err(dal::kCellEbusy));  // reacquired by the waiter
+    CHECK(syscallAs(*a, 104, plain) == 0);
+  }
+  setMutexAttr(2, 0x10);
+  CHECK(syscallAs(*a, 100, id_out, attr) == 0);
+  const std::uint32_t rec = dalRead32(base, id_out);
+  CHECK(syscallAs(*a, 105, cond_out, rec, attr) == 0);
+  const std::uint32_t rc = dalRead32(base, cond_out);
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    CHECK(syscallAs(*a, 102, rec, 0) == 0);
+    CHECK(syscallAs(*a, 102, rec, 0) == 0);
+    CHECK(syscallAs(*a, 107, rc, 1000) == err(dal::kCellEtimedout));
+    CHECK(syscallAs(*a, 104, rec) == 0);  // the recursion count came back
+    CHECK(syscallAs(*a, 104, rec) == 0);
+    CHECK(syscallAs(*a, 104, rec) == err(dal::kCellEperm));
+  }
+  CHECK(syscallAs(*a, 106, rc) == 0);
+  CHECK(syscallAs(*a, 106, rc) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 101, rec) == 0);
+
+  // Contention: a second host thread blocks on a held mutex and gets it after the unlock. The
+  // worker holds the guest lock from the flag write until its blocking wait releases it, so seeing
+  // the flag while holding the lock means the worker is waiting.
+  CHECK(syscallAs(*a, 100, id_out, attr) == 0);
+  const std::uint32_t contended = dalRead32(base, id_out);
+  std::atomic<bool> b_ready{false};
+  std::uint64_t b_result = ~0ull;
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    CHECK(syscallAs(*a, 102, contended, 0) == 0);
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      b_ready = true;
+      b_result = syscallAs(*b, 102, contended, 0);
+    });
+    dal::guestLock().unlock();
+    while (!b_ready) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(syscallAs(*a, 104, contended) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  }
+  CHECK(b_result == 0);
+  CHECK(syscallAs(*a, 104, contended) == err(dal::kCellEperm));
+  CHECK(syscallAs(*b, 104, contended) == 0);
+
+  // A waiter is woken by a signal and returns holding the mutex again.
+  CHECK(syscallAs(*a, 105, cond_out, contended, attr) == 0);
+  const std::uint32_t cv = dalRead32(base, cond_out);
+  b_ready = false;
+  b_result = ~0ull;
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      syscallAs(*b, 102, contended, 0);
+      b_ready = true;
+      b_result = syscallAs(*b, 107, cv, 0);
+    });
+    dal::guestLock().unlock();
+    while (!b_ready) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(syscallAs(*a, 102, contended, 0) == 0);  // free: the waiter released it
+    CHECK(syscallAs(*a, 108, cv) == 0);
+    CHECK(syscallAs(*a, 104, contended) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  }
+  CHECK(b_result == 0);
+  CHECK(syscallAs(*b, 104, contended) == 0);  // held by the waiter after the wait
+
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+void testLwmutex() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t lw = scratch, lw2 = scratch + 0x20, attr = scratch + 0x40;
+
+  constexpr const char* kModule = "sysPrxForUser";
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x2f85c0ef, kModule, "sys_lwmutex_create"},
+      {0x00800010, 0xc3476d0c, kModule, "sys_lwmutex_destroy"},
+      {0x00800020, 0x1573dc3f, kModule, "sys_lwmutex_lock"},
+      {0x00800030, 0xaeb78725, kModule, "sys_lwmutex_trylock"},
+      {0x00800040, 0x1bc200f4, kModule, "sys_lwmutex_unlock"},
+  };
+  dal::installImports(imports, 5);
+  enum { kCreate, kDestroy, kLock, kTryLock, kUnlock };
+  auto call = [&](dal::GuestThread& caller, std::uint32_t index, std::uint64_t r3,
+                  std::uint64_t r4 = 0) {
+    DalPpuContext* ctx = &caller.context();
+    ctx->gpr[3] = r3;
+    ctx->gpr[4] = r4;
+    dalHleCall(ctx, base, index);
+    return ctx->gpr[3];
+  };
+  auto a = makeCaller(0x01000000);
+  auto b = makeCaller(0x01000001);
+
+  dalWrite32(base, attr, 2);
+  dalWrite32(base, attr + 4, 0x10);
+  CHECK(call(*a, kCreate, lw, attr) == 0);
+  CHECK(dalRead32(base, lw) == dal::kLwmutexFree);
+  CHECK(dalRead32(base, lw + 8) == 0x12);
+  CHECK(dalRead32(base, lw + 16) == 0x95000000);
+
+  CHECK(call(*a, kLock, lw, 0) == 0);
+  CHECK(dalRead32(base, lw) == 0x01000000);
+  CHECK(call(*a, kLock, lw, 0) == 0);  // recursive
+  CHECK(dalRead32(base, lw + 12) == 1);
+  CHECK(call(*a, kTryLock, lw) == 0);
+  CHECK(dalRead32(base, lw + 12) == 2);
+  CHECK(call(*b, kTryLock, lw) == err(dal::kCellEbusy));
+  CHECK(call(*b, kUnlock, lw) == err(dal::kCellEperm));
+  CHECK(call(*a, kDestroy, lw) == err(dal::kCellEbusy));
+  CHECK(call(*b, kDestroy, lw) == err(dal::kCellEbusy));
+  CHECK(call(*a, kUnlock, lw) == 0);
+  CHECK(call(*a, kUnlock, lw) == 0);
+  CHECK(dalRead32(base, lw + 12) == 0);
+  CHECK(dalRead32(base, lw) == 0x01000000);
+  CHECK(call(*a, kUnlock, lw) == 0);
+  CHECK(dalRead32(base, lw) == dal::kLwmutexFree);
+
+  // Contention: the second thread blocks until the owner unlocks, and the waiter count shows in
+  // the guest struct meanwhile.
+  CHECK(call(*a, kLock, lw, 0) == 0);
+  std::atomic<bool> b_ready{false};
+  std::uint64_t b_result = ~0ull;
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      b_ready = true;
+      b_result = call(*b, kLock, lw, 0);
+    });
+    dal::guestLock().unlock();
+    while (!b_ready) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(dalRead32(base, lw + 4) == 1);
+    CHECK(call(*a, kUnlock, lw) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  }
+  CHECK(b_result == 0);
+  CHECK(dalRead32(base, lw) == 0x01000001);
+  CHECK(dalRead32(base, lw + 4) == 0);
+  CHECK(call(*b, kUnlock, lw) == 0);
+
+  // A timed lock on a held lwmutex gives up with ETIMEDOUT.
+  CHECK(call(*a, kLock, lw, 0) == 0);
+  {
+    std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+    CHECK(call(*b, kLock, lw, 1000) == err(dal::kCellEtimedout));
+  }
+  CHECK(call(*a, kUnlock, lw) == 0);
+
+  // Non-recursive: relock is EDEADLK; a destroyed lwmutex is dead.
+  dalWrite32(base, attr, 1);
+  dalWrite32(base, attr + 4, 0x20);
+  CHECK(call(*a, kCreate, lw2, attr) == 0);
+  CHECK(call(*a, kLock, lw2, 0) == 0);
+  CHECK(call(*a, kLock, lw2, 0) == err(dal::kCellEdeadlk));
+  CHECK(call(*a, kUnlock, lw2) == 0);
+  CHECK(call(*a, kDestroy, lw2) == 0);
+  CHECK(dalRead32(base, lw2) == dal::kLwmutexDead);
+  CHECK(call(*a, kLock, lw2, 0) == err(dal::kCellEinval));
+  CHECK(call(*a, kTryLock, lw2) == err(dal::kCellEinval));
+
+  dalWrite32(base, attr + 4, 0x30);
+  CHECK(call(*a, kCreate, lw2, attr) == err(dal::kCellEinval));
+  dalWrite32(base, attr, 3);
+  dalWrite32(base, attr + 4, 0x10);
+  CHECK(call(*a, kCreate, lw2, attr) == err(dal::kCellEinval));
+
+  // The process-internal objects take the first ids of their kinds.
+  dal::resetSyncObjects();
+  dal::createProcessSyncObjects(base);
+  const dal::ProcessSyncObjects& objects = dal::processSyncObjects();
+  CHECK(dalRead32(base, objects.atexit_lwmutex + 16) == 0x95000000);
+  CHECK(dalRead32(base, objects.prx_lwmutex + 16) == 0x95000100);
+  CHECK(objects.once_mutex == 0x85000000 && objects.exit_mutex == 0x85000100);
+
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
 }
 
 // Waiters get the lock in the order they queued, whatever the host scheduler does.
@@ -1054,6 +1341,8 @@ int main(int argc, char** argv) {
   testHle();
   testStartupSyscalls();
   testSysPrxForUser();
+  testMutexAndCond();
+  testLwmutex();
   testTimebase();
   testGuestLockFifo();
   testReservationAndDcbz();

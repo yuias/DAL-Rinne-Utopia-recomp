@@ -26,6 +26,18 @@ void sysMemoryAllocate(DalPpuContext* ctx, std::uint8_t* base);
 void sysMemoryFree(DalPpuContext* ctx, std::uint8_t* base);
 void sysMemoryGetUserMemorySize(DalPpuContext* ctx, std::uint8_t* base);
 
+// Handlers defined in sys_mutex_cond.cpp.
+void sysMutexCreate(DalPpuContext* ctx, std::uint8_t* base);
+void sysMutexDestroy(DalPpuContext* ctx, std::uint8_t* base);
+void sysMutexLock(DalPpuContext* ctx, std::uint8_t* base);
+void sysMutexTryLock(DalPpuContext* ctx, std::uint8_t* base);
+void sysMutexUnlock(DalPpuContext* ctx, std::uint8_t* base);
+void sysCondCreate(DalPpuContext* ctx, std::uint8_t* base);
+void sysCondDestroy(DalPpuContext* ctx, std::uint8_t* base);
+void sysCondWait(DalPpuContext* ctx, std::uint8_t* base);
+void sysCondSignal(DalPpuContext* ctx, std::uint8_t* base);
+void sysCondSignalAll(DalPpuContext* ctx, std::uint8_t* base);
+
 namespace {
 
 // The numbers the game's code issues (found by scanning the generated code for the r11 value in
@@ -40,15 +52,16 @@ constexpr SyscallEntry kSyscalls[] = {
     {83, "sys_event_flag_destroy", nullptr},
     {85, "sys_event_flag_wait", nullptr},
     {87, "sys_event_flag_set", nullptr},
-    {100, "sys_mutex_create", nullptr},
-    {101, "sys_mutex_destroy", nullptr},
-    {102, "sys_mutex_lock", nullptr},
-    {104, "sys_mutex_unlock", nullptr},
-    {105, "sys_cond_create", nullptr},
-    {106, "sys_cond_destroy", nullptr},
-    {107, "sys_cond_wait", nullptr},
-    {108, "sys_cond_signal", nullptr},
-    {109, "sys_cond_signal_all", nullptr},
+    {100, "sys_mutex_create", sysMutexCreate},
+    {101, "sys_mutex_destroy", sysMutexDestroy},
+    {102, "sys_mutex_lock", sysMutexLock},
+    {103, "sys_mutex_trylock", sysMutexTryLock},
+    {104, "sys_mutex_unlock", sysMutexUnlock},
+    {105, "sys_cond_create", sysCondCreate},
+    {106, "sys_cond_destroy", sysCondDestroy},
+    {107, "sys_cond_wait", sysCondWait},
+    {108, "sys_cond_signal", sysCondSignal},
+    {109, "sys_cond_signal_all", sysCondSignalAll},
     {118, "sys_event_flag_clear", nullptr},
     {128, "sys_event_queue_create", nullptr},
     {129, "sys_event_queue_destroy", nullptr},

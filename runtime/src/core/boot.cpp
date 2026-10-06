@@ -13,6 +13,7 @@
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "core/threads.h"
+#include "lv2/sys_sync.h"
 
 namespace dal {
 namespace {
@@ -84,7 +85,6 @@ std::uint32_t allocateTls() {
 
 std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_t thread_id,
                             std::uint32_t vaddr, std::uint32_t filesz, std::uint32_t memsz) {
-  (void)base;
   if (ctx->gpr[13] != 0) {
     return static_cast<std::uint32_t>(ctx->gpr[13]);
   }
@@ -112,6 +112,10 @@ std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_
   ctx->gpr[13] = r13;
   logInfo("dal: tls: thread {:#010x} area {:#010x} block {:#x} slots {} r13 {:#010x}", thread_id,
           area, g_tls.block_size, g_tls.used.size(), r13);
+
+  // The sync objects RPCS3 creates at this point: the atexit and `_lv2prx` lwmutexes and the
+  // `_lv2ppu` and `_lv2tls` mutexes.
+  createProcessSyncObjects(base);
   return r13;
 }
 
