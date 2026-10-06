@@ -10,3 +10,12 @@
 [submodule "externals/yyjson"]
 	path = externals/yyjson
 	url = https://github.com/ibireme/yyjson
+[submodule "externals/Vulkan-Headers"]
+	path = externals/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers
+[submodule "externals/volk"]
+	path = externals/volk
+	url = https://github.com/zeux/volk
+[submodule "externals/VulkanMemoryAllocator"]
+	path = externals/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator

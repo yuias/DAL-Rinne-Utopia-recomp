@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -22,6 +23,7 @@
 #include "hle/hle.h"
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
+#include "render/vk_context.h"
 #include "rsx/rsx_thread.h"
 
 namespace {
@@ -40,6 +42,7 @@ struct Options {
   bool strict = false;
   bool quiet_hle = false;
   bool load_only = false;
+  bool render_vulkan = false;
 };
 
 void printUsage() {
@@ -47,7 +50,8 @@ void printUsage() {
       "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--quiet-hle] [--load-only]\n"
-      "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n",
+      "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
+      "                [--render none|vulkan]\n",
       stderr);
 }
 
@@ -91,6 +95,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         std::fprintf(stderr, "error: --pad needs none or neutral\n");
         return false;
       }
+    } else if (arg == "--render") {
+      std::string name;
+      if (!value(name)) return false;
+      if (name != "none" && name != "vulkan") {
+        std::fprintf(stderr, "error: --render needs none or vulkan\n");
+        return false;
+      }
+      opt.render_vulkan = name == "vulkan";
     } else if (arg == "--seconds") {
       std::string text;
       if (!value(text)) return false;
@@ -250,6 +262,22 @@ int main(int argc, char** argv) {
 
   if (opt.load_only) {
     return static_cast<int>(dal::ExitCode::ProcessExit);
+  }
+
+  // Kept alive for the whole run; the process ends without unwinding main.
+  std::unique_ptr<dal::VkContext> render_context;
+  if (opt.render_vulkan) {
+    std::string render_error;
+    render_context = dal::createVkContext({}, render_error);
+    if (render_context) {
+      const std::uint32_t api = render_context->deviceProperties().apiVersion;
+      dal::logInfo("dal: render: vulkan device {} (api {}.{}.{}, d24s8 {})",
+                   render_context->deviceName(), VK_API_VERSION_MAJOR(api),
+                   VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api),
+                   render_context->hasD24S8() ? "yes" : "no");
+    } else {
+      dal::logWarn("dal: render: {}; continuing without rendering", render_error);
+    }
   }
 
   // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
