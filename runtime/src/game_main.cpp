@@ -28,6 +28,7 @@ struct Options {
   std::string hdd_dir;
   std::string sdata_cache;
   std::string log_file;
+  std::string dialog_answer;
   unsigned seconds = 0;
   bool strict = false;
   bool quiet_hle = false;
@@ -37,7 +38,8 @@ struct Options {
 void printUsage() {
   std::fputs(
       "usage: dal_game --game-dir DIR [--elf PATH] [--seconds N] [--strict] [--log FILE]\n"
-      "                [--hdd-dir DIR] [--sdata-cache DIR] [--quiet-hle] [--load-only]\n",
+      "                [--hdd-dir DIR] [--sdata-cache DIR] [--quiet-hle] [--load-only]\n"
+      "                [--dialog-answer yes|no|ok]\n",
       stderr);
 }
 
@@ -62,6 +64,12 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.sdata_cache)) return false;
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
+    } else if (arg == "--dialog-answer") {
+      if (!value(opt.dialog_answer)) return false;
+      if (!dal::setDialogAnswer(opt.dialog_answer)) {
+        std::fprintf(stderr, "error: --dialog-answer needs yes, no or ok\n");
+        return false;
+      }
     } else if (arg == "--seconds") {
       std::string text;
       if (!value(text)) return false;

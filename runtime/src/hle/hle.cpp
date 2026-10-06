@@ -35,11 +35,11 @@ struct InstalledImport {
 // Every module's handler list. No static self-registration: archive members are not pulled in by
 // static initialisers, so each module is named here.
 using HandlerList = std::span<const HleEntry> (*)();
-constexpr std::array<HandlerList, 9> kRegistries{sysPrxForUserHandlers, cellSysmoduleHandlers,
-                                                 cellSpursHandlers, cellGcmSysHandlers,
-                                                 cellGameHandlers, cellFsHandlers,
-                                                 sceNpHandlers, sceNpTrophyHandlers,
-                                                 cellSysutilHandlers};
+constexpr std::array<HandlerList, 10> kRegistries{sysPrxForUserHandlers, cellSysmoduleHandlers,
+                                                  cellSpursHandlers, cellGcmSysHandlers,
+                                                  cellGameHandlers, cellFsHandlers,
+                                                  sceNpHandlers, sceNpTrophyHandlers,
+                                                  cellSysutilHandlers, cellMsgDialogHandlers};
 
 // Written by installImports before any guest thread starts; the call counters are updated under
 // the guest lock.

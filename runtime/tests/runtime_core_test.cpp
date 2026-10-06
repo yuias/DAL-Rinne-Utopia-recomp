@@ -2362,6 +2362,167 @@ void testCellSysutil() {
   dal::resetLogOnce();
 }
 
+std::vector<std::pair<std::int64_t, std::uint32_t>> g_dialog_results;
+std::vector<std::uint64_t> g_dialog_sysutil_events;
+
+DAL_PPU_FUNC(msgDialogCallback) {
+  (void)base;
+  g_dialog_results.emplace_back(static_cast<std::int32_t>(ctx->gpr[3]),
+                                static_cast<std::uint32_t>(ctx->gpr[4]));
+}
+
+DAL_PPU_FUNC(msgDialogSysutilCallback) {
+  (void)base;
+  g_dialog_sysutil_events.push_back(ctx->gpr[3]);
+}
+
+void testCellMsgDialog() {
+  std::vector<std::string> log_lines;
+  dal::setLogSink([&](std::string_view line) { log_lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetHostFunctions();
+  dal::resetCellSysutil();
+  dal::resetCellMsgDialog();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+
+  enum Import : std::uint32_t { Open2, Close, BarReset, BarInc, Register, Check, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x7603d3db, "cellSysutil", "cellMsgDialogOpen2"},
+      {0x00800010, 0x20543730, "cellSysutil", "cellMsgDialogClose"},
+      {0x00800020, 0x7bc2c8a8, "cellSysutil", "cellMsgDialogProgressBarReset"},
+      {0x00800030, 0x94862702, "cellSysutil", "cellMsgDialogProgressBarInc"},
+      {0x00800040, 0x9d98afa0, "cellSysutil", "cellSysutilRegisterCallback"},
+      {0x00800050, 0x189a74da, "cellSysutil", "cellSysutilCheckCallback"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[1] = 0x500000;
+  CHECK(p.memory.commit(0x4f0000, 0x10000));
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0,
+                  std::uint64_t d = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    ctx->gpr[5] = c;
+    ctx->gpr[6] = d;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kErrorParam = 0x8002b301, kErrorNotOpened = 0x8002b302,
+                          kErrorBusy = 0x8002b105;
+  constexpr std::uint32_t kOk = 2u << 4, kYesNo = 1u << 4;
+  const std::uint32_t text = scratch;
+  auto setText = [&](const char* s) { std::memcpy(base + text, s, std::strlen(s) + 1); };
+  auto logged = [&](std::string_view needle) {
+    for (const std::string& line : log_lines) {
+      if (line.find(needle) != std::string::npos) return true;
+    }
+    return false;
+  };
+
+  const std::uint32_t dialog_cb = dal::registerHostFunction("msgDialogCallback", msgDialogCallback);
+  const std::uint32_t sysutil_cb =
+      dal::registerHostFunction("msgDialogSysutilCallback", msgDialogSysutilCallback);
+  g_dialog_results.clear();
+  g_dialog_sysutil_events.clear();
+  dal::setDialogAnswerDelay(std::chrono::milliseconds(0));
+  CHECK(call(Register, 0, sysutil_cb, 0) == 0);
+
+  // Nothing is open.
+  CHECK(call(Close) == kErrorNotOpened);
+  CHECK(call(BarReset, 0) == kErrorNotOpened);
+  CHECK(call(BarInc, 0, 1) == kErrorNotOpened);
+
+  // Parameter checks: no text, unknown type bits, a cursor or bars where they do not belong.
+  setText("hello");
+  CHECK(call(Open2, kOk, 0, 0, 0) == kErrorParam);
+  CHECK(call(Open2, 0x8, text, 0, 0) == kErrorParam);        // bit 3 is not a type bit
+  CHECK(call(Open2, kOk | (1u << 8), text, 0, 0) == kErrorParam);
+  CHECK(call(Open2, kYesNo | (3u << 8), text, 0, 0) == kErrorParam);
+  CHECK(call(Open2, kYesNo | (1u << 12), text, 0, 0) == kErrorParam);
+  CHECK(call(Open2, 3u << 12, text, 0, 0) == kErrorParam);   // more than two bars
+  CHECK(call(Open2, 3u << 4, text, 0, 0) == kErrorParam);    // unknown button type
+  std::memset(base + text, 'a', 512);
+  base[text + 512] = 0;
+  CHECK(call(Open2, kOk, text, 0, 0) == kErrorParam);        // text of CELL_MSGDIALOG_STRING_SIZE
+  CHECK(g_dialog_sysutil_events.empty());
+
+  // An OK dialog answers itself with OK; DRAWING_BEGIN/END surround it and the callback gets the
+  // button and the user data. A second dialog is refused while the first one is open.
+  setText("\xe3\x82\xbb\xe3\x83\xbc\xe3\x83\x96");  // UTF-8 text reaches the log verbatim
+  CHECK(call(Open2, kOk, text, dialog_cb, 0x77) == 0);
+  CHECK(logged("open type 0x20") && logged("\xe3\x82\xbb\xe3\x83\xbc\xe3\x83\x96"));
+  CHECK(call(Open2, kOk, text, 0, 0) == kErrorBusy);
+  CHECK(call(Check) == 0);
+  CHECK(g_dialog_sysutil_events.size() == 1 && g_dialog_sysutil_events[0] == dal::kSysutilDrawingBegin);
+  CHECK(g_dialog_results.empty());
+  CHECK(call(Check) == 0);
+  CHECK(g_dialog_sysutil_events.size() == 2 && g_dialog_sysutil_events[1] == dal::kSysutilDrawingEnd);
+  CHECK(g_dialog_results.size() == 1 && g_dialog_results[0].first == 1 &&
+        g_dialog_results[0].second == 0x77);
+  CHECK(ctx->gpr[1] == 0x500000);
+  CHECK(call(Close) == kErrorNotOpened);
+
+  // A Yes/No dialog answers YES by default and NO when asked to.
+  g_dialog_results.clear();
+  CHECK(call(Open2, kYesNo | (1u << 8), text, dialog_cb, 1) == 0);
+  CHECK(call(Check) == 0 && call(Check) == 0);
+  CHECK(g_dialog_results.size() == 1 && g_dialog_results[0].first == 1);
+  CHECK(!dal::setDialogAnswer("maybe"));
+  CHECK(dal::setDialogAnswer("no"));
+  CHECK(call(Open2, kYesNo, text, dialog_cb, 2) == 0);
+  CHECK(call(Check) == 0 && call(Check) == 0);
+  CHECK(g_dialog_results.size() == 2 && g_dialog_results[1].first == 2 &&
+        g_dialog_results[1].second == 2);
+  CHECK(dal::setDialogAnswer("ok"));
+
+  // A dialog without buttons waits for cellMsgDialogClose; Close(0) ends it with button NONE (-1).
+  // Type 0x85 has no progress bar; 0x1000 has one.
+  g_dialog_results.clear();
+  CHECK(call(Open2, 0x85, text, dialog_cb, 3) == 0);
+  for (int i = 0; i < 5; i++) CHECK(call(Check) == 0);
+  CHECK(g_dialog_results.empty());
+  CHECK(call(BarInc, 0, 1) == kErrorParam && call(BarReset, 0) == kErrorParam);
+  ctx->fpr[1].f64 = 0.0;
+  CHECK(call(Close) == 0);
+  CHECK(call(Check) == 0 && call(Check) == 0);
+  CHECK(g_dialog_results.size() == 1 && g_dialog_results[0].first == -1 &&
+        g_dialog_results[0].second == 3);
+
+  g_dialog_results.clear();
+  CHECK(call(Open2, 0x1000, text, dialog_cb, 4) == 0);
+  CHECK(call(BarInc, 0, 5) == 0 && call(BarReset, 0) == 0);
+  CHECK(call(BarInc, 1, 5) == kErrorParam);
+  ctx->fpr[1].f64 = 1.0e9;  // a far-away deadline keeps the dialog open
+  CHECK(call(Close) == 0);
+  for (int i = 0; i < 3; i++) CHECK(call(Check) == 0);
+  CHECK(g_dialog_results.empty() && call(Open2, 0x1000, text, 0, 0) == kErrorBusy);
+  ctx->fpr[1].f64 = -5.0;  // a negative delay counts as 0; a later Close replaces the deadline
+  CHECK(call(Close) == 0);
+  CHECK(call(Check) == 0 && call(Check) == 0);
+  CHECK(g_dialog_results.size() == 1 && g_dialog_results[0].first == -1);
+
+  // After a close a new dialog opens again, and the events stayed paired.
+  CHECK(call(Open2, 0x4, text, 0, 0) == 0);
+  ctx->fpr[1].f64 = 0.0;
+  CHECK(call(Close) == 0);
+  CHECK(call(Check) == 0 && call(Check) == 0);
+  CHECK(dal::queueSysutilEvent(dal::kSysutilDrawingEnd, 0) == -1);
+
+  dal::resetCellMsgDialog();
+  dal::resetCellSysutil();
+  g_dialog_results.clear();
+  g_dialog_sysutil_events.clear();
+  dal::resetHostFunctions();
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void testFifoParser() {
   using dal::FifoParser;
   using dal::FifoStatus;
@@ -3967,6 +4128,7 @@ int main(int argc, char** argv) {
   testCellFs();
   testSceNpAndTrophy();
   testCellSysutil();
+  testCellMsgDialog();
   testFifoParser();
   testRsxConsumer();
   testLwmutex();

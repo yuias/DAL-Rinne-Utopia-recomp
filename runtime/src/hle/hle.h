@@ -1,10 +1,12 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "dal/ppu_context.h"
 #include "lv2/syscalls.h"
@@ -77,6 +79,21 @@ std::int32_t queueSysutilEvent(std::uint64_t status, std::uint64_t param);
 
 // Forgets the registered callbacks, the queue and the BGM state. Intended for tests.
 void resetCellSysutil();
+
+// Handlers of the cellMsgDialog imports (cellSysutil module): Open2, Close and the progress bar
+// calls.
+std::span<const HleEntry> cellMsgDialogHandlers();
+
+// Sets what an auto-answered Yes/No dialog replies: "yes", "ok" (same as yes) or "no". Returns false
+// for any other value. OK dialogs always answer OK; dialogs without buttons wait for
+// cellMsgDialogClose.
+bool setDialogAnswer(std::string_view answer);
+
+// Delay before a dialog with buttons answers itself (default 200 ms).
+void setDialogAnswerDelay(std::chrono::milliseconds delay);
+
+// Forgets the open dialog and restores the answer and delay defaults. Intended for tests.
+void resetCellMsgDialog();
 
 // Handlers of the sys_fs module (cellFs*).
 std::span<const HleEntry> cellFsHandlers();
