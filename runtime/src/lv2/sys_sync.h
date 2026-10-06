@@ -101,7 +101,10 @@ struct ProcessSyncObjects {
 const ProcessSyncObjects& processSyncObjects();
 void createProcessSyncObjects(std::uint8_t* base);
 
-// Forgets every mutex, condition variable and lwmutex. Intended for tests.
+// Forgets every event flag, event queue and event port (sys_event.cpp).
+void resetEventObjects();
+
+// Forgets every mutex, condition variable, lwmutex and event object. Intended for tests.
 void resetSyncObjects();
 
 }  // namespace dal

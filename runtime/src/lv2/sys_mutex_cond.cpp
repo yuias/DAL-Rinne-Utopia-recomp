@@ -251,6 +251,7 @@ void resetSyncObjects() {
   g_conds = IdMap<Cond>(kCondIdBase, kSyncIdStep);
   g_lwmutexes = IdMap<Lwmutex>(kLwmutexIdBase, kSyncIdStep);
   g_process_objects = ProcessSyncObjects{};
+  resetEventObjects();
 }
 
 // 100 sys_mutex_create(u32* mutex_id, sys_mutex_attribute_t* attr)

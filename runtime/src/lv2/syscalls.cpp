@@ -38,6 +38,24 @@ void sysCondWait(DalPpuContext* ctx, std::uint8_t* base);
 void sysCondSignal(DalPpuContext* ctx, std::uint8_t* base);
 void sysCondSignalAll(DalPpuContext* ctx, std::uint8_t* base);
 
+// Handlers defined in sys_event.cpp.
+void sysEventFlagCreate(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagDestroy(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagWait(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagSet(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagClear(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagCancel(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventFlagGet(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventQueueCreate(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventQueueDestroy(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventQueueReceive(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventQueueDrain(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventPortCreate(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventPortDestroy(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventPortConnectLocal(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventPortDisconnect(DalPpuContext* ctx, std::uint8_t* base);
+void sysEventPortSend(DalPpuContext* ctx, std::uint8_t* base);
+
 // Handlers defined in sys_ppu_thread.cpp.
 void sysPpuThreadExit(DalPpuContext* ctx, std::uint8_t* base);
 void sysPpuThreadYield(DalPpuContext* ctx, std::uint8_t* base);
@@ -57,10 +75,10 @@ constexpr SyscallEntry kSyscalls[] = {
     {44, "sys_ppu_thread_join", sysPpuThreadJoin},
     {47, "sys_ppu_thread_set_priority", sysPpuThreadSetPriority},
     {48, "sys_ppu_thread_get_priority", sysPpuThreadGetPriority},
-    {82, "sys_event_flag_create", nullptr},
-    {83, "sys_event_flag_destroy", nullptr},
-    {85, "sys_event_flag_wait", nullptr},
-    {87, "sys_event_flag_set", nullptr},
+    {82, "sys_event_flag_create", sysEventFlagCreate},
+    {83, "sys_event_flag_destroy", sysEventFlagDestroy},
+    {85, "sys_event_flag_wait", sysEventFlagWait},
+    {87, "sys_event_flag_set", sysEventFlagSet},
     {100, "sys_mutex_create", sysMutexCreate},
     {101, "sys_mutex_destroy", sysMutexDestroy},
     {102, "sys_mutex_lock", sysMutexLock},
@@ -71,18 +89,18 @@ constexpr SyscallEntry kSyscalls[] = {
     {107, "sys_cond_wait", sysCondWait},
     {108, "sys_cond_signal", sysCondSignal},
     {109, "sys_cond_signal_all", sysCondSignalAll},
-    {118, "sys_event_flag_clear", nullptr},
-    {128, "sys_event_queue_create", nullptr},
-    {129, "sys_event_queue_destroy", nullptr},
-    {130, "sys_event_queue_receive", nullptr},
-    {132, "sys_event_flag_cancel", nullptr},
-    {133, "sys_event_queue_drain", nullptr},
-    {134, "sys_event_port_create", nullptr},
-    {135, "sys_event_port_destroy", nullptr},
-    {136, "sys_event_port_connect_local", nullptr},
-    {137, "sys_event_port_disconnect", nullptr},
-    {138, "sys_event_port_send", nullptr},
-    {139, "sys_event_flag_get", nullptr},
+    {118, "sys_event_flag_clear", sysEventFlagClear},
+    {128, "sys_event_queue_create", sysEventQueueCreate},
+    {129, "sys_event_queue_destroy", sysEventQueueDestroy},
+    {130, "sys_event_queue_receive", sysEventQueueReceive},
+    {132, "sys_event_flag_cancel", sysEventFlagCancel},
+    {133, "sys_event_queue_drain", sysEventQueueDrain},
+    {134, "sys_event_port_create", sysEventPortCreate},
+    {135, "sys_event_port_destroy", sysEventPortDestroy},
+    {136, "sys_event_port_connect_local", sysEventPortConnectLocal},
+    {137, "sys_event_port_disconnect", sysEventPortDisconnect},
+    {138, "sys_event_port_send", sysEventPortSend},
+    {139, "sys_event_flag_get", sysEventFlagGet},
     {141, "sys_timer_usleep", sysTimerUsleep},
     {142, "sys_timer_sleep", sysTimerSleep},
     {147, "sys_time_get_timebase_frequency", sysTimeGetTimebaseFrequency},

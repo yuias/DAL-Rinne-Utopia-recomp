@@ -34,6 +34,7 @@ function(dal_runtime_add_core)
     runtime/src/core/threads.cpp
     runtime/src/hle/hle.cpp
     runtime/src/hle/sys_prx_for_user.cpp
+    runtime/src/lv2/sys_event.cpp
     runtime/src/lv2/sys_misc.cpp
     runtime/src/lv2/sys_mutex_cond.cpp
     runtime/src/lv2/sys_ppu_thread.cpp

@@ -770,12 +770,15 @@ std::unique_ptr<dal::GuestThread> makeCaller(std::uint32_t id) {
 }
 
 std::uint64_t syscallAs(dal::GuestThread& caller, std::uint32_t number, std::uint64_t r3 = 0,
-                        std::uint64_t r4 = 0, std::uint64_t r5 = 0) {
+                        std::uint64_t r4 = 0, std::uint64_t r5 = 0, std::uint64_t r6 = 0,
+                        std::uint64_t r7 = 0) {
   DalPpuContext* ctx = &caller.context();
   ctx->gpr[11] = number;
   ctx->gpr[3] = r3;
   ctx->gpr[4] = r4;
   ctx->gpr[5] = r5;
+  ctx->gpr[6] = r6;
+  ctx->gpr[7] = r7;
   dalSyscall(ctx, dal::process().memory.base(), 0x10000);
   return ctx->gpr[3];
 }
@@ -920,6 +923,214 @@ void testMutexAndCond() {
   }
   CHECK(b_result == 0);
   CHECK(syscallAs(*b, 104, contended) == 0);  // held by the waiter after the wait
+
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+void testEventObjects() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t id_out = scratch, attr = scratch + 0x40, result = scratch + 0x80,
+                      num = scratch + 0x90;
+
+  auto a = makeCaller(0x01000000);
+  auto b = makeCaller(0x01000001);
+  // Waiting calls need the guest lock; the helpers below hand it over to the worker threads.
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+
+  // Event flag: attribute checks, then OR / AND waits with the clear modes.
+  dalWrite32(base, attr, 1);             // protocol FIFO
+  dalWrite32(base, attr + 20, 0x20000);  // multiple waiters
+  CHECK(syscallAs(*a, 82, 0, attr, 0) == err(dal::kCellEfault));
+  dalWrite32(base, attr + 20, 0x30000);
+  CHECK(syscallAs(*a, 82, id_out, attr, 0) == err(dal::kCellEinval));
+  dalWrite32(base, attr + 20, 0x20000);
+  CHECK(syscallAs(*a, 82, id_out, attr, 0x5) == 0);
+  const std::uint32_t flag = dalRead32(base, id_out);
+  CHECK(flag == 0x98000000);
+  CHECK(syscallAs(*a, 139, flag, result) == 0);
+  CHECK(dalRead64(base, result) == 0x5);
+
+  CHECK(syscallAs(*a, 85, flag, 0x4, dal::kWaitOr, result, 0) == 0);  // already set
+  CHECK(dalRead64(base, result) == 0x5);
+  CHECK(syscallAs(*a, 85, flag, 0x4, dal::kWaitOr | dal::kWaitClear, result, 1000) == 0);
+  CHECK(dalRead64(base, result) == 0x5);  // the value before the clear
+  CHECK(syscallAs(*a, 139, flag, result) == 0);
+  CHECK(dalRead64(base, result) == 0x1);
+  CHECK(syscallAs(*a, 87, flag, 0x6) == 0);
+  CHECK(syscallAs(*a, 139, flag, result) == 0);
+  CHECK(dalRead64(base, result) == 0x7);
+  CHECK(syscallAs(*a, 85, flag, 0x3, dal::kWaitAnd | dal::kWaitClearAll, result, 1000) == 0);
+  CHECK(dalRead64(base, result) == 0x7);
+  CHECK(syscallAs(*a, 139, flag, result) == 0);
+  CHECK(dalRead64(base, result) == 0);
+  CHECK(syscallAs(*a, 87, flag, 0x3) == 0);
+  CHECK(syscallAs(*a, 85, flag, 0x7, dal::kWaitAnd, result, 1000) == err(dal::kCellEtimedout));
+  CHECK(dalRead64(base, result) == 0x3);  // the pattern at the time of the timeout
+  CHECK(syscallAs(*a, 118, flag, 0x2) == 0);
+  CHECK(syscallAs(*a, 139, flag, result) == 0);
+  CHECK(dalRead64(base, result) == 0x2);
+  CHECK(syscallAs(*a, 85, flag, 0x1, 0x3, result, 1000) == err(dal::kCellEinval));  // AND|OR
+  CHECK(syscallAs(*a, 85, flag, 0x1, 0x4, result, 1000) == err(dal::kCellEinval));
+  CHECK(syscallAs(*a, 85, 0x98000fff, 0x1, dal::kWaitOr, result, 1000) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 139, 0x98000fff, result) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 87, 0x98000fff, 1) == err(dal::kCellEsrch));
+
+  // A waiter on another host thread is woken by a set and cancelled by a cancel. The worker holds
+  // the guest lock from the flag write until its blocking wait releases it.
+  std::atomic<bool> b_ready{false};
+  std::uint64_t b_result = ~0ull;
+  auto runWaiter = [&](std::uint32_t id, std::uint64_t pattern, std::uint32_t mode) {
+    b_ready = false;
+    b_result = ~0ull;
+    std::thread worker([&, id, pattern, mode] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      b_ready = true;
+      b_result = syscallAs(*b, 85, id, pattern, mode, result + 0x20, 0);
+    });
+    dal::guestLock().unlock();
+    while (!b_ready) std::this_thread::yield();
+    dal::guestLock().lock();
+    return worker;
+  };
+  const auto finish = [&](std::thread& worker) {
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  };
+  {
+    CHECK(syscallAs(*a, 118, flag, 0) == 0);
+    std::thread worker = runWaiter(flag, 0x8, dal::kWaitOr | dal::kWaitClear);
+    CHECK(syscallAs(*a, 83, flag) == err(dal::kCellEbusy));
+    CHECK(syscallAs(*a, 87, flag, 0x1) == 0);  // does not match: still waiting
+    CHECK(b_result == ~0ull);
+    CHECK(syscallAs(*a, 87, flag, 0x8) == 0);
+    finish(worker);
+    CHECK(b_result == 0);
+    CHECK(dalRead64(base, result + 0x20) == 0x9);
+    CHECK(syscallAs(*a, 139, flag, result) == 0);
+    CHECK(dalRead64(base, result) == 0x1);  // the waiter cleared its bit only
+
+    std::thread canceled = runWaiter(flag, 0x10, dal::kWaitAnd);
+    CHECK(syscallAs(*a, 132, flag, num) == 0);
+    CHECK(dalRead32(base, num) == 1);
+    finish(canceled);
+    CHECK(b_result == err(dal::kCellEcanceled));
+    CHECK(dalRead64(base, result + 0x20) == 0x1);
+    CHECK(syscallAs(*a, 132, flag, num) == 0);
+    CHECK(dalRead32(base, num) == 0);
+    CHECK(syscallAs(*a, 132, 0x98000fff, num) == err(dal::kCellEsrch));
+  }
+  CHECK(syscallAs(*a, 83, flag) == 0);
+  CHECK(syscallAs(*a, 83, flag) == err(dal::kCellEsrch));
+
+  // A single-waiter flag refuses a second waiter.
+  dalWrite32(base, attr + 20, 0x10000);
+  CHECK(syscallAs(*a, 82, id_out, attr, 0) == 0);
+  const std::uint32_t single = dalRead32(base, id_out);
+  CHECK(single == 0x98000100);
+  {
+    std::thread worker = runWaiter(single, 0x1, dal::kWaitOr);
+    CHECK(syscallAs(*a, 85, single, 0x2, dal::kWaitOr, result, 0) == err(dal::kCellEperm));
+    CHECK(syscallAs(*a, 87, single, 0x1) == 0);
+    finish(worker);
+    CHECK(b_result == 0);
+  }
+  CHECK(syscallAs(*a, 83, single) == 0);
+
+  // Event queue and port: send then receive delivers source/data1..3 in r4..r7.
+  const std::uint32_t queue_id = scratch + 0xa0, port_id = scratch + 0xb0,
+                      sys_event = scratch + 0xc0;
+  dalWrite32(base, attr, 2);      // protocol PRIORITY
+  dalWrite32(base, attr + 4, 1);  // PPU queue
+  CHECK(syscallAs(*a, 128, queue_id, attr, 0, 0) == err(dal::kCellEinval));    // size 0
+  CHECK(syscallAs(*a, 128, queue_id, attr, 0, 128) == err(dal::kCellEinval));  // size 128
+  dalWrite32(base, attr + 4, 3);
+  CHECK(syscallAs(*a, 128, queue_id, attr, 0, 2) == err(dal::kCellEinval));  // type
+  dalWrite32(base, attr + 4, 1);
+  CHECK(syscallAs(*a, 128, queue_id, attr, 0, 2) == 0);
+  const std::uint32_t queue = dalRead32(base, queue_id);
+  CHECK(queue == 0x8d000000);
+  CHECK(syscallAs(*a, 134, port_id, 2, 0) == err(dal::kCellEinval));
+  CHECK(syscallAs(*a, 134, port_id, 1, 0) == 0);
+  const std::uint32_t port = dalRead32(base, port_id);
+  CHECK(port == 0x0e000000);
+  CHECK(syscallAs(*a, 138, port, 1, 2, 3) == err(dal::kCellEnotconn));
+  CHECK(syscallAs(*a, 136, port, 0x8d000fff) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 136, port, queue) == 0);
+  CHECK(syscallAs(*a, 136, port, queue) == err(dal::kCellEisconn));
+  CHECK(syscallAs(*a, 135, port) == err(dal::kCellEisconn));
+
+  CHECK(syscallAs(*a, 138, port, 0x11, 0x22, 0x33) == 0);
+  CHECK(syscallAs(*a, 138, port, 0x44, 0x55, 0x66) == 0);
+  CHECK(syscallAs(*a, 138, port, 0x77, 0x88, 0x99) == err(dal::kCellEbusy));  // queue full
+  CHECK(syscallAs(*a, 130, queue, sys_event, 1000) == 0);
+  DalPpuContext* actx = &a->context();
+  CHECK(actx->gpr[4] == ((std::uint64_t{1} << 32) | port));  // unnamed port: pid << 32 | id
+  CHECK(actx->gpr[5] == 0x11 && actx->gpr[6] == 0x22 && actx->gpr[7] == 0x33);
+  CHECK(dalRead64(base, sys_event) == 0);  // the event pointer is never written
+  CHECK(syscallAs(*a, 133, queue) == 0);   // drain
+  CHECK(syscallAs(*a, 130, queue, sys_event, 1000) == err(dal::kCellEtimedout));
+
+  // A named port reports its name; a blocked receiver gets the event directly.
+  CHECK(syscallAs(*a, 137, port) == 0);
+  CHECK(syscallAs(*a, 137, port) == err(dal::kCellEnotconn));
+  CHECK(syscallAs(*a, 135, port) == 0);
+  CHECK(syscallAs(*a, 134, port_id, 1, 0xabcd) == 0);
+  const std::uint32_t named = dalRead32(base, port_id);
+  CHECK(syscallAs(*a, 136, named, queue) == 0);
+  {
+    std::atomic<bool> receiving{false};
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      receiving = true;
+      b_result = syscallAs(*b, 130, queue, sys_event, 0);
+    });
+    dal::guestLock().unlock();
+    while (!receiving) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(syscallAs(*a, 129, queue, 0) == err(dal::kCellEbusy));  // a receiver waits
+    CHECK(syscallAs(*a, 138, named, 7, 8, 9) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  }
+  CHECK(b_result == 0);
+  DalPpuContext* bctx = &b->context();
+  CHECK(bctx->gpr[4] == 0xabcd && bctx->gpr[5] == 7 && bctx->gpr[6] == 8 && bctx->gpr[7] == 9);
+
+  // Forced destroy cancels receivers; the port is then disconnected.
+  {
+    std::atomic<bool> receiving{false};
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      receiving = true;
+      b_result = syscallAs(*b, 130, queue, sys_event, 0);
+    });
+    dal::guestLock().unlock();
+    while (!receiving) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(syscallAs(*a, 129, queue, 2) == err(dal::kCellEinval));
+    CHECK(syscallAs(*a, 129, queue, 1) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+  }
+  CHECK(b_result == err(dal::kCellEcanceled));
+  CHECK(syscallAs(*a, 129, queue, 0) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 130, queue, sys_event, 1000) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*a, 138, named, 1, 2, 3) == err(dal::kCellEnotconn));
+  CHECK(syscallAs(*a, 135, named) == 0);
+  CHECK(syscallAs(*a, 135, named) == err(dal::kCellEsrch));
 
   p.main.free(scratch);
   dal::resetSyncObjects();
@@ -1528,6 +1739,7 @@ int main(int argc, char** argv) {
   testStartupSyscalls();
   testSysPrxForUser();
   testMutexAndCond();
+  testEventObjects();
   testLwmutex();
   testPpuThreads();
   testTimebase();
