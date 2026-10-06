@@ -6,7 +6,7 @@ from ps3recomp import cell
 from ps3recomp.elf import ElfError, ElfFile
 
 from tests import elf_fixture as fx
-from tests.elf_fixture import FixtureSegment, build_elf64_be
+from tests.elf_fixture import FixtureSection, FixtureSegment, build_elf64_be
 
 
 def _patched(data: bytes, elf: ElfFile, va: int, payload: bytes) -> ElfFile:
@@ -141,6 +141,50 @@ class Ps3FixtureTest(unittest.TestCase):
         self.assertEqual(mods[0].functions, [])
 
 
+class FindTextRangeTest(unittest.TestCase):
+    TEXT_VA = 0x10000
+
+    def _elf(self, sections, text_size=0x40, with_sections=True):
+        data = build_elf64_be(
+            entry=0x10000,
+            segments=[FixtureSegment(1, self.TEXT_VA, bytes(text_size), flags=5),
+                      FixtureSegment(1, 0x20000, bytes(0x40), flags=6)],
+            sections=sections if with_sections else None)
+        return ElfFile.from_bytes(data)
+
+    def test_canonical_fixture(self):
+        elf = ElfFile.from_bytes(fx.build_ps3_fixture())
+        self.assertEqual(cell.find_text_range(elf), (0x10000, 0x10020))
+
+    def test_without_sections_uses_exec_segment(self):
+        elf = self._elf(None, text_size=0x22, with_sections=False)
+        self.assertEqual(elf.sections, [])
+        self.assertEqual(cell.find_text_range(elf), (0x10000, 0x10020))
+
+    def test_largest_section_wins(self):
+        elf = self._elf([FixtureSection("", 1, 0x10000, 0x10, flags=4),
+                         FixtureSection("", 1, 0x10010, 0x20, flags=6)])
+        self.assertEqual(cell.find_text_range(elf), (0x10010, 0x10030))
+
+    def test_tie_prefers_lowest_address(self):
+        elf = self._elf([FixtureSection("", 1, 0x10020, 0x10, flags=4),
+                         FixtureSection("", 1, 0x10000, 0x10, flags=4)])
+        self.assertEqual(cell.find_text_range(elf), (0x10000, 0x10010))
+
+    def test_ignores_non_exec_nobits_and_outside_sections(self):
+        elf = self._elf([FixtureSection("", 1, 0x10000, 0x30, flags=2),
+                         FixtureSection("", 8, 0x10000, 0x38, flags=6),
+                         FixtureSection("", 1, 0x20000, 0x40, flags=6),
+                         FixtureSection("", 1, 0x90000, 0x1000, flags=6)])
+        # No usable section: falls back to the whole exec segment.
+        self.assertEqual(cell.find_text_range(elf), (0x10000, 0x10040))
+
+    def test_no_exec_segment(self):
+        data = build_elf64_be(entry=0, segments=[FixtureSegment(1, 0x20000, bytes(8))])
+        with self.assertRaises(ElfError):
+            cell.find_text_range(ElfFile.from_bytes(data))
+
+
 @unittest.skipUnless(os.environ.get("DAL_EBOOT_ELF"), "DAL_EBOOT_ELF is not set")
 class RealEbootCellTest(unittest.TestCase):
     @classmethod
@@ -149,6 +193,9 @@ class RealEbootCellTest(unittest.TestCase):
         if not os.path.isfile(path):
             raise unittest.SkipTest("DAL_EBOOT_ELF does not point to a file")
         cls.elf = ElfFile.from_path(path)
+
+    def test_text_range(self):
+        self.assertEqual(cell.find_text_range(self.elf), (0x00010230, 0x000DCF2C))
 
     def test_entry(self):
         entry = cell.parse_entry(self.elf)

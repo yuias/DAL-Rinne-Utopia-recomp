@@ -11,7 +11,9 @@ PT_TLS = 7
 PT_SCE_PROC_PARAM = 0x60000001
 PT_SCE_PRX_PARAM = 0x60000002
 
-PROC_PARAM_MAGIC = 0x13BCC5F6
+SHF_EXECINSTR = 0x4
+
+PROC_PARAM_MAGIC =0x13BCC5F6
 PRX_PARAM_MAGIC = 0x1B434CEC
 
 IMPORT_ENTRY_SIZE = 0x2C
@@ -98,6 +100,32 @@ def parse_entry(elf: ElfFile) -> EntryInfo:
         return EntryInfo("opd", elf.e_entry, func, toc)
     # e_entry already points at code (non-PS3 style); there is no TOC to report.
     return EntryInfo("code", None, elf.e_entry, None)
+
+
+def find_text_range(elf: ElfFile) -> tuple[int, int]:
+    """Return `(start, end_exclusive)` of the main code range.
+
+    Picks the largest executable section backed by file data inside an executable
+    segment (ties: lowest address). Sections are unnamed in RPCS3 output, so the name
+    is never consulted. Without such a section the first executable segment is used.
+    """
+    segments = elf.exec_segments()
+    best: tuple[int, int] | None = None
+    for sec in elf.sections:
+        if (not sec.sh_flags & SHF_EXECINSTR or sec.sh_type == SHT_NOBITS
+                or not sec.data_present or sec.sh_size == 0):
+            continue
+        start, end = sec.sh_addr, sec.sh_addr + sec.sh_size
+        if not any(s.p_vaddr <= start and end <= s.p_vaddr + s.p_filesz for s in segments):
+            continue
+        if best is None or (end - start, -start) > (best[1] - best[0], -best[0]):
+            best = (start, end)
+    if best is not None:
+        return best
+    if not segments:
+        raise ElfError("no executable segment")
+    seg = segments[0]
+    return seg.p_vaddr, seg.p_vaddr + seg.p_filesz // 4 * 4
 
 
 def parse_opd_section(elf: ElfFile) -> list[tuple[int, int]] | None:
