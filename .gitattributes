@@ -10,6 +10,8 @@
 *.cxx       text eol=lf
 *.md        text eol=lf
 *.sh        text eol=lf
+*.py        text eol=lf
+*.ps1       text eol=crlf
 
 *.json      text eol=lf
 CMakeLists.txt text eol=lf
