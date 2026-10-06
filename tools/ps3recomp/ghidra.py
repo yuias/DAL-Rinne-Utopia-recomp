@@ -142,6 +142,20 @@ def _covered(merged: list[tuple[int, int]], start: int, end: int) -> bool:
     return any(s <= start and end <= e for s, e in merged)
 
 
+def _uncovered(merged: list[tuple[int, int]], start: int, end: int) -> list[tuple[int, int]]:
+    holes = []
+    cur = start
+    for s, e in merged:
+        if e <= cur or s >= end:
+            continue
+        if s > cur:
+            holes.append((cur, s))
+        cur = max(cur, e)
+    if cur < end:
+        holes.append((cur, end))
+    return holes
+
+
 def validate_export(export: dict, elf: ElfFile, sha256: str) -> None:
     if not isinstance(export, dict):
         raise CliError(EXIT_IO, "invalid Ghidra export: not a JSON object")
@@ -162,11 +176,15 @@ def validate_export(export: dict, elf: ElfFile, sha256: str) -> None:
     export_text_range(export)
 
     merged = _merged_blocks(export)
+    # Ghidra's ELF loader maps sections, so the alignment padding between them is left
+    # unmapped. Only holes with non-zero file content indicate a real mismatch.
     for seg in elf.loads():
-        if seg.p_filesz and not _covered(merged, seg.p_vaddr, seg.p_vaddr + seg.p_filesz):
-            raise CliError(EXIT_TOOL, "Ghidra memory map does not match PT_LOAD segments: "
-                           "file range 0x%08x-0x%08x is not covered"
-                           % (seg.p_vaddr, seg.p_vaddr + seg.p_filesz))
+        if not seg.p_filesz:
+            continue
+        for lo, hi in _uncovered(merged, seg.p_vaddr, seg.p_vaddr + seg.p_filesz):
+            if any(elf.read_va(lo, hi - lo)):
+                raise CliError(EXIT_TOOL, "Ghidra memory map does not match PT_LOAD segments: "
+                               "file range 0x%08x-0x%08x is not covered" % (lo, hi))
     for seg in elf.loads():
         if seg.p_memsz > seg.p_filesz:
             lo, hi = seg.p_vaddr + seg.p_filesz, seg.p_vaddr + seg.p_memsz
