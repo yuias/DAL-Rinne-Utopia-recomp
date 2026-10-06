@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import struct
 import sys
+from collections import Counter
 from pathlib import Path
 
 from . import cell
 from .elf import EM_SPU, ELFCLASS32, PF_R, PF_W, PF_X, ElfError, ElfFile
 from .info import (DEFAULT_CONFIG, EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliError,
                    load_config, parse_ppu_elf, read_input, reject_encrypted)
+from .ppu import decode
 
 DEFAULT_OUTPUT = REPO_ROOT / "generated" / "analysis" / "probe.json"
 
@@ -69,6 +72,44 @@ def _imageJson(main: ElfFile, data: bytes, hit: int, elf: ElfFile) -> dict:
     }
 
 
+_SC_LOOKBACK = 8
+_BRANCHES = frozenset({"b", "bc", "bclr", "bcctr"})
+# `sc` with LEV = 0, the lv2 syscall form. The decoder's `sc` entry matches the primary
+# opcode only, so it also hits float constants and ASCII data; compare the whole word.
+_SC_WORD = 0x44000002
+
+
+def census_syscalls(main: ElfFile) -> dict:
+    """Count `sc` sites and resolve the lv2 number from a preceding `li r11, N`."""
+    sites = unresolved = 0
+    by_number: Counter = Counter()
+    for seg in main.exec_segments():
+        size = seg.p_filesz // 4 * 4
+        words = struct.unpack(">%dI" % (size // 4), main.read_va(seg.p_vaddr, size))
+        for i, word in enumerate(words):
+            if word != _SC_WORD:
+                continue
+            sites += 1
+            number = None
+            for j in range(i - 1, max(i - 1 - _SC_LOOKBACK, -1), -1):
+                insn = decode(words[j])
+                name = insn.spec.name if insn.spec is not None else None
+                if name in _BRANCHES:
+                    break
+                if name == "addi" and insn.field("rD") == 11 and insn.field("rA") == 0:
+                    number = insn.field("SIMM")
+                    break
+            if number is None:
+                unresolved += 1
+            else:
+                by_number[number] += 1
+    return {
+        "sites": sites,
+        "unresolved": unresolved,
+        "by_number": {str(n): by_number[n] for n in sorted(by_number)},
+    }
+
+
 def build_probe(main: ElfFile, data: bytes, path: str, sha256: str) -> dict:
     spu_images, other_elfs = [], []
     invalid = 0
@@ -98,6 +139,7 @@ def build_probe(main: ElfFile, data: bytes, path: str, sha256: str) -> dict:
         "other_elfs": other_elfs,
         "invalid_magic_hits": invalid,
         "imports": imports,
+        "syscalls": census_syscalls(main),
         "summary": {
             "spu_image_count": len(spu_images),
             "spu_related_imports": [i["name"] for i in imports if i["spu_related"]],
@@ -141,6 +183,9 @@ def _run(args: argparse.Namespace) -> int:
     summary = report["summary"]
     print("spu images: %d" % summary["spu_image_count"])
     print("spu-related imports: %s" % (", ".join(summary["spu_related_imports"]) or "none"))
+    sc = report["syscalls"]
+    print("syscalls: %d sites, %d distinct, %d unresolved"
+          % (sc["sites"], len(sc["by_number"]), sc["unresolved"]))
     return 0
 
 

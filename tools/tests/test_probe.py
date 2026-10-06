@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,8 @@ class SpuFixtureTest(ProbeTestBase):
         lines = self.stdout.splitlines()
         self.assertRegex(lines[0], r"^spu file_off=0x[0-9a-f]{8} vaddr=0x00020200 "
                                    r"size=0x[0-9a-f]{8} entry=0x00000000 sha256=[0-9a-f]{16}$")
-        self.assertEqual(lines[1:], ["spu images: 1", "spu-related imports: cellSpurs"])
+        self.assertEqual(lines[1:], ["spu images: 1", "spu-related imports: cellSpurs",
+                                     "syscalls: 1 sites, 1 distinct, 0 unresolved"])
 
 
 class NoSpuFixtureTest(ProbeTestBase):
@@ -102,6 +104,58 @@ class NoSpuFixtureTest(ProbeTestBase):
         doc = self.load_output()
         self.assertEqual(doc["spu_images"], [])
         self.assertEqual([e["machine"] for e in doc["other_elfs"]], [20])
+
+
+class SyscallCensusTest(ProbeTestBase):
+    TEXT_VA = 0x10000
+
+    def patched_fixture(self, words: dict[int, int]) -> bytes:
+        # `words` maps instruction index in the text segment to a replacement word.
+        data = bytearray(fx.build_ps3_fixture())
+        base = ElfFile.from_bytes(bytes(data)).va_to_offset(self.TEXT_VA)
+        for index, word in words.items():
+            struct.pack_into(">I", data, base + 4 * index, word)
+        return bytes(data)
+
+    def census(self, data: bytes) -> dict:
+        code, _, _ = self.run_probe(data)
+        self.assertEqual(code, 0)
+        return self.load_output()["syscalls"]
+
+    def test_fixture(self):
+        self.assertEqual(self.census(fx.build_ps3_fixture()),
+                         {"sites": 1, "unresolved": 0, "by_number": {"141": 1}})
+
+    def test_branch_between_li_and_sc_is_unresolved(self):
+        # li r11,141 ; blr ; sc
+        data = self.patched_fixture({3: 0x4E800020, 4: 0x44000002})
+        self.assertEqual(self.census(data),
+                         {"sites": 1, "unresolved": 1, "by_number": {}})
+
+    def test_lookback_limit(self):
+        nop = 0x60000000
+
+        def census_of(words: list[int]) -> dict:
+            image = fx.build_elf64_be(
+                entry=self.TEXT_VA,
+                segments=[FixtureSegment(fx.PT_LOAD, self.TEXT_VA,
+                                         struct.pack(">%dI" % len(words), *words), flags=5)])
+            return probe.census_syscalls(ElfFile.from_bytes(image))
+
+        li, sc = 0x3960008D, 0x44000002
+        # The li is 9 instructions before the sc: out of reach.
+        self.assertEqual(census_of([li] + [nop] * 8 + [sc]),
+                         {"sites": 1, "unresolved": 1, "by_number": {}})
+        # The li is exactly 8 instructions before the sc.
+        self.assertEqual(census_of([li] + [nop] * 7 + [sc]),
+                         {"sites": 1, "unresolved": 0, "by_number": {"141": 1}})
+
+    def test_by_number_sorted_numerically(self):
+        words = {0: 0x3960000A, 1: 0x44000002, 2: 0x39600064, 3: 0x44000002,
+                 4: 0x3960000A, 5: 0x44000002}
+        census = self.census(self.patched_fixture(words))
+        self.assertEqual(census["sites"], 3)
+        self.assertEqual(list(census["by_number"].items()), [("10", 2), ("100", 1)])
 
 
 class ErrorTest(ProbeTestBase):

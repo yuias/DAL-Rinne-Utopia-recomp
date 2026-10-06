@@ -106,6 +106,12 @@ class RealEbootProbeTest(unittest.TestCase):
         self.assertEqual(len(spurs), 1)
         self.assertEqual(spurs[0]["num_func"], 4)
 
+    def test_syscall_census(self):
+        self.assertIn("syscalls", self.doc)
+        sc = self.doc["syscalls"]
+        self.assertEqual(sc["sites"], sc["unresolved"] + sum(sc["by_number"].values()),
+                         "census: %r" % (sc,))
+
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
                      "DAL_EBOOT_ELF is not set or does not name an existing file")
