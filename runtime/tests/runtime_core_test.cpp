@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -44,6 +45,7 @@
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
+#include "rsx/rsx_census.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
 #include "zlib.h"
@@ -4394,6 +4396,110 @@ dal::RsxCensus fakeRsxCensusWithHandlerCalls() {
   return census;
 }
 
+// Words of a fragment program as stored in guest memory: the 16-bit halves of each word swapped.
+std::uint32_t fpStoredWord(std::uint32_t decoded) { return std::rotl(decoded, 16); }
+
+void testRsxArgCensus() {
+  CHECK(dal::rsxMethodName(0x1A04 + 2 * 0x20) == "NV4097_SET_TEXTURE_FORMAT[2]");
+  CHECK(dal::rsxMethodName(0x0208) == "NV4097_SET_SURFACE_FORMAT");
+  CHECK(dal::rsxMethodName(0x0004) == "0x0004");
+  CHECK(dal::rsxDecodeArgument(0x0208, 8 | (2u << 5) | (2u << 8) | (10u << 16) | (9u << 24)) ==
+        "color=A8R8G8B8 depth=Z24S8 type=swizzle aa=center_1 size=1024x512");
+  CHECK(dal::rsxDecodeArgument(0x1A04 + 0x20, 2 | (2u << 4) | (0xA5u << 8) | (1u << 16)) ==
+        "location=main cubemap=0 border=0 dim=2D format=A8R8G8B8_LN_NR mipmaps=1");
+  CHECK(dal::rsxTextureFormatName(0x86 | 0x40) == "DXT1_SZ_UN");
+  CHECK(dal::rsxDecodeArgument(0x1814, 5 | (3u << 24)) == "first=5 count=4");
+  CHECK(dal::rsxDecodeArgument(0x1808, 5) == "TRIANGLES");
+  CHECK(dal::rsxDecodeArgument(0x08E4, 0x1000 | 2) == "location=main offset=0x1000");
+  CHECK(dal::rsxDecodeArgument(0x1740, 2 | (3u << 4) | (12u << 8)) == "type=f size=3 stride=12 frequency=0");
+  CHECK(dal::rsxDecodeArgument(0x1680, 0x80000040) == "location=main offset=0x40");
+  CHECK(dal::rsxDecodeArgument(0x0324, (1u << 16) | 1u) == "R-B-");
+  CHECK(dal::rsxFpOpcodeName(0x42) == "IFE" && dal::rsxFpOpcodeName(0x30) == "OP_0x30");
+  CHECK(dal::rsxVpVecOpcodeName(7) == "DP4" && dal::rsxVpScaOpcodeName(2) == "RCP");
+
+  // Fragment program: MOV, then MUL with an inline constant and the end flag.
+  const std::vector<std::uint32_t> fp = {
+      fpStoredWord(1u << 24), 0, 0, 0,                                      // MOV
+      fpStoredWord((2u << 24) | 1u), 0, fpStoredWord(2u), 0,                // MUL, end, src1 is a constant
+      0x3F800000, 0x3F800000, 0, 0,                                         // the constant
+  };
+  const auto fpReader = [&](std::uint32_t index, std::uint32_t& word) {
+    if (index >= fp.size()) return false;
+    word = fp[index];
+    return true;
+  };
+  const dal::RsxFpScan scan = dal::scanFragmentProgram(fpReader);
+  CHECK(scan.terminated && scan.instructions == 2 && scan.constant_words == 1 && scan.words.size() == 12);
+  CHECK((scan.opcodes == std::map<std::uint32_t, std::uint32_t>{{1, 1}, {2, 1}}));
+  // The opcode's high bit lives in the second source word.
+  const std::vector<std::uint32_t> hi = {fpStoredWord((2u << 24) | 1u), 0, fpStoredWord(0x80000000u), 0};
+  const dal::RsxFpScan hi_scan = dal::scanFragmentProgram([&](std::uint32_t index, std::uint32_t& word) {
+    if (index >= hi.size()) return false;
+    word = hi[index];
+    return true;
+  });
+  CHECK(hi_scan.terminated && hi_scan.opcodes.count(0x42) == 1);
+  // A program that runs off readable memory is not reported as terminated.
+  const dal::RsxFpScan cut = dal::scanFragmentProgram([&](std::uint32_t index, std::uint32_t& word) {
+    if (index >= 8) return false;
+    word = fp[index];
+    return true;
+  });
+  CHECK(!cut.terminated && cut.instructions == 2);
+
+  std::vector<std::uint32_t> ucode(dal::kRsxVpInstructionCount * 4, 0);
+  ucode[3 * 4 + 1] = (1u << 22) | (2u << 27);  // MOV / RCP
+  ucode[4 * 4 + 3] = 1;                        // end
+  const dal::RsxVpScan vp = dal::scanVertexProgram(ucode.data(), 3);
+  CHECK(vp.terminated && vp.instructions == 2);
+  CHECK((vp.vec_opcodes == std::map<std::uint32_t, std::uint32_t>{{0, 1}, {1, 1}}));
+  CHECK((vp.sca_opcodes == std::map<std::uint32_t, std::uint32_t>{{0, 1}, {2, 1}}));
+  CHECK(!dal::scanVertexProgram(std::vector<std::uint32_t>(dal::kRsxVpInstructionCount * 4, 0).data(), 540).terminated);
+
+  // Collector: feed the register writes of one draw.
+  namespace stdfs = std::filesystem;
+  const stdfs::path root = stdfs::temp_directory_path() / ("dal_rsx_census_test_" + std::to_string(GetCurrentProcessId()));
+  std::error_code ec;
+  stdfs::remove_all(root, ec);
+  dal::RsxArgCensus census(
+      root / "census.json", root / "dump",
+      [&](std::uint32_t location, std::uint32_t offset, std::uint32_t& word) {
+        return location == 1 && offset >= 0x2000 && offset % 4 == 0 && fpReader((offset - 0x2000) / 4, word);
+      },
+      1000000);
+  census.onWrite(0x0208, 8 | (2u << 5) | (2u << 8) | (10u << 16) | (9u << 24));
+  census.onWrite(0x1740, 2 | (3u << 4) | (12u << 8));
+  census.onWrite(0x1A0C, 1u << 31);
+  census.onWrite(0x1A04, 2 | (2u << 4) | (0xA5u << 8));
+  census.onWrite(0x08E4, 0x2000 | 2);
+  census.onWrite(0x1E9C, 0);
+  census.onWrite(0x1EA0, 0);
+  for (std::uint32_t i = 0; i < 4; i++) census.onWrite(0x0B80 + i * 4, i == 3 ? 1u : (i == 1 ? (1u << 22) : 0u));
+  census.onWrite(0x1808, 5);
+  census.onWrite(0x1814, 0 | (5u << 24));
+  census.onWrite(0x1808, 0);
+  census.onFlip(1500000);
+  census.onFlip(2500000);
+  CHECK(census.writesOf(0x0208) == 1 && census.distinctValuesOf(0x0208) == 1);
+  CHECK(census.writesOf(0x0B80) == 1 && census.draws() == 1);
+  CHECK(census.fragmentProgramCount() == 1 && census.vertexProgramCount() == 1);
+  const std::string json = census.formatJson();
+  CHECK(json.find("\"name\": \"NV4097_SET_SURFACE_FORMAT\"") != std::string::npos);
+  CHECK(json.find("A8R8G8B8_LN_NR") != std::string::npos);
+  CHECK(json.find("\"flips_per_second\"") != std::string::npos);
+  CHECK(json.find("\"instructions\": 2") != std::string::npos);
+  CHECK(census.writeFiles());
+  std::size_t dumps = 0;
+  for (const auto& entry : stdfs::directory_iterator(root / "dump")) {
+    const std::string name = entry.path().filename().string();
+    dumps += (name.starts_with("fp_") || name.starts_with("vp_")) && name.ends_with(".bin") ? 1 : 0;
+    if (name.starts_with("fp_")) CHECK(stdfs::file_size(entry.path()) == 48);
+    if (name.starts_with("vp_")) CHECK(stdfs::file_size(entry.path()) == 16);
+  }
+  CHECK(dumps == 2 && stdfs::exists(root / "census.json"));
+  stdfs::remove_all(root, ec);
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -5794,6 +5900,7 @@ int main(int argc, char** argv) {
   testCellSaveData();
   testCellPngDec();
   testFifoParser();
+  testRsxArgCensus();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();

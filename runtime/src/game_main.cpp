@@ -22,6 +22,7 @@
 #include "hle/hle.h"
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
+#include "rsx/rsx_thread.h"
 
 namespace {
 
@@ -32,6 +33,7 @@ struct Options {
   std::string sdata_cache;
   std::string vfs_config;
   std::string png_dump;
+  std::string rsx_census;
   std::string log_file;
   std::string dialog_answer;
   unsigned seconds = 0;
@@ -72,6 +74,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.vfs_config)) return false;
     } else if (arg == "--png-dump") {
       if (!value(opt.png_dump)) return false;
+    } else if (arg == "--rsx-census") {
+      if (!value(opt.rsx_census)) return false;
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
     } else if (arg == "--dialog-answer") {
@@ -208,6 +212,7 @@ int main(int argc, char** argv) {
   }
 
   loadGameParamSfo();
+  if (!opt.rsx_census.empty()) dal::setRsxArgCensusFile(opt.rsx_census);
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();

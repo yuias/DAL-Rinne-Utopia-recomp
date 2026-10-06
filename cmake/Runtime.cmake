@@ -113,6 +113,7 @@ function(dal_runtime_add_core)
     runtime/src/lv2/vfs_config.cpp
     runtime/src/rsx/fifo_parser.cpp
     runtime/src/rsx/gcm_interrupts.cpp
+    runtime/src/rsx/rsx_census.cpp
     runtime/src/rsx/rsx_state.cpp
     runtime/src/rsx/rsx_thread.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
@@ -124,7 +125,7 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
   target_link_libraries(dal_runtime_core PRIVATE png_static)
-  # PRIVATE as well: JSON types stay inside vfs_config.cpp.
+  # PRIVATE as well: JSON types stay inside vfs_config.cpp and rsx_census.cpp.
   target_link_libraries(dal_runtime_core PRIVATE yyjson)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)

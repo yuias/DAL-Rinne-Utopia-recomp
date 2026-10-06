@@ -8,10 +8,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <string>
 
 #include "core/census.h"
 #include "rsx/fifo_parser.h"
+#include "rsx/rsx_census.h"
 
 namespace dal {
 
@@ -45,6 +48,10 @@ class RsxConsumer final : public RsxSink {
   void vblankTick();
 
   RsxCensus census() const;
+
+  // Collects the argument census (rsx/rsx_census.h) from now on. Call before the first write.
+  void enableArgCensus(std::filesystem::path json_path, std::filesystem::path dump_dir);
+  RsxArgCensus* argCensus() { return arg_census_.get(); }
   bool faulted() const { return faulted_; }
   std::uint32_t parserGet() const { return get_; }
 
@@ -61,6 +68,8 @@ class RsxConsumer final : public RsxSink {
   // one of the areas the consumer serves.
   bool resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size, std::uint32_t& ea) const;
   void resetDmaRegisters();
+  // Word of RSX-visible memory for the argument census: location 0 = local, 1 = main (IO map).
+  bool readCensusWord(std::uint32_t location, std::uint32_t offset, std::uint32_t& word) const;
 
   std::uint8_t* base_;
   FifoParser parser_;
@@ -81,7 +90,12 @@ class RsxConsumer final : public RsxSink {
 
   std::atomic<std::uint64_t> headers_{0}, flips_{0}, user_commands_{0};
   std::unique_ptr<std::atomic<std::uint64_t>[]> method_counts_;  // by register offset >> 2
+  std::unique_ptr<RsxArgCensus> arg_census_;  // null unless --rsx-census
 };
+
+// Turns the argument census on for the consumer startRsxThread creates; written to `json_path` (the
+// program dumps go to generated/rsx) when the process stops. Call before startRsxThread.
+void setRsxArgCensusFile(std::string json_path);
 
 // Starts the consumer thread over the guest memory at `base` and registers its census section.
 // Call once after the RSX state is initialised; later calls do nothing.

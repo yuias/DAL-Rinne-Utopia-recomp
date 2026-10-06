@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <string>
 #include <thread>
@@ -112,6 +113,29 @@ bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
   if (!execute(method, value)) return false;
   // Counted on completion, so a write retried while waiting is counted once.
   method_counts_[(method >> 2) & (kMethodCount - 1)].fetch_add(1, std::memory_order_relaxed);
+  if (arg_census_ != nullptr) arg_census_->onWrite(method, value);
+  return true;
+}
+
+void RsxConsumer::enableArgCensus(std::filesystem::path json_path, std::filesystem::path dump_dir) {
+  arg_census_ = std::make_unique<RsxArgCensus>(
+      std::move(json_path), std::move(dump_dir),
+      [this](std::uint32_t location, std::uint32_t offset, std::uint32_t& word) {
+        return readCensusWord(location, offset, word);
+      },
+      systemTimeUs());
+}
+
+bool RsxConsumer::readCensusWord(std::uint32_t location, std::uint32_t offset, std::uint32_t& word) const {
+  std::uint32_t ea = 0;
+  if (location == 0) {
+    if (offset >= kRsxLocalSize || (offset & 3) != 0) return false;
+    ea = kRsxLocalBase + offset;
+  } else if (!rsxIoToEa(offset, ea)) {
+    return false;
+  }
+  if (!process().memory.isCommitted(ea, 4)) return false;
+  word = dalRead32(base_, ea);
   return true;
 }
 
@@ -268,6 +292,7 @@ bool RsxConsumer::flip(std::uint32_t buffer) {
   state.flip_status = kRsxFlipStatusDone;
   const std::uint64_t now = systemTimeUs();
   state.last_flip_time = now > kFlipTimeOffsetUs ? now - kFlipTimeOffsetUs : 0;
+  if (arg_census_ != nullptr) arg_census_->onFlip(now);
   std::memset(base_ + kRsxLabelAddr + kFlipSemaphoreOffset, 0, 16);
   // RPCS3 resets the method registers on every flip; the context DMA objects are the ones that matter.
   resetDmaRegisters();
@@ -286,6 +311,7 @@ void RsxConsumer::userCommand(std::uint32_t cause) {
 
 void RsxConsumer::vblankTick() {
   rsxState().vblank_count++;
+  if (arg_census_ != nullptr) arg_census_->onVBlank(systemTimeUs());
   signalInterrupt(RsxInterrupt::VBlank, 1);
 }
 
@@ -346,6 +372,7 @@ RsxCensus RsxConsumer::census() const {
 namespace {
 
 RsxConsumer* g_consumer = nullptr;
+std::string g_arg_census_file;
 
 RsxCensus consumerCensus() {
   RsxCensus result = g_consumer != nullptr ? g_consumer->census() : RsxCensus{};
@@ -354,6 +381,10 @@ RsxCensus consumerCensus() {
   result.flip_handler_runs = calls.flip;
   result.user_handler_runs = calls.user;
   return result;
+}
+
+void writeArgCensus() {
+  if (g_consumer != nullptr && g_consumer->argCensus() != nullptr) g_consumer->argCensus()->writeFiles();
 }
 
 // A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
@@ -418,11 +449,17 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
 
 }  // namespace
 
+void setRsxArgCensusFile(std::string json_path) { g_arg_census_file = std::move(json_path); }
+
 void startRsxThread(std::uint8_t* base) {
   if (g_consumer != nullptr) return;
   // Leaked: the thread runs until the process ends.
   g_consumer = new RsxConsumer(base);
   setRsxCensusProvider(&consumerCensus);
+  if (!g_arg_census_file.empty()) {
+    g_consumer->enableArgCensus(g_arg_census_file, std::filesystem::path("generated") / "rsx");
+    setRsxArgCensusWriter(&writeArgCensus);
+  }
   std::thread(consumerLoop, g_consumer, base).detach();
 }
 

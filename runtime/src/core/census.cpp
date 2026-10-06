@@ -29,6 +29,7 @@ struct CensusState {
   std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> unknown_targets;
   ThreadCensusFn thread_fn = nullptr;
   RsxCensusFn rsx_fn = nullptr;
+  CensusWriterFn rsx_arg_writer = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -144,6 +145,12 @@ void setRsxCensusProvider(RsxCensusFn fn) {
   s.rsx_fn = fn;
 }
 
+void setRsxArgCensusWriter(CensusWriterFn fn) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.rsx_arg_writer = fn;
+}
+
 std::string formatCensus() {
   CensusState& s = state();
   std::string out;
@@ -234,6 +241,13 @@ void printCensus() {
     logInfo("{}", rest.substr(0, end));
     rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
   }
+  CensusWriterFn writer = nullptr;
+  {
+    CensusState& s = state();
+    std::lock_guard lock(s.mutex);
+    writer = s.rsx_arg_writer;
+  }
+  if (writer != nullptr) writer();
 }
 
 void installCensus() { setCensusPrinter(&printCensus); }
@@ -246,6 +260,7 @@ void resetCensus() {
   s.unknown_targets.clear();
   s.thread_fn = nullptr;
   s.rsx_fn = nullptr;
+  s.rsx_arg_writer = nullptr;
 }
 
 }  // namespace dal

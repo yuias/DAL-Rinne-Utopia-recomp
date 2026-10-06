@@ -63,6 +63,11 @@ struct RsxCensus {
 using RsxCensusFn = RsxCensus (*)();
 void setRsxCensusProvider(RsxCensusFn fn);
 
+// Called once by printCensus() after the text census, on the stop path; the RSX consumer uses it to
+// write its argument census (--rsx-census). Runs without the census lock.
+using CensusWriterFn = void (*)();
+void setRsxArgCensusWriter(CensusWriterFn fn);
+
 // The census as text, one line per element, no trailing newline. Entries are sorted by count
 // (descending) and then by name. In the syscall and HLE headers "default-handled" is the number of
 // distinct entries that used the default handler.
