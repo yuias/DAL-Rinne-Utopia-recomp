@@ -19,6 +19,10 @@ std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_
 // memory is exhausted.
 std::uint32_t allocateTls();
 
+// Gives back the block of a thread whose r13 is `r13` (RPCS3 `ppu_free_tls`). Call with the guest
+// lock held.
+void freeTls(std::uint32_t r13);
+
 // Creates the main thread exactly as RPCS3 `ppu_load_exec` does (stack, argument block, TLS,
 // entry registers), logs the resulting registers and starts it. The thread runs under the guest
 // lock, so it begins once this function has returned.

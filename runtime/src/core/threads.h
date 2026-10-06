@@ -123,6 +123,10 @@ std::uint32_t createGuestThread(const GuestThreadParams& params);
 // thread. Must be called with the guest lock held.
 [[noreturn]] void exitCurrentThread(std::uint64_t value);
 
+// Hands the guest lock to the threads queued behind the caller and queues behind them. Returns
+// false, doing nothing, when nobody waits. Must be called with the guest lock held.
+bool yieldGuestLock();
+
 // Bookkeeping around a blocking wait, used by blockingWait. A null thread (host thread) is ignored.
 void blockEnter(GuestThread* thread, const char* what, bool indefinite);
 void blockLeave(GuestThread* thread);

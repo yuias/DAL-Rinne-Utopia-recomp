@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/boot.h"
 #include "core/census.h"
 #include "core/fatal.h"
 #include "core/guest_memory.h"
@@ -133,9 +134,11 @@ unsigned __stdcall guestThreadMain(void* arg) {
   }
   function(&ctx, base);
 
-  // lr is 0 at entry, so a C return from the entry function ends the thread.
+  // lr is 0 at entry, so a C return from the entry function ends the thread, like a call to
+  // sys_ppu_thread_exit (which also gives the TLS block back).
   logInfo("dal: thread {:#010x} {} returned from its entry function with {:#x}", thread->id(),
           thread->name(), ctx.gpr[3]);
+  freeTls(static_cast<std::uint32_t>(ctx.gpr[13]));
   exitCurrentThread(ctx.gpr[3]);
 }
 
@@ -257,6 +260,15 @@ void exitCurrentThread(std::uint64_t value) {
   std::_Exit(static_cast<int>(ExitCode::Fatal));
 }
 
+bool yieldGuestLock() {
+  GuestLock& lock = guestLock();
+  if (!lock.hasWaiters()) return false;
+  // The ticket lock hands over in arrival order, so this thread queues behind the waiters.
+  lock.unlock();
+  lock.lock();
+  return true;
+}
+
 void blockEnter(GuestThread* thread, const char* what, bool indefinite) {
   if (thread != nullptr) thread->setBlocked(what, indefinite, steadyMs());
 }
@@ -302,12 +314,7 @@ extern "C" {
 void dalYield(DalPpuContext* ctx, uint8_t* base) {
   (void)base;
   ctx->preempt_budget = kDalPreemptBudget;
-  dal::GuestLock& lock = dal::guestLock();
-  if (lock.hasWaiters()) {
-    // The ticket lock hands over in arrival order, so this thread queues behind the waiters.
-    lock.unlock();
-    lock.lock();
-  }
+  dal::yieldGuestLock();
 }
 
 }  // extern "C"

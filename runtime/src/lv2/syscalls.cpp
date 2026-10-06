@@ -38,6 +38,13 @@ void sysCondWait(DalPpuContext* ctx, std::uint8_t* base);
 void sysCondSignal(DalPpuContext* ctx, std::uint8_t* base);
 void sysCondSignalAll(DalPpuContext* ctx, std::uint8_t* base);
 
+// Handlers defined in sys_ppu_thread.cpp.
+void sysPpuThreadExit(DalPpuContext* ctx, std::uint8_t* base);
+void sysPpuThreadYield(DalPpuContext* ctx, std::uint8_t* base);
+void sysPpuThreadJoin(DalPpuContext* ctx, std::uint8_t* base);
+void sysPpuThreadSetPriority(DalPpuContext* ctx, std::uint8_t* base);
+void sysPpuThreadGetPriority(DalPpuContext* ctx, std::uint8_t* base);
+
 namespace {
 
 // The numbers the game's code issues (found by scanning the generated code for the r11 value in
@@ -45,9 +52,11 @@ namespace {
 // which mirrors RPCS3 `Emu/Cell/lv2/lv2.cpp`; 988 has none. Keep sorted by number.
 constexpr SyscallEntry kSyscalls[] = {
     {22, "_sys_process_exit", sysProcessExit},
-    {44, "sys_ppu_thread_join", nullptr},
-    {47, "sys_ppu_thread_set_priority", nullptr},
-    {48, "sys_ppu_thread_get_priority", nullptr},
+    {41, "_sys_ppu_thread_exit", sysPpuThreadExit},
+    {43, "sys_ppu_thread_yield", sysPpuThreadYield},
+    {44, "sys_ppu_thread_join", sysPpuThreadJoin},
+    {47, "sys_ppu_thread_set_priority", sysPpuThreadSetPriority},
+    {48, "sys_ppu_thread_get_priority", sysPpuThreadGetPriority},
     {82, "sys_event_flag_create", nullptr},
     {83, "sys_event_flag_destroy", nullptr},
     {85, "sys_event_flag_wait", nullptr},

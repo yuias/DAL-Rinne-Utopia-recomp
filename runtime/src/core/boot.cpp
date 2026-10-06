@@ -83,6 +83,28 @@ std::uint32_t allocateTls() {
   return block + kTlsSystemArea + kTlsPointerBias;
 }
 
+void freeTls(std::uint32_t r13) {
+  if (!g_tls.ready || r13 < kTlsSystemArea + kTlsPointerBias) {
+    return;
+  }
+  const std::uint32_t block = r13 - kTlsPointerBias - kTlsSystemArea;
+  const std::uint32_t offset = block - g_tls.area;  // wraps for a block below the area
+  if (block >= g_tls.area && offset % g_tls.block_size == 0 &&
+      offset / g_tls.block_size < g_tls.used.size()) {
+    // Same slot test as RPCS3 `ppu_free_tls`; a second free of a slot is reported and ignored.
+    const std::uint32_t slot = offset / g_tls.block_size;
+    if (!g_tls.used[slot]) {
+      logWarn("freeTls({:#x}): block is not allocated", block);
+    }
+    g_tls.used[slot] = false;
+    return;
+  }
+  // A block that did not fit the shared area came from the main region.
+  if (process().main.free(block) == 0) {
+    logWarn("freeTls({:#x}): block is not allocated", block);
+  }
+}
+
 std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_t thread_id,
                             std::uint32_t vaddr, std::uint32_t filesz, std::uint32_t memsz) {
   if (ctx->gpr[13] != 0) {

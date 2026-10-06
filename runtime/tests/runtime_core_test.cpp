@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/boot.h"
 #include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
@@ -25,6 +26,7 @@
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
 #include "lv2/cell_error.h"
+#include "lv2/sys_ppu_thread.h"
 #include "lv2/syscalls.h"
 #include "lv2/sys_sync.h"
 
@@ -490,7 +492,7 @@ void testSyscalls() {
   dal::resetLogOnce();
 
   const auto table = dal::syscallTable();
-  CHECK(table.size() == 55);  // the 53 census numbers plus 22 (_sys_process_exit) and 103
+  CHECK(table.size() == 57);  // the 53 census numbers plus the implemented 22, 41, 43 and 103
   bool sorted = true;
   for (std::size_t i = 1; i < table.size(); i++) sorted = sorted && table[i - 1].number < table[i].number;
   CHECK(sorted);
@@ -502,7 +504,7 @@ void testSyscalls() {
   CHECK(dal::findSyscall(999) == nullptr);
 
   auto ctx = std::make_unique<DalPpuContext>();
-  ctx->gpr[11] = 44;  // sys_ppu_thread_join has no handler yet
+  ctx->gpr[11] = 169;  // sys_spu_initialize has no handler
   ctx->gpr[3] = 0x1234;
   dalSyscall(ctx.get(), nullptr, 0x10000);
   CHECK(ctx->gpr[3] == dal::kCellOk);
@@ -512,14 +514,14 @@ void testSyscalls() {
   dalSyscall(ctx.get(), nullptr, 0x10004);
   CHECK(ctx->gpr[3] == dal::kCellOk);
 
-  CHECK(countContaining(lines, "dal: first sc 44 sys_ppu_thread_join") == 1);
+  CHECK(countContaining(lines, "dal: first sc 169 sys_spu_initialize") == 1);
   CHECK(countContaining(lines, "dal: first sc 999 ?") == 1);
-  CHECK(countContaining(lines, "dal: default sc 44 sys_ppu_thread_join(0x1234") == 1);
+  CHECK(countContaining(lines, "dal: default sc 169 sys_spu_initialize(0x1234") == 1);
   CHECK(countContaining(lines, "dal: default sc 999 ?(0x1234") == 1);
 
   const std::string census = dal::formatCensus();
   CHECK(census.find("census: syscalls 3 calls, 2 distinct, 2 default-handled") != std::string::npos);
-  CHECK(census.find("  sc 44 sys_ppu_thread_join: 2 [default]") != std::string::npos);
+  CHECK(census.find("  sc 169 sys_spu_initialize: 2 [default]") != std::string::npos);
   CHECK(census.find("  sc 999 ?: 1 [default]") != std::string::npos);
 
   dal::setLogSink({});
@@ -755,7 +757,7 @@ void testSysPrxForUser() {
   CHECK(t0 != 0 && call(6) >= t0);
   CHECK(call(7, 0x55) == 0);
   CHECK(call(8, 0x55) == 0);
-  CHECK(dal::sysPrxForUserHandlers().size() == 19);
+  CHECK(dal::sysPrxForUserHandlers().size() == 23);
 
   dal::setLogSink({});
   dal::resetCensus();
@@ -1043,6 +1045,190 @@ void testLwmutex() {
 
   p.main.free(scratch);
   dal::resetSyncObjects();
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
+// What the entry function of the guest threads below saw; written under the guest lock.
+std::uint64_t g_entry_arg, g_entry_r2, g_entry_r4, g_entry_r13;
+std::uint32_t g_entry_runs, g_once_runs;
+
+DAL_PPU_FUNC(ppuThreadEntry) {
+  g_entry_runs++;
+  g_entry_arg = ctx->gpr[3];
+  g_entry_r2 = ctx->gpr[2];
+  g_entry_r4 = ctx->gpr[4];
+  g_entry_r13 = ctx->gpr[13];
+  if (ctx->gpr[3] == 5) {
+    ctx->gpr[3] = 0x77;
+    dalHleCall(ctx, base, 3);  // sys_ppu_thread_exit: does not return
+    return;
+  }
+  ctx->gpr[3] += 100;  // a C return ends the thread with r3 as the value
+}
+
+DAL_PPU_FUNC(ppuOnceInit) {
+  (void)ctx;
+  (void)base;
+  g_once_runs++;
+}
+
+void testPpuThreads() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::resetPpuThreadState();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t id_out = scratch, opd_entry = scratch + 0x10, opd_init = scratch + 0x20;
+  const std::uint32_t once_ctrl = scratch + 0x30, name = scratch + 0x40, join_out = scratch + 0x80;
+  const std::uint32_t tls_image = scratch + 0x100;
+
+  const DalFuncMapping mappings[] = {{0x10200, ppuThreadEntry}, {0x10210, ppuOnceInit}};
+  dalRegisterFuncs(mappings, 2);
+  dalWrite32(base, opd_entry, 0x10200);
+  dalWrite32(base, opd_entry + 4, 0x1234);
+  dalWrite32(base, opd_init, 0x10210);
+  dalWrite32(base, opd_init + 4, 0x4321);
+
+  constexpr const char* kModule = "sysPrxForUser";
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x24a1ea07, kModule, "sys_ppu_thread_create"},
+      {0x00800010, 0x350d454e, kModule, "sys_ppu_thread_get_id"},
+      {0x00800020, 0xa3e3be68, kModule, "sys_ppu_thread_once"},
+      {0x00800030, 0xaff080a4, kModule, "sys_ppu_thread_exit"},
+  };
+  dal::installImports(imports, 4);
+  enum { kCreate, kGetId, kOnce };
+  auto call = [&](dal::GuestThread& caller, std::uint32_t index, std::uint64_t r3 = 0,
+                  std::uint64_t r4 = 0, std::uint64_t r5 = 0, std::uint64_t r6 = 0,
+                  std::uint64_t r7 = 0, std::uint64_t r8 = 0, std::uint64_t r9 = 0) {
+    DalPpuContext* ctx = &caller.context();
+    ctx->gpr[3] = r3;
+    ctx->gpr[4] = r4;
+    ctx->gpr[5] = r5;
+    ctx->gpr[6] = r6;
+    ctx->gpr[7] = r7;
+    ctx->gpr[8] = r8;
+    ctx->gpr[9] = r9;
+    dalHleCall(ctx, base, index);
+    return ctx->gpr[3];
+  };
+
+  // The guest lock is held throughout: blocking calls release it while they wait.
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  auto caller = makeCaller(0x0e000000);
+
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+  const std::uint32_t probe = dal::allocateTls();
+  dal::freeTls(probe);
+  CHECK(probe != 0);
+
+  // Creation errors give the TLS block back.
+  CHECK(call(*caller, kCreate, id_out, 0, 1, 500, 0x10000, 1, 0) == err(dal::kCellEfault));
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 1, 3072, 0x10000, 1, 0) == err(dal::kCellEinval));
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 1, static_cast<std::uint64_t>(-1), 0x10000, 1,
+             0) == err(dal::kCellEinval));
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 1, 500, 0x10000, 3, 0) == err(dal::kCellEperm));
+  CHECK(call(*caller, kCreate, 0, opd_entry, 1, 500, 0x10000, 1, 0) == err(dal::kCellEnomem));
+  const std::uint32_t probe2 = dal::allocateTls();
+  dal::freeTls(probe2);
+  CHECK(probe2 == probe);
+  CHECK(g_entry_runs == 0);
+
+  // A joinable thread starts at the descriptor with r3 = arg, r4 = 0, r2 = TOC and its own r13.
+  const char long_name[] = "a-thread-name-that-is-far-longer-than-27-characters";
+  std::memcpy(base + name, long_name, sizeof(long_name));
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 7, 500, 0x10000, 1, name) == 0);
+  const auto id = static_cast<std::uint32_t>(dalRead64(base, id_out));
+  dal::GuestThread* thread = dal::findThread(id);
+  CHECK(thread != nullptr && thread->id() == id);
+  if (thread != nullptr) {
+    CHECK(thread->name() == std::string(long_name, 27));
+    CHECK(thread->joinable() && thread->priority() == 500 && thread->stackSize() == 0x10000);
+    CHECK(thread->tlsR13() == probe);
+    CHECK(thread->context().gpr[13] == probe && thread->context().gpr[2] == 0x1234);
+    CHECK(std::memcmp(base + thread->stackAddr(), "STACKGRD", 8) == 0);
+  }
+  CHECK(syscallAs(*caller, 44, id, join_out) == 0);
+  CHECK(dalRead64(base, join_out) == 107);
+  CHECK(g_entry_runs == 1 && g_entry_arg == 7 && g_entry_r4 == 0 && g_entry_r2 == 0x1234);
+  CHECK(g_entry_r13 == probe);
+  CHECK(syscallAs(*caller, 44, id, join_out) == err(dal::kCellEsrch));  // already joined
+  CHECK(syscallAs(*caller, 48, id, join_out) == err(dal::kCellEsrch));
+
+  // Leaving through sys_ppu_thread_exit returns the TLS block and reports the exit value.
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 5, 500, 0x4000, 1, 0) == 0);
+  const auto id2 = static_cast<std::uint32_t>(dalRead64(base, id_out));
+  CHECK(id2 == id + 1);
+  CHECK(syscallAs(*caller, 44, id2, join_out) == 0);
+  CHECK(dalRead64(base, join_out) == 0x77);
+  const std::uint32_t probe3 = dal::allocateTls();
+  dal::freeTls(probe3);
+  CHECK(probe3 == probe);
+  CHECK(syscallAs(*caller, 44, id2, 0) == err(dal::kCellEsrch));
+
+  // A detached thread cannot be joined; a missing result pointer is reported after the join.
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 1, 500, 0x4000, 0, 0) == 0);
+  const auto id3 = static_cast<std::uint32_t>(dalRead64(base, id_out));
+  CHECK(syscallAs(*caller, 44, id3, join_out) == err(dal::kCellEinval));
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 2, 500, 0x4000, 1, 0) == 0);
+  const auto id4 = static_cast<std::uint32_t>(dalRead64(base, id_out));
+  CHECK(syscallAs(*caller, 44, id4, 0) == err(dal::kCellEfault));
+  while (dal::findThread(id3)->state() != dal::ThreadState::Exited) {
+    syscallAs(*caller, 141, 1000);  // sleeping releases the guest lock
+  }
+  CHECK(syscallAs(*caller, 47, id3, 100) == err(dal::kCellEsrch));  // detached and gone
+  CHECK(g_entry_runs == 4);
+
+  // The interrupt flag creates the thread without starting it.
+  CHECK(call(*caller, kCreate, id_out, opd_entry, 1, 500, 0x4000, 2, 0) == 0);
+  const auto id5 = static_cast<std::uint32_t>(dalRead64(base, id_out));
+  CHECK(dal::findThread(id5) != nullptr &&
+        dal::findThread(id5)->state() == dal::ThreadState::Created);
+  CHECK(g_entry_runs == 4);
+
+  // join: self and unknown ids.
+  CHECK(syscallAs(*caller, 44, 0x0e000000, join_out) == err(dal::kCellEdeadlk));
+  CHECK(syscallAs(*caller, 44, 0x0e0000f0, join_out) == err(dal::kCellEsrch));
+
+  // Priority is stored; the caller is not registered, so it is found through its context.
+  CHECK(syscallAs(*caller, 47, 0x0e000000, 1234) == 0);
+  CHECK(syscallAs(*caller, 48, 0x0e000000, join_out) == 0);
+  CHECK(dalRead32(base, join_out) == 1234);
+  CHECK(syscallAs(*caller, 47, 0x0e000000, 3072) == err(dal::kCellEinval));
+  CHECK(syscallAs(*caller, 47, 0x0e000000, static_cast<std::uint64_t>(-1)) ==
+        err(dal::kCellEinval));
+  CHECK(syscallAs(*caller, 47, 0x0e0000f0, 100) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*caller, 48, 0x0e0000f0, join_out) == err(dal::kCellEsrch));
+  CHECK(syscallAs(*caller, 47, id5, 77) == 0);
+  CHECK(dal::findThread(id5)->priority() == 77);
+
+  // yield: CELL_CANCEL when no other thread waits for the lock.
+  CHECK(syscallAs(*caller, 43) == 1);
+
+  // sys_ppu_thread_get_id writes the id of the calling thread as a BE u64.
+  dalWrite64(base, id_out, ~0ull);
+  CHECK(call(*caller, kGetId, id_out) == 0);
+  CHECK(dalRead64(base, id_out) == 0x0e000000);
+
+  // sys_ppu_thread_once runs the initialiser once and leaves the mutex unlocked.
+  dalWrite32(base, once_ctrl, dal::kOnceInit);
+  call(*caller, kOnce, once_ctrl, opd_init);
+  call(*caller, kOnce, once_ctrl, opd_init);
+  CHECK(g_once_runs == 1 && dalRead32(base, once_ctrl) == dal::kDoneInit);
+  CHECK(dal::mutexTryLock(&caller->context(), dal::processSyncObjects().once_mutex) == 0);
+  CHECK(dal::mutexUnlock(&caller->context(), dal::processSyncObjects().once_mutex) == 0);
+
+  p.main.free(scratch);
+  dalRegisterFuncs(nullptr, 0);
+  dal::resetSyncObjects();
+  dal::resetPpuThreadState();
   dal::setLogSink({});
   dal::resetCensus();
 }
@@ -1343,6 +1529,7 @@ int main(int argc, char** argv) {
   testSysPrxForUser();
   testMutexAndCond();
   testLwmutex();
+  testPpuThreads();
   testTimebase();
   testGuestLockFifo();
   testReservationAndDcbz();
