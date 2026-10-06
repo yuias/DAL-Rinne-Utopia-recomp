@@ -123,32 +123,68 @@ class SyscallCensusTest(ProbeTestBase):
         return self.load_output()["syscalls"]
 
     def test_fixture(self):
-        self.assertEqual(self.census(fx.build_ps3_fixture()),
+        census = self.census(fx.build_ps3_fixture())
+        self.assertEqual({k: census[k] for k in ("sites", "unresolved", "by_number")},
                          {"sites": 1, "unresolved": 0, "by_number": {"141": 1}})
 
     def test_branch_between_li_and_sc_is_unresolved(self):
         # li r11,141 ; blr ; sc
         data = self.patched_fixture({3: 0x4E800020, 4: 0x44000002})
-        self.assertEqual(self.census(data),
-                         {"sites": 1, "unresolved": 1, "by_number": {}})
+        census = self.census(data)
+        self.assertEqual((census["sites"], census["unresolved"], census["by_number"]),
+                         (1, 1, {}))
+
+    @staticmethod
+    def census_of(words: list[int]) -> dict:
+        image = fx.build_elf64_be(
+            entry=SyscallCensusTest.TEXT_VA,
+            segments=[FixtureSegment(fx.PT_LOAD, SyscallCensusTest.TEXT_VA,
+                                     struct.pack(">%dI" % len(words), *words), flags=5)])
+        return probe.census_syscalls(ElfFile.from_bytes(image))
+
+    def assert_resolved(self, between: list[int]):
+        self.assertEqual(self.census_of([self.LI_141, *between, self.SC]),
+                         {"sites": 1, "unresolved": 0, "by_number": {"141": 1}}, between)
+
+    def assert_unresolved(self, between: list[int]):
+        self.assertEqual(self.census_of([self.LI_141, *between, self.SC]),
+                         {"sites": 1, "unresolved": 1, "by_number": {}}, between)
+
+    LI_141 = 0x3960008D
+    SC = 0x44000002
+    NOP = 0x60000000
+
+    def test_conditional_branches_are_scanned_through(self):
+        # bne cr0,<fwd>
+        self.assert_resolved([0x40820008])
+        # beqlr
+        self.assert_resolved([0x4D820020])
+
+    def test_blocking_instructions_leave_the_site_unresolved(self):
+        cases = {
+            "b <fwd>": 0x48000008,
+            "bl <fwd>": 0x48000009,
+            "mr r11,r3": 0x7C6B1B78,
+            "addi r11,r11,1": 0x396B0001,
+            "lwzu r3,4(r11)": 0x866B0004,
+            ".long 0": 0x00000000,
+            "blr": 0x4E800020,
+            "bdnzl <fwd>": 0x42000009,
+        }
+        for label, word in cases.items():
+            with self.subTest(label):
+                self.assert_unresolved([word])
+
+    def test_unrelated_writes_do_not_block(self):
+        # lwz r3,0(r4) ; mr r12,r3 ; cmpwi cr7,r3,0
+        self.assert_resolved([0x80640000, 0x7C6C1B78, 0x2F830000])
 
     def test_lookback_limit(self):
-        nop = 0x60000000
-
-        def census_of(words: list[int]) -> dict:
-            image = fx.build_elf64_be(
-                entry=self.TEXT_VA,
-                segments=[FixtureSegment(fx.PT_LOAD, self.TEXT_VA,
-                                         struct.pack(">%dI" % len(words), *words), flags=5)])
-            return probe.census_syscalls(ElfFile.from_bytes(image))
-
-        li, sc = 0x3960008D, 0x44000002
-        # The li is 9 instructions before the sc: out of reach.
-        self.assertEqual(census_of([li] + [nop] * 8 + [sc]),
-                         {"sites": 1, "unresolved": 1, "by_number": {}})
-        # The li is exactly 8 instructions before the sc.
-        self.assertEqual(census_of([li] + [nop] * 7 + [sc]),
-                         {"sites": 1, "unresolved": 0, "by_number": {"141": 1}})
+        # 20 words back is within the window, 30 is not; the window is 24 words.
+        self.assert_resolved([self.NOP] * 19)
+        self.assert_resolved([self.NOP] * 23)
+        self.assert_unresolved([self.NOP] * 24)
+        self.assert_unresolved([self.NOP] * 29)
 
     def test_by_number_sorted_numerically(self):
         words = {0: 0x3960000A, 1: 0x44000002, 2: 0x39600064, 3: 0x44000002,
@@ -156,6 +192,32 @@ class SyscallCensusTest(ProbeTestBase):
         census = self.census(self.patched_fixture(words))
         self.assertEqual(census["sites"], 3)
         self.assertEqual(list(census["by_number"].items()), [("10", 2), ("100", 1)])
+
+
+class SyscallNamesTest(ProbeTestBase):
+    def write_table(self, syscalls: dict) -> str:
+        path = self.tmp / "syscalls.json"
+        path.write_text(json.dumps({"schema": 1, "syscalls": syscalls}), encoding="utf-8")
+        return str(path)
+
+    def test_names_filled_from_table(self):
+        table = self.write_table({"141": "sys_timer_usleep", "999": "unused"})
+        code, _, _ = self.run_probe(fx.build_ps3_fixture(), "--syscalls", table)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.load_output()["syscalls"]["names"],
+                         {"141": "sys_timer_usleep"})
+
+    def test_unknown_number_has_no_name(self):
+        table = self.write_table({"1": "sys_process_getpid"})
+        code, _, _ = self.run_probe(fx.build_ps3_fixture(), "--syscalls", table)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.load_output()["syscalls"]["names"], {})
+
+    def test_explicit_missing_table_is_an_error(self):
+        code, _, err = self.run_probe(fx.build_ps3_fixture(),
+                                      "--syscalls", str(self.tmp / "missing.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.strip().splitlines()), 1)
 
 
 class ErrorTest(ProbeTestBase):

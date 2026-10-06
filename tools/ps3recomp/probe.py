@@ -14,6 +14,7 @@ from . import cell
 from .elf import EM_SPU, ELFCLASS32, PF_R, PF_W, PF_X, ElfError, ElfFile
 from .info import (DEFAULT_CONFIG, EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliError,
                    load_config, parse_ppu_elf, read_input, reject_encrypted)
+from .nids import DEFAULT_SYSCALLS, load_syscall_table
 from .ppu import decode
 
 DEFAULT_OUTPUT = REPO_ROOT / "generated" / "analysis" / "probe.json"
@@ -47,7 +48,7 @@ def _file_offset_to_va(main: ElfFile, offset: int) -> int | None:
     return None
 
 
-def _tryParseAt(data: bytes, hit: int) -> ElfFile | None:
+def _try_parse_at(data: bytes, hit: int) -> ElfFile | None:
     try:
         elf = ElfFile.from_bytes(data, base=hit)
     except ElfError:
@@ -55,7 +56,7 @@ def _tryParseAt(data: bytes, hit: int) -> ElfFile | None:
     return elf if elf.e_type in _VALID_E_TYPES else None
 
 
-def _imageJson(main: ElfFile, data: bytes, hit: int, elf: ElfFile) -> dict:
+def _image_json(main: ElfFile, data: bytes, hit: int, elf: ElfFile) -> dict:
     size = elf.image_extent()
     return {
         "file_offset": _hex(hit),
@@ -72,11 +73,59 @@ def _imageJson(main: ElfFile, data: bytes, hit: int, elf: ElfFile) -> dict:
     }
 
 
-_SC_LOOKBACK = 8
+_SC_LOOKBACK = 24
 _BRANCHES = frozenset({"b", "bc", "bclr", "bcctr"})
 # `sc` with LEV = 0, the lv2 syscall form. The decoder's `sc` entry matches the primary
 # opcode only, so it also hits float constants and ASCII data; compare the whole word.
 _SC_WORD = 0x44000002
+_UPDATE_FORMS = frozenset(
+    "lwzu lbzu lhzu lhau lfsu lfdu stwu stbu sthu stfsu stfdu ldu stdu "
+    "lwzux lbzux lhzux lhaux lwaux ldux stwux stbux sthux stdux lfsux lfdux "
+    "stfsux stfdux".split())
+
+
+def _written_gprs(insn) -> frozenset[int]:
+    """GPRs an instruction overwrites (rD, logical-op rA, update-form rA)."""
+    spec = insn.spec
+    written = set()
+    if spec.operands[:1] == ("rD",):
+        written.add(insn.field("rD"))
+        if spec.name == "lmw":
+            written.update(range(insn.field("rD"), 32))
+    if spec.operands[:2] == ("rA", "rS"):
+        written.add(insn.field("rA"))
+    if spec.name in _UPDATE_FORMS:
+        written.add(insn.field("rA"))
+    return frozenset(written)
+
+
+def _is_unconditional_branch(insn) -> bool:
+    name = insn.spec.name
+    if name == "b":
+        return True
+    return name in ("bc", "bclr", "bcctr") and insn.field("BO") & 0x14 == 0x14
+
+
+def _resolve_syscall_number(words: tuple[int, ...], index: int) -> int | None:
+    """Find the `li r11, N` that feeds the `sc` at `words[index]`, scanning backwards."""
+    # Known limitation: a branch target between the `li` and the `sc` is not detected
+    # without a CFG, so a join point could in theory mix in another path's r11.
+    for j in range(index - 1, max(index - 1 - _SC_LOOKBACK, -1), -1):
+        insn = decode(words[j], strict=True)
+        spec = insn.spec
+        if spec is None:
+            return None
+        if spec.name == "addi" and insn.field("rD") == 11 and insn.field("rA") == 0:
+            return insn.field("SIMM")
+        if 11 in _written_gprs(insn):
+            return None
+        if spec.name in _BRANCHES:
+            # A call clobbers r11; an unconditional jump leaves the fall-through path.
+            if "lk" in spec.flags and insn.field("LK"):
+                return None
+            if _is_unconditional_branch(insn):
+                return None
+    return None
 
 
 def census_syscalls(main: ElfFile) -> dict:
@@ -90,15 +139,7 @@ def census_syscalls(main: ElfFile) -> dict:
             if word != _SC_WORD:
                 continue
             sites += 1
-            number = None
-            for j in range(i - 1, max(i - 1 - _SC_LOOKBACK, -1), -1):
-                insn = decode(words[j])
-                name = insn.spec.name if insn.spec is not None else None
-                if name in _BRANCHES:
-                    break
-                if name == "addi" and insn.field("rD") == 11 and insn.field("rA") == 0:
-                    number = insn.field("SIMM")
-                    break
+            number = _resolve_syscall_number(words, i)
             if number is None:
                 unresolved += 1
             else:
@@ -110,21 +151,26 @@ def census_syscalls(main: ElfFile) -> dict:
     }
 
 
-def build_probe(main: ElfFile, data: bytes, path: str, sha256: str) -> dict:
+def build_probe(main: ElfFile, data: bytes, path: str, sha256: str,
+                syscall_names: dict[int, str] | None = None) -> dict:
     spu_images, other_elfs = [], []
     invalid = 0
     hit = data.find(_ELF_MAGIC, 1)
     while hit >= 0:
-        elf = _tryParseAt(data, hit)
+        elf = _try_parse_at(data, hit)
         if elf is None:
             invalid += 1
         else:
-            image = _imageJson(main, data, hit, elf)
+            image = _image_json(main, data, hit, elf)
             if elf.ei_class == ELFCLASS32 and elf.e_machine == EM_SPU:
                 spu_images.append(image)
             else:
                 other_elfs.append(image)
         hit = data.find(_ELF_MAGIC, hit + 1)
+
+    syscalls = census_syscalls(main)
+    names = syscall_names or {}
+    syscalls["names"] = {n: names[int(n)] for n in syscalls["by_number"] if int(n) in names}
 
     prx = cell.parse_prx_param(main)
     modules = cell.parse_imports(main, prx) if prx is not None else []
@@ -139,7 +185,7 @@ def build_probe(main: ElfFile, data: bytes, path: str, sha256: str) -> dict:
         "other_elfs": other_elfs,
         "invalid_magic_hits": invalid,
         "imports": imports,
-        "syscalls": census_syscalls(main),
+        "syscalls": syscalls,
         "summary": {
             "spu_image_count": len(spu_images),
             "spu_related_imports": [i["name"] for i in imports if i["spu_related"]],
@@ -156,14 +202,25 @@ def _load_default_config() -> dict | None:
         return None
 
 
+def _resolve_syscall_names(syscalls_arg: str | None) -> dict[int, str]:
+    if syscalls_arg is not None:
+        return load_syscall_table(Path(syscalls_arg))
+    if not DEFAULT_SYSCALLS.is_file():
+        print("note: syscall table %s not found; syscall names are not resolved"
+              % DEFAULT_SYSCALLS, file=sys.stderr)
+        return {}
+    return load_syscall_table(DEFAULT_SYSCALLS)
+
+
 def _run(args: argparse.Namespace) -> int:
     data = read_input(args.elf)
     sha256 = hashlib.sha256(data).hexdigest()
     reject_encrypted(data, sha256, _load_default_config())
     main_elf = parse_ppu_elf(data)
+    syscall_names = _resolve_syscall_names(args.syscalls)
 
     try:
-        report = build_probe(main_elf, data, args.elf, sha256)
+        report = build_probe(main_elf, data, args.elf, sha256, syscall_names)
     except ElfError as e:
         raise CliError(EXIT_NOT_PPU_ELF, "malformed PS3 structures: %s" % e)
 
@@ -197,6 +254,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("elf", help="decrypted EBOOT.elf")
     parser.add_argument("-o", "--output", help="JSON output path "
                         "(default: generated/analysis/probe.json)")
+    parser.add_argument("--syscalls", help="lv2 syscall name table "
+                        "(default: config/lv2_syscalls.json)")
     return parser
 
 

@@ -132,8 +132,11 @@ class RealEbootProbeTest(unittest.TestCase):
     def test_syscall_census(self):
         self.assertIn("syscalls", self.doc)
         sc = self.doc["syscalls"]
+        self.assertEqual(sc["sites"], 217)
         self.assertEqual(sc["sites"], sc["unresolved"] + sum(sc["by_number"].values()),
                          "census: %r" % (sc,))
+        self.assertLess(sc["unresolved"], 17)
+        self.assertEqual(sc["names"]["403"], "sys_tty_write")
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
