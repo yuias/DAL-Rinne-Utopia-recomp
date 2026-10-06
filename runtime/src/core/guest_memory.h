@@ -18,6 +18,16 @@ inline constexpr GuestRegion kUser1mRegion{0x20000000, 0x30000000, 0x100000, 0, 
 inline constexpr GuestRegion kUser64kRegion{0x30000000, 0x40000000, 0x10000, 0, "user64k"};
 inline constexpr GuestRegion kStackRegion{0xD0000000, 0xE0000000, 0x1000, 0x1000, "stack"};
 
+// RSX ranges are fixed by the console memory map, not handed out by an allocator.
+inline constexpr std::uint32_t kRsxContextBegin = 0x10000000;
+inline constexpr std::uint32_t kRsxContextEnd = 0x20000000;
+inline constexpr std::uint32_t kRsxLocalBegin = 0xC0000000;
+inline constexpr std::uint32_t kRsxLocalEnd = 0xD0000000;
+
+// Name of the guest range holding `addr`: "main", "user1m", "user64k", "stack", "rsx-context",
+// "rsx-local", or nullptr when it is in none of them.
+const char* guestRangeName(std::uint32_t addr);
+
 // The flat guest address space: 4 GiB plus a guard tail reserved up front, with pages committed on
 // demand. Memory is zero-filled when it is first committed or committed again after a decommit.
 class GuestMemory {
@@ -36,6 +46,10 @@ class GuestMemory {
   // already committed keeps their contents.
   bool commit(std::uint32_t addr, std::uint32_t size);
   void decommit(std::uint32_t addr, std::uint32_t size);
+
+  // True when every page of [addr, addr + size) is committed (VirtualQuery). False before reserve()
+  // and when the range runs past the 32-bit space.
+  bool isCommitted(std::uint32_t addr, std::uint32_t size) const;
 
   // True when `host` points into the reservation, including the guard tail.
   bool containsHost(const void* host) const;

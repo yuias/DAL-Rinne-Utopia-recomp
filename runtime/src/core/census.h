@@ -22,6 +22,10 @@ void censusSyscall(std::uint32_t number, const char* name, bool implemented);
 // Counts one HLE import call; the first call logs "dal: first hle module::name".
 void censusHle(const char* module, const char* name, bool implemented);
 
+// Attaches a note to an import that was already counted; the census line becomes
+// "  module::name: N [default] <note>". Ignored when the import has not been called yet.
+void censusHleNote(const char* module, const char* name, std::string note);
+
 // Counts a dynamic transfer to an address with no generated function. Returns true the first
 // time this (target, site) pair is seen.
 bool censusUnknownTarget(std::uint32_t target, std::uint32_t site);

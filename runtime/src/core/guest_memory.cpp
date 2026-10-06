@@ -102,6 +102,26 @@ void GuestMemory::decommit(std::uint32_t addr, std::uint32_t size) {
   VirtualFree(base_ + begin, static_cast<std::size_t>(end - begin), MEM_DECOMMIT);
 }
 
+bool GuestMemory::isCommitted(std::uint32_t addr, std::uint32_t size) const {
+  if (base_ == nullptr) {
+    return false;
+  }
+  const std::uint64_t end = static_cast<std::uint64_t>(addr) + std::max<std::uint32_t>(size, 1);
+  if (end > kGuestSpace) {
+    return false;
+  }
+  for (std::uint64_t cursor = addr; cursor < end;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(base_ + cursor, &info, sizeof info) == 0 || info.State != MEM_COMMIT ||
+        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+      return false;
+    }
+    // RegionSize counts from the page containing the queried address.
+    cursor = static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize - base_;
+  }
+  return true;
+}
+
 bool GuestMemory::containsHost(const void* host) const {
   if (base_ == nullptr) {
     return false;
@@ -109,6 +129,21 @@ bool GuestMemory::containsHost(const void* host) const {
   const auto p = reinterpret_cast<std::uintptr_t>(host);
   const auto b = reinterpret_cast<std::uintptr_t>(base_);
   return p >= b && p < b + kGuestSpace + kDalGuestGuardSize;
+}
+
+const char* guestRangeName(std::uint32_t addr) {
+  for (const GuestRegion* region : {&kMainRegion, &kUser1mRegion, &kUser64kRegion, &kStackRegion}) {
+    if (addr >= region->begin && addr < region->end) {
+      return region->name;
+    }
+  }
+  if (addr >= kRsxContextBegin && addr < kRsxContextEnd) {
+    return "rsx-context";
+  }
+  if (addr >= kRsxLocalBegin && addr < kRsxLocalEnd) {
+    return "rsx-local";
+  }
+  return nullptr;
 }
 
 RegionAllocator::RegionAllocator(GuestMemory& memory, GuestRegion region)

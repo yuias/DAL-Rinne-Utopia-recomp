@@ -36,6 +36,29 @@ struct InstalledImport {
 std::vector<InstalledImport> g_imports;
 bool g_quiet = false;
 
+// Logs the arguments of a default-handled import that look like out-pointers (a guest address in
+// committed memory that is not code) and records them in the census, so the census doubles as a
+// work list for the handlers still missing.
+void hintOutPointers(const InstalledImport& import, const DalPpuContext* ctx) {
+  const char* module = import.module != nullptr ? import.module : "?";
+  const char* name = import.name != nullptr ? import.name : "?";
+  std::string note;
+  for (int reg = 3; reg <= 10; reg++) {
+    const std::uint64_t value = ctx->gpr[reg];
+    if (value == 0 || (value >> 32) != 0) continue;
+    const auto addr = static_cast<std::uint32_t>(value);
+    if (!process().memory.isCommitted(addr, 4) || findOwningFunction(addr) != 0) continue;
+
+    const char* range = guestRangeName(addr);
+    logInfo("dal: default hle {}::{}: possible out-pointer r{}={:#010x}{}", module, name, reg, addr,
+            range != nullptr ? std::format(" ({})", range) : std::string());
+    note += note.empty() ? std::format("ptr r{}", reg) : std::format(",r{}", reg);
+  }
+  if (!note.empty()) {
+    censusHleNote(module, name, std::move(note));
+  }
+}
+
 }  // namespace
 
 void installImports(const DalImportInfo* imports, std::uint32_t count) {
@@ -104,6 +127,9 @@ void dalHleCall(DalPpuContext* ctx, uint8_t* base, uint32_t import_index) {
                  import.module != nullptr ? import.module : "?",
                  import.name != nullptr ? import.name : "?", ctx->gpr[3], ctx->gpr[4], ctx->gpr[5],
                  ctx->gpr[6], ctx->gpr[7], ctx->gpr[8]);
+  }
+  if (import.default_calls == 0) {
+    dal::hintOutPointers(import, ctx);
   }
   import.default_calls++;
   ctx->gpr[3] = dal::kCellOk;

@@ -149,6 +149,31 @@ void testGuestMemoryRoundTrip() {
   CHECK(!memory->containsHost(base - 1));
 }
 
+void testIsCommittedAndRangeNames() {
+  std::unique_ptr<dal::GuestMemory> memory(newMemory());
+  CHECK(!memory->isCommitted(0x10000, 4));
+  CHECK(memory->commit(0x10000, 0x2000));
+  CHECK(memory->isCommitted(0x10000, 4));
+  CHECK(memory->isCommitted(0x11ffc, 4));
+  CHECK(memory->isCommitted(0x10ff0, 0x20));  // spans two pages
+  CHECK(!memory->isCommitted(0x11ffe, 4));  // runs into the uncommitted page after
+  CHECK(!memory->isCommitted(0x12000, 4));
+  CHECK(!memory->isCommitted(0xFFFFFFFEu, 4));  // past the 32-bit space
+  dal::GuestMemory unreserved;
+  CHECK(!unreserved.isCommitted(0x10000, 4));
+
+  CHECK(std::string_view(dal::guestRangeName(0x10000)) == "main");
+  CHECK(std::string_view(dal::guestRangeName(0x0FFFFFFF)) == "main");
+  CHECK(std::string_view(dal::guestRangeName(0x10000000)) == "rsx-context");
+  CHECK(std::string_view(dal::guestRangeName(0x20000000)) == "user1m");
+  CHECK(std::string_view(dal::guestRangeName(0x30000000)) == "user64k");
+  CHECK(std::string_view(dal::guestRangeName(0xC0000000)) == "rsx-local");
+  CHECK(std::string_view(dal::guestRangeName(0xD0000000)) == "stack");
+  CHECK(dal::guestRangeName(0) == nullptr);
+  CHECK(dal::guestRangeName(0x40000000) == nullptr);
+  CHECK(dal::guestRangeName(0xE0000000) == nullptr);
+}
+
 void testTopOfAddressSpace() {
   std::unique_ptr<dal::GuestMemory> memory(newMemory());
   std::uint8_t* base = memory->base();
@@ -588,6 +613,63 @@ void testHle() {
   CHECK(ctx->gpr[2] == 0x1111);
   CHECK(ctx->lr == 0x2222);
 
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+void testHleOutPointerHints() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::resetCensus();
+  dal::resetLogOnce();
+  CHECK(dal::process().memory.reserve());
+
+  // 0x500000 and 0x501000 are committed data, 0x700000 is not, 0x10200 is committed code.
+  CHECK(dal::process().memory.commit(0x500000, 0x2000));
+  CHECK(dal::process().memory.commit(0x10000, 0x1000));
+  const DalFuncMapping mappings[] = {{0x10200, opdTarget}};
+  dalRegisterFuncs(mappings, 1);
+
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x11111111, "cellHintModule", "cellHintFirst"},
+      {0x00800010, 0x22222222, "cellHintModule", "cellHintSecond"},
+      {0x00800020, 0x33333333, "cellHintModule", "cellHintThird"},
+  };
+  dal::installImports(imports, 3);
+
+  auto ctx = std::make_unique<DalPpuContext>();
+  ctx->gpr[3] = 0;                 // null
+  ctx->gpr[4] = 0x500000;          // candidate
+  ctx->gpr[5] = 0x100000000ull | 0x500000;  // upper bits set
+  ctx->gpr[6] = 0x700000;          // uncommitted
+  ctx->gpr[7] = 0x10200;           // code address
+  ctx->gpr[8] = 0x501000;          // candidate
+  ctx->gpr[9] = 0x20;              // small integer, not committed
+  dal::setQuietHle(true);          // the hint is printed anyway
+  dalHleCall(ctx.get(), nullptr, 0);
+  dalHleCall(ctx.get(), nullptr, 0);  // only the first default call scans
+  dal::setQuietHle(false);
+  CHECK(ctx->gpr[3] == dal::kCellOk);
+  CHECK(countContaining(lines, "possible out-pointer") == 2);
+  CHECK(countContaining(lines,
+                        "dal: default hle cellHintModule::cellHintFirst: possible out-pointer "
+                        "r4=0x00500000 (main)") == 1);
+  CHECK(countContaining(lines, "r8=0x00501000 (main)") == 1);
+
+  ctx->gpr[3] = 0x500000;
+  for (int reg = 4; reg <= 10; reg++) ctx->gpr[reg] = 0;
+  dalHleCall(ctx.get(), nullptr, 1);
+  dalHleCall(ctx.get(), nullptr, 2);  // no candidates: no note
+  CHECK(countContaining(lines, "cellHintSecond: possible out-pointer r3=0x00500000 (main)") == 1);
+
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("  cellHintModule::cellHintFirst: 2 [default] ptr r4,r8\n") != std::string::npos);
+  CHECK(census.find("  cellHintModule::cellHintSecond: 1 [default] ptr r3\n") != std::string::npos);
+  CHECK(census.find("  cellHintModule::cellHintThird: 1 [default]\n") != std::string::npos);
+
+  dal::process().memory.decommit(0x500000, 0x2000);
+  dal::process().memory.decommit(0x10000, 0x1000);
   dal::setLogSink({});
   dal::resetCensus();
   dal::resetLogOnce();
@@ -1780,6 +1862,7 @@ int main(int argc, char** argv) {
   testLogLevelsAndPrefix();
   testLogOnce();
   testGuestMemoryRoundTrip();
+  testIsCommittedAndRangeNames();
   testTopOfAddressSpace();
   testAllocatorFirstFit();
   testAllocatorMarkUsedAndExhaustion();
@@ -1790,6 +1873,7 @@ int main(int argc, char** argv) {
   testCensus();
   testSyscalls();
   testHle();
+  testHleOutPointerHints();
   testStartupSyscalls();
   testSysPrxForUser();
   testMutexAndCond();

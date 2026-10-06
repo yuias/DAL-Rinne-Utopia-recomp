@@ -19,6 +19,7 @@ struct CallStat {
   std::string name;
   std::uint64_t count = 0;
   bool implemented = false;
+  std::string note;
 };
 
 struct CensusState {
@@ -41,6 +42,7 @@ struct Line {
   std::string name;  // sort key and display name
   std::uint32_t number;
   bool implemented;
+  std::string note = {};
 };
 
 void sortLines(std::vector<Line>& lines) {
@@ -112,6 +114,17 @@ void censusHle(const char* module, const char* name, bool implemented) {
   }
 }
 
+void censusHleNote(const char* module, const char* name, std::string note) {
+  CensusState& s = state();
+  const std::string key =
+      std::format("{}::{}", module != nullptr ? module : "?", name != nullptr ? name : "?");
+  std::lock_guard lock(s.mutex);
+  const auto it = s.hle.find(key);
+  if (it != s.hle.end()) {
+    it->second.note = std::move(note);
+  }
+}
+
 bool censusUnknownTarget(std::uint32_t target, std::uint32_t site) {
   CensusState& s = state();
   std::lock_guard lock(s.mutex);
@@ -147,7 +160,7 @@ std::string formatCensus() {
     lines.clear();
     calls = 0;
     for (const auto& [key, stat] : s.hle) {
-      lines.push_back({stat.count, stat.name, 0, stat.implemented});
+      lines.push_back({stat.count, stat.name, 0, stat.implemented, stat.note});
       calls += stat.count;
     }
     sortLines(lines);
@@ -155,6 +168,9 @@ std::string formatCensus() {
     for (const Line& line : lines) {
       out += std::format("\n  {}: {} [{}]", line.name, line.count,
                          line.implemented ? "impl" : "default");
+      if (!line.note.empty()) {
+        out += " " + line.note;
+      }
     }
 
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t>> targets(
