@@ -27,3 +27,12 @@ set_tests_properties(runtime_version PROPERTIES
 add_test(NAME runtime_musttail COMMAND dal_runtime --selftest-musttail)
 set_tests_properties(runtime_musttail PROPERTIES
   PASS_REGULAR_EXPRESSION "musttail ok")
+
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
+
+add_test(NAME tools_unittest
+  COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tools/tests -t tools
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(tools_unittest PROPERTIES
+  ENVIRONMENT "DAL_EBOOT_ELF=${DAL_EBOOT_ELF}")

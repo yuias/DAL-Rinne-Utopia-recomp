@@ -110,6 +110,71 @@ def build_elf64_be(*, entry: int, segments: list[FixtureSegment],
     return bytes(buf)
 
 
+PS3_ENTRY = 0x20000
+PS3_TEXT_VA = 0x10000
+PS3_DATA_VA = 0x20000
+PS3_TOC = 0x28000
+PS3_OPD0 = 0x20000
+PS3_OPD1 = 0x20008
+PS3_LIBENT_VA = 0x20010
+PS3_LIBSTUB0_VA = 0x20030
+PS3_LIBSTUB1_VA = 0x2005C
+PS3_LIBSTUB_END = 0x20088
+PS3_PROC_PARAM_VA = 0x20300
+PS3_PRX_PARAM_VA = 0x20340
+PS3_TLS_VA = 0x20180
+PS3_SLOT_ADDRS = (0x20150, 0x20154, 0x20158)
+PS3_FNIDS = (0x0BAE8772, 0x9D98AFA0, 0xACFC8DBC)
+PS3_EXPORT_FNID = 0xBC9A0086
+
+_PS3_TEXT_WORDS = (0x7C0802A6, 0xF821FF91, 0x3960008D, 0x44000002,
+                   0x38210070, 0x7C0803A6, 0x4E800020, 0x00000000)
+
+
+def build_ps3_fixture() -> bytes:
+    """Canonical PS3-style image: OPDs, one export, two imports, param segments, TLS."""
+    text = struct.pack(">8I", *_PS3_TEXT_WORDS)
+
+    data = bytearray(0x200)
+
+    def put(offset: int, fmt: str, *values) -> None:
+        struct.pack_into(fmt, data, offset, *values)
+
+    put(0x000, ">II", 0x10000, PS3_TOC)
+    put(0x008, ">II", 0x10018, PS3_TOC)
+    put(0x010, ">BBHHHHHBB2sIII", 0x1C, 0, 1, 0x8000, 1, 0, 0, 0, 0, b"\0\0",
+        0, 0x20100, 0x20104)
+    put(0x030, ">BBHHHHHBB2sIIIIIII", 0x2C, 0, 1, 0x0009, 2, 0, 0, 0, 0, b"\0\0",
+        0x20120, 0x20140, 0x20150, 0, 0, 0, 0)
+    put(0x05C, ">BBHHHHHBB2sIIIIIII", 0x2C, 0, 1, 0x0009, 1, 0, 0, 0, 0, b"\0\0",
+        0x20130, 0x20148, 0x20158, 0, 0, 0, 0)
+    put(0x100, ">II", PS3_EXPORT_FNID, 0x00020000)
+    data[0x120:0x12C] = b"cellSysutil\0"
+    data[0x130:0x13A] = b"cellSpurs\0"
+    put(0x140, ">III", *PS3_FNIDS)
+
+    proc_param = struct.pack(">IIIIiIII", 0x20, 0x13BCC5F6, 0x00330000, 0x00440001,
+                             1000, 0x10000, 0x100000, 0)
+    prx_param = struct.pack(">IIIIIIIIHHI", 0x28, 0x1B434CEC, 4, 0, 0x20010, 0x2002C,
+                            0x20030, PS3_LIBSTUB_END, 1, 0, 0)
+
+    return build_elf64_be(
+        entry=PS3_ENTRY,
+        segments=[
+            FixtureSegment(PT_LOAD, PS3_TEXT_VA, text, flags=5),
+            FixtureSegment(PT_LOAD, PS3_DATA_VA, bytes(data), memsz=0x10000, flags=6),
+            FixtureSegment(0x60000001, PS3_PROC_PARAM_VA, proc_param),
+            FixtureSegment(0x60000002, PS3_PRX_PARAM_VA, prx_param),
+            FixtureSegment(7, PS3_TLS_VA, b"", memsz=0x10),
+        ],
+        sections=[
+            FixtureSection(".text", 1, PS3_TEXT_VA, 0x20, flags=6),
+            FixtureSection(".opd", 1, PS3_DATA_VA, 0x10, flags=3),
+            FixtureSection(".missing", 1, 0x90000, 0x40),
+        ],
+    )
+
+
 def build_elf32_be(*, entry: int, segments: list[FixtureSegment],
                    e_type: int = 2, machine: int = 23) -> bytes:
     ehsize, phentsize = 52, 32
