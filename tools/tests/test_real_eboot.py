@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from ps3recomp import disasm, ghidra_diff, info, nids, probe
+from ps3recomp import disasm, ghidra_diff, ghidra_summary, info, nids, probe
 from ps3recomp.elf import ElfFile
 from ps3recomp.ppu import decode_range
 
@@ -246,6 +246,43 @@ class RealGhidraDiffTest(unittest.TestCase):
                          % strict["pairs"]["ghidra_code_we_unknown"][:5])
         for key in ("mnemonic_mismatch", "operand_mismatch"):
             self.assertEqual(strict["categories"][key], lax["categories"][key])
+
+
+@unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file()
+                     and _GHIDRA_JSON and Path(_GHIDRA_JSON).is_file(),
+                     "DAL_EBOOT_ELF and DAL_GHIDRA_JSON must name existing files")
+class RealGhidraSummaryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "summary.json"
+            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
+                cls.exit_code = ghidra_summary.main(
+                    [_ELF_PATH, "--ghidra", _GHIDRA_JSON, "-o", str(out_path)])
+            cls.summary = ghidra_summary.load_summary(out_path)
+
+    def test_exit_code(self):
+        self.assertEqual(self.exit_code, 0)
+
+    def test_function_count(self):
+        self.assertEqual(len(self.summary.functions), 2549)
+
+    def test_word_kinds(self):
+        start, end = self.summary.text
+        words = (end - start) // 4
+        code = sum(b - a for a, b in self.summary.code_ranges) // 4
+        data = sum(b - a for a, b in self.summary.data_ranges) // 4
+        self.assertEqual((code, data, words - code - data), (175301, 891, 33535))
+
+    def test_entries_are_in_or_next_to_text(self):
+        # Ghidra also starts functions in the executable sections around .text
+        # (the section below it and the import stubs); everything else is in .text.
+        start, end = self.summary.text
+        outside = [f.entry for f in self.summary.functions if not start <= f.entry < end]
+        self.assertEqual(len(self.summary.functions) - len(outside), 2388)
+        stray = [hex(a) for a in outside if not (a < start and a >= 0x10200
+                                                 or end <= a < 0xDE410)]
+        self.assertEqual(stray, [])
 
 
 @unittest.skipUnless(_ELF_PATH and Path(_ELF_PATH).is_file(),
