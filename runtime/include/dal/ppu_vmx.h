@@ -382,3 +382,239 @@ DAL_FORCEINLINE void dalSetCr6(DalPpuContext* ctx, DalVr result) {
     uint64_t any = result.u64[0] | result.u64[1];
     dalSetCrField(ctx, 6, ((uint32_t)(all == ~0ull) << 3) | ((uint32_t)(any == 0) << 1));
 }
+
+// Per-element shifts and rotates (RPCS3 `VSLB`, `VSRAW`, `VRLH` etc.): each element of vB supplies
+// its own count, taken modulo the element width, so no shift amount reaches the width. Left shifts
+// run on the unsigned view because shifting a negative value left is not defined in C. The rotate
+// uses (width - n) & (width - 1) so that n == 0 shifts by 0 instead of by the full width.
+#define DAL_VMX_SHIFTS(sfx, view, sview, utype, stype, mask)                                   \
+    DAL_FORCEINLINE DalVr dalVrl##sfx(DalVr a, DalVr b) {                                      \
+        DalVr v;                                                                               \
+        utype n = b.view & mask;                                                               \
+        v.view = (a.view << n) | (a.view >> ((mask + 1 - n) & mask));                          \
+        return v;                                                                              \
+    }                                                                                          \
+    DAL_FORCEINLINE DalVr dalVsl##sfx(DalVr a, DalVr b) {                                      \
+        DalVr v;                                                                               \
+        v.view = a.view << (b.view & mask);                                                    \
+        return v;                                                                              \
+    }                                                                                          \
+    DAL_FORCEINLINE DalVr dalVsr##sfx(DalVr a, DalVr b) {                                      \
+        DalVr v;                                                                               \
+        v.view = a.view >> (b.view & mask);                                                    \
+        return v;                                                                              \
+    }                                                                                          \
+    DAL_FORCEINLINE DalVr dalVsra##sfx(DalVr a, DalVr b) {                                     \
+        DalVr v;                                                                               \
+        v.sview = a.sview >> (stype)(b.view & mask);                                           \
+        return v;                                                                              \
+    }
+
+DAL_VMX_SHIFTS(b, u8, s8, DalU8x16, DalS8x16, 7)
+DAL_VMX_SHIFTS(h, u16, s16, DalU16x8, DalS16x8, 15)
+DAL_VMX_SHIFTS(w, u32, s32, DalU32x4, DalS32x4, 31)
+#undef DAL_VMX_SHIFTS
+
+// Widening multiplies. "Even" and "odd" count elements in big-endian order (element 0 is even), so
+// even elements are the odd host lanes (RPCS3 `VMULEUB` reads the high byte of each host halfword).
+// The products of 8-bit and 16-bit elements fit the result type, so no lane overflows.
+DAL_FORCEINLINE DalVr dalVmuleub(DalVr a, DalVr b) {
+    DalVr v;
+    v.u16 = (a.u16 >> 8) * (b.u16 >> 8);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmuloub(DalVr a, DalVr b) {
+    DalVr v;
+    v.u16 = (a.u16 & 0xffu) * (b.u16 & 0xffu);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmulesb(DalVr a, DalVr b) {
+    DalVr v;
+    v.s16 = (a.s16 >> 8) * (b.s16 >> 8);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmulosb(DalVr a, DalVr b) {
+    DalVr v;
+    DalS16x8 ea = __builtin_convertvector(__builtin_shufflevector(a.s8, a.s8, 0, 2, 4, 6, 8, 10, 12, 14),
+                                          DalS16x8);
+    DalS16x8 eb = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 2, 4, 6, 8, 10, 12, 14),
+                                          DalS16x8);
+    v.s16 = ea * eb;
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmuleuh(DalVr a, DalVr b) {
+    DalVr v;
+    v.u32 = __builtin_convertvector(__builtin_shufflevector(a.u16, a.u16, 1, 3, 5, 7), DalU32x4) *
+            __builtin_convertvector(__builtin_shufflevector(b.u16, b.u16, 1, 3, 5, 7), DalU32x4);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmulouh(DalVr a, DalVr b) {
+    DalVr v;
+    v.u32 = __builtin_convertvector(__builtin_shufflevector(a.u16, a.u16, 0, 2, 4, 6), DalU32x4) *
+            __builtin_convertvector(__builtin_shufflevector(b.u16, b.u16, 0, 2, 4, 6), DalU32x4);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmulesh(DalVr a, DalVr b) {
+    DalVr v;
+    v.s32 = __builtin_convertvector(__builtin_shufflevector(a.s16, a.s16, 1, 3, 5, 7), DalS32x4) *
+            __builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 1, 3, 5, 7), DalS32x4);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmulosh(DalVr a, DalVr b) {
+    DalVr v;
+    v.s32 = __builtin_convertvector(__builtin_shufflevector(a.s16, a.s16, 0, 2, 4, 6), DalS32x4) *
+            __builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 0, 2, 4, 6), DalS32x4);
+    return v;
+}
+
+// Clamp to the signed 16-bit, signed 32-bit or unsigned 32-bit range and set SAT when the value
+// changed.
+DAL_FORCEINLINE int16_t dalClampS16(DalPpuContext* ctx, int32_t x) {
+    int32_t r = x < -32768 ? -32768 : x > 32767 ? 32767 : x;
+    dalSetSat(ctx, r != x);
+    return (int16_t)r;
+}
+
+DAL_FORCEINLINE int32_t dalClampS32(DalPpuContext* ctx, int64_t x) {
+    int64_t r = x < INT32_MIN ? INT32_MIN : x > INT32_MAX ? INT32_MAX : x;
+    dalSetSat(ctx, r != x);
+    return (int32_t)r;
+}
+
+DAL_FORCEINLINE uint32_t dalClampU32(DalPpuContext* ctx, uint64_t x) {
+    uint64_t r = x > UINT32_MAX ? UINT32_MAX : x;
+    dalSetSat(ctx, r != x);
+    return (uint32_t)r;
+}
+
+// vmhaddshs: (a * b >> 15) + c per halfword, saturated. The shifted product of -32768 * -32768 is
+// 32768, which only the 32-bit intermediate keeps (RPCS3 `VMHADDSHS` special-cases it).
+// vmhraddshs adds 0x4000 before the shift (RPCS3 `VMHRADDSHS`).
+DAL_FORCEINLINE DalVr dalVmhaddshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 8; i++)
+        v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i]) >> 15) + c.s16[i]);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmhraddshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 8; i++)
+        v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i] + 0x4000) >> 15) + c.s16[i]);
+    return v;
+}
+
+// vmladduhm: low 16 bits of a * b + c per halfword (RPCS3 `VMLADDUHM`).
+DAL_FORCEINLINE DalVr dalVmladduhm(DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    v.u16 = a.u16 * b.u16 + c.u16;
+    return v;
+}
+
+// vmsum*: word i of the result is c's word i plus the products of the elements of a and b that lie
+// in word i. Elements of one word share a host lane, so no big-endian mapping is needed. The modulo
+// forms wrap in 32 bits; the saturating forms add exactly in 64 bits and clamp (RPCS3 `VMSUMUBM`,
+// `VMSUMMBM` (a signed, b unsigned), `VMSUMUHM`, `VMSUMSHM`, `VMSUMUHS`, `VMSUMSHS`).
+DAL_FORCEINLINE DalVr dalVmsumubm(DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++) {
+        uint32_t sum = c.u32[i];
+        for (int k = 0; k < 4; k++) sum += (uint32_t)a.u8[4 * i + k] * b.u8[4 * i + k];
+        v.u32[i] = sum;
+    }
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmsummbm(DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++) {
+        uint32_t sum = c.u32[i];
+        for (int k = 0; k < 4; k++) sum += (uint32_t)((int32_t)a.s8[4 * i + k] * b.u8[4 * i + k]);
+        v.u32[i] = sum;
+    }
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmsumuhm(DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++)
+        v.u32[i] = c.u32[i] + (uint32_t)a.u16[2 * i] * b.u16[2 * i] +
+                   (uint32_t)a.u16[2 * i + 1] * b.u16[2 * i + 1];
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmsumshm(DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++)
+        v.u32[i] = c.u32[i] + (uint32_t)((int32_t)a.s16[2 * i] * b.s16[2 * i]) +
+                   (uint32_t)((int32_t)a.s16[2 * i + 1] * b.s16[2 * i + 1]);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmsumuhs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++)
+        v.u32[i] = dalClampU32(ctx, (uint64_t)c.u32[i] + (uint64_t)a.u16[2 * i] * b.u16[2 * i] +
+                                        (uint64_t)a.u16[2 * i + 1] * b.u16[2 * i + 1]);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVmsumshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
+    DalVr v;
+    for (int i = 0; i < 4; i++)
+        v.s32[i] = dalClampS32(ctx, (int64_t)c.s32[i] + (int64_t)a.s16[2 * i] * b.s16[2 * i] +
+                                        (int64_t)a.s16[2 * i + 1] * b.s16[2 * i + 1]);
+    return v;
+}
+
+// vsum4*: word i of the result is b's word i plus the elements of a's word i, summed exactly in
+// 64 bits before the clamp (RPCS3 `VSUM4SBS`, `VSUM4SHS`, `VSUM4UBS`).
+DAL_FORCEINLINE DalVr dalVsum4sbs(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalVr v;
+    for (int i = 0; i < 4; i++) {
+        int64_t sum = b.s32[i];
+        for (int k = 0; k < 4; k++) sum += a.s8[4 * i + k];
+        v.s32[i] = dalClampS32(ctx, sum);
+    }
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVsum4shs(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalVr v;
+    for (int i = 0; i < 4; i++)
+        v.s32[i] = dalClampS32(ctx, (int64_t)b.s32[i] + a.s16[2 * i] + a.s16[2 * i + 1]);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVsum4ubs(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalVr v;
+    for (int i = 0; i < 4; i++) {
+        uint64_t sum = b.u32[i];
+        for (int k = 0; k < 4; k++) sum += a.u8[4 * i + k];
+        v.u32[i] = dalClampU32(ctx, sum);
+    }
+    return v;
+}
+
+// vsum2sws: big-endian word 1 = a0 + a1 + b1 and word 3 = a2 + a3 + b3, saturated; words 0 and 2
+// are zero. vsumsws: word 3 = a0 + a1 + a2 + a3 + b3, the other words are zero. Big-endian word n is
+// host lane 3 - n (RPCS3 `VSUM2SWS`, `VSUMSWS` read b's host lane 0 and 2 the same way).
+DAL_FORCEINLINE DalVr dalVsum2sws(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalVr v = {};
+    v.s32[2] = dalClampS32(ctx, (int64_t)a.s32[3] + a.s32[2] + b.s32[2]);
+    v.s32[0] = dalClampS32(ctx, (int64_t)a.s32[1] + a.s32[0] + b.s32[0]);
+    return v;
+}
+
+DAL_FORCEINLINE DalVr dalVsumsws(DalPpuContext* ctx, DalVr a, DalVr b) {
+    DalVr v = {};
+    v.s32[0] = dalClampS32(ctx, (int64_t)a.s32[3] + a.s32[2] + a.s32[1] + a.s32[0] + b.s32[0]);
+    return v;
+}

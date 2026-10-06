@@ -570,5 +570,38 @@ class VmxIntTest(unittest.TestCase):
                              ["ctx->vr[3] = dal%s(ctx->vr[1], ctx->vr[2]);" % name.capitalize()], name)
 
 
+class VmxMulTest(unittest.TestCase):
+    def test_every_member_of_the_group_is_handled(self):
+        from ps3recomp.emit_db import GROUPS
+        from ps3recomp.emit_core import load_handlers
+        self.assertEqual(sorted(set(GROUPS["vmx_mul"]) - set(load_handlers())), [])
+
+    def test_two_source_forms_call_their_helper(self):
+        for name in ("vslw", "vsraw", "vrlb", "vsrh", "vmuleub", "vmulosh"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx->vr[1], ctx->vr[2]);" % name.capitalize()], name)
+
+    def test_three_source_forms_pass_vrc_last(self):
+        for name in ("vmladduhm", "vmsumubm", "vmsummbm", "vmsumuhm", "vmsumshm"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2, vC=4))[0],
+                             ["ctx->vr[3] = dal%s(ctx->vr[1], ctx->vr[2], ctx->vr[4]);"
+                              % name.capitalize()], name)
+
+    def test_saturating_forms_receive_the_context(self):
+        for name in ("vmhaddshs", "vmhraddshs", "vmsumuhs", "vmsumshs"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2, vC=4))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[1], ctx->vr[2], ctx->vr[4]);"
+                              % name.capitalize()], name)
+        for name in ("vsum4ubs", "vsum4sbs", "vsum4shs", "vsum2sws", "vsumsws"):
+            self.assertEqual(body(asm.encode(name, vD=3, vA=1, vB=2))[0],
+                             ["ctx->vr[3] = dal%s(ctx, ctx->vr[1], ctx->vr[2]);" % name.capitalize()],
+                             name)
+
+    def test_modulo_forms_do_not_touch_sat(self):
+        for name in ("vmsumubm", "vmsumshm", "vmladduhm"):
+            lines, _ = body(asm.encode(name, vD=3, vA=1, vB=2, vC=4))
+            self.assertNotIn("ctx,", lines[0], name)
+
+
 if __name__ == "__main__":
     unittest.main()
