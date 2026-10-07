@@ -102,6 +102,40 @@ void testLogLevelsAndPrefix() {
   }
 }
 
+void testLogVisibleLevel() {
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::setGuestThreadIdProvider(nullptr);
+  dal::resetLogOnce();
+
+  CHECK(!dal::logEnabled(dal::LogLevel::Debug));
+  CHECK(dal::logEnabled(dal::LogLevel::Info));
+  dal::logTrace("t0");
+  dal::logDebug("d0");
+  dal::logInfo("i0");
+  const std::size_t default_count = lines.size();
+
+  // A suppressed logOnce does not use up its key.
+  dal::logOnce(dal::LogLevel::Debug, "level-key", "once");
+
+  dal::setLogLevel(dal::LogLevel::Debug);
+  dal::logTrace("t1");
+  dal::logDebug("d1 {}", 5);
+  dal::logOnce(dal::LogLevel::Debug, "level-key", "once");
+
+  dal::setLogLevel(dal::LogLevel::Info);
+  dal::setLogSink({});
+
+  CHECK(default_count == 1);
+  CHECK(lines.size() == 3);
+  if (lines.size() == 3) {
+    CHECK(lines[0] == "[host] i0");
+    CHECK(lines[1] == "[host] debug: d1 5");
+    CHECK(lines[2] == "[host] debug: once");
+  }
+  CHECK(!dal::logEnabled(dal::LogLevel::Debug));
+}
+
 void testLogOnce() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -6904,6 +6938,7 @@ int main(int argc, char** argv) {
 
   dal::installProcessSettings();
   testLogLevelsAndPrefix();
+  testLogVisibleLevel();
   testLogOnce();
   testGuestMemoryRoundTrip();
   testIsCommittedAndRangeNames();

@@ -185,12 +185,22 @@ void printUsage() {
   std::fputs(
       "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
+      "                [--log-level trace|debug|info|warn|error]\n"
       "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
       "                [--vk-validation] [--window]\n",
       stderr);
+}
+
+std::optional<dal::LogLevel> parseLogLevel(std::string_view name) {
+  if (name == "trace") return dal::LogLevel::Trace;
+  if (name == "debug") return dal::LogLevel::Debug;
+  if (name == "info") return dal::LogLevel::Info;
+  if (name == "warn") return dal::LogLevel::Warn;
+  if (name == "error") return dal::LogLevel::Error;
+  return std::nullopt;
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -226,6 +236,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       }
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
+    } else if (arg == "--log-level") {
+      std::string name;
+      if (!value(name)) return false;
+      const std::optional<dal::LogLevel> level = parseLogLevel(name);
+      if (!level) {
+        std::fprintf(stderr, "error: --log-level needs trace, debug, info, warn or error\n");
+        return false;
+      }
+      // Applied here so that nothing later in startup logs at the wrong level.
+      dal::setLogLevel(*level);
     } else if (arg == "--dialog-answer") {
       if (!value(opt.dialog_answer)) return false;
       if (!dal::setDialogAnswer(opt.dialog_answer)) {

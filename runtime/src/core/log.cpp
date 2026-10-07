@@ -59,8 +59,9 @@ struct LogState {
     stderr_sink = std::make_shared<spdlog::sinks::stderr_sink_mt>();
     stderr_sink->set_formatter(makeFormatter("\n"));
     logger = std::make_shared<spdlog::logger>("dal", stderr_sink);
-    logger->set_level(spdlog::level::trace);
-    // Each line must reach the stream before a fatal path ends the process.
+    logger->set_level(spdlog::level::info);
+    // Each emitted line must reach the stream before a fatal path ends the process. This is
+    // independent of the visible level, which drops lines before they get here.
     logger->flush_on(spdlog::level::trace);
   }
 
@@ -98,6 +99,10 @@ LogState& state() {
 
 std::string_view levelTag(spdlog::level::level_enum level) {
   switch (level) {
+    case spdlog::level::trace:
+      return "trace: ";
+    case spdlog::level::debug:
+      return "debug: ";
     case spdlog::level::warn:
       return "warn: ";
     case spdlog::level::err:
@@ -110,6 +115,10 @@ std::string_view levelTag(spdlog::level::level_enum level) {
 
 spdlog::level::level_enum toSpdlogLevel(LogLevel level) {
   switch (level) {
+    case LogLevel::Trace:
+      return spdlog::level::trace;
+    case LogLevel::Debug:
+      return spdlog::level::debug;
     case LogLevel::Warn:
       return spdlog::level::warn;
     case LogLevel::Error:
@@ -168,6 +177,17 @@ void setLogSink(std::function<void(std::string_view)> sink) {
     s.sink.reset();
   }
   s.rebuildSinks();
+}
+
+void setLogLevel(LogLevel level) {
+  LogState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.logger->set_level(toSpdlogLevel(level));
+}
+
+bool logEnabled(LogLevel level) {
+  // spdlog keeps the level in an atomic, so this needs no lock.
+  return state().logger->should_log(toSpdlogLevel(level));
 }
 
 void flushLog() {

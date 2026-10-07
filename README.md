@@ -489,7 +489,7 @@ code was emitted from.
 
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
-         [--seconds N] [--strict] [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
+         [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
          [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
          [--shader-cache DIR] [--vk-validation] [--window]
@@ -505,6 +505,7 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
 | `--seconds N` | Watchdog: stop after `N` seconds. 0 (the default) disables it. |
 | `--strict` | Treat a jump to an address that is not a recovered function as a fatal error (see "Dispatch"). |
 | `--log FILE` | Also write every log line to `FILE`, which is truncated. |
+| `--log-level trace\|debug\|info\|warn\|error` | Lowest level that is logged (default `info`). `debug` adds diagnostics such as the 10 s window statistics; `trace` is the most verbose. Debug and trace lines carry a `debug: ` / `trace: ` tag. |
 | `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
 | `--pad none\|neutral` | Input source: `neutral` (the default) connects a standard pad on port 0 that never changes, `none` connects no pad. |

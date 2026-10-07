@@ -10,7 +10,7 @@
 
 namespace dal {
 
-enum class LogLevel { Info, Warn, Error };
+enum class LogLevel { Trace, Debug, Info, Warn, Error };
 
 // Returns the id of the guest thread running on the calling host thread, or nullopt on a host
 // thread. Registered by the thread layer so the logger does not depend on it.
@@ -29,6 +29,12 @@ void setLogSink(std::function<void(std::string_view)> sink);
 // Forgets which keys logOnce has seen. Intended for tests.
 void resetLogOnce();
 
+// Messages below `level` are dropped. The default is Info. Safe to call from any thread.
+void setLogLevel(LogLevel level);
+
+// Returns true when a message at `level` would be written. Cheap enough for hot paths.
+bool logEnabled(LogLevel level);
+
 void logWrite(LogLevel level, std::string_view message);
 
 // Flushes every active output. Lines are already flushed as they are written; this is for paths
@@ -38,26 +44,43 @@ void flushLog();
 // Returns true the first time `key` is passed in.
 bool firstUse(std::string_view key);
 
+// A suppressed message is not formatted.
+template <typename... Args>
+void logTrace(std::format_string<Args...> fmt, Args&&... args) {
+  if (!logEnabled(LogLevel::Trace)) return;
+  logWrite(LogLevel::Trace, std::format(fmt, std::forward<Args>(args)...));
+}
+
+template <typename... Args>
+void logDebug(std::format_string<Args...> fmt, Args&&... args) {
+  if (!logEnabled(LogLevel::Debug)) return;
+  logWrite(LogLevel::Debug, std::format(fmt, std::forward<Args>(args)...));
+}
+
 template <typename... Args>
 void logInfo(std::format_string<Args...> fmt, Args&&... args) {
+  if (!logEnabled(LogLevel::Info)) return;
   logWrite(LogLevel::Info, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logWarn(std::format_string<Args...> fmt, Args&&... args) {
+  if (!logEnabled(LogLevel::Warn)) return;
   logWrite(LogLevel::Warn, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logError(std::format_string<Args...> fmt, Args&&... args) {
+  if (!logEnabled(LogLevel::Error)) return;
   logWrite(LogLevel::Error, std::format(fmt, std::forward<Args>(args)...));
 }
 
 // Logs only the first time `key` is seen, so hot paths can report an unimplemented call without
-// flooding the output. The message is not formatted on later calls.
+// flooding the output. The message is not formatted on later calls. A suppressed level does not
+// use up the key.
 template <typename... Args>
 void logOnce(LogLevel level, std::string_view key, std::format_string<Args...> fmt, Args&&... args) {
-  if (firstUse(key)) {
+  if (logEnabled(level) && firstUse(key)) {
     logWrite(level, std::format(fmt, std::forward<Args>(args)...));
   }
 }

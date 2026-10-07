@@ -462,11 +462,11 @@ void Presenter::reportStats() {
   const double seconds = std::chrono::duration<double>(elapsed).count();
   const double acquires = static_cast<double>(std::max<std::uint64_t>(stats_.acquires, 1));
   const double presents = static_cast<double>(std::max<std::uint64_t>(stats_.presents, 1));
-  logInfo("dal: render: window: {} presents in {:.1f} s ({:.1f}/s), acquire avg {:.2f} max {:.2f} ms, present avg {:.2f} max {:.2f} ms, "
-          "{} skipped, {} swapchain creations",
-          stats_.presents, seconds, static_cast<double>(stats_.presents) / seconds, toMs(stats_.acquire_total) / acquires,
-          toMs(stats_.acquire_max), toMs(stats_.present_total) / presents, toMs(stats_.present_max), stats_.skipped,
-          stats_.recreations);
+  logDebug("dal: render: window: {} presents in {:.1f} s ({:.1f}/s), acquire avg {:.2f} max {:.2f} ms, present avg {:.2f} max {:.2f} ms, "
+           "{} skipped, {} swapchain creations",
+           stats_.presents, seconds, static_cast<double>(stats_.presents) / seconds, toMs(stats_.acquire_total) / acquires,
+           toMs(stats_.acquire_max), toMs(stats_.present_total) / presents, toMs(stats_.present_max), stats_.skipped,
+           stats_.recreations);
   const std::uint64_t recreations = stats_.recreations;
   stats_ = Stats{};
   stats_.recreations = recreations;
