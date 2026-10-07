@@ -37,6 +37,7 @@
 #include "hle/hle.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_buttons.h"
+#include "input/pad_script.h"
 #include "png.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_ppu_thread.h"
@@ -3415,6 +3416,181 @@ void testKeyboardPadThreads() {
   CHECK(state->held() == expected);
   CHECK(provider->poll(0).button[dal::kPadButtonDigital2] == 0x40);
   CHECK(polls > 0);
+}
+
+struct ScriptEventSpec {
+  int at_ms;
+  dal::PadButtons buttons;
+  bool down;
+};
+
+bool scriptEventsAre(const std::string& text, std::initializer_list<ScriptEventSpec> expected) {
+  const auto parsed = dal::parsePadScript(text);
+  if (!parsed) {
+    std::fprintf(stderr, "parse failed: %s\n", parsed.error().c_str());
+    return false;
+  }
+  if (parsed->size() != expected.size()) return false;
+  std::size_t i = 0;
+  for (const ScriptEventSpec& want : expected) {
+    const dal::PadScriptEvent& got = (*parsed)[i++];
+    if (got.at.count() != want.at_ms || got.buttons != want.buttons || got.down != want.down) return false;
+  }
+  return true;
+}
+
+std::string scriptError(const std::string& text) {
+  const auto parsed = dal::parsePadScript(text);
+  return parsed ? std::string{} : parsed.error();
+}
+
+void testPadScriptParse() {
+  using dal::PadButton;
+  constexpr dal::PadButtons kStart = dal::padButtonBit(PadButton::Start);
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+  constexpr dal::PadButtons kR1 = dal::padButtonBit(PadButton::R1);
+  constexpr int kHold = static_cast<int>(dal::kPadScriptTapHold.count());
+  CHECK(dal::kPadScriptTapHold > dal::KeyboardPadState::kMinPressVisible);
+
+  // Comments, blank lines, tabs, CRLF and a missing final newline.
+  CHECK(scriptEventsAre("", {}));
+  CHECK(scriptEventsAre("# only a comment\n\n   \t\n", {}));
+  CHECK(scriptEventsAre("1 press start # trailing comment\r\n\t2.5\tpress\t cross", {
+      {1000, kStart, true}, {2500, kCross, true}}));
+
+  // press / release, decimal times (also rounding past the third decimal), several buttons.
+  CHECK(scriptEventsAre("40 press start\n40.5 release start\n0.25 press cross+r1\n0.0004 release r1\n"
+                        "0.0005 release r1",
+                        {{0, kR1, false}, {1, kR1, false}, {250, kCross | kR1, true}, {40000, kStart, true},
+                         {40500, kStart, false}}));
+
+  // tap = press and release one hold later; the sort is by time.
+  CHECK(scriptEventsAre("3 tap start\n1 tap cross+r1\n",
+                        {{1000, kCross | kR1, true}, {1000 + kHold, kCross | kR1, false},
+                         {3000, kStart, true}, {3000 + kHold, kStart, false}}));
+
+  // Repeated taps at time + k * interval while <= until: 1, 3, 5.
+  CHECK(scriptEventsAre("1 tap start every 2 until 6",
+                        {{1000, kStart, true}, {1000 + kHold, kStart, false}, {3000, kStart, true},
+                         {3000 + kHold, kStart, false}, {5000, kStart, true}, {5000 + kHold, kStart, false}}));
+  // `until` is inclusive (5 here); a lone tap when no repeat fits before it.
+  CHECK(scriptEventsAre("1 tap start every 2 until 5",
+                        {{1000, kStart, true}, {1000 + kHold, kStart, false}, {3000, kStart, true},
+                         {3000 + kHold, kStart, false}, {5000, kStart, true}, {5000 + kHold, kStart, false}}));
+  CHECK(scriptEventsAre("1 tap start every 0.151 until 1",
+                        {{1000, kStart, true}, {1000 + kHold, kStart, false}}));
+
+  // Equal times: releases before presses, otherwise file order (stable).
+  CHECK(scriptEventsAre("2 press start\n2 release cross\n2 press cross\n2 release start\n",
+                        {{2000, kCross, false}, {2000, kStart, false}, {2000, kStart, true}, {2000, kCross, true}}));
+  // A release of one tap and the press of the next at the same instant also order release first.
+  CHECK(scriptEventsAre("1 tap start\n1.15 tap start",
+                        {{1000, kStart, true}, {1150, kStart, false}, {1150, kStart, true}, {1300, kStart, false}}));
+}
+
+void testPadScriptErrors() {
+  CHECK(scriptError("1 press start\n\n3 press crosss\n") == "line 3: unknown button \"crosss\"");
+  CHECK(scriptError("# header\n1 jump start") == "line 2: unknown command \"jump\"");
+  CHECK(scriptError("soon press start") == "line 1: bad time \"soon\"");
+  CHECK(scriptError("-1 press start").starts_with("line 1: bad time"));
+  CHECK(scriptError("1.2.3 press start").starts_with("line 1: bad time"));
+  CHECK(scriptError("1e3 press start").starts_with("line 1: bad time"));
+  CHECK(scriptError("5. press start").starts_with("line 1: bad time"));
+  CHECK(scriptError("99999999 press start").starts_with("line 1: bad time"));
+  CHECK(scriptError("1").starts_with("line 1: missing command"));
+  CHECK(scriptError("1 press").starts_with("line 1: \"press\" needs buttons"));
+  CHECK(scriptError("1 press start+").starts_with("line 1: unknown button \"\""));
+  CHECK(scriptError("1 press cross+cross+nope") == "line 1: unknown button \"nope\"");
+  CHECK(scriptError("1 press start now").starts_with("line 1: unexpected \"now\""));
+
+  // Interval no longer than the hold, missing or malformed `every` clauses.
+  CHECK(scriptError("1 tap start every 0.15 until 5").starts_with("line 1: interval must be longer"));
+  CHECK(scriptError("1 tap start every 0 until 5").starts_with("line 1: interval must be longer"));
+  CHECK(scriptError("1 tap start every 2").starts_with("line 1: \"every\" needs \"until <time>\""));
+  CHECK(scriptError("1 tap start every 2 till 5").starts_with("line 1: \"every\" needs \"until <time>\""));
+  CHECK(scriptError("1 tap start every").starts_with("line 1: \"every\" needs an interval"));
+  CHECK(scriptError("1 tap start every x until 5") == "line 1: bad interval \"x\"");
+  CHECK(scriptError("1 tap start every 2 until").starts_with("line 1: \"until\" needs a time"));
+  CHECK(scriptError("1 tap start every 2 until x") == "line 1: bad time \"x\"");
+  CHECK(scriptError("4 tap start every 2 until 3").starts_with("line 1: \"until\" is before"));
+  CHECK(scriptError("1 tap start often").starts_with("line 1: unexpected \"often\""));
+  CHECK(scriptError("1 tap start every 2 until 5 extra").starts_with("line 1: unexpected \"extra\""));
+  CHECK(scriptError("1 tap start every 0.2 until 999999").starts_with("line 1: more than"));
+
+  const auto missing = dal::loadPadScript(std::filesystem::path("no_such_dir") / "no_such_script.txt");
+  CHECK(!missing && missing.error().starts_with("cannot open"));
+
+  const std::filesystem::path file = std::filesystem::temp_directory_path() / "dal_pad_script_test.txt";
+  {
+    std::ofstream out(file, std::ios::binary);
+    out << "# test\n2 tap start\n";
+  }
+  const auto loaded = dal::loadPadScript(file);
+  CHECK(loaded && loaded->size() == 2 && (*loaded)[0].at.count() == 2000);
+  {
+    std::ofstream out(file, std::ios::binary);
+    out << "1 press start\n2 press bogus\n";
+  }
+  const auto bad = dal::loadPadScript(file);
+  CHECK(!bad && bad.error() == "line 2: unknown button \"bogus\"");
+  std::error_code ignored;
+  std::filesystem::remove(file, ignored);
+}
+
+void testPadScriptPlay() {
+  using dal::PadButton;
+  using std::chrono::milliseconds;
+  constexpr dal::PadButtons kStart = dal::padButtonBit(PadButton::Start);
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+  constexpr dal::PadButtons kR1 = dal::padButtonBit(PadButton::R1);
+
+  const auto parsed = dal::parsePadScript("1 press start\n2 press cross+r1\n3 release start\n4 release cross+r1\n");
+  CHECK(parsed && parsed->size() == 4);
+  if (!parsed || parsed->size() != 4) return;
+
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+  dal::setGuestThreadIdProvider(nullptr);
+  dal::KeyboardPadState state;
+  std::vector<std::int64_t> waits;
+  std::vector<dal::PadButtons> held_before_wait;
+  dal::playPadScript(*parsed, state, [&](milliseconds at) {
+    waits.push_back(at.count());
+    held_before_wait.push_back(state.held());
+  });
+  dal::setLogSink({});
+
+  // wait_until runs before each event, so it sees the state left by the previous one.
+  CHECK((waits == std::vector<std::int64_t>{1000, 2000, 3000, 4000}));
+  CHECK((held_before_wait == std::vector<dal::PadButtons>{0, kStart, kStart | kCross | kR1, kCross | kR1}));
+  CHECK(state.held() == 0);
+
+  CHECK(lines.size() == 4);
+  if (lines.size() == 4) {
+    CHECK(lines[0] == "[host] dal: pad: script 1.000 s: press start");
+    CHECK(lines[1] == "[host] dal: pad: script 2.000 s: press r1+cross");
+    CHECK(lines[2] == "[host] dal: pad: script 3.000 s: release start");
+    CHECK(lines[3] == "[host] dal: pad: script 4.000 s: release r1+cross");
+  }
+
+  // Script buttons are held in their own source: a keyboard focus loss does not drop them.
+  dal::KeyboardPadState mixed;
+  const auto now = dal::KeyboardPadState::Clock::now();
+  mixed.setButtons(dal::InputSource::Script, kStart, true, now);
+  mixed.keyEvent(0x2C, true, false, now);
+  mixed.releaseAll(dal::InputSource::Keyboard);
+  CHECK(mixed.held() == kStart);
+
+  // The detached player thread applies the events on its own clock and keeps the state alive.
+  auto shared = std::make_shared<dal::KeyboardPadState>();
+  dal::startPadScript({}, shared);  // nothing to play: no thread, no change
+  CHECK(shared->held() == 0);
+  dal::startPadScript({{milliseconds(0), kCross, true}, {milliseconds(20), kStart, true}}, shared);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (shared->held() != (kCross | kStart) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(milliseconds(1));
+  }
+  CHECK(shared->held() == (kCross | kStart));
 }
 
 void testCellMsgDialog() {
@@ -7295,6 +7471,9 @@ int main(int argc, char** argv) {
   testKeyboardPadState();
   testKeyboardPadProvider();
   testKeyboardPadThreads();
+  testPadScriptParse();
+  testPadScriptErrors();
+  testPadScriptPlay();
   testCellMsgDialog();
   testCellSaveData();
   testCellPngDec();

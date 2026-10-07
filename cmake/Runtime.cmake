@@ -109,6 +109,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/sys_prx_for_user.cpp
     runtime/src/input/keyboard_pad.cpp
     runtime/src/input/pad_buttons.cpp
+    runtime/src/input/pad_script.cpp
     runtime/src/lv2/sys_event.cpp
     runtime/src/lv2/sys_fs.cpp
     runtime/src/lv2/sys_misc.cpp
