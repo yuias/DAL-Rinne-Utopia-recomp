@@ -60,7 +60,8 @@ function(dal_render_add)
 
   add_library(dal_render STATIC
     runtime/src/render/shader_compiler.cpp
-    runtime/src/render/vk_context.cpp)
+    runtime/src/render/vk_context.cpp
+    runtime/src/render/vp_translator.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_include_directories(dal_render SYSTEM PUBLIC
@@ -82,6 +83,16 @@ function(dal_render_add)
   set_tests_properties(render_core PROPERTIES
     PASS_REGULAR_EXPRESSION
       "render tests: [0-9]+ passed, 0 failed|render tests: skipped: no Vulkan device")
+
+  # Needs no GPU. The dumped programs come from generated/rsx; the test skips them when absent.
+  add_executable(dal_vp_translator_tests runtime/tests/vp_translator_test.cpp)
+  target_compile_options(dal_vp_translator_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_definitions(dal_vp_translator_tests PRIVATE
+    DAL_RSX_DUMP_DIR="${CMAKE_SOURCE_DIR}/generated/rsx")
+  target_link_libraries(dal_vp_translator_tests PRIVATE dal_render)
+  add_test(NAME vp_translator COMMAND dal_vp_translator_tests)
+  set_tests_properties(vp_translator PROPERTIES
+    PASS_REGULAR_EXPRESSION "vp translator tests: [0-9]+ passed, 0 failed")
 
   # Replays a capture without the game; for now it prints the command list from the frame builder.
   add_executable(dal_rsxreplay tools/dal_rsxreplay/main.cpp)
