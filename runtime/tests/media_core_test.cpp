@@ -3,6 +3,7 @@
 // test reads game data; it is optional and runs only when DAL_GAME_DIR is set.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "core/boot.h"
@@ -32,6 +34,7 @@
 #include "hle/sail_service.h"
 #include "lv2/sys_sync.h"
 #include "media/movie_decoder.h"
+#include "media/movie_player.h"
 #include "media/pamf.h"
 
 namespace {
@@ -598,6 +601,523 @@ void testPamfDemuxDamage() {
   CHECK(bad_header.errors == 1 && bad_header.aus[0].empty());
 }
 
+// Fake codecs for the player: one frame or chunk comes out per access unit, marked with its index, so
+// the tests see exactly what the player did with it.
+struct FakeShared {
+  std::atomic<int> video_sent{0}, audio_sent{0};
+  std::atomic<int> video_delay_ms{0};
+  std::atomic<std::int64_t> format_start_pts{-12345};
+  bool fail_video = false, fail_audio = false;
+};
+
+constexpr std::uint32_t kFakeChunkFrames = 2048;  // sample frames per fake ATRAC3plus chunk
+constexpr std::uint32_t kFakeFrameBytes = 8;      // stereo float32
+
+class FakeVideoDecoder : public dal::VideoDecoder {
+ public:
+  explicit FakeVideoDecoder(FakeShared* shared) : shared_(shared) {}
+  bool send(std::span<const std::uint8_t>, std::int64_t pts, std::int64_t) override {
+    if (const int delay = shared_->video_delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    const int index = shared_->video_sent++;
+    // Like the real decoder: a frame without a PTS continues after the previous one.
+    last_pts_ = pts >= 0 ? pts : last_pts_ + 3003;
+    dal::VideoFrame frame;
+    frame.pts = last_pts_;
+    frame.width = 4;
+    frame.height = 2;
+    frame.pitch = 16;
+    frame.bytes.assign(32, static_cast<std::uint8_t>(index));
+    pending_.push_back(std::move(frame));
+    return true;
+  }
+  bool receive(dal::VideoFrame& out) override {
+    if (pending_.empty()) return false;
+    out = std::move(pending_.front());
+    pending_.erase(pending_.begin());
+    return true;
+  }
+  void flush() override {}
+
+ private:
+  FakeShared* shared_;
+  std::int64_t last_pts_ = 0;
+  std::vector<dal::VideoFrame> pending_;
+};
+
+class FakeAudioDecoder : public dal::AudioDecoder {
+ public:
+  explicit FakeAudioDecoder(FakeShared* shared) : shared_(shared) {}
+  bool send(std::span<const std::uint8_t>, std::int64_t pts) override {
+    const int index = shared_->audio_sent++;
+    dal::AudioChunk chunk;
+    chunk.pts = pts;
+    chunk.frames = kFakeChunkFrames;
+    chunk.bytes.assign(std::size_t{kFakeChunkFrames} * kFakeFrameBytes, static_cast<std::uint8_t>(index + 1));
+    pending_.push_back(std::move(chunk));
+    return true;
+  }
+  bool receive(dal::AudioChunk& out) override {
+    if (pending_.empty()) return false;
+    out = std::move(pending_.front());
+    pending_.erase(pending_.begin());
+    return true;
+  }
+  void flush() override {}
+
+ private:
+  FakeShared* shared_;
+  std::vector<dal::AudioChunk> pending_;
+};
+
+class FakeFactory : public dal::MediaCodecFactory {
+ public:
+  explicit FakeFactory(FakeShared* shared) : shared_(shared) {}
+  std::unique_ptr<dal::VideoDecoder> createVideo(const dal::PamfStream&, const dal::VideoOutputFormat& format,
+                                                 std::string& error) override {
+    shared_->format_start_pts = format.start_pts;
+    if (shared_->fail_video) {
+      error = "fake video failure";
+      return nullptr;
+    }
+    return std::make_unique<FakeVideoDecoder>(shared_);
+  }
+  std::unique_ptr<dal::AudioDecoder> createAudio(const dal::PamfStream&, const dal::AudioOutputFormat&,
+                                                 std::string& error) override {
+    if (shared_->fail_audio) {
+      error = "fake audio failure";
+      return nullptr;
+    }
+    return std::make_unique<FakeAudioDecoder>(shared_);
+  }
+
+ private:
+  FakeShared* shared_;
+};
+
+// Video PES i has PTS 89310 + 3003 i (the header's start PTS is 89310). The first `audio_packs`
+// packs are each followed by an audio pack with two ATRAC3plus frames; the first frame starts at
+// 85470, one frame before the start PTS, as in the game's movies.
+Bytes makePlayerStream(int video_packs, int audio_packs) {
+  Bytes data;
+  auto add = [&](const Bytes& pack) { data.insert(data.end(), pack.begin(), pack.end()); };
+  for (int i = 0; i < video_packs; i++) {
+    add(makePack({makePes(0xE0, Bytes{0, 0, 0, 1, 0x09, 0x10, static_cast<std::uint8_t>(i)}, 89310 + 3003 * i)}));
+    if (i < audio_packs) {
+      const Bytes es = makeAtracFrames(2);
+      add(makePack({makePes(0xBD, makeAudioPayload(es, 0, es.size(), 0), 85470 + 7680 * i)}));
+    }
+  }
+  return data;
+}
+
+struct TempMovie {
+  std::filesystem::path path;
+  explicit TempMovie(const Bytes& data, const char* name = "dal_movie_player_test.pam") {
+    std::error_code ec;
+    path = std::filesystem::temp_directory_path(ec) / name;
+    Bytes file = makePamfHeader(static_cast<std::uint32_t>(data.size() / 2048));
+    file.insert(file.end(), data.begin(), data.end());
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+  }
+  ~TempMovie() {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+};
+
+template <class Pred>
+bool pollFor(Pred done, int timeout_ms = 5000) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+constexpr std::int64_t kPlayerStartPts = 89310;
+constexpr std::int64_t kPlayerDuration = 722910 - 89310;
+
+struct PlayerFixture {
+  FakeShared shared;
+  std::atomic<std::int64_t> clock{1000};
+  dal::MoviePlayerOptions options;
+  PlayerFixture() {
+    options.clock = [this] { return clock.load(); };
+    dal::setMediaCodecFactory(std::make_unique<FakeFactory>(&shared));
+  }
+  ~PlayerFixture() { dal::setMediaCodecFactory(nullptr); }
+};
+
+bool decodeFinished(const dal::MoviePlayer& player) { return player.stats().decode_finished; }
+
+void testMoviePlayerOrderAndTiming() {
+  PlayerFixture fx;
+  fx.options.video_queue_frames = 64;  // everything fits, so decoding ends without a consumer
+  const TempMovie movie(makePlayerStream(10, 4));
+  dal::MoviePlayer player(fx.options);
+
+  CHECK(!player.start());
+  CHECK(!player.open(std::filesystem::temp_directory_path() / "dal_movie_player_missing.pam", {}, {}).has_value());
+  CHECK(!player.start());
+  const auto info = player.open(movie.path, {}, {});
+  CHECK(info.has_value());
+  if (!info) return;
+  CHECK(info->streams.size() == 2 && static_cast<std::int64_t>(info->start_pts) == kPlayerStartPts);
+  CHECK(player.start());
+  CHECK(!player.start());
+  CHECK(player.waitPrerolled(std::chrono::seconds(5)));
+  CHECK(pollFor([&] { return decodeFinished(player); }));
+  // The decoder is told the file's start PTS even though the caller passed none.
+  CHECK(fx.shared.format_start_pts == kPlayerStartPts);
+
+  dal::MoviePlayerStats stats = player.stats();
+  CHECK(stats.video_decoder && stats.audio_decoder && stats.codec_error.empty());
+  CHECK(stats.video_decoded == 10 && stats.audio_decoded_frames == 8 * kFakeChunkFrames);
+  CHECK(stats.demux_errors == 0 && stats.read_errors == 0);
+  CHECK(stats.width == 1280 && stats.height == 720 && stats.duration_ticks == kPlayerDuration);
+  CHECK(stats.frame_rate_num == 30000 && stats.frame_rate_den == 1001);  // the header states no rate
+
+  const std::int64_t origin = 1000;
+  std::int64_t last_pts = -1;
+  int delivered = 0;
+  std::uint32_t dropped = 0;
+  auto expectFrame = [&](std::int64_t now, int index, std::uint32_t expected_dropped) {
+    auto due = player.takeDueVideo(now);
+    CHECK(due.has_value());
+    if (!due) return;
+    CHECK(due->frame.pts == kPlayerStartPts + 3003 * index);
+    CHECK(!due->frame.bytes.empty() && due->frame.bytes[0] == index);
+    CHECK(due->dropped == expected_dropped);
+    CHECK(due->frame.pts > last_pts);
+    last_pts = due->frame.pts;
+    delivered++;
+    dropped += due->dropped;
+  };
+  // Frame i is due 3003 i ticks after the origin; nothing before that.
+  expectFrame(origin, 0, 0);
+  CHECK(!player.takeDueVideo(origin + 3002).has_value());
+  expectFrame(origin + 3003, 1, 0);
+  CHECK(!player.takeDueVideo(origin + 3003 + 3002).has_value());
+  // A jump over frames 2, 3 and 4 delivers the newest due frame and counts the skipped ones.
+  expectFrame(origin + 5 * 3003 + 10, 5, 3);
+  expectFrame(origin + 1000000, 9, 3);
+  CHECK(!player.takeDueVideo(origin + 2000000).has_value());
+  stats = player.stats();
+  CHECK(stats.video_delivered == 4 && stats.video_dropped == 6 && delivered == 4 && dropped == 6);
+
+  // The movie ends when the clock has covered the interval, whatever the queues hold.
+  CHECK(!player.atEnd(origin + kPlayerDuration - 1));
+  CHECK(player.atEnd(origin + kPlayerDuration));
+  CHECK(player.stats().played_ticks == kPlayerDuration);
+
+  // Audio keeps its own PTS on the video's origin, including the frame before the start PTS.
+  const dal::MovieAudioBlock a = player.takeAudio(100);
+  CHECK(a.pts == 85470 && a.pts < kPlayerStartPts && a.frames == 100 && a.real_frames == 100);
+  CHECK(a.bytes.size() == 100 * kFakeFrameBytes && a.bytes[0] == 1);
+  // A partial chunk advances the PTS by the samples taken (100 frames = 187.5 ticks, rounded down).
+  const dal::MovieAudioBlock b = player.takeAudio(100);
+  CHECK(b.pts == 85470 + 187 && b.real_frames == 100);
+  // A block that spans three chunks: 1848 frames of chunk 0, all of chunk 1, 1104 frames of chunk 2.
+  const dal::MovieAudioBlock c = player.takeAudio(5000);
+  CHECK(c.pts == 85470 + 200 * 90000 / 48000 && c.frames == 5000 && c.real_frames == 5000);
+  CHECK(c.bytes.size() == 5000 * kFakeFrameBytes);
+  if (c.bytes.size() == 5000 * kFakeFrameBytes) {
+    CHECK(c.bytes[0] == 1 && c.bytes[1847 * kFakeFrameBytes] == 1);
+    CHECK(c.bytes[1848 * kFakeFrameBytes] == 2 && c.bytes[3895 * kFakeFrameBytes] == 2);
+    CHECK(c.bytes[3896 * kFakeFrameBytes] == 3 && c.bytes[4999 * kFakeFrameBytes + 7] == 3);
+  }
+  // Asking for more than is left gives the rest and then zero-filled silence.
+  const dal::MovieAudioBlock d = player.takeAudio(20000);
+  const std::uint32_t left = 8 * kFakeChunkFrames - 5200;
+  CHECK(d.frames == 20000 && d.real_frames == left);
+  CHECK(d.bytes.size() == 20000 * kFakeFrameBytes && d.bytes[left * kFakeFrameBytes - 1] == 8);
+  CHECK(d.bytes[left * kFakeFrameBytes] == 0 && d.bytes.back() == 0);
+  // Silence continues where the previous block ended.
+  const dal::MovieAudioBlock e = player.takeAudio(64);
+  CHECK(e.real_frames == 0 && e.pts == d.pts + 20000 * 90000 / 48000);
+  CHECK(e.bytes == Bytes(64 * kFakeFrameBytes, 0));
+  stats = player.stats();
+  CHECK(stats.audio_delivered_frames == 8 * kFakeChunkFrames);
+  CHECK(stats.audio_silence_frames == 20000 - left + 64);
+
+  // Re-opening resets the player.
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.stats().video_decoded == 0 && !player.stats().decode_finished);
+  CHECK(!player.takeDueVideo(origin + 1000000).has_value());
+}
+
+void testMoviePlayerBackpressure() {
+  PlayerFixture fx;
+  const TempMovie movie(makePlayerStream(40, 0));
+  dal::MoviePlayer player(fx.options);
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.start());
+
+  // Nobody takes frames: the queue holds 4 and the decode thread holds one more, then it waits.
+  CHECK(pollFor([&] { return fx.shared.video_sent >= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  CHECK(fx.shared.video_sent <= 6);
+  CHECK(!decodeFinished(player));
+
+  // The consumer is not held up by the blocked decode thread.
+  const auto before = std::chrono::steady_clock::now();
+  auto first = player.takeDueVideo(1000);
+  const auto took = std::chrono::steady_clock::now() - before;
+  CHECK(first.has_value() && first->frame.bytes[0] == 0);
+  CHECK(took < std::chrono::milliseconds(500));
+  CHECK(!decodeFinished(player));
+
+  // Taking frames lets the thread go on until the end of the file.
+  std::uint64_t seen = first ? 1 + first->dropped : 0;
+  const std::int64_t far = 1000 + 100000000;
+  CHECK(pollFor([&] {
+    if (auto due = player.takeDueVideo(far)) seen += 1 + due->dropped;
+    return decodeFinished(player);
+  }));
+  while (auto due = player.takeDueVideo(far)) seen += 1 + due->dropped;
+  CHECK(seen == 40 && fx.shared.video_sent == 40);
+  CHECK(player.stats().video_decoded == 40);
+}
+
+// Nobody pulls audio (the default cellAudio never does): the video decode must still reach the end.
+void testMoviePlayerUnpulledAudio() {
+  PlayerFixture fx;
+  fx.options.read_chunk_bytes = 2048;  // many small reads, so a stalled read shows up
+  fx.options.audio_queue_frames = 4096;
+  const TempMovie movie(makePlayerStream(40, 20));
+  dal::MoviePlayer player(fx.options);
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.start());
+
+  // The clock runs past the whole movie, so every queued chunk is stale once the queue is over its soft
+  // limit.
+  const std::int64_t far = 1000 + 100000000;
+  fx.clock = far;
+  CHECK(pollFor([&] {
+    player.takeDueVideo(far);
+    return decodeFinished(player);
+  }));
+  const dal::MoviePlayerStats stats = player.stats();
+  CHECK(stats.video_decoded == 40 && stats.audio_decoded_frames == 40 * kFakeChunkFrames);
+  CHECK(stats.audio_stale_frames > 0 && stats.audio_overflow_frames == 0);
+
+  // What is left is the newest PCM, in increasing PTS order.
+  std::int64_t last_pts = -1;
+  std::uint64_t real = 0;
+  bool increasing = true;
+  for (;;) {
+    const dal::MovieAudioBlock block = player.takeAudio(1000);
+    if (block.real_frames == 0) break;
+    if (block.pts <= last_pts) increasing = false;
+    last_pts = block.pts;
+    real += block.real_frames;
+  }
+  CHECK(real > 0 && increasing);
+  CHECK(real + stats.audio_stale_frames == stats.audio_decoded_frames);
+}
+
+// A stalled clock: nothing is stale, so only the hard cap bounds the queue.
+void testMoviePlayerAudioHardCap() {
+  PlayerFixture fx;
+  fx.options.read_chunk_bytes = 2048;
+  fx.options.audio_queue_frames = 4096;
+  fx.options.audio_queue_cap_frames = 8192;
+  const TempMovie movie(makePlayerStream(40, 20));
+  dal::MoviePlayer player(fx.options);
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.start());
+  CHECK(pollFor([&] {
+    player.takeDueVideo(1000 + 100000000);  // frames only; the player's clock stays at the origin
+    return decodeFinished(player);
+  }));
+  const dal::MoviePlayerStats stats = player.stats();
+  CHECK(stats.audio_decoded_frames == 40 * kFakeChunkFrames);
+  CHECK(stats.audio_stale_frames == 0 && stats.audio_overflow_frames > 0);
+  // The lead is measured against the stalled clock: all of the audio ends beyond it.
+  CHECK(stats.audio_max_lead_ticks > 0 && stats.audio_max_lead_at_ticks == 0);
+
+  std::uint64_t real = 0;
+  std::int64_t last_pts = -1;
+  bool increasing = true;
+  for (;;) {
+    const dal::MovieAudioBlock block = player.takeAudio(1000);
+    if (block.real_frames == 0) break;
+    if (block.pts <= last_pts) increasing = false;
+    last_pts = block.pts;
+    real += block.real_frames;
+  }
+  CHECK(real > 0 && real <= 8192 && increasing);
+  CHECK(real + stats.audio_overflow_frames == stats.audio_decoded_frames);
+}
+
+void testMoviePlayerStop() {
+  const auto elapsedMs = [](std::chrono::steady_clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
+  };
+
+  // Blocked on a full video queue.
+  {
+    PlayerFixture fx;
+    const TempMovie movie(makePlayerStream(40, 0));
+    dal::MoviePlayer player(fx.options);
+    CHECK(player.open(movie.path, {}, {}).has_value());
+    CHECK(player.start());
+    CHECK(pollFor([&] { return fx.shared.video_sent >= 5; }));
+    const auto before = std::chrono::steady_clock::now();
+    player.stop();
+    CHECK(elapsedMs(before) < 1000);
+    CHECK(decodeFinished(player));
+    CHECK(player.takeDueVideo(1000 + 100000000).has_value());  // what was queued stays readable
+    player.stop();  // idempotent
+  }
+
+  // Busy in a slow decoder.
+  {
+    PlayerFixture fx;
+    fx.options.video_queue_frames = 1000;
+    fx.shared.video_delay_ms = 20;
+    const TempMovie movie(makePlayerStream(200, 0));
+    dal::MoviePlayer player(fx.options);
+    CHECK(player.open(movie.path, {}, {}).has_value());
+    CHECK(player.start());
+    CHECK(pollFor([&] { return fx.shared.video_sent >= 2; }));
+    const auto before = std::chrono::steady_clock::now();
+    player.stop();
+    CHECK(elapsedMs(before) < 500);
+    CHECK(fx.shared.video_sent < 200);
+  }
+
+  // Destroyed without stop(), with the thread waiting on a full queue.
+  {
+    PlayerFixture fx;
+    const TempMovie movie(makePlayerStream(40, 0));
+    const auto before = std::chrono::steady_clock::now();
+    {
+      dal::MoviePlayer player(fx.options);
+      CHECK(player.open(movie.path, {}, {}).has_value());
+      CHECK(player.start());
+      CHECK(pollFor([&] { return fx.shared.video_sent >= 5; }));
+    }
+    CHECK(elapsedMs(before) < 1500);
+  }
+}
+
+void testMoviePlayerWithoutCodecs() {
+  dal::setMediaCodecFactory(nullptr);
+  const TempMovie movie(makePlayerStream(5, 2));
+  std::atomic<std::int64_t> clock{100};
+  dal::MoviePlayerOptions options;
+  options.clock = [&] { return clock.load(); };
+  dal::MoviePlayer player(options);
+
+  dal::VideoOutputFormat video;
+  video.alpha = 0x80;
+  CHECK(player.open(movie.path, video, {}).has_value());
+  CHECK(player.start());
+  CHECK(player.waitPrerolled(std::chrono::seconds(5)));
+  CHECK(pollFor([&] { return decodeFinished(player); }));
+  dal::MoviePlayerStats stats = player.stats();
+  CHECK(!stats.video_decoder && !stats.audio_decoder && stats.video_decoded == 0);
+  CHECK(stats.codec_error.find("no codec factory") != std::string::npos);
+
+  // One black frame at the start PTS, in the stream's size: ARGB with the format's alpha.
+  auto black = player.takeDueVideo(100);
+  CHECK(black.has_value());
+  if (black) {
+    const dal::VideoFrame& f = black->frame;
+    CHECK(f.pts == kPlayerStartPts && f.width == 1280 && f.height == 720 && f.pitch == 5120);
+    CHECK(f.bytes.size() == 5120u * 720u);
+    if (f.bytes.size() == 5120u * 720u) {
+      CHECK(f.bytes[0] == 0x80 && f.bytes[1] == 0 && f.bytes[2] == 0 && f.bytes[3] == 0);
+      CHECK(f.bytes[4] == 0x80 && f.bytes[f.bytes.size() - 4] == 0x80 && f.bytes.back() == 0);
+    }
+  }
+  CHECK(!player.takeDueVideo(100 + 10000000).has_value());
+
+  // Silence for the whole movie: the PTS runs on from the start PTS.
+  const dal::MovieAudioBlock a = player.takeAudio(480);
+  CHECK(a.pts == kPlayerStartPts && a.frames == 480 && a.real_frames == 0);
+  CHECK(a.bytes == Bytes(480 * kFakeFrameBytes, 0));
+  CHECK(player.takeAudio(480).pts == kPlayerStartPts + 900);
+
+  // The movie ends after its duration on the clock. Moving the origin later moves the end.
+  CHECK(!player.atEnd(100 + kPlayerDuration - 1));
+  CHECK(player.atEnd(100 + kPlayerDuration));
+  clock = 200;
+  player.restartClock();
+  CHECK(!player.atEnd(100 + kPlayerDuration));
+  CHECK(player.atEnd(200 + kPlayerDuration));
+
+  // Other pixel formats; the same player opens another movie.
+  video.coding = dal::VideoCoding::Rgba;
+  CHECK(player.open(movie.path, video, {}).has_value());
+  CHECK(player.start());
+  CHECK(player.waitPrerolled(std::chrono::seconds(5)));
+  black = player.takeDueVideo(clock);
+  CHECK(black.has_value() && black->frame.bytes.size() == 5120u * 720u);
+  if (black && black->frame.bytes.size() == 5120u * 720u) {
+    CHECK(black->frame.bytes[0] == 0 && black->frame.bytes[3] == 0x80);
+  }
+  video.coding = dal::VideoCoding::Yuv420Planar;
+  video.width = 16;
+  video.height = 8;
+  CHECK(player.open(movie.path, video, {}).has_value());
+  CHECK(player.start());
+  CHECK(player.waitPrerolled(std::chrono::seconds(5)));
+  black = player.takeDueVideo(clock);
+  CHECK(black.has_value() && black->frame.bytes.size() == 16u * 8u + 2u * 8u * 4u);
+  if (black && black->frame.bytes.size() == 16u * 8u + 2u * 8u * 4u) {
+    CHECK(black->frame.pitch == 16 && black->frame.bytes[0] == 16 && black->frame.bytes[127] == 16);
+    CHECK(black->frame.bytes[128] == 128 && black->frame.bytes.back() == 128);
+  }
+}
+
+void testMoviePlayerPartialCodecs() {
+  // The video decoder cannot be created: black frame, but the audio still plays.
+  {
+    PlayerFixture fx;
+    fx.shared.fail_video = true;
+    const TempMovie movie(makePlayerStream(5, 2));
+    dal::MoviePlayer player(fx.options);
+    CHECK(player.open(movie.path, {}, {}).has_value());
+    CHECK(player.start());
+    CHECK(pollFor([&] { return decodeFinished(player); }));
+    // Nothing takes audio, so decoding of the 4 chunks stays within the queue and finishes.
+    const dal::MoviePlayerStats stats = player.stats();
+    CHECK(!stats.video_decoder && stats.audio_decoder);
+    CHECK(stats.codec_error.find("fake video failure") != std::string::npos);
+    auto black = player.takeDueVideo(1000);
+    CHECK(black.has_value() && black->frame.pts == kPlayerStartPts);
+    const dal::MovieAudioBlock a = player.takeAudio(300);
+    CHECK(a.real_frames == 300 && a.pts == 85470);
+  }
+  // The audio decoder cannot be created: video plays, audio is silence.
+  {
+    PlayerFixture fx;
+    fx.shared.fail_audio = true;
+    fx.options.video_queue_frames = 64;  // no consumer here
+    const TempMovie movie(makePlayerStream(5, 2));
+    dal::MoviePlayer player(fx.options);
+    CHECK(player.open(movie.path, {}, {}).has_value());
+    CHECK(player.start());
+    CHECK(pollFor([&] { return decodeFinished(player); }));
+    const dal::MoviePlayerStats stats = player.stats();
+    CHECK(stats.video_decoder && !stats.audio_decoder && stats.video_decoded == 5);
+    const dal::MovieAudioBlock a = player.takeAudio(300);
+    CHECK(a.real_frames == 0 && a.frames == 300);
+  }
+  // A file that is not PAMF is refused by open().
+  {
+    const TempMovie garbage(Bytes(4096, 0x5A), "dal_movie_player_garbage.pam");
+    dal::MoviePlayer player;
+    std::ofstream(garbage.path, std::ios::binary | std::ios::trunc) << "not a movie";
+    const auto info = player.open(garbage.path, {}, {});
+    CHECK(!info.has_value() && !info.error().empty());
+  }
+}
+
 struct GameFile {
   const char* name;
   // The first three counts are from the whole-file statistics of the format description;
@@ -749,6 +1269,13 @@ int main() {
   testPamfHeader();
   testPamfDemuxSynthetic();
   testPamfDemuxDamage();
+  testMoviePlayerOrderAndTiming();
+  testMoviePlayerBackpressure();
+  testMoviePlayerUnpulledAudio();
+  testMoviePlayerAudioHardCap();
+  testMoviePlayerStop();
+  testMoviePlayerWithoutCodecs();
+  testMoviePlayerPartialCodecs();
   testPamfGameFiles();
   std::printf("media core tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed != 0 ? 1 : 0;

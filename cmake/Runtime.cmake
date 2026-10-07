@@ -112,6 +112,7 @@ function(dal_runtime_add_core)
     runtime/src/lv2/syscalls.cpp
     runtime/src/lv2/vfs.cpp
     runtime/src/lv2/vfs_config.cpp
+    runtime/src/media/movie_player.cpp
     runtime/src/media/pamf.cpp
     runtime/src/rsx/fifo_parser.cpp
     runtime/src/rsx/gcm_interrupts.cpp
