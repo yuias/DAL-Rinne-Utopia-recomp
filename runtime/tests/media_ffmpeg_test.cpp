@@ -1,6 +1,7 @@
 // Self-checking tests for the run-time FFmpeg loader.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -339,8 +340,162 @@ void testVideoDecoderLifecycle() {
   CHECK(!decoder->receive(frame));
   CHECK(decoder->send(plain, -1, -1));
 
-  // Audio is not provided yet and says so.
+  // The audio factory serves ATRAC3plus only.
   CHECK(factory.createAudio(stream, {}, error) == nullptr);
+}
+
+std::uint32_t loadBe32(const std::uint8_t* p) {
+  return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) | (std::uint32_t{p[2]} << 8) | p[3];
+}
+
+std::int16_t loadBe16(const std::uint8_t* p) {
+  return static_cast<std::int16_t>((p[0] << 8) | p[1]);
+}
+
+// Planar float in, interleaved big-endian out: byte order, channel order, rounding and clamping.
+void testAudioConversion() {
+  const auto& loaded = dal::defaultFfmpeg();
+  CHECK(loaded.has_value());
+  if (!loaded) return;
+
+  constexpr int kSamples = 6;
+  float left[kSamples] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f};
+  float right[kSamples] = {0.0f, 0.25f, std::nanf(""), 1e-6f, -1e-6f, 0.999f};
+  AVFrame* frame = loaded->av_frame_alloc();
+  CHECK(frame != nullptr);
+  if (!frame) return;
+  frame->format = AV_SAMPLE_FMT_FLTP;
+  frame->nb_samples = kSamples;
+  loaded->av_channel_layout_default(&frame->ch_layout, 2);
+  frame->data[0] = reinterpret_cast<std::uint8_t*>(left);
+  frame->data[1] = reinterpret_cast<std::uint8_t*>(right);
+  frame->extended_data = frame->data;
+
+  dal::AudioChunk chunk;
+  std::string error;
+  CHECK(dal::convertAudioFrame(*frame, true, chunk, error));
+  CHECK(chunk.frames == kSamples && chunk.bytes.size() == kSamples * 2 * 4);
+  if (chunk.bytes.size() == kSamples * 2 * 4) {
+    const std::uint8_t* p = chunk.bytes.data();
+    CHECK(loadBe32(p) == 0x3F000000);       // 0.5f, left of sample 0
+    CHECK(loadBe32(p + 4) == 0x00000000);   // 0.0f, right of sample 0
+    CHECK(loadBe32(p + 8) == 0xBF000000);   // -0.5f, left of sample 1
+    CHECK(loadBe32(p + 12) == 0x3E800000);  // 0.25f
+    CHECK(loadBe32(p + 32) == 0x40000000);  // 2.0f is passed through unclamped
+  }
+
+  CHECK(dal::convertAudioFrame(*frame, false, chunk, error));
+  CHECK(chunk.frames == kSamples && chunk.bytes.size() == kSamples * 2 * 2);
+  if (chunk.bytes.size() == kSamples * 2 * 2) {
+    const std::uint8_t* p = chunk.bytes.data();
+    const std::int16_t want_left[kSamples] = {16384, -16384, 32767, -32767, 32767, -32768};
+    const std::int16_t want_right[kSamples] = {0, 8192, 0, 0, 0, 32734};  // NaN is silence
+    bool ok = true;
+    for (int i = 0; i < kSamples; ++i) {
+      ok = ok && loadBe16(p + i * 4) == want_left[i] && loadBe16(p + i * 4 + 2) == want_right[i];
+    }
+    CHECK(ok);
+  }
+
+  // Anything the decoder could not legitimately produce is refused.
+  frame->format = AV_SAMPLE_FMT_S16P;
+  CHECK(!dal::convertAudioFrame(*frame, true, chunk, error));
+  frame->format = AV_SAMPLE_FMT_FLTP;
+  frame->nb_samples = 0;
+  CHECK(!dal::convertAudioFrame(*frame, true, chunk, error));
+  frame->nb_samples = 1 << 20;
+  CHECK(!dal::convertAudioFrame(*frame, true, chunk, error));
+  frame->nb_samples = kSamples;
+  loaded->av_channel_layout_default(&frame->ch_layout, 9);
+  CHECK(!dal::convertAudioFrame(*frame, true, chunk, error));
+  loaded->av_channel_layout_default(&frame->ch_layout, 2);
+  CHECK(dal::convertAudioFrame(*frame, true, chunk, error));
+  frame->data[0] = frame->data[1] = nullptr;  // not owned by the frame
+  loaded->av_frame_free(&frame);
+}
+
+// An ATRAC3plus frame as the demuxer delivers it: the 8-byte header, then the payload.
+std::vector<std::uint8_t> atracFrame(unsigned rate_index, unsigned channel_index, unsigned size_code,
+                                     std::size_t total_size = 0) {
+  const std::size_t payload = (size_code + 1) * 8;
+  std::vector<std::uint8_t> frame(total_size != 0 ? total_size : 8 + payload, 0x55);
+  const unsigned params = (rate_index << 13) | (channel_index << 10) | size_code;
+  frame[0] = 0x0F;
+  frame[1] = 0xD0;
+  frame[2] = static_cast<std::uint8_t>(params >> 8);
+  frame[3] = static_cast<std::uint8_t>(params);
+  return frame;
+}
+
+void testAudioDecoderLifecycle() {
+  const auto& loaded = dal::defaultFfmpeg();
+  CHECK(loaded.has_value());
+  if (!loaded) return;
+
+  dal::FfmpegCodecFactory factory(*loaded);
+  dal::PamfStream stream;
+  stream.codec = dal::PamfCodec::Atrac3plus;
+  stream.sample_rate = 48000;
+  stream.channels = 2;
+  std::string error;
+  dal::AudioOutputFormat format;
+
+  // The requested format comes from guest memory.
+  dal::AudioOutputFormat too_many = format;
+  too_many.channels = 1000;
+  CHECK(factory.createAudio(stream, too_many, error) == nullptr);
+  dal::PamfStream other = stream;
+  other.codec = dal::PamfCodec::Avc;
+  CHECK(factory.createAudio(other, format, error) == nullptr);
+
+  std::unique_ptr<dal::AudioDecoder> decoder = factory.createAudio(stream, format, error);
+  CHECK(decoder != nullptr);
+  if (!decoder) return;
+  const auto* ffmpeg_decoder = dynamic_cast<dal::FfmpegAudioDecoder*>(decoder.get());
+  CHECK(ffmpeg_decoder != nullptr);
+  if (!ffmpeg_decoder) return;
+  const dal::FfmpegAudioStats& stats = ffmpeg_decoder->stats();
+  CHECK(ffmpeg_decoder->sampleRate() == 0);  // not configured before the first frame
+
+  dal::AudioChunk chunk;
+  CHECK(!decoder->receive(chunk));  // nothing sent yet
+  decoder->flush();                 // and nothing to flush
+  CHECK(!decoder->receive(chunk));
+
+  // Frames that cannot be configured from are refused and counted.
+  const std::uint8_t noise[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  CHECK(!decoder->send(noise, 0));
+  CHECK(!decoder->send({}, 0));
+  CHECK(!decoder->send(atracFrame(3, 2, 0x7F), 0));    // rate index 3 does not exist
+  CHECK(!decoder->send(atracFrame(2, 0, 0x7F), 0));    // channel configuration 0 is invalid
+  CHECK(!decoder->send(atracFrame(2, 2, 0x7F, 100), 0));  // shorter than the header announces
+  CHECK(stats.rejected_frames == 5);
+
+  // A well-formed header with a payload that is not ATRAC3plus data: the outcome is up to the
+  // decoder, but it must come back with an answer and stay usable.
+  const std::vector<std::uint8_t> valid = atracFrame(2, 2, 0x7F);
+  decoder->send(valid, 3840);
+  for (int i = 0; i < 4 && decoder->receive(chunk); ++i) {
+    CHECK(chunk.frames == 2048);
+  }
+  decoder->send(valid, 7680);
+  decoder->flush();
+  const std::uint64_t errors = stats.decode_errors;
+  CHECK(!decoder->send(valid, 11520));  // refused while draining, without being counted
+  CHECK(stats.decode_errors == errors);
+  for (int i = 0; i < 4 && decoder->receive(chunk); ++i) {
+  }
+  CHECK(!decoder->receive(chunk));      // fully drained
+  const std::uint64_t before = stats.decode_errors;
+  const bool accepted = decoder->send(valid, 0);  // usable again: accepted or counted, not refused
+  CHECK(accepted || stats.decode_errors > before);
+
+  // A change of parameters in the middle of a stream reopens the decoder.
+  decoder->send(atracFrame(1, 1, 0x3F), 0);
+  decoder->flush();
+  for (int i = 0; i < 4 && decoder->receive(chunk); ++i) {
+  }
+  CHECK(!decoder->receive(chunk));
 }
 
 }  // namespace
@@ -354,6 +509,8 @@ int main(int argc, char** argv) {
   testLoad();
   testYuvToRgb();
   testVideoDecoderLifecycle();
+  testAudioConversion();
+  testAudioDecoderLifecycle();
   std::printf("media ffmpeg tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;
 }

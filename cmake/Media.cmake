@@ -119,7 +119,9 @@ function(dal_media_add)
     message(STATUS "DAL: movie_decode test not registered (${DAL_MOVIE_DECODE_MOVIE} not found in the game directory)")
   else()
     set(movie_args "${movie_path}" --frames ${DAL_MOVIE_DECODE_FRAMES}
-      --expect-frames ${DAL_MOVIE_DECODE_EXPECTED_FRAMES})
+      --expect-frames ${DAL_MOVIE_DECODE_EXPECTED_FRAMES}
+      --audio --expect-audio-samples ${DAL_MOVIE_DECODE_AUDIO_SAMPLES}
+      --expect-pcm "${DAL_MOVIE_DECODE_PCM_SHA256}")
     foreach(pin ${DAL_MOVIE_DECODE_YUV_SHA256})
       list(APPEND movie_args --expect-yuv "${pin}")
     endforeach()

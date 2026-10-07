@@ -3,7 +3,10 @@
 // FFmpeg implementation of the movie codec interfaces (see media/movie_decoder.h). Everything goes
 // through the run-time loader in media/ffmpeg_api.h, so building this needs the FFmpeg headers only.
 
+#include <cstdint>
+#include <deque>
 #include <memory>
+#include <span>
 #include <string>
 
 #include "media/ffmpeg_api.h"
@@ -48,6 +51,65 @@ class FfmpegVideoConverter {
   ContextKey key_;
 };
 
+// Converts a decoded planar-float audio frame into interleaved big-endian samples (float32, or s16
+// with the float range [-1, 1] scaled by 32767 and rounded). Only AV_SAMPLE_FMT_FLTP with 1 to 8
+// channels is accepted. `out.pts` is left alone. False with a reason in `error` otherwise.
+bool convertAudioFrame(const AVFrame& frame, bool float32, AudioChunk& out, std::string& error);
+
+struct FfmpegAudioStats {
+  std::uint64_t rejected_frames = 0;    // no valid frame header, or fewer bytes than it announces
+  std::uint64_t decode_errors = 0;      // FFmpeg errors and frames that could not be converted
+  std::uint64_t rate_mismatches = 0;    // chunks emitted at a rate other than the requested one
+  std::uint64_t channel_mismatches = 0; // chunks emitted with a channel count other than requested
+};
+
+// ATRAC3plus decoder. Input is one demuxer frame including its 8-byte header: the header's sample
+// rate, channel configuration and size configure FFmpeg's decoder (which needs block_align) when the
+// first frame arrives, and only the payload after the header goes to FFmpeg. Output keeps the
+// stream's own rate and channel count; a difference from the requested format is counted and logged
+// (no resampling or mixing).
+class FfmpegAudioDecoder final : public AudioDecoder {
+ public:
+  FfmpegAudioDecoder(const FfmpegApi& api, const PamfStream& stream, const AudioOutputFormat& format);
+  ~FfmpegAudioDecoder() override;
+  FfmpegAudioDecoder(const FfmpegAudioDecoder&) = delete;
+  FfmpegAudioDecoder& operator=(const FfmpegAudioDecoder&) = delete;
+
+  bool create(std::string& error);
+
+  bool send(std::span<const std::uint8_t> frame, std::int64_t pts) override;
+  bool receive(AudioChunk& out) override;
+  void flush() override;
+
+  const FfmpegAudioStats& stats() const { return stats_; }
+  // Rate taken from the frame headers; 0 until the first valid frame has configured the decoder.
+  std::uint32_t sampleRate() const { return open_rate_; }
+
+ private:
+  bool openContext(std::uint32_t sample_rate, std::uint32_t channels, std::uint32_t payload,
+                   std::string& error);
+  void closeContext();
+  bool sendPacket(const AVPacket* packet);
+  bool receiveDecoded(AudioChunk& out);
+  void takeReadyFrames();
+  std::int64_t timestampOf(std::int64_t frame_pts, std::uint32_t samples);
+
+  FfmpegApi api_;
+  PamfStream stream_;
+  AudioOutputFormat format_;
+  FfmpegAudioStats stats_;
+  AVCodecContext* context_ = nullptr;
+  AVFrame* frame_ = nullptr;
+  AVPacket* packet_ = nullptr;
+  std::deque<AudioChunk> pending_;
+  // Parameters the open context was configured with; 0 while none is open.
+  std::uint32_t open_rate_ = 0, open_channels_ = 0, open_payload_ = 0;
+  bool draining_ = false;
+  bool warned_rate_ = false, warned_channels_ = false;
+  std::int64_t anchor_ = -1;  // last known PTS; -1 before the first
+  std::int64_t samples_since_anchor_ = 0;
+};
+
 class FfmpegCodecFactory final : public MediaCodecFactory {
  public:
   explicit FfmpegCodecFactory(const FfmpegApi& api, const FfmpegCodecOptions& options = {})
@@ -55,7 +117,7 @@ class FfmpegCodecFactory final : public MediaCodecFactory {
 
   std::unique_ptr<VideoDecoder> createVideo(const PamfStream& stream, const VideoOutputFormat& format,
                                             std::string& error) override;
-  // Not available yet: reports an error so the player falls back to silence.
+  // ATRAC3plus only; any other codec reports an error so the player falls back to silence.
   std::unique_ptr<AudioDecoder> createAudio(const PamfStream& stream, const AudioOutputFormat& format,
                                             std::string& error) override;
 

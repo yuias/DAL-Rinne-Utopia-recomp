@@ -21,3 +21,10 @@ set(DAL_MOVIE_DECODE_RGB_SHA256
   "30:e9467c1ecabcf1110a3319f7c29e2699143985f470c88b36f118052d2c4b1626"
   "59:db19ebc4ec0037fef86fa5ea7b536ccfceb390be64ebea3e44fbfe1cdc6015da"
 )
+
+# The whole ATRAC3plus stream of the movie, independent of --frames: samples per channel and the
+# SHA-256 of the decoder's output (interleaved big-endian float32, as handed to the game). The audio
+# decoder is single-threaded and the hash was identical over repeated runs, but FFmpeg's float DSP
+# may round differently between builds or CPU feature sets; re-pin then (the sample count stays).
+set(DAL_MOVIE_DECODE_AUDIO_SAMPLES 342016)
+set(DAL_MOVIE_DECODE_PCM_SHA256 "71a55bf85de4af084d3d875cdf53c4c0449311f0912bb36550a3e571190a024c")

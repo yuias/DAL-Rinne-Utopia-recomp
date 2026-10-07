@@ -12,11 +12,13 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/frame.h>
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/samplefmt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -35,6 +37,7 @@ namespace dal {
   X(avutil, av_log_set_callback)      \
   X(avutil, av_log_set_level)         \
   X(avutil, av_log_format_line2)      \
+  X(avutil, av_channel_layout_default) \
   X(avcodec, avcodec_version)         \
   X(avcodec, avcodec_get_name)        \
   X(avcodec, avcodec_find_decoder)    \
