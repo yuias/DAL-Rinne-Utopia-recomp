@@ -1,0 +1,203 @@
+# Runtime internals
+
+## Logging
+
+Log lines go to stderr, and to `--log FILE` when given, one line each. The logger is a thin layer
+over spdlog (the `externals/spdlog` submodule, built as a static library with `std::format`
+instead of the bundled fmt); spdlog types do not appear in the runtime's own headers. A line is
+prefixed with `[host]` or with `[t XXXXXXXX]`, the id of the guest thread that wrote it, followed
+by `warn: ` or `error: ` for those levels. Output from the guest itself (`sys_tty_write`) goes to
+stdout, unprefixed.
+
+## Census
+
+On every stop the runtime prints what the game did, sorted by count and then by name:
+
+```
+census: syscalls 18 calls, 14 distinct, 2 default-handled
+  sc 141 sys_timer_usleep: 1 [impl]
+  sc 169 sys_spu_initialize: 1 [default]
+census: hle 118 calls, 21 distinct, 10 default-handled
+  sysPrxForUser::sys_lwmutex_lock: 29 [impl]
+  cellSysmodule::cellSysmoduleLoadModule: 15 [default]
+census: unknown targets 0 distinct
+census: rsx 383050 headers, 264 distinct methods, 836 flips, rendered 2761 draws, skipped 0
+  interrupt handler calls: vblank 1492, flip 0, user 836
+  method 0x324: 7912
+  method 0xfeac GCM_FLIP_COMMAND: 836
+census: rsx unimplemented 1 kinds
+  state zpass report constant: 1673
+census: threads 5 created, 5 live
+  0x01000000 main_thread: running
+  0x01000001 _SPU_printf_server: blocked in sys_event_queue_receive
+  0x01000005 _gcm_intr_thread: blocked in gcm interrupt wait [service]
+```
+
+`[impl]` marks a call that an implemented handler served and `[default]` one that the default
+handler took (see below). An unknown target is printed as `0x<target> from 0x<site>: count`. A default-handled import is
+followed by `ptr r3,r5,...`, the argument registers that held a pointer to committed guest memory
+(an out-pointer candidate, see [Default handlers](#default-handlers)). The `rsx` section is described under [Fake RSX](rendering.md#fake-rsx);
+the `, rendered ... draws, skipped ...` part appears when the renderer runs, and the
+`rsx unimplemented` section under [Rendering](rendering.md#rendering).
+After a run that played movies, a `census: sail <n> movies` section repeats the per-movie
+summary lines (see [Movies](movies.md#log-lines-and-census)).
+Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
+each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
+the game runs; these lines are the progress markers that `game_boot` checks.
+
+## Memory map
+
+The guest space is one reservation of 4 GiB plus a guard area, big-endian, accessed only through
+the `dalRead*` and `dalWrite*` helpers. Pages are committed on demand by the allocators below. An
+access to an uncommitted page raises a fault that the runtime turns into a fatal stop with the
+guest address and the access kind.
+
+| Range | Use |
+| --- | --- |
+| `0x00010000..0x10000000` | Main region: the ELF image (committed at its segment addresses), per-thread TLS blocks and the heap handlers' allocations. 64 KiB granularity. |
+| `0x10000000..0x20000000` | RSX context area, fixed by the console memory map: the default command buffer context (`0x10000000`), the DMA control and `put`/`get`/`ref` registers (`0x10100000`, `0x10100040`), the driver info block (`0x10200000`) and the reports and semaphores (`0x10300000`). The first 4 MiB are committed when the game initializes GCM. |
+| `0x20000000..0x30000000` | User memory with 1 MiB pages (`sys_memory_allocate` with flags 0x400 or 0). |
+| `0x30000000..0x40000000` | User memory with 64 KiB pages (`sys_memory_allocate` with flags 0x200). |
+| `0xC0000000..0xCF900000` | RSX local memory (video memory), committed when the game initializes GCM. |
+| `0xD0000000..0xE0000000` | Thread stacks, 4 KiB pages, with an uncommitted 4 KiB guard page on each side of every stack. |
+
+The top 64 KiB, `0xFFFF0000..0xFFFFFFFF`, are never committed: they hold the entry keys of host
+functions, the function descriptors that the HLE layer hands to guest code (for example a callback
+the runtime itself provides). Guest code can call or start a thread on such a descriptor, and the
+dispatcher resolves the key to the host handler.
+
+The primary stack size from the executable's process parameters is clamped as RPCS3 does (the
+game's 0x8000 becomes 0x10000). The argument block (`argv`, `envp`, strings) sits at the top of
+the stack. `sys_memory_get_user_memory_size` reports a 0xD500000 container. The timebase runs at
+79.8 MHz, scaled from the host performance counter.
+
+## Dispatch
+
+`dalRegisterFuncs` builds a flat table indexed by guest address from the generated function
+mappings, so a computed jump or an indirect call costs one lookup. A target that is not in the
+table is an unknown target: the first occurrence of each (target, call site) pair is logged with
+the call trace and counted in the census. With `--strict` it is a fatal stop. Without it the
+dispatch returns, which acts like a callee that returned immediately, so the run goes on and the
+census lists every such target.
+
+## Threads
+
+Each guest thread is a host thread (16 MiB host stack) with its own context. All guest code runs
+under one global guest lock, a FIFO ticket lock, so guest threads never run in parallel. A thread
+gives up the lock only in `dalYield` (called from loop hooks, when another thread is waiting), in
+a blocking wait and when it exits. Blocking system calls (mutex, condition variable, event flag,
+event queue, sleep, join) wait on host condition variables with the guest lock, and record what
+they wait for for the census and for stall detection.
+
+Priority scheduling is deferred. Runnable threads get the lock in arrival order, and
+`sys_ppu_thread_set_priority` and `sys_ppu_thread_get_priority` only store and return the value.
+Thread ids start at `0x01000000`. lv2 interrupt threads are not implemented; the one interrupt
+thread the game needs is the GCM interrupt thread described under [Fake RSX](rendering.md#fake-rsx).
+
+A service thread is a guest thread that the runtime starts on the game's behalf and that waits
+for work from the host (the GCM interrupt thread, and `_libsail-control`, which delivers the
+cellSail notify events and allocator calls; see [Movies](movies.md)). The census marks it `[service]`, and the
+stall detector and the check for "no guest threads left" ignore it, so a game whose own threads
+are all blocked still ends with a stall stop.
+
+The host main thread is the supervisor. After boot it checks every 100 ms for the watchdog, a
+stall and the absence of live guest threads.
+
+## Implemented system calls
+
+Everything else goes to the default handler. Behaviour follows the RPCS3 handler of the same
+name; struct layouts and error codes are restated from its headers.
+
+| Group | Calls |
+| --- | --- |
+| Process | `_sys_process_exit` (22) |
+| TTY | `sys_tty_write` (403); `sys_tty_read` (402) returns `CELL_EIO` |
+| Time | `sys_timer_usleep` (141), `sys_timer_sleep` (142), `sys_time_get_timebase_frequency` (147) |
+| Memory | `sys_memory_allocate` (348), `sys_memory_free` (349), `sys_memory_get_user_memory_size` (352) |
+| Mutex and condition variable | `sys_mutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock` (100-104); `sys_cond_create`, `_destroy`, `_wait`, `_signal`, `_signal_all` (105-109) |
+| Event flag | `sys_event_flag_create` (82), `_destroy` (83), `_wait` (85), `_set` (87), `_clear` (118), `_cancel` (132), `_get` (139) |
+| Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138) |
+| SPU | `sys_spu_initialize` (169), `sys_spu_thread_write_ls` (181), `_read_ls` (182), `_write_spu_mb` (190), `_connect_event` (191), `_disconnect_event` (192), `sys_spu_thread_group_connect_event_all_threads` (251), `_disconnect_event_all_threads` (252). Only the bookkeeping is kept; no SPU code runs. |
+| File system | `sys_fs_open` (801), `_read` (802), `_write` (803), `_close` (804), `_opendir` (805), `_readdir` (806), `_closedir` (807), `_stat` (808), `_fstat` (809), `_mkdir` (811), `_unlink` (814), `_lseek` (818); see [Virtual file system](virtual-file-system.md#virtual-file-system) |
+| Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48) |
+
+## Implemented imports
+
+Imports are matched to handlers by module and FNID. 141 of the executable's 166 imports have a
+handler (the log says `dal: hle: 166 imports, 141 with handlers`); the rest use the default handler. Behaviour follows the RPCS3 function of the same name
+(`Emu/Cell/Modules/`); each handler file lists its deviations in its header comment.
+
+| Module | Imports |
+| --- | --- |
+| `sysPrxForUser` (all 23 imports) | `sys_initialize_tls` (per-thread TLS blocks laid out as RPCS3 does), `sys_ppu_thread_create`, `_get_id`, `_once`, `_exit`; `sys_lwmutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock`; `_sys_heap_create_heap`, `_malloc`, `_memalign`, `_free`, `_delete_heap`; `sys_time_get_system_time`, `sys_process_exit`; `_sys_process_atexitspawn`, `_sys_process_at_Exitspawn`, `sys_prx_exitspawn_with_level`, `sys_prx_register_library`, `_sys_spu_printf_initialize`, `_sys_spu_printf_finalize` (the last six return `CELL_OK` and do nothing else) |
+| `cellSysmodule` | `cellSysmoduleLoadModule`, `cellSysmoduleUnloadModule`: every module id succeeds, because the HLE functions are always available |
+| `cellSpurs` | `cellSpursInitializeWithAttribute2` and its attribute helper, `cellSpursGetSpuThreadGroupId`, `cellSpursFinalize`: a SPURS instance can be created and queried, but no SPU thread, workload or helper thread exists |
+| `cellGcmSys` | 26 imports: initialization (`_cellGcmInitBody`), configuration, IO mapping (`cellGcmMapMainMemory`, `cellGcmAddressToOffset`, `cellGcmUnmapEaIoAddress`), display buffers, flip mode and flip status, the vblank, flip and user handlers, tiles and zcull, the control register and the default command buffer callback; see [Fake RSX](rendering.md#fake-rsx) |
+| `cellSysutil` | the callback pump (`cellSysutilRegisterCallback`, `_UnregisterCallback`, `_CheckCallback`), BGM playback status, `cellVideoOutConfigure`, `_GetState`, `_GetResolutionAvailability`, `cellAudioOutGetState`, the message dialog (`cellMsgDialogOpen2`, `_Close`, progress bar reset and increment) and save data (`cellSaveDataAutoLoad2`, `AutoSave2`, `ListLoad2`, `ListSave2`, `Delete2`) |
+| `cellGame` | `cellGameDataCheck`, `cellGameCreateGameData`, `cellGameContentPermit`, `cellGameContentErrorDialog` |
+| `sys_fs` | `cellFsOpen`, `cellFsSdataOpen`, `cellFsReadWithOffset`, `cellFsWriteWithOffset`, `cellFsClose`, `cellFsFstat`, `cellFsStat`, `cellFsMkdir`, `cellFsUnlink` |
+| `sys_io` | `cellPadInit`, `cellPadEnd`, `cellPadSetPortSetting`, `cellPadGetData`, `cellPadGetInfo2`, `cellPadSetActDirect` |
+| `cellPngDec` | `cellPngDecCreate`, `cellPngDecDestroy`, `cellPngDecExtOpen`, `cellPngDecExtReadHeader`, `cellPngDecExtSetParameter`, `cellPngDecExtDecodeData`, `cellPngDecClose`; see [PNG decoding](#png-decoding) |
+| `cellSail` | the 27 imports the game uses: the memory allocator, player initialise, boot, open, start and finalize, descriptors and their stream database, and the graphics and sound adapters (format, `GetFrame`, `UpdateAvSync`); see [Movies](movies.md) |
+| `cellPamf` | `cellPamfReaderGetNumberOfSpecificStreams` on the descriptor's stream database |
+| `cellAtrac` | `cellAtracSetDataAndGetMemSize` only, as a placeholder: it reports a work memory size so the title scene's decode thread can start, and decodes nothing |
+| `sceNp`, `sceNpTrophy` | `sceNpInit`, `sceNpTerm`, `sceNpDrmIsAvailable`; the 10 trophy imports (`sceNpTrophyInit` to `sceNpTrophyUnlockTrophy`) |
+
+Video and audio out report what the game's `PARAM.SFO` allows (the `RESOLUTION` and
+`SOUND_FORMAT` attributes); a missing or unreadable file keeps the defaults.
+
+## Headless policy
+
+RPCS3 opens dialogs and waits for the user in several of these modules. `dal_game` has no user
+interface, so each module follows a documented policy that never blocks on a person:
+
+- **Message dialogs** (`cellMsgDialogOpen2`): the type and the text are logged. A dialog with
+  buttons answers itself after 200 ms: OK for an OK dialog, and the `--dialog-answer` value
+  (default yes) for a Yes/No dialog. A dialog without buttons stays open until
+  `cellMsgDialogClose`. The answer is delivered through the cellSysutil callback queue, so the
+  guest sees it from `cellSysutilCheckCallback`, as on the console.
+- **Save data**: a save lives in `/dev_hdd0/home/00000001/savedata/<dir name>/`. Error dialogs
+  are logged and their error code is returned, without a dialog object. A save list is never
+  shown; the entry is the one the game's list callback highlights, with RPCS3's fallbacks, and
+  without a choice the call returns `CELL_CANCEL`. `cellSaveDataDelete2` returns `CELL_CANCEL`.
+  Secure files are stored in plain text.
+- **Trophies**: no trophy pack is installed from the network and no notification is shown. The
+  pack is read for its trophy list, and the unlock state is kept as a text file in the trophy
+  directory under `/dev_hdd0/home/00000001`. The registration status callbacks run inside
+  `sceNpTrophyRegisterContext` instead of being spread over two seconds.
+- **cellSysutil callbacks**: they run on the guest thread that calls `cellSysutilCheckCallback`,
+  from a queue that the modules above feed. `CELL_SYSUTIL_REQUEST_EXITGAME` is not acted on.
+- **cellGame**: the content directories are created on the host through the VFS, under the
+  `--hdd-dir` directory.
+- **Input**: see `--pad`. A host keyboard or gamepad backend plugs in through a provider
+  interface (`runtime/src/hle/hle.h`); none is implemented.
+
+## PNG decoding
+
+`cellPngDec` decodes with libpng's classic API (`externals/libpng` at v1.6.59, built as a static
+library together with zlib v1.3.2 from `externals/zlib`; nothing is installed or downloaded).
+libpng reports errors by `longjmp`, so every call that can fail runs in a function that owns the
+`setjmp` and has no locals with destructors. The handle and stream objects are allocated through
+the game's malloc and free callbacks, as on the console. A buffer or file source is read into one
+host buffer; with a `cbCtrlStrm` callback the runtime calls it for more data until the IEND chunk
+is complete and then decodes the whole image. Output RGBA, ARGB, RGB, gray and gray-alpha come
+from the stored format (palette, tRNS and sub-8-bit samples expand, 16-bit samples drop to the
+high byte for 8-bit output, Adam7 images are de-interlaced); rows are written
+`outputBytesPerLine` apart, top to bottom or bottom to top. Not implemented: RGB to grayscale, partial output through `cbCtrlDisp`, the
+`cellPngDecGet*` chunk accessors. Each stream's source, header and output format are logged with
+the `dal: pngdec:` prefix.
+
+## Default handlers
+
+A system call without a handler, and an import without one, return 0 (`CELL_OK`) in `r3` and
+change nothing else. The first call of each distinct syscall is logged as
+`dal: default sc <number> <name>(r3..r6)`, and the first 8 calls of each import as
+`dal: default hle <module>::<name>(r3..r8)` (none with `--quiet-hle`); later calls are only
+counted. Returning success is a probe, not an implementation: guest code that depends on an
+output parameter reads whatever was in memory, so a default-handled call can lead to a later
+fault. The census shows which calls were default-handled, which is the work list for the next
+handlers. For each default-handled import the runtime also logs the argument registers that look
+like out-pointers (a nonzero 32-bit value that addresses committed memory outside the code), as
+`dal: default hle <module>::<name>: possible out-pointer r<N>=<address>`, and the census repeats the
+register list as `ptr r<N>,...`. These are hints for writing the handler, not facts: a register
+left over from an earlier call can look like a pointer too.
