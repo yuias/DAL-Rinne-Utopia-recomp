@@ -48,6 +48,7 @@
 #include "rsx/rsx_census.h"
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame.h"
+#include "rsx/rsx_frame_builder.h"
 #include "rsx/rsx_registers.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
@@ -4575,6 +4576,31 @@ void testRsxRegisters() {
   CHECK(regs->reg(0x0904 + 3 * 0x20) == 0x1BC21 && regs->reg(0x0904 + 4 * 0x20) == 0);
   CHECK(regs->reg(0x1DB0) == 0xFFFFFFFF && regs->reg(0x1D7C) == 0xFFFF0000);
 
+  // contextReset (RPCS3 `rsx_state::reset`, run on every flip): assigned registers go back, including
+  // the explicit zeros; registers it does not assign, the vertex program store, the constants and the
+  // load pointers stay.
+  regs->apply(dal::kMethodNv4097SetTransformProgramLoad, 4);
+  regs->apply(dal::kMethodNv4097SetTransformProgramStart, 5);
+  regs->apply(dal::kMethodNv4097SetTransformConstantLoad, 6);
+  regs->apply(dal::kMethodNv4097SetTransformConstant, 0x88);
+  regs->vp_ucode[0] = 0x77;
+  regs->apply(0x0200, 0x05000500);   // SURFACE_CLIP_HORIZONTAL: reset writes an explicit zero
+  regs->apply(0x1738, 9);            // VERTEX_DATA_BASE_OFFSET: explicit zero
+  regs->apply(0x0064, 0x30);         // SEMAPHORE_OFFSET: 0x10 here, 0x30 at init
+  regs->apply(0x1A0C, 0x80000000);   // TEXTURE_CONTROL0 unit 0
+  regs->apply(0x1A08, 0x5555);       // TEXTURE_ADDRESS unit 0
+  regs->apply(0x1A08 + 2 * 0x20, 0x7777);  // unit 2: reset never assigns it
+  regs->apply(0x1A04, 0x1234);       // TEXTURE_FORMAT: init only
+  regs->apply(0x08E4, 0x2002);       // SHADER_PROGRAM: init only
+  regs->contextReset();
+  CHECK(regs->reg(0x0200) == 0 && regs->reg(0x1738) == 0 && regs->reg(0x0064) == 0x10);
+  CHECK(regs->reg(0x1A0C) == 0x60000 && regs->reg(0x1A08) == 0x30101);
+  CHECK(regs->reg(0x1A08 + 2 * 0x20) == 0x7777 && regs->reg(0x1A08 + 3 * 0x20) == 0x30101);
+  CHECK(regs->reg(0x1A04) == 0x1234 && regs->reg(0x08E4) == 0x2002);
+  CHECK(regs->vp_ucode[0] == 0x77 && regs->vp_constants[24] == 0x88);
+  CHECK(regs->vp_load == 4 && regs->vp_start == 5 && regs->constant_load == 6);
+  CHECK(regs->reg(dal::kMethodNv4097SetTransformProgramLoad) == 4 && regs->reg(0x0A00) == 0x10000000);
+
   // The command types compose into the variant and start out zeroed.
   dal::RsxCommand command = dal::RsxDraw{};
   CHECK(std::holds_alternative<dal::RsxDraw>(command));
@@ -4790,6 +4816,242 @@ void testRsxDecode() {
   dal::rsxUnimplementedReset();
 }
 
+// RSX-visible memory backed by two byte arrays: reads outside them fail.
+class FakeRsxMemory final : public dal::RsxMemoryView {
+ public:
+  FakeRsxMemory() : local(0x10000), main(0x10000) {}
+  bool read(std::uint32_t location, std::uint32_t offset, std::span<std::uint8_t> out) override {
+    const std::vector<std::uint8_t>& bytes = location == 0 ? local : main;
+    if (offset > bytes.size() || out.size() > bytes.size() - offset) return false;
+    std::memcpy(out.data(), bytes.data() + offset, out.size());
+    return true;
+  }
+  void putWord(std::uint32_t location, std::uint32_t offset, std::uint32_t word) {
+    std::vector<std::uint8_t>& bytes = location == 0 ? local : main;
+    for (int i = 0; i < 4; i++) bytes[offset + i] = static_cast<std::uint8_t>(word >> (24 - 8 * i));
+  }
+  std::vector<std::uint8_t> local, main;
+};
+
+void testRsxFrameBuilder() {
+  auto regs = std::make_unique<dal::RsxRegisters>();
+  regs->reset();
+  dal::rsxUnimplementedReset();
+  FakeRsxMemory memory;
+  dal::RsxFrameBuilder builder(memory);
+  const auto write = [&](std::uint32_t method, std::uint32_t value) {
+    regs->apply(method, value);
+    builder.onWrite(*regs, method, value);
+  };
+
+  // Surface: A8R8G8B8 1280x720 at local 0x100000 with Z24S8, scissor covering all of it.
+  write(0x0200, 1280u << 16);
+  write(0x0204, 720u << 16);
+  write(0x0208, 8u | (2u << 5) | (1u << 8));
+  write(0x020C, 0x1400);
+  write(0x0210, 0x100000);
+  write(0x0214, 0x900000);
+  write(0x022C, 0x1400);
+  write(0x0220, 1);
+  write(0x08C0, 1280u << 16);
+  write(0x08C4, 720u << 16);
+
+  // CLEAR_SURFACE 0xF3 gives a clear that keeps all bits and registers the color target.
+  write(0x1D90, 0xFF102030);
+  write(0x1D8C, 0xFFFFFF00);
+  write(0x1D94, 0xF3);
+  std::vector<dal::RsxCommand> commands = builder.takeCommands();
+  CHECK(commands.size() == 1 && std::holds_alternative<dal::RsxClear>(commands[0]));
+  const dal::RsxClear& clear = std::get<dal::RsxClear>(commands[0]);
+  CHECK(clear.mask == 0xF3 && clear.color_argb == 0xFF102030 && clear.depth_stencil == 0xFFFFFF00);
+  CHECK(clear.scissor[0] == 0 && clear.scissor[1] == 0 && clear.scissor[2] == 1280 && clear.scissor[3] == 720);
+  CHECK(builder.knownSurfaces().size() == 1 && builder.knownSurfaces()[0].offset == 0x100000);
+  CHECK(builder.takeCommands().empty());
+
+  // A zero stencil write mask drops the stencil bit, a clear without color, depth or stencil bits does
+  // nothing, and the rectangle is clipped to the framebuffer.
+  write(0x032C, 0);
+  write(0x1D94, 0xF3);
+  write(0x1D94, 0x02);
+  write(0x1D94, 0x0C);
+  write(0x1D94, 0x00);
+  write(0x032C, 0xFF);
+  write(0x08C0, 1000u | (1000u << 16));
+  write(0x08C4, 700u | (100u << 16));
+  write(0x1D94, 0x10);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 2);
+  CHECK(std::get<dal::RsxClear>(commands[0]).mask == 0xF1);
+  const dal::RsxClear& clipped = std::get<dal::RsxClear>(commands[1]);
+  CHECK(clipped.mask == 0x10 && clipped.scissor[0] == 1000 && clipped.scissor[2] == 280);
+  CHECK(clipped.scissor[1] == 700 && clipped.scissor[3] == 20);
+  write(0x08C0, 1280u << 16);
+  write(0x08C4, 720u << 16);
+
+  // Draw state: slot 0 is three floats with stride 12 in main memory at 0x1000, eight vertices whose
+  // bytes count up. The fragment program is one instruction with the end flag, in local memory.
+  for (std::uint32_t i = 0; i < 96; i++) memory.main[0x1000 + i] = static_cast<std::uint8_t>(i);
+  write(0x1740, 2u | (3u << 4) | (12u << 8));
+  write(0x1680, 0x80001000);
+  write(0x08E4, 0x2000 | 1);
+  memory.putWord(0, 0x2000, 0x00010000);
+  write(0x1D60, 0x40);
+  write(0x0B40 + 4, 1);
+
+  // A DRAW_INDEX_ARRAY of 4 u16 indices gives one draw with the index bytes and the vertices rebased
+  // to the smallest index.
+  const std::uint16_t indices[] = {1, 2, 3, 2};
+  for (int i = 0; i < 4; i++) {
+    memory.main[0x2000 + i * 2] = static_cast<std::uint8_t>(indices[i] >> 8);
+    memory.main[0x2000 + i * 2 + 1] = static_cast<std::uint8_t>(indices[i]);
+  }
+  write(0x181C, 0x2000);
+  write(0x1820, 1u | (1u << 4));
+  write(0x1808, 5);
+  write(0x1824, 3u << 24);
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1 && std::holds_alternative<dal::RsxDraw>(commands[0]));
+  const dal::RsxDraw& indexed = std::get<dal::RsxDraw>(commands[0]);
+  CHECK(indexed.indexed && indexed.index_type == dal::kRsxIndexTypeU16 && indexed.primitive == dal::RsxPrimitive::Triangles);
+  CHECK(indexed.first == 0 && indexed.count == 4 && indexed.min_index == 1);
+  CHECK((indexed.index_data == std::vector<std::uint8_t>{0, 1, 0, 2, 0, 3, 0, 2}));
+  CHECK(indexed.attribs.size() == 1 && indexed.attribs[0].slot == 0 && indexed.attribs[0].location == 1);
+  CHECK(indexed.attribs[0].data_offset == 0 && indexed.vertex_data.size() == 36);
+  CHECK(indexed.vertex_data[0] == 12 && indexed.vertex_data[35] == 47);
+  CHECK(indexed.surfaces.color.offset == 0x100000 && indexed.raster.cull == false);
+  CHECK(indexed.fp_ucode.size() == 4);
+  CHECK(indexed.fp_ucode[0] == 0x00010000 && indexed.fp_hash != 0 && indexed.fp_constants.empty());
+  CHECK(indexed.fp_control == 0x40 && indexed.texcoord_control == 2);
+  CHECK(indexed.vp_constants.size() == dal::kRsxVpConstantCount * 4);
+  CHECK(unimplementedCount("state unterminated vertex program") == 1);
+  CHECK(indexed.attribs[0].has_data);
+
+  // SET_VERTEX_DATA_BASE_INDEX rebases the vertex start of an indexed draw: (min_index + 2) * stride. A
+  // slot of a type the builder cannot copy stays in the list without data.
+  write(0x173C, 2);
+  write(0x1744, 0u | (4u << 4) | (4u << 8));
+  write(0x1684, 0x80001000);
+  write(0x1808, 5);
+  write(0x1824, 3u << 24);
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1);
+  const dal::RsxDraw& rebased = std::get<dal::RsxDraw>(commands[0]);
+  CHECK(rebased.min_index == 1 && rebased.vertex_data.size() == 36 && rebased.vertex_data[0] == (1 + 2) * 12);
+  CHECK(rebased.attribs.size() == 2 && rebased.attribs[0].has_data && !rebased.attribs[1].has_data);
+  write(0x173C, 0);
+  write(0x1744, 0);
+
+  // An array draw with a vertex base offset, merged contiguous ranges and a different primitive.
+  write(0x1738, 0x10);
+  write(0x1808, 6);
+  write(0x1814, 2u | (1u << 24));
+  write(0x1814, 4u | (1u << 24));
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1);
+  const dal::RsxDraw& array = std::get<dal::RsxDraw>(commands[0]);
+  CHECK(!array.indexed && array.primitive == dal::RsxPrimitive::TriangleStrip);
+  CHECK(array.first == 2 && array.count == 4 && array.min_index == 2 && array.index_data.empty());
+  CHECK(array.vertex_data.size() == 3 * 12 + 12 && array.vertex_data[0] == 0x10 + 24);
+  CHECK(unimplementedCount("state multiple ranges") == 0);
+
+  // Ranges that do not touch keep the first one; an empty clause emits nothing; an index set of one
+  // element draws nothing.
+  write(0x1808, 5);
+  write(0x1814, 0);
+  write(0x1814, 5u | (2u << 24));
+  write(0x1808, 0);
+  write(0x1808, 5);
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1 && std::get<dal::RsxDraw>(commands[0]).count == 1);
+  CHECK(unimplementedCount("state multiple ranges") == 1);
+  write(0x1824, 0);
+  write(0x1808, 5);
+  write(0x1824, 0);
+  write(0x1808, 0);
+  CHECK(builder.takeCommands().empty());
+
+  // Texture unit 0 sits at the cleared surface and is an alias; unit 1 is a linear 4x4 texture whose
+  // bytes are copied without the row padding; unit 2 is swizzled and only counted. Disabled units are
+  // not decoded.
+  for (std::uint32_t i = 0; i < 256; i++) memory.local[0x3000 + i] = static_cast<std::uint8_t>(i ^ 0x5A);
+  const std::uint32_t format = 1u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16);
+  write(0x1A00, 0x100000);
+  write(0x1A04, format);
+  write(0x1A0C, 0x80000000);
+  write(0x1A18, (16u << 16) | 4u);
+  write(0x1840, 64);
+  write(0x1A00 + 0x20, 0x3000);
+  write(0x1A04 + 0x20, format);
+  write(0x1A0C + 0x20, 0x80000000);
+  write(0x1A18 + 0x20, (16u << 16) | 4u);
+  write(0x1840 + 4, 64);
+  write(0x1A00 + 0x40, 0x3000);
+  write(0x1A04 + 0x40, 1u | (2u << 4) | (0x85u << 8) | (1u << 16));
+  write(0x1A0C + 0x40, 0x80000000);
+  write(0x1A18 + 0x40, (16u << 16) | 4u);
+  write(0x1A04 + 0x80, 0);
+  write(0x1808, 5);
+  write(0x1814, 2u << 24);
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1);
+  const dal::RsxDraw& textured = std::get<dal::RsxDraw>(commands[0]);
+  CHECK(textured.textures.size() == 3);
+  CHECK(textured.textures[0].unit == 0 && textured.textures[0].rt_alias == 0 && textured.textures[0].data_size == 0);
+  CHECK(textured.textures[1].unit == 1 && textured.textures[1].rt_alias == -1 && textured.textures[1].data_size == 64 * 3 + 64);
+  CHECK(textured.texture_data.size() == 256 && textured.texture_data[0] == (0 ^ 0x5A) && textured.texture_data[255] == (255 ^ 0x5A));
+  CHECK(textured.textures[2].unit == 2 && textured.textures[2].data_size == 0);
+  CHECK(unimplementedCount("texture layout swizzled") == 1);
+  CHECK(unimplementedCount("state texture location 0x0") == 0);
+
+  // The fragment program with an inline constant keeps its place in the ucode but zeroed; programs
+  // that differ only in the constant hash equal.
+  const auto fragmentProgram = [&](std::uint32_t constant) {
+    memory.putWord(0, 0x2000, 0);
+    memory.putWord(0, 0x2004, 0x00020000);  // instruction 0 reads a constant (source type 2)
+    memory.putWord(0, 0x2008, 0);
+    memory.putWord(0, 0x200C, 0);
+    memory.putWord(0, 0x2010, constant);
+    memory.putWord(0, 0x2020, 0x00010000);  // instruction 1, end flag
+    write(0x1808, 5);
+    write(0x1814, 2u << 24);
+    write(0x1808, 0);
+    return std::get<dal::RsxDraw>(builder.takeCommands().at(0));
+  };
+  const dal::RsxDraw first_program = fragmentProgram(0x3F800000);
+  const dal::RsxDraw second_program = fragmentProgram(0x40000000);
+  CHECK(first_program.fp_ucode.size() == 12 && first_program.fp_constants.size() == 4);
+  CHECK(first_program.fp_constants[0] == 0x3F800000 && first_program.fp_ucode[4] == 0 && first_program.fp_ucode[8] == 0x00010000);
+  CHECK(second_program.fp_constants[0] == 0x40000000 && first_program.fp_hash == second_program.fp_hash);
+
+  // Flips carry the display buffer; ignored methods are counted.
+  write(0x1818, 0x12345678);
+  dal::RsxDisplayBuffer display;
+  display.offset = 0x400000;
+  display.pitch = 0x1400;
+  display.width = 1280;
+  display.height = 720;
+  builder.onFlip(*regs, 1, display);
+  builder.onFlip(*regs, 2, display);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 2 && std::get<dal::RsxFlip>(commands[0]).flip_index == 0);
+  CHECK(std::get<dal::RsxFlip>(commands[1]).flip_index == 1 && std::get<dal::RsxFlip>(commands[1]).buffer == 2);
+  CHECK(std::get<dal::RsxFlip>(commands[1]).offset == 0x400000 && std::get<dal::RsxFlip>(commands[1]).height == 720);
+  CHECK(unimplementedCount("method NV4097_INLINE_ARRAY") == 1);
+
+  // Unreadable vertex memory drops the draw and counts it.
+  write(0x1680, 0x80000000 | 0x20000);
+  write(0x1808, 5);
+  write(0x1814, 2u << 24);
+  write(0x1808, 0);
+  CHECK(builder.takeCommands().empty() && unimplementedCount("state unreadable vertex memory") == 1);
+  dal::rsxUnimplementedReset();
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -4811,6 +5073,7 @@ void testRsxConsumer() {
   constexpr std::uint32_t kControl = 0x10100040, kLabels = 0x10300000, kDevice = 0x10000000;
   constexpr std::uint32_t kStart = 0x1000;
   dal::RsxConsumer consumer(base);
+  consumer.enableFrameBuilder();
   std::uint32_t at = kStart;
   const auto emit = [&](std::uint32_t method, std::initializer_list<std::uint32_t> args) {
     dalWrite32(base, area + at, method | (static_cast<std::uint32_t>(args.size()) << 18));
@@ -4883,9 +5146,15 @@ void testRsxConsumer() {
   emit(dal::kMethodGcmFlipCommand, {1});
   CHECK(run() == FifoStatus::Waiting && consumer.census().flips == 0);
   CHECK(state.flip_status == dal::kRsxFlipStatusWaiting && label(0x10) == 0x1111);
+  // The frame builder ends the frame when the command is reached, once, however often it is retried.
+  std::vector<dal::RsxCommand> built = consumer.takeCommands();
+  CHECK(built.size() == 1 && std::holds_alternative<dal::RsxFlip>(built[0]));
+  CHECK(std::get<dal::RsxFlip>(built[0]).buffer == 1 && std::get<dal::RsxFlip>(built[0]).flip_index == 0);
+  CHECK(run() == FifoStatus::Waiting && consumer.takeCommands().empty());
   consumer.vblankTick();
   CHECK(state.vblank_count == 1);
   CHECK(consumer.pump(100) == FifoStatus::Idle);
+  CHECK(consumer.takeCommands().empty());
   CHECK(consumer.census().flips == 1 && state.flip_status == dal::kRsxFlipStatusDone && label(0x10) == 0);
   CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::VBlank, 1}, {dal::RsxInterrupt::Flip, 1}}));
   CHECK(countContaining(lines, "dal: rsx: first flip") == 1);
@@ -4893,6 +5162,8 @@ void testRsxConsumer() {
   state.requested_vsync = false;
   emit(dal::kMethodGcmFlipCommand, {2});
   CHECK(run() == FifoStatus::Idle && consumer.census().flips == 2);
+  built = consumer.takeCommands();
+  CHECK(built.size() == 1 && std::get<dal::RsxFlip>(built[0]).buffer == 2 && std::get<dal::RsxFlip>(built[0]).flip_index == 1);
 
   // User commands reach the hook; without one they are only logged.
   g_interrupts.clear();
@@ -6193,6 +6464,7 @@ int main(int argc, char** argv) {
   testRsxArgCensus();
   testRsxRegisters();
   testRsxDecode();
+  testRsxFrameBuilder();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();

@@ -35,7 +35,8 @@ struct RsxVertexAttrib {
   std::uint8_t slot = 0, type = 0, size = 0;
   std::uint16_t stride = 0;
   std::uint32_t location = 0, offset = 0;
-  std::uint32_t data_offset = 0;  // into RsxDraw::vertex_data
+  std::uint32_t data_offset = 0;  // into RsxDraw::vertex_data; meaningful only when has_data
+  bool has_data = false;          // false for a type the builder cannot copy (no bytes in vertex_data)
 };
 
 struct RsxTextureDesc {
@@ -68,6 +69,9 @@ struct RsxDraw {
   RsxRasterState raster;
   RsxPrimitive primitive = RsxPrimitive::Triangles;
   // Contiguous DRAW_* ranges are merged; otherwise count `state: multiple ranges` and keep the first.
+  // Indexed: index_data already starts at `first` (draw it with firstIndex 0, count indices), and the
+  // index values are raw: element 0 of each vertex slot is vertex `min_index`, so the renderer uses
+  // vertexOffset = -min_index. Array draws: element 0 is vertex `first` (= min_index), same offset.
   bool indexed = false;
   std::uint8_t index_type = 0;
   std::uint32_t first = 0, count = 0, min_index = 0;

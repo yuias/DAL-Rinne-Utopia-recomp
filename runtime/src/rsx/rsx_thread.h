@@ -2,19 +2,25 @@
 
 // The fake RSX command consumer: a host thread that feeds the FIFO parser, executes the
 // synchronisation methods (labels, reports, reference, flips, user commands) and counts every
-// register write for the census. Nothing is drawn. Method semantics follow RPCS3
+// register write for the census. Nothing is drawn; with the frame builder enabled the writes also turn
+// into render commands (rsx/rsx_frame_builder.h). Method semantics follow RPCS3
 // `Emu/RSX/NV47/HW/nv406e.cpp`, `nv4097.cpp`, `nv47_sync.hpp`, `rsx_methods.cpp` (`flip_command`,
 // `user_command`) and `RSXThread.cpp` (`get_address`, `handle_emu_flip`, `post_vblank_event`).
 
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/census.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/rsx_census.h"
+#include "rsx/rsx_frame.h"
+#include "rsx/rsx_frame_builder.h"
+#include "rsx/rsx_registers.h"
 
 namespace dal {
 
@@ -52,6 +58,20 @@ class RsxConsumer final : public RsxSink {
   // Collects the argument census (rsx/rsx_census.h) from now on. Call before the first write.
   void enableArgCensus(std::filesystem::path json_path, std::filesystem::path dump_dir);
   RsxArgCensus* argCensus() { return arg_census_.get(); }
+
+  // Keeps a register file and builds render commands from every completed write. Call before the first
+  // write.
+  void enableFrameBuilder();
+  bool frameBuilderEnabled() const { return builder_ != nullptr; }
+  // Commands built since the last call; with the guest lock held, like write().
+  std::vector<RsxCommand> takeCommands();
+  // Counts the commands by kind for the stop line; any thread.
+  void countCommands(const std::vector<RsxCommand>& commands);
+  struct CommandCounts {
+    std::uint64_t clears = 0, draws = 0, flips = 0;
+  };
+  CommandCounts commandCounts() const;
+
   bool faulted() const { return faulted_; }
   std::uint32_t parserGet() const { return get_; }
 
@@ -91,7 +111,22 @@ class RsxConsumer final : public RsxSink {
   std::atomic<std::uint64_t> headers_{0}, flips_{0}, user_commands_{0};
   std::unique_ptr<std::atomic<std::uint64_t>[]> method_counts_;  // by register offset >> 2
   std::unique_ptr<RsxArgCensus> arg_census_;  // null unless --rsx-census
+
+  // Null unless enableFrameBuilder() was called.
+  std::unique_ptr<RsxRegisters> regs_;
+  std::unique_ptr<GuestRsxMemoryView> memory_view_;
+  std::unique_ptr<RsxFrameBuilder> builder_;
+  bool flip_reached_ = false;  // the flip command was seen and is waiting for its VBlank
+  std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0};
 };
+
+// Receives the commands the frame builder produced, in order, on the RSX thread without the guest lock.
+// Without a sink they are counted and dropped. Call before startRsxThread.
+using RsxCommandSink = std::function<void(std::vector<RsxCommand>&&)>;
+void setRsxCommandSink(RsxCommandSink sink);
+
+// Turns the frame builder on for the consumer startRsxThread creates. Call before startRsxThread.
+void setRsxFrameBuilderEnabled(bool enabled);
 
 // Turns the argument census on for the consumer startRsxThread creates; written to `json_path` (the
 // program dumps go to generated/rsx) when the process stops. Call before startRsxThread.

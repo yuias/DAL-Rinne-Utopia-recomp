@@ -29,6 +29,9 @@ struct RsxRegisters {
   void apply(std::uint32_t method, std::uint32_t value);
   std::uint32_t reg(std::uint32_t method) const { return regs[(method >> 2) & 0x3FFF]; }
   void reset();  // RPCS3 `rsx_state::init` defaults
+  // RPCS3 `rsx_state::reset`, run at every flip: overwrites the registers it assigns (zeros included)
+  // and leaves all others, the vertex program store and constants, and the load pointers alone.
+  void contextReset();
 };
 
 }  // namespace dal

@@ -9,6 +9,8 @@
 #include <format>
 #include <string>
 #include <thread>
+#include <variant>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -115,7 +117,40 @@ bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
   // Counted on completion, so a write retried while waiting is counted once.
   method_counts_[(method >> 2) & (kMethodCount - 1)].fetch_add(1, std::memory_order_relaxed);
   if (arg_census_ != nullptr) arg_census_->onWrite(method, value);
+  if (builder_ != nullptr) {
+    regs_->apply(method, value);
+    builder_->onWrite(*regs_, method, value);
+  }
   return true;
+}
+
+void RsxConsumer::enableFrameBuilder() {
+  if (builder_ != nullptr) return;
+  regs_ = std::make_unique<RsxRegisters>();
+  regs_->reset();
+  memory_view_ = std::make_unique<GuestRsxMemoryView>(base_);
+  builder_ = std::make_unique<RsxFrameBuilder>(*memory_view_);
+}
+
+std::vector<RsxCommand> RsxConsumer::takeCommands() {
+  return builder_ != nullptr ? builder_->takeCommands() : std::vector<RsxCommand>{};
+}
+
+void RsxConsumer::countCommands(const std::vector<RsxCommand>& commands) {
+  std::uint64_t clears = 0, draws = 0, flips = 0;
+  for (const RsxCommand& command : commands) {
+    clears += std::holds_alternative<RsxClear>(command);
+    draws += std::holds_alternative<RsxDraw>(command);
+    flips += std::holds_alternative<RsxFlip>(command);
+  }
+  clears_.fetch_add(clears, std::memory_order_relaxed);
+  draws_.fetch_add(draws, std::memory_order_relaxed);
+  built_flips_.fetch_add(flips, std::memory_order_relaxed);
+}
+
+RsxConsumer::CommandCounts RsxConsumer::commandCounts() const {
+  return {clears_.load(std::memory_order_relaxed), draws_.load(std::memory_order_relaxed),
+          built_flips_.load(std::memory_order_relaxed)};
 }
 
 void RsxConsumer::enableArgCensus(std::filesystem::path json_path, std::filesystem::path dump_dir) {
@@ -274,6 +309,15 @@ void RsxConsumer::getReport(std::uint32_t value) {
 
 bool RsxConsumer::flip(std::uint32_t buffer) {
   RsxState& state = rsxState();
+  // The frame ends when the parser reaches the command, not when the flip completes; a retry while it
+  // waits for VBlank must not end it again.
+  if (builder_ != nullptr && !flip_reached_) {
+    flip_reached_ = true;
+    static constexpr RsxDisplayBuffer kNoBuffer{};
+    builder_->onFlip(*regs_, buffer, buffer < kRsxDisplayBufferCount ? state.display[buffer] : kNoBuffer);
+    // RPCS3 resets the method registers where the command executes (`flip_command` -> `thread::reset`).
+    regs_->contextReset();
+  }
   // With vsync the flip completes on the first VBlank after it was reached.
   if (state.requested_vsync) {
     if (!flip_armed_) {
@@ -284,6 +328,7 @@ bool RsxConsumer::flip(std::uint32_t buffer) {
     if (state.vblank_count == flip_vblank_) return false;
   }
   flip_armed_ = false;
+  flip_reached_ = false;
 
   if (flips_.fetch_add(1, std::memory_order_relaxed) == 0) {
     logInfo("dal: rsx: first flip of buffer {}: put={:#x} get={:#x} parser={:#x}", buffer,
@@ -386,8 +431,25 @@ RsxCensus consumerCensus() {
 
 RsxUnimplementedCensus unimplementedCensus() { return {rsxUnimplementedSnapshot(), rsxUnimplementedDropped()}; }
 
-void writeArgCensus() {
-  if (g_consumer != nullptr && g_consumer->argCensus() != nullptr) g_consumer->argCensus()->writeFiles();
+RsxCommandSink g_command_sink;
+bool g_frame_builder_enabled = false;
+
+// Runs once on the stop path, after the text census.
+void onStop() {
+  if (g_consumer == nullptr) return;
+  if (g_consumer->frameBuilderEnabled()) {
+    const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
+    logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
+  }
+  if (g_consumer->argCensus() != nullptr) g_consumer->argCensus()->writeFiles();
+}
+
+// Counts the commands built so far and hands them to the sink. Same thread as the pump, so nothing
+// else touches the builder in between.
+void dispatchCommands(RsxConsumer* consumer, std::vector<RsxCommand> commands) {
+  if (commands.empty()) return;
+  consumer->countCommands(commands);
+  if (g_command_sink) g_command_sink(std::move(commands));
 }
 
 // A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
@@ -440,12 +502,17 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
     bool pending_tick = tick;
     FifoStatus status;
     do {
-      std::lock_guard<GuestLock> lock(guestLock());
-      if (pending_tick) {
-        consumer->vblankTick();
-        pending_tick = false;
+      std::vector<RsxCommand> commands;
+      {
+        std::lock_guard<GuestLock> lock(guestLock());
+        if (pending_tick) {
+          consumer->vblankTick();
+          pending_tick = false;
+        }
+        status = consumer->pump(kPumpBudgetWords);
+        commands = consumer->takeCommands();
       }
-      status = consumer->pump(kPumpBudgetWords);
+      dispatchCommands(consumer, std::move(commands));
     } while (status == FifoStatus::Budget);
   }
 }
@@ -453,6 +520,10 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
 }  // namespace
 
 void setRsxArgCensusFile(std::string json_path) { g_arg_census_file = std::move(json_path); }
+
+void setRsxCommandSink(RsxCommandSink sink) { g_command_sink = std::move(sink); }
+
+void setRsxFrameBuilderEnabled(bool enabled) { g_frame_builder_enabled = enabled; }
 
 void startRsxThread(std::uint8_t* base) {
   if (g_consumer != nullptr) return;
@@ -462,8 +533,9 @@ void startRsxThread(std::uint8_t* base) {
   setRsxUnimplementedProvider(&unimplementedCensus, &rsxUnimplementedReset);
   if (!g_arg_census_file.empty()) {
     g_consumer->enableArgCensus(g_arg_census_file, std::filesystem::path("generated") / "rsx");
-    setRsxArgCensusWriter(&writeArgCensus);
   }
+  if (g_frame_builder_enabled) g_consumer->enableFrameBuilder();
+  if (!g_arg_census_file.empty() || g_frame_builder_enabled) setRsxStopWriter(&onStop);
   std::thread(consumerLoop, g_consumer, base).detach();
 }
 

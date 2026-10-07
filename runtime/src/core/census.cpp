@@ -31,7 +31,7 @@ struct CensusState {
   RsxCensusFn rsx_fn = nullptr;
   RsxUnimplementedFn unimplemented_fn = nullptr;
   CensusResetFn unimplemented_reset = nullptr;
-  CensusWriterFn rsx_arg_writer = nullptr;
+  CensusWriterFn rsx_stop_writer = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -154,10 +154,10 @@ void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset) {
   s.unimplemented_reset = reset;
 }
 
-void setRsxArgCensusWriter(CensusWriterFn fn) {
+void setRsxStopWriter(CensusWriterFn fn) {
   CensusState& s = state();
   std::lock_guard lock(s.mutex);
-  s.rsx_arg_writer = fn;
+  s.rsx_stop_writer = fn;
 }
 
 std::string formatCensus() {
@@ -269,7 +269,7 @@ void printCensus() {
   {
     CensusState& s = state();
     std::lock_guard lock(s.mutex);
-    writer = s.rsx_arg_writer;
+    writer = s.rsx_stop_writer;
   }
   if (writer != nullptr) writer();
 }
@@ -286,7 +286,7 @@ void resetCensus() {
     s.unknown_targets.clear();
     s.thread_fn = nullptr;
     s.rsx_fn = nullptr;
-    s.rsx_arg_writer = nullptr;
+    s.rsx_stop_writer = nullptr;
     s.unimplemented_fn = nullptr;
     unimplemented_reset = s.unimplemented_reset;
     s.unimplemented_reset = nullptr;

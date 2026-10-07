@@ -103,8 +103,8 @@ bool decodePrimitive(std::uint32_t value, RsxPrimitive& out);
 
 // CLEAR_SURFACE with the current state. color_argb and depth_stencil are the raw clear-value words:
 // color is A8R8G8B8 (blue in the low byte); depth_stencil holds Z24 in bits 8..31 and stencil in bits
-// 0..7 for Z24S8, Z16 in bits 0..15 for Z16. The scissor is {x, y, w, h}; the renderer clips it to
-// the surface.
+// 0..7 for Z24S8, Z16 in bits 0..15 for Z16. The scissor is {x, y, w, h} as written; the frame
+// builder clips it to the surface and trims the mask.
 RsxClear decodeClear(const RsxRegisters& regs, std::uint32_t mask);
 
 // Group name of a written method that has render semantics the frame builder ignores (immediate

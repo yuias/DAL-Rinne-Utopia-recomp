@@ -267,6 +267,9 @@ int main(int argc, char** argv) {
   // Kept alive for the whole run; the process ends without unwinding main.
   std::unique_ptr<dal::VkContext> render_context;
   if (opt.render_vulkan) {
+    // No renderer consumes the commands yet: the frame builder runs and its output is counted.
+    dal::setRsxFrameBuilderEnabled(true);
+    dal::logInfo("dal: render: renderer not available; recording frame commands only");
     std::string render_error;
     render_context = dal::createVkContext({}, render_error);
     if (render_context) {
