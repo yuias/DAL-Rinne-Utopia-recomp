@@ -2,9 +2,13 @@
 
 ## FFmpeg
 
-The runtime decodes movies with FFmpeg (`libavcodec`, `libavutil`, `libswscale`). FFmpeg is not
-part of this repository and no FFmpeg binary is tracked. `tools/fetch-ffmpeg.ps1` downloads a
-pinned, SHA-256 verified build into `generated/deps/ffmpeg`; the pin is in `cmake/ffmpeg.cmake`.
+The runtime decodes movies with FFmpeg (`libavcodec`, `libavutil`, `libswscale`; `libavcodec`
+also imports `libswresample`, none of whose functions the runtime calls). FFmpeg is not part of
+this repository and no FFmpeg binary is tracked. `tools/fetch-ffmpeg.ps1` downloads a pinned,
+SHA-256 verified build into `generated/deps/ffmpeg` (`-From <zip>` takes a local copy of the
+pinned zip and applies the same check); the pin is in `cmake/ffmpeg.cmake`. The build copies the
+four DLLs, the FFmpeg `LICENSE.txt` and this notice next to `dal_game` (`bin/` of the build
+directory, the licence and notice under `bin/licenses/ffmpeg/`).
 
 | | |
 | --- | --- |
@@ -23,9 +27,14 @@ accompany any redistributed copy of the DLLs.
 ### Dynamic loading and replacement
 
 The FFmpeg DLLs are not linked into the executables. The runtime loads them at run time with
-`LoadLibrary` from the application directory, so they can be replaced by another build of the same
-major versions (`avcodec-63`, `avutil-61`, `swscale-10`) without rebuilding this project. Without
-the DLLs the runtime logs the problem and plays movies without decoding them.
+`LoadLibraryExW` and the flags `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`,
+from the directory of the executable, so their dependencies are looked up only in that directory
+and in the Windows system directory (not in `PATH` or the working directory). They can be replaced
+by another build of the same major versions (`avcodec-63`, `avutil-61`, `swresample-7`,
+`swscale-10`) without rebuilding this project; a different major version is reported as
+unavailable. Without usable DLLs the runtime logs one warning,
+`dal: sail: codecs unavailable: <reason>`, and every movie plays as black frames without sound
+for the duration of its stream, then ends normally.
 
 ### Source code
 
