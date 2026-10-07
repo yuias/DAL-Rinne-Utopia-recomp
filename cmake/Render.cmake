@@ -62,4 +62,22 @@ function(dal_render_add)
   set_tests_properties(render_core PROPERTIES
     PASS_REGULAR_EXPRESSION
       "render tests: [0-9]+ passed, 0 failed|render tests: skipped: no Vulkan device")
+
+  # Replays a capture without the game; for now it prints the command list from the frame builder.
+  add_executable(dal_rsxreplay tools/dal_rsxreplay/main.cpp)
+  target_compile_options(dal_rsxreplay PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_rsxreplay PRIVATE dal_runtime_core)
+
+  include("${CMAKE_SOURCE_DIR}/cmake/rsx_replay.cmake")
+  set(replay_capture
+    "${CMAKE_SOURCE_DIR}/generated/rsx/captures/${DAL_RSX_REPLAY_CAPTURE}.dalcap")
+  if(EXISTS "${replay_capture}")
+    add_test(NAME rsx_replay
+      COMMAND dal_rsxreplay "${replay_capture}" --out "${CMAKE_BINARY_DIR}/replay")
+    set_tests_properties(rsx_replay PROPERTIES
+      PASS_REGULAR_EXPRESSION "replay: [0-9]+ commands, [0-9]+ draws, [0-9]+ skipped")
+  else()
+    message(STATUS "DAL: rsx_replay test not registered "
+      "(generated/rsx/captures/${DAL_RSX_REPLAY_CAPTURE}.dalcap not found)")
+  endif()
 endfunction()

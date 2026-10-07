@@ -54,6 +54,7 @@
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
 #include "rsx/rsx_unimplemented.h"
+#include "rsx_synthetic.h"
 #include "zlib.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -5303,6 +5304,46 @@ void testRsxCapture() {
   dal::rsxUnimplementedReset();
 }
 
+// The in-memory captures of rsx_synthetic.h replay into the commands they describe.
+void testRsxSyntheticCaptures() {
+  dal::rsxUnimplementedReset();
+  const auto replay = [](const std::vector<std::uint8_t>& file) {
+    dal::RsxCaptureReader reader;
+    std::string error;
+    CHECK(reader.parse(file, error));
+    dal::ReplayRsxMemoryView view;
+    dal::RsxFrameBuilder builder(view);
+    dal::replayCapture(reader, view, builder);
+    return builder.takeCommands();
+  };
+
+  std::vector<dal::RsxCommand> commands = replay(dal::rsx_synthetic::makeClearCapture(0xFF405060));
+  CHECK(commands.size() == 2 && std::holds_alternative<dal::RsxClear>(commands[0]));
+  CHECK(std::get<dal::RsxClear>(commands[0]).color_argb == 0xFF405060 && std::get<dal::RsxClear>(commands[0]).mask == 0xF3);
+  CHECK(std::get<dal::RsxClear>(commands[0]).surfaces.color.width == dal::rsx_synthetic::kSurfaceSize);
+  CHECK(std::holds_alternative<dal::RsxFlip>(commands[1]) && std::get<dal::RsxFlip>(commands[1]).buffer == 0);
+
+  commands = replay(dal::rsx_synthetic::makeQuadCapture());
+  CHECK(commands.size() == 3 && std::holds_alternative<dal::RsxDraw>(commands[1]));
+  const dal::RsxDraw& quad = std::get<dal::RsxDraw>(commands[1]);
+  CHECK(quad.primitive == dal::RsxPrimitive::TriangleStrip && quad.count == 4 && quad.attribs.size() == 2);
+  CHECK(quad.attribs[0].slot == 0 && quad.attribs[0].type == 2 && quad.attribs[1].slot == 3 && quad.attribs[1].type == 4);
+  CHECK(quad.vertex_data.size() == 4 * 12 + 4 * 4 && quad.textures.empty());
+  CHECK(quad.vp_ucode.size() == 4 && quad.fp_ucode.size() == 4);
+  CHECK(unimplementedCount("state unterminated vertex program") == 0);
+  // -0.5f, big-endian, is the first position component.
+  CHECK(quad.vertex_data[0] == 0xBF && quad.vertex_data[1] == 0x00 && quad.vertex_data[2] == 0x00);
+
+  commands = replay(dal::rsx_synthetic::makeTexturedQuadCapture());
+  CHECK(commands.size() == 3 && std::holds_alternative<dal::RsxDraw>(commands[1]));
+  const dal::RsxDraw& textured = std::get<dal::RsxDraw>(commands[1]);
+  CHECK(textured.textures.size() == 1 && textured.textures[0].rt_alias == -1 && textured.textures[0].width == 2);
+  CHECK(textured.textures[0].data_size == 16 && textured.texture_data.size() == 16);
+  CHECK(textured.texture_data[0] == 0xFF && textured.texture_data[1] == 0xFF && textured.texture_data[2] == 0x00);
+  CHECK(unimplementedCount("capture missing range") == 0);
+  dal::rsxUnimplementedReset();
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -6777,6 +6818,7 @@ int main(int argc, char** argv) {
   testRsxDecode();
   testRsxFrameBuilder();
   testRsxCapture();
+  testRsxSyntheticCaptures();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();
