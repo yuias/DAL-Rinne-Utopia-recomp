@@ -27,6 +27,7 @@ struct PamfStream {
 };
 
 struct PamfInfo {
+  // Bytes. The data area (MPEG-PS) starts at `data_offset`, which equals `header_size`.
   std::uint32_t header_size = 0, data_offset = 0, data_size = 0;
   std::uint64_t start_pts = 0, end_pts = 0;  // 90 kHz
   std::uint32_t mux_rate_bound = 0;
@@ -40,7 +41,9 @@ struct PamfAccessUnit {
   std::uint32_t stream_index = 0;  // index into PamfInfo::streams
   std::int64_t pts = -1, dts = -1;  // 90 kHz, -1 if absent
   // Video: the elementary-stream bytes of one PES payload (access units need not align with PES
-  // packets). Audio: one ATRAC3plus frame.
+  // packets); pts/dts are those of the PES header, never derived. Audio: one ATRAC3plus frame including
+  // its 8-byte header; a frame without a PES timestamp gets the previous frame's pts plus one frame
+  // duration, or -1 before the first timestamp.
   std::vector<std::uint8_t> bytes;
 };
 
@@ -54,7 +57,9 @@ class PamfDemuxer {
   PamfDemuxer& operator=(const PamfDemuxer&) = delete;
 
   void feed(std::span<const std::uint8_t> bytes);
-  // No more input: bytes held back for a split packet are flushed or counted as errors.
+  // No more input: delivers the ATRAC3plus frame that ends at the end of the data. A last section
+  // shorter than 2048 bytes is parsed as far as it goes and counts as one error; so does a cut-off
+  // frame. A program end code in the data has the same effect on the frames.
   void endOfStream();
   std::optional<PamfAccessUnit> next(std::uint32_t stream_index);
   std::uint64_t errors() const;
