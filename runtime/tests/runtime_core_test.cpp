@@ -882,6 +882,11 @@ void testHostFunctionsAndCallGuestFunction() {
   CHECK(dal::readGuestString(base, 0x500100, 64) == "hello");
   CHECK(dal::readGuestString(base, 0x500100, 3) == "hel");
   CHECK(dal::readGuestString(base, 0x500100, 0).empty());
+  // A string that reaches the end of the committed range stops there instead of reading on.
+  std::memcpy(base + 0x501ff8, "abcdefgh", 8);
+  CHECK(!dal::process().memory.isCommitted(0x502000, 1));
+  CHECK(dal::readGuestString(base, 0x501ff8, 64) == "abcdefgh");
+  CHECK(dal::readGuestString(base, 0x502000, 64).empty());
 
   dalRegisterFuncs(nullptr, 0);
   dal::resetHostFunctions();

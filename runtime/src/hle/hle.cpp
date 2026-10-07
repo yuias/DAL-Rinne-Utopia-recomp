@@ -150,8 +150,14 @@ std::uint64_t callGuestFunction(DalPpuContext* ctx, std::uint8_t* base, std::uin
 
 std::string readGuestString(const std::uint8_t* base, std::uint32_t addr, std::uint32_t max) {
   std::string text;
+  constexpr std::uint32_t kPageMask = 0xfff;
   for (std::uint32_t i = 0; i < max; i++) {
-    const char c = static_cast<char>(base[addr + i]);
+    const std::uint32_t at = addr + i;
+    if (at < addr) break;  // wrapped past the 32-bit space
+    // Commitment is per page, so ask once at the start and at each page boundary; a string that runs
+    // into unmapped memory ends there instead of faulting.
+    if ((i == 0 || (at & kPageMask) == 0) && !process().memory.isCommitted(at, 1)) break;
+    const char c = static_cast<char>(base[at]);
     if (c == '\0') break;
     text += c;
   }
