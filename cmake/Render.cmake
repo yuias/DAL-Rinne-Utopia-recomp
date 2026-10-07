@@ -23,25 +23,44 @@ function(dal_render_add_libraries)
   target_compile_options(volk PRIVATE -march=x86-64-v3)
 endfunction()
 
-# Informational: the run-time shader compiler comes from the SDK (static shaderc), which is
-# located through the environment and not linked yet.
-function(dal_render_report_sdk)
-  find_package(Vulkan QUIET OPTIONAL_COMPONENTS shaderc_combined)
-  if(Vulkan_FOUND)
-    message(STATUS "DAL: Vulkan SDK found (shaderc_combined: "
-      "${Vulkan_shaderc_combined_FOUND})")
-  else()
-    message(STATUS "DAL: Vulkan SDK not found; shader compilation is unavailable")
+# The run-time shader compiler is the SDK's static shaderc, located through $VULKAN_SDK. The
+# debug variant (shaderc_combinedd.lib) is built against the debug CRT (/MDd) and must be used
+# with Debug only; every other configuration uses the release library (/MD).
+function(dal_render_add_shaderc)
+  if(NOT DEFINED ENV{VULKAN_SDK} OR "$ENV{VULKAN_SDK}" STREQUAL "")
+    message(FATAL_ERROR
+      "DAL: VULKAN_SDK is not set; expected $VULKAN_SDK/Lib/shaderc_combined.lib "
+      "and $VULKAN_SDK/Lib/shaderc_combinedd.lib")
   endif()
+  file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" sdk)
+  set(release_lib "${sdk}/Lib/shaderc_combined.lib")
+  set(debug_lib "${sdk}/Lib/shaderc_combinedd.lib")
+  foreach(lib ${release_lib} ${debug_lib})
+    if(NOT EXISTS "${lib}")
+      message(FATAL_ERROR "DAL: missing ${lib} (expected under $VULKAN_SDK/Lib)")
+    endif()
+  endforeach()
+  if(NOT EXISTS "${sdk}/Include/shaderc/shaderc.hpp")
+    message(FATAL_ERROR "DAL: missing $VULKAN_SDK/Include/shaderc/shaderc.hpp")
+  endif()
+
+  add_library(shaderc_combined STATIC IMPORTED GLOBAL)
+  set_target_properties(shaderc_combined PROPERTIES
+    IMPORTED_LOCATION "${release_lib}"
+    IMPORTED_LOCATION_DEBUG "${debug_lib}")
+  target_include_directories(shaderc_combined SYSTEM INTERFACE "${sdk}/Include")
+  message(STATUS "DAL: shaderc: shaderc_combined.lib / shaderc_combinedd.lib from $VULKAN_SDK/Lib")
 endfunction()
 
 # The renderer library. dal_runtime_core stays GPU-free: only targets that link dal_render see
 # Vulkan. Call after dal_runtime_add_core() and enable_testing().
 function(dal_render_add)
   dal_render_add_libraries()
-  dal_render_report_sdk()
+  dal_render_add_shaderc()
 
-  add_library(dal_render STATIC runtime/src/render/vk_context.cpp)
+  add_library(dal_render STATIC
+    runtime/src/render/shader_compiler.cpp
+    runtime/src/render/vk_context.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_include_directories(dal_render SYSTEM PUBLIC
@@ -53,6 +72,7 @@ function(dal_render_add)
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1
     VMA_VULKAN_VERSION=1003000)
   target_link_libraries(dal_render PUBLIC volk dal_runtime_core)
+  target_link_libraries(dal_render PRIVATE shaderc_combined)
 
   add_executable(dal_render_tests runtime/tests/render_test.cpp)
   target_compile_options(dal_render_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)

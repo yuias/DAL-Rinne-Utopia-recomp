@@ -1,16 +1,16 @@
 // Self-checking tests for the Vulkan renderer library. They skip when no Vulkan device exists.
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <string>
 #include <system_error>
 #include <vector>
 
+#include "render/shader_compiler.h"
 #include "render/vk_context.h"
 
 namespace {
@@ -28,26 +28,92 @@ int g_failed;
     }                                                                        \
   } while (0)
 
-// Informational only: which static shaderc libraries the SDK provides.
-void listShadercLibraries() {
-  char* sdk = nullptr;
-  std::size_t sdk_length = 0;
-  _dupenv_s(&sdk, &sdk_length, "VULKAN_SDK");
-  if (sdk == nullptr) {
-    std::printf("shaderc: VULKAN_SDK is not set\n");
-    return;
-  }
-  const std::filesystem::path lib_dir = std::filesystem::path(sdk) / "Lib";
-  std::free(sdk);
+constexpr const char* kTrivialVertex = R"(#version 450
+layout(location = 0) in vec4 position;
+void main() { gl_Position = position; }
+)";
+
+constexpr const char* kTrivialFragment = R"(#version 450
+layout(location = 0) out vec4 color;
+void main() { color = vec4(1.0, 0.0, 0.0, 1.0); }
+)";
+
+// Needs no Vulkan device, so it runs before the context is created.
+void testShaderCompiler() {
   std::error_code ec;
-  std::vector<std::string> names;
-  for (const auto& entry : std::filesystem::directory_iterator(lib_dir, ec)) {
-    const std::string name = entry.path().filename().string();
-    if (name.starts_with("shaderc_combined") && name.ends_with(".lib")) names.push_back(name);
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path(ec) / "dal_shader_compiler_test";
+  std::filesystem::remove_all(dir, ec);
+  dal::setShaderCacheDir(dir);
+
+  const dal::ShaderCompilerStats start = dal::shaderCompilerStats();
+  auto vert = dal::compileGlsl(dal::ShaderStage::Vertex, kTrivialVertex, 0x1111);
+  auto frag = dal::compileGlsl(dal::ShaderStage::Fragment, kTrivialFragment, 0x2222);
+  CHECK(vert.has_value() && vert->size() > 5 && vert->front() == 0x07230203);
+  CHECK(frag.has_value() && frag->size() > 5 && frag->front() == 0x07230203);
+  if (!vert) std::fprintf(stderr, "vertex: %s\n", vert.error().c_str());
+  if (!frag) std::fprintf(stderr, "fragment: %s\n", frag.error().c_str());
+
+  // Not cached, and the shaderc message reaches the caller.
+  auto bad = dal::compileGlsl(dal::ShaderStage::Fragment, "#version 450\nvoid main() { oops }\n",
+                              0x3333);
+  CHECK(!bad.has_value());
+  if (!bad) {
+    std::printf("shader syntax error message: %s", bad.error().c_str());
+    CHECK(bad.error().find("error") != std::string::npos);
   }
-  std::sort(names.begin(), names.end());
-  std::printf("shaderc: %zu static libraries in the SDK\n", names.size());
-  for (const std::string& name : names) std::printf("shaderc:   %s\n", name.c_str());
+
+  const dal::ShaderCompilerStats compiled = dal::shaderCompilerStats();
+  CHECK(compiled.compiles - start.compiles == 3);
+  CHECK(compiled.cache_hits == start.cache_hits);
+
+  // Second round: both good shaders come from disk and match the first result.
+  auto vert2 = dal::compileGlsl(dal::ShaderStage::Vertex, kTrivialVertex, 0x1111);
+  auto frag2 = dal::compileGlsl(dal::ShaderStage::Fragment, kTrivialFragment, 0x2222);
+  const dal::ShaderCompilerStats cached = dal::shaderCompilerStats();
+  CHECK(vert2.has_value() && vert && *vert2 == *vert);
+  CHECK(frag2.has_value() && frag && *frag2 == *frag);
+  CHECK(cached.cache_hits - compiled.cache_hits == 2);
+  CHECK(cached.compiles == compiled.compiles);
+
+  // A truncated file is recompiled and rewritten.
+  std::filesystem::path file;
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (entry.path().filename().string().starts_with("vert_0000000000001111_")) {
+      file = entry.path();
+    }
+  }
+  CHECK(!file.empty() && std::filesystem::exists(file, ec));
+  std::filesystem::resize_file(file, 10, ec);
+  auto vert3 = dal::compileGlsl(dal::ShaderStage::Vertex, kTrivialVertex, 0x1111);
+  const dal::ShaderCompilerStats repaired = dal::shaderCompilerStats();
+  CHECK(vert3.has_value() && vert && *vert3 == *vert);
+  CHECK(repaired.compiles - cached.compiles == 1);
+  CHECK(std::filesystem::file_size(file, ec) == vert->size() * 4);
+
+  // Same cache_key, different GLSL: two compiles, no hit, and the SPIR-V differs.
+  const char* variant_vertex = R"(#version 450
+layout(location = 0) in vec4 position;
+void main() { gl_Position = position * 2.0; }
+)";
+  auto vert4 = dal::compileGlsl(dal::ShaderStage::Vertex, variant_vertex, 0x1111);
+  const dal::ShaderCompilerStats variant = dal::shaderCompilerStats();
+  CHECK(vert4.has_value() && vert && *vert4 != *vert);
+  CHECK(variant.compiles - repaired.compiles == 1);
+  CHECK(variant.cache_hits == repaired.cache_hits);
+  auto vert5 = dal::compileGlsl(dal::ShaderStage::Vertex, variant_vertex, 0x1111);
+  auto vert6 = dal::compileGlsl(dal::ShaderStage::Vertex, kTrivialVertex, 0x1111);
+  const dal::ShaderCompilerStats variant_cached = dal::shaderCompilerStats();
+  CHECK(vert5.has_value() && vert4 && *vert5 == *vert4);
+  CHECK(vert6.has_value() && vert && *vert6 == *vert);
+  CHECK(variant_cached.cache_hits - variant.cache_hits == 2);
+  CHECK(variant_cached.compiles == variant.compiles);
+
+  std::printf("shader cache: %llu hits, %llu compiles\n",
+              static_cast<unsigned long long>(variant_cached.cache_hits - start.cache_hits),
+              static_cast<unsigned long long>(variant_cached.compiles - start.compiles));
+  dal::setShaderCacheDir({});
+  std::filesystem::remove_all(dir, ec);
 }
 
 void imageBarrier(VkCommandBuffer cmd, VkImage image, VkPipelineStageFlags2 src_stage,
@@ -202,7 +268,7 @@ void testClearAndReadback(dal::VkContext& ctx) {
 int main() {
   const bool layer = dal::vkValidationLayerAvailable();
   std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
-  listShadercLibraries();
+  testShaderCompiler();
 
   dal::VkContextOptions options;
   options.validation = true;
@@ -211,7 +277,7 @@ int main() {
   if (!ctx) {
     std::printf("vulkan: %s\n", error.c_str());
     std::printf("render tests: skipped: no Vulkan device\n");
-    return 0;
+    return g_failed != 0 ? 1 : 0;
   }
 
   const std::uint32_t api = ctx->deviceProperties().apiVersion;
