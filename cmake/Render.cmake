@@ -66,6 +66,7 @@ function(dal_render_add)
     runtime/src/render/vk_context.cpp
     runtime/src/render/vk_pipelines.cpp
     runtime/src/render/vk_renderer.cpp
+    runtime/src/render/vk_textures.cpp
     runtime/src/render/vp_translator.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
@@ -119,13 +120,47 @@ function(dal_render_add)
   include("${CMAKE_SOURCE_DIR}/cmake/rsx_replay.cmake")
   set(replay_capture
     "${CMAKE_SOURCE_DIR}/generated/rsx/captures/${DAL_RSX_REPLAY_CAPTURE}.dalcap")
-  if(EXISTS "${replay_capture}")
-    add_test(NAME rsx_replay
-      COMMAND dal_rsxreplay "${replay_capture}" --out "${CMAKE_BINARY_DIR}/replay")
+  set(replay_reference
+    "${CMAKE_SOURCE_DIR}/generated/rsx/reference/${DAL_RSX_REPLAY_CAPTURE}.png")
+  set(replay_args "${replay_capture}" --out "${CMAKE_BINARY_DIR}/replay")
+  set(replay_register TRUE)
+  if(NOT "${DAL_RSX_REPLAY_REFERENCE_SHA256}" STREQUAL "")
+    # A pinned reference must exist and match, so the thresholds are never applied to another image.
+    set(replay_register FALSE)
+    # The pin is checked at configure time, so a changed or newly added reference must re-run it.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${replay_reference}")
+    if(NOT EXISTS "${replay_reference}")
+      message(STATUS "DAL: rsx_replay test not registered "
+        "(generated/rsx/reference/${DAL_RSX_REPLAY_CAPTURE}.png not found)")
+    else()
+      file(SHA256 "${replay_reference}" replay_reference_sha256)
+      if(NOT replay_reference_sha256 STREQUAL "${DAL_RSX_REPLAY_REFERENCE_SHA256}")
+        message(STATUS "DAL: rsx_replay test not registered "
+          "(generated/rsx/reference/${DAL_RSX_REPLAY_CAPTURE}.png does not match the pinned SHA-256)")
+      else()
+        set(replay_register TRUE)
+        list(APPEND replay_args --compare "${replay_reference}")
+        if(NOT "${DAL_RSX_REPLAY_MAX_DIFF}" STREQUAL "")
+          list(APPEND replay_args --max-diff "${DAL_RSX_REPLAY_MAX_DIFF}")
+        endif()
+        if(NOT "${DAL_RSX_REPLAY_MEAN_DIFF}" STREQUAL "")
+          list(APPEND replay_args --max-mean "${DAL_RSX_REPLAY_MEAN_DIFF}")
+        endif()
+        if(NOT "${DAL_RSX_REPLAY_DIFFERING_PERCENT}" STREQUAL "")
+          list(APPEND replay_args --max-differing "${DAL_RSX_REPLAY_DIFFERING_PERCENT}")
+        endif()
+      endif()
+    endif()
+  endif()
+  if(NOT EXISTS "${replay_capture}")
+    set(replay_register FALSE)
+  endif()
+  if(replay_register)
+    add_test(NAME rsx_replay COMMAND dal_rsxreplay ${replay_args})
     set_tests_properties(rsx_replay PROPERTIES
       PASS_REGULAR_EXPRESSION "replay: [0-9]+ commands, [0-9]+ draws, [0-9]+ skipped"
       FAIL_REGULAR_EXPRESSION "validation: [a-z]+, [1-9][0-9]* errors;error: ")
-  else()
+  elseif(NOT EXISTS "${replay_capture}")
     message(STATUS "DAL: rsx_replay test not registered "
       "(generated/rsx/captures/${DAL_RSX_REPLAY_CAPTURE}.dalcap not found)")
   endif()

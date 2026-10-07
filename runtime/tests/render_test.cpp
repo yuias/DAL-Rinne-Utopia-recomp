@@ -851,6 +851,323 @@ void testRendererQuad(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
 }
 
+// ---- Textures ----
+
+// Needs no Vulkan device.
+void testTextureMapping() {
+  constexpr VkComponentSwizzle kR = VK_COMPONENT_SWIZZLE_R, kG = VK_COMPONENT_SWIZZLE_G, kB = VK_COMPONENT_SWIZZLE_B,
+                               kA = VK_COMPONENT_SWIZZLE_A, kZero = VK_COMPONENT_SWIZZLE_ZERO,
+                               kOne = VK_COMPONENT_SWIZZLE_ONE;
+  const auto same = [](VkComponentMapping m, VkComponentSwizzle r, VkComponentSwizzle g, VkComponentSwizzle b,
+                       VkComponentSwizzle a) { return m.r == r && m.g == g && m.b == b && m.a == a; };
+
+  // Every sampled image is B8G8R8A8, so the identity remap gives an identity view.
+  CHECK(same(dal::textureComponentMapping(0xAAE4), kR, kG, kB, kA));
+  // Red and blue exchanged (R reads B, B reads R).
+  CHECK(same(dal::textureComponentMapping(0xAA6C), kB, kG, kR, kA));
+  // Alpha forced to one, then every channel forced to zero.
+  CHECK(same(dal::textureComponentMapping(0xA9E4), kR, kG, kB, kOne));
+  CHECK(same(dal::textureComponentMapping(0x0000), kZero, kZero, kZero, kZero));
+  // The high half (override bits) does not change the mapping.
+  CHECK(same(dal::textureComponentMapping(0x1234AAE4), kR, kG, kB, kA));
+
+  // The border word (ARGB) goes through the same remap.
+  CHECK(dal::remapBorderColor(0x80402010, 0xAAE4) == 0x80402010);
+  CHECK(dal::remapBorderColor(0x80402010, 0xAA6C) == 0x80102040);  // R and B exchanged
+  CHECK(dal::remapBorderColor(0x80402010, 0xA9E4) == 0xFF402010);  // alpha forced to one
+  CHECK(dal::remapBorderColor(0x80402010, 0x0000) == 0);
+
+  dal::RsxTextureDesc texture;
+  texture.filter = (3u << 16) | (4u << 24);  // NEAREST_NEAREST, CONVOLUTION_MAG
+  texture.address = 1u | (4u << 8) | (3u << 16);
+  texture.border = 0xFF000000;
+  texture.remap = 0xAAE4;
+  dal::rsxUnimplementedReset();
+  dal::SamplerSettings sampler = dal::samplerSettings(texture);
+  CHECK(sampler.min_filter == VK_FILTER_NEAREST && sampler.mag_filter == VK_FILTER_LINEAR);
+  CHECK(sampler.wrap_s == VK_SAMPLER_ADDRESS_MODE_REPEAT && sampler.wrap_t == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
+        sampler.wrap_r == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  CHECK(sampler.border == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK);
+  CHECK(dal::rsxUnimplementedSnapshot().empty());
+
+  texture.filter = (6u << 16) | (2u << 24);  // LINEAR_LINEAR, LINEAR
+  texture.address = 2u | (5u << 8) | (1u << 16);
+  sampler = dal::samplerSettings(texture);
+  CHECK(sampler.min_filter == VK_FILTER_LINEAR && sampler.mag_filter == VK_FILTER_LINEAR);
+  CHECK(sampler.wrap_s == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT && sampler.wrap_t == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  CHECK(sampler.border == VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK);  // no wrap uses the border
+
+  // A mirror-once wrap and a custom border color are replaced and counted.
+  texture.address = 6u | (4u << 8);
+  texture.border = 0xFF204060;
+  sampler = dal::samplerSettings(texture);
+  CHECK(sampler.wrap_s == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && sampler.border == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK);
+  CHECK(unimplementedCount("texture sampler mirror once wrap") == 1 && unimplementedCount("texture sampler custom border color") == 1);
+  dal::rsxUnimplementedReset();
+}
+
+// Position in slot 0, 2D texture coordinates in slot 8 (TEX0): the vertex program moves both to its
+// outputs; the fragment program is TEX H0, TEX0.
+dal::rsx_synthetic::Programs texturedPrograms() {
+  dal::rsx_synthetic::Programs programs;
+  programs.vertex.clear();
+  for (const auto& instruction : {vpMove(0, 0, "xyzw", false), vpMove(7, 8, "xyzw", true)}) {
+    programs.vertex.insert(programs.vertex.end(), instruction.begin(), instruction.end());
+  }
+  constexpr std::array<std::uint32_t, 4> kTex = {0x17009e81, 0x1c9dc801, 0x0001c800, 0x0001c800};
+  programs.fragment.clear();
+  for (const std::uint32_t word : kTex) programs.fragment.push_back(dal::fpFixupWord(word));
+  return programs;
+}
+
+enum class TextureScene {
+  Memory,    // the 2x2 texture in guest memory
+  Alias,     // a cleared render target at another offset
+  Feedback,  // the render target the draw writes to
+};
+
+struct TextureOptions {
+  TextureScene scene = TextureScene::Memory;
+  std::uint32_t remap = 0xAAE4;
+  std::uint32_t wrap = 1;       // WRAP in S and T
+  std::uint32_t border = 0;
+  float coord_scale = 1.0f;     // texture coordinates run 0..coord_scale over the quad
+  std::uint32_t pitch = 0;      // Memory scene: row pitch in bytes (0: no padding); padding holds junk
+  bool unnormalized = false;    // _UN format: coordinates are in texels
+};
+
+constexpr std::uint32_t kAliasOffset = 0x50000;
+constexpr std::uint32_t kAliasColor = 0xFF336699;
+
+// A quad covering pixels 16..48 whose corners carry the texture coordinates (0, 0), (1, 0), (0, 1), (1, 1)
+// times coord_scale, in strip order top left, top right, bottom left, bottom right.
+std::vector<std::uint8_t> makeTexturedCapture(const TextureOptions& options) {
+  using namespace dal::rsx_synthetic;
+  SceneBuilder scene;
+  scene.setSurface();
+  if (options.scene == TextureScene::Alias) {
+    scene.write(dal::kMethodNv4097SetSurfaceColorAOffset, kAliasOffset);
+    scene.clear(kAliasColor);
+    scene.write(dal::kMethodNv4097SetSurfaceColorAOffset, kSurfaceOffset);
+    scene.clear(0xFF000000);
+    scene.bindTexture(kAliasOffset, kSurfaceSize, kSurfaceSize);
+  } else if (options.scene == TextureScene::Feedback) {
+    scene.clear(kAliasColor);
+    scene.bindTexture(kSurfaceOffset, kSurfaceSize, kSurfaceSize);
+  } else {
+    scene.clear(0xFF000000);
+    const std::uint32_t pitch = options.pitch != 0 ? options.pitch : kTextureSize * 4;
+    for (std::uint32_t y = 0; y < kTextureSize; y++) {
+      for (std::uint32_t x = 0; x < pitch / 4; x++) {
+        scene.memory().putWord(0, kTextureOffset + y * pitch + x * 4,
+                               x < kTextureSize ? kTexturePixels[y * kTextureSize + x] : 0xDEADBEEF);
+      }
+    }
+    scene.bindTexture(kTextureOffset, kTextureSize, kTextureSize, pitch, options.unnormalized ? 0x40u : 0u);
+  }
+  scene.write(dal::kMethodNv4097SetTextureControl1, options.remap);
+  scene.write(dal::kMethodNv4097SetTextureAddress, options.wrap | (options.wrap << 8) | (1u << 16));
+  scene.write(dal::kMethodNv4097SetTextureBorderColor, options.border);
+
+  setQuadRenderState(scene);
+  scene.write(dal::kMethodNv4097SetVertexAttribOutputMask, 1u << 14);  // TEX0
+  scene.write(dal::kMethodNv4097SetShaderControl, 0x400);              // color from H0
+  scene.write(dal::kMethodNv4097SetTexCoordControl, 1);                // 2D coordinate
+  for (std::uint32_t v = 0; v < 4; v++) {
+    for (std::uint32_t c = 0; c < 3; c++) scene.memory().putFloat(1, kPositionsOffset + v * 12 + c * 4, kQuadCorners[v][c]);
+    scene.memory().putFloat(1, kTexCoordsOffset + v * 8, (v & 1) != 0 ? options.coord_scale : 0.0f);
+    scene.memory().putFloat(1, kTexCoordsOffset + v * 8 + 4, (v & 2) != 0 ? options.coord_scale : 0.0f);
+  }
+  scene.setFloatAttrib(0, 3, kPositionsOffset);
+  scene.setFloatAttrib(8, 2, kTexCoordsOffset);
+  scene.setPrograms(texturedPrograms());
+  scene.drawStrip(4);
+  return scene.finish();
+}
+
+// Two quads (pixels 4..28 and 36..60) textured by the same 2x2 texture; the texel words change between
+// the draws, so the second quad must show yellow, cyan, magenta and grey instead.
+std::vector<std::uint8_t> makeChangedTextureCapture() {
+  using namespace dal::rsx_synthetic;
+  SceneBuilder scene;
+  scene.setSurface();
+  scene.clear(0xFF000000);
+  scene.setTexture();
+  setQuadRenderState(scene);
+  scene.write(dal::kMethodNv4097SetVertexAttribOutputMask, 1u << 14);
+  scene.write(dal::kMethodNv4097SetShaderControl, 0x400);
+  scene.write(dal::kMethodNv4097SetTexCoordControl, 1);
+  scene.setFloatAttrib(0, 3, kPositionsOffset);
+  scene.setFloatAttrib(8, 2, kTexCoordsOffset);
+  scene.setPrograms(texturedPrograms());
+
+  const auto quad = [&](float x0, float x1) {
+    const float xs[4] = {x0, x1, x0, x1};
+    for (std::uint32_t v = 0; v < 4; v++) {
+      scene.memory().putFloat(1, kPositionsOffset + v * 12, xs[v]);
+      scene.memory().putFloat(1, kPositionsOffset + v * 12 + 4, kQuadCorners[v][1]);
+      scene.memory().putFloat(1, kPositionsOffset + v * 12 + 8, 0.0f);
+      scene.memory().putFloat(1, kTexCoordsOffset + v * 8, (v & 1) != 0 ? 1.0f : 0.0f);
+      scene.memory().putFloat(1, kTexCoordsOffset + v * 8 + 4, (v & 2) != 0 ? 1.0f : 0.0f);
+    }
+    scene.drawStrip(4);
+  };
+  quad(-0.875f, -0.125f);
+  constexpr std::uint32_t kSecond[4] = {0xFFFFFF00, 0xFF00FFFF, 0xFFFF00FF, 0xFF808080};
+  for (std::uint32_t i = 0; i < 4; i++) {
+    scene.memory().putWord(0, kTextureOffset + (i / kTextureSize) * (kTextureSize * 4) + (i % kTextureSize) * 4, kSecond[i]);
+  }
+  quad(0.125f, 0.875f);
+  return scene.finish();
+}
+
+void testRendererTextures(dal::VkContext& ctx) {
+  using namespace dal::rsx_synthetic;
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  CHECK(renderer.valid());
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+
+  const auto render = [&](const TextureOptions& options) {
+    std::vector<dal::RsxCommand> commands = replaySynthetic(makeTexturedCapture(options));
+    dal::rsxUnimplementedReset();
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height));
+    CHECK(width == 64 && height == 64 && bgra.size() == 64 * 64 * 4);
+    if (bgra.size() != 64 * 64 * 4) bgra.assign(64 * 64 * 4, 0);
+  };
+  const auto expectNoNotes = [] {
+    for (const auto& [name, count] : dal::rsxUnimplementedSnapshot()) {
+      std::fprintf(stderr, "unimplemented: %s: %llu\n", name.c_str(), static_cast<unsigned long long>(count));
+    }
+    CHECK(dal::rsxUnimplementedSnapshot().empty());
+  };
+
+  // The 2x2 texture magnified 16 times with NEAREST filters: each texel fills a quarter of the quad, and
+  // the pixels outside it keep the clear color.
+  render({});
+  CHECK(pixelArgb(bgra, width, 24, 24) == 0xFFFF0000);
+  CHECK(pixelArgb(bgra, width, 40, 24) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 24, 40) == 0xFF0000FF);
+  CHECK(pixelArgb(bgra, width, 40, 40) == 0x80FFFFFF);
+  CHECK(pixelArgb(bgra, width, 2, 2) == 0xFF000000 && pixelArgb(bgra, width, 61, 61) == 0xFF000000);
+  CHECK(renderer.stats().draws_skipped == 0 && renderer.stats().texture_uploads == 1);
+  expectNoNotes();
+
+  // The remap exchanges red and blue.
+  TextureOptions swapped;
+  swapped.remap = 0xAA6C;
+  render(swapped);
+  CHECK(pixelArgb(bgra, width, 24, 24) == 0xFF0000FF);
+  CHECK(pixelArgb(bgra, width, 40, 24) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 24, 40) == 0xFFFF0000);
+  expectNoNotes();
+
+  // The remap forces alpha to one: the half-transparent texel becomes opaque.
+  TextureOptions opaque;
+  opaque.remap = 0xA9E4;
+  render(opaque);
+  CHECK(pixelArgb(bgra, width, 40, 40) == 0xFFFFFFFF);
+  CHECK(pixelArgb(bgra, width, 24, 24) == 0xFFFF0000);
+  expectNoNotes();
+
+  // Coordinates run 0..2 over the quad. WRAP repeats the texture; BORDER returns the border color past
+  // 1. The quad's pixels 16..32 hold the texture once (texels switch at 24), 32..48 the second period.
+  TextureOptions repeat;
+  repeat.coord_scale = 2.0f;
+  render(repeat);
+  CHECK(pixelArgb(bgra, width, 20, 20) == 0xFFFF0000 && pixelArgb(bgra, width, 28, 20) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 36, 20) == 0xFFFF0000 && pixelArgb(bgra, width, 44, 20) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 20, 44) == 0xFF0000FF);
+  expectNoNotes();
+
+  TextureOptions border = repeat;
+  border.wrap = 4;
+  border.border = 0xFFFFFFFF;
+  render(border);
+  CHECK(pixelArgb(bgra, width, 20, 20) == 0xFFFF0000 && pixelArgb(bgra, width, 28, 20) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 20, 28) == 0xFF0000FF);
+  CHECK(pixelArgb(bgra, width, 44, 20) == 0xFFFFFFFF && pixelArgb(bgra, width, 20, 44) == 0xFFFFFFFF &&
+        pixelArgb(bgra, width, 44, 44) == 0xFFFFFFFF);
+  expectNoNotes();
+
+  // An opaque black border reads as opaque black (not as transparent black) past the texture, and the
+  // remap applies to the border: transparent black with alpha forced to one is opaque black.
+  border.border = 0xFF000000;
+  render(border);
+  CHECK(pixelArgb(bgra, width, 20, 20) == 0xFFFF0000);
+  CHECK(pixelArgb(bgra, width, 44, 20) == 0xFF000000 && pixelArgb(bgra, width, 44, 44) == 0xFF000000);
+  expectNoNotes();
+  border.border = 0x00000000;
+  border.remap = 0xA9E4;
+  render(border);
+  CHECK(pixelArgb(bgra, width, 44, 20) == 0xFF000000 && pixelArgb(bgra, width, 20, 44) == 0xFF000000);
+  expectNoNotes();
+
+  // A row pitch of 16 bytes for 2-texel rows: the junk after each row is not sampled.
+  TextureOptions padded;
+  padded.pitch = 16;
+  render(padded);
+  CHECK(pixelArgb(bgra, width, 24, 24) == 0xFFFF0000 && pixelArgb(bgra, width, 40, 24) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 24, 40) == 0xFF0000FF && pixelArgb(bgra, width, 40, 40) == 0x80FFFFFF);
+  expectNoNotes();
+
+  // Unnormalized coordinates run 0..2 (texels) over the quad and give the same picture.
+  TextureOptions unnormalized;
+  unnormalized.unnormalized = true;
+  unnormalized.coord_scale = 2.0f;
+  render(unnormalized);
+  CHECK(pixelArgb(bgra, width, 24, 24) == 0xFFFF0000 && pixelArgb(bgra, width, 40, 24) == 0xFF00FF00);
+  CHECK(pixelArgb(bgra, width, 24, 40) == 0xFF0000FF && pixelArgb(bgra, width, 40, 40) == 0x80FFFFFF);
+  expectNoNotes();
+
+  // Two draws of one texture (same key) with the guest bytes changed in between: each quad shows the
+  // bytes of its own draw.
+  {
+    std::vector<dal::RsxCommand> commands = replaySynthetic(makeChangedTextureCapture());
+    dal::rsxUnimplementedReset();
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height));
+    if (bgra.size() != 64 * 64 * 4) bgra.assign(64 * 64 * 4, 0);
+    CHECK(pixelArgb(bgra, width, 10, 24) == 0xFFFF0000 && pixelArgb(bgra, width, 22, 40) == 0x80FFFFFF);
+    CHECK(pixelArgb(bgra, width, 42, 24) == 0xFFFFFF00 && pixelArgb(bgra, width, 54, 40) == 0xFF808080);
+    CHECK(renderer.stats().draws_skipped == 0);
+    expectNoNotes();
+  }
+
+  // A texture at another render target samples that target's cleared contents, with no upload.
+  const std::uint64_t uploads = renderer.stats().texture_uploads;
+  TextureOptions alias;
+  alias.scene = TextureScene::Alias;
+  render(alias);
+  CHECK(pixelArgb(bgra, width, 32, 32) == kAliasColor && pixelArgb(bgra, width, 18, 45) == kAliasColor);
+  CHECK(pixelArgb(bgra, width, 2, 2) == 0xFF000000);
+  CHECK(renderer.stats().texture_uploads == uploads && renderer.stats().feedback_copies == 0);
+  expectNoNotes();
+
+  // The remap applies to an alias too: 0x336699 with red and blue exchanged is 0x996633.
+  alias.remap = 0xAA6C;
+  render(alias);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0xFF996633);
+  expectNoNotes();
+
+  // Sampling the target the draw renders to reads a copy taken before the draw: the quad shows the
+  // exchanged colors and the rest of the target keeps its clear color.
+  TextureOptions feedback;
+  feedback.scene = TextureScene::Feedback;
+  feedback.remap = 0xAA6C;
+  render(feedback);
+  CHECK(renderer.stats().feedback_copies == 1);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0xFF996633 && pixelArgb(bgra, width, 2, 2) == kAliasColor);
+  expectNoNotes();
+
+  CHECK(renderer.valid());
+  dal::rsxUnimplementedReset();
+}
+
 // A clear that includes stencil under a write mask other than 0 or 0xFF is counted by the frame
 // builder (the renderer clears the whole byte).
 void testPartialStencilNote() {
@@ -880,6 +1197,7 @@ int main() {
   const bool layer = dal::vkValidationLayerAvailable();
   std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
   testShaderCompiler();
+  testTextureMapping();
   testFrameDump();
   testPartialStencilNote();
   testVertexConvert();
@@ -905,6 +1223,7 @@ int main() {
   testRendererClear(*ctx);
   testRendererScissorAndMask(*ctx);
   testRendererQuad(*ctx);
+  testRendererTextures(*ctx);
   CHECK(ctx->validationErrorCount() == 0);
 
   ctx.reset();

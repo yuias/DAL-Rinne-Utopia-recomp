@@ -1,6 +1,7 @@
 #include "render/vk_renderer.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -14,7 +15,9 @@
 #include "render/fp_translator.h"
 #include "render/shader_compiler.h"
 #include "render/vertex_convert.h"
+#include "render/vk_textures.h"
 #include "render/vp_translator.h"
+#include "rsx/rsx_census.h"
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_unimplemented.h"
 
@@ -24,6 +27,7 @@ namespace {
 constexpr std::uint64_t kFenceTimeoutNs = 10'000'000'000ull;
 constexpr std::size_t kUploadAlignment = 256;  // covers every uniform and vertex buffer offset alignment
 constexpr std::size_t kUploadBlockSize = 8u << 20;
+constexpr std::uint32_t kIdentityRemap = 0xAAE4;  // RSX_TEXTURE_REMAP_IDENTITY (RPCS3 `gcm_enums.h`)
 
 bool formatHasStencil(VkFormat format) {
   return format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -133,11 +137,14 @@ struct RsxRenderer::RenderTarget {
   bool depth = false;
   // Layout at the end of the commands recorded so far (the frame's command buffer is submitted in order).
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  // Views with a non-identity channel remap for sampling the target, by remap word (low 16 bits).
+  std::map<std::uint32_t, VkImageView> sampled_views;
 
   RenderTarget() = default;
   RenderTarget(const RenderTarget&) = delete;
   RenderTarget& operator=(const RenderTarget&) = delete;
   ~RenderTarget() {
+    for (const auto& entry : sampled_views) vkDestroyImageView(context->device(), entry.second, nullptr);
     if (view != VK_NULL_HANDLE) vkDestroyImageView(context->device(), view, nullptr);
     if (image != VK_NULL_HANDLE) vmaDestroyImage(context->allocator(), image, allocation);
   }
@@ -168,6 +175,8 @@ struct RsxRenderer::FrameSlot {
   // Targets recorded into this slot's command buffer; kept alive until its fence has signaled, so a
   // target dropped from the cache by a resize outlives the commands that use it.
   std::vector<std::shared_ptr<RenderTarget>> in_use;
+  // The same for texture images and render target copies.
+  std::vector<std::shared_ptr<TextureImage>> texture_refs;
   // Host-visible copy of the display buffer written at the flip that submitted this slot.
   VkBuffer readback = VK_NULL_HANDLE;
   VmaAllocation readback_allocation = nullptr;
@@ -183,6 +192,7 @@ RsxRenderer::RsxRenderer(VkContext& context, RenderOptions options)
     fail(pipelines_->error());
     return;
   }
+  textures_ = std::make_unique<TextureCache>(context_);
   const VkDevice device = context_.device();
   for (std::unique_ptr<FrameSlot>& slot_ptr : slots_) {
     slot_ptr = std::make_unique<FrameSlot>();
@@ -220,6 +230,7 @@ RsxRenderer::~RsxRenderer() {
   for (std::unique_ptr<FrameSlot>& slot : slots_) {
     if (!slot) continue;
     slot->in_use.clear();
+    slot->texture_refs.clear();
     for (FrameSlot::UploadBlock& block : slot->uploads) {
       vmaDestroyBuffer(context_.allocator(), block.buffer, block.allocation);
     }
@@ -228,6 +239,7 @@ RsxRenderer::~RsxRenderer() {
     if (slot->pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, slot->pool, nullptr);
   }
   pipelines_.reset();
+  textures_.reset();
   if (placeholder_sampler_ != VK_NULL_HANDLE) vkDestroySampler(device, placeholder_sampler_, nullptr);
   if (placeholder_view_ != VK_NULL_HANDLE) vkDestroyImageView(device, placeholder_view_, nullptr);
   if (placeholder_image_ != VK_NULL_HANDLE) vmaDestroyImage(context_.allocator(), placeholder_image_, placeholder_allocation_);
@@ -248,6 +260,7 @@ bool RsxRenderer::waitSlot(FrameSlot& slot) {
   }
   slot.pending = false;
   slot.in_use.clear();
+  slot.texture_refs.clear();
   return true;
 }
 
@@ -459,7 +472,7 @@ bool RsxRenderer::allocUpload(std::size_t size, UploadRef& out) {
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = created.size;
     buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo alloc_info{};
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
     alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
@@ -572,6 +585,159 @@ bool RsxRenderer::vertexFormatSupported(VkFormat format) {
   const bool supported = (props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
   vertex_format_support_[format] = supported;
   return supported;
+}
+
+// Fills the image info and coordinate scale of every texture unit the draw's fragment program samples.
+// A unit without a usable texture (disabled, a layout or format that was counted by the frame builder)
+// keeps the placeholder. Texture memory is uploaded again for every draw, as the guest may have changed
+// it between draws.
+//
+// A texture at a known render target samples that target's image. When the target is the one the draw
+// renders to (a cyclic reference), the draw would read and write the same image: it samples a copy
+// taken now instead. The copy is a snapshot, so the result does not depend on rasterization order. RPCS3
+// instead keeps the surface in GENERAL or ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT layout and uses texture
+// barriers (`VK/VKDraw.cpp` `validate_image_layout_for_read_access`); the extension is not enabled here
+// and GENERAL leaves reads of pixels still in flight undefined, so the copy is used.
+bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shaders, RenderTarget& color,
+                                  VkDescriptorImageInfo (&infos)[kFpTextureUnitCount],
+                                  float (&scales)[kFpTextureUnitCount][4]) {
+  FrameSlot& slot = *slots_[current_slot_];
+  const VkCommandBuffer cmd = slot.cmd;
+  const auto reference = [&](const std::shared_ptr<TextureImage>& image) {
+    if (std::find(slot.texture_refs.begin(), slot.texture_refs.end(), image) == slot.texture_refs.end()) {
+      slot.texture_refs.push_back(image);
+    }
+  };
+
+  std::vector<const TextureImage*> uploaded;  // uploaded for this draw already
+  std::shared_ptr<TextureImage> feedback_copy;
+  for (std::uint32_t unit = 0; unit < kFpTextureUnitCount; unit++) {
+    infos[unit] = {placeholder_sampler_, placeholder_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    scales[unit][0] = scales[unit][1] = scales[unit][2] = scales[unit][3] = 1.0f;
+    if ((shaders.texture_units & (1u << unit)) == 0) continue;
+
+    const RsxTextureDesc* texture = nullptr;
+    for (const RsxTextureDesc& candidate : draw.textures) {
+      if (candidate.unit == unit) texture = &candidate;
+    }
+    if (texture == nullptr) {
+      rsxNoteUnimplemented("texture", "sampled unit is disabled");
+      continue;
+    }
+    // Unnormalized coordinates are divided by the size in the shader (fp_translator.h).
+    if (!texture->normalized && texture->width != 0 && texture->height != 0) {
+      scales[unit][0] = 1.0f / static_cast<float>(texture->width);
+      scales[unit][1] = 1.0f / static_cast<float>(texture->height);
+    }
+
+    VkImageView view = VK_NULL_HANDLE;
+    if (texture->rt_alias >= 0) {
+      // The render target holds A8R8G8B8 data; another texture format cannot be read from it.
+      if ((texture->format & kRsxTextureBaseMask) != kRsxTextureA8R8G8B8) {
+        rsxNoteUnimplemented("texture format", rsxTextureFormatName(texture->format));
+        continue;
+      }
+      std::shared_ptr<RenderTarget> target;
+      const auto found = color_targets_.find(TargetKey{texture->location, texture->offset});
+      if (found != color_targets_.end()) {
+        target = found->second;
+        touch(target);
+        if (target->width != texture->width || target->height != texture->height) {
+          rsxNoteUnimplemented("texture layout", "render target alias of another size");
+        }
+      } else {
+        // The target was drawn to before the commands the renderer has seen; it holds no data here.
+        rsxNoteUnimplemented("texture", "alias of unknown render target");
+        RsxSurface surface;
+        surface.location = texture->location;
+        surface.offset = texture->offset;
+        surface.pitch = texture->pitch;
+        surface.width = texture->width;
+        surface.height = texture->height;
+        surface.format = RsxColorFormat::A8R8G8B8;
+        target = acquireColor(surface);
+        if (!valid()) return false;
+        if (!target) continue;
+      }
+
+      if (target.get() == &color) {
+        if (!feedback_copy) {
+          feedback_copy = textures_->scratch(target->width, target->height);
+          if (!textures_->valid()) {
+            fail(textures_->error());
+            return false;
+          }
+          if (!feedback_copy) continue;
+          reference(feedback_copy);
+          transition(*target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+          textures_->recordCopy(cmd, *feedback_copy, target->image);
+          stats_.feedback_copies++;
+        }
+        view = textures_->view(*feedback_copy, texture->remap);
+      } else {
+        transition(*target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        const std::uint32_t remap = texture->remap & 0xFFFF;
+        if (remap == kIdentityRemap) {
+          view = target->view;
+        } else {
+          VkImageView& cached = target->sampled_views[remap];
+          if (cached == VK_NULL_HANDLE) {
+            cached = textures_->createView(target->image, target->format, remap);
+          }
+          view = cached;
+          if (view == VK_NULL_HANDLE) target->sampled_views.erase(remap);
+        }
+      }
+    } else if (texture->data_size != 0) {
+      if (texture->pitch % 4 != 0) {
+        rsxNoteUnimplemented("texture layout", "pitch is not a multiple of 4");
+        continue;
+      }
+      if (static_cast<std::uint64_t>(texture->data_offset) + texture->data_size > draw.texture_data.size()) {
+        rsxNoteUnimplemented("state", "texture data short");
+        continue;
+      }
+      // The copy reads pitch * (height - 1) + width * 4 bytes from the staging buffer.
+      const std::uint64_t row_bytes = static_cast<std::uint64_t>(texture->width) * 4;
+      if (texture->pitch < row_bytes ||
+          texture->data_size < static_cast<std::uint64_t>(texture->pitch) * (texture->height - 1) + row_bytes) {
+        rsxNoteUnimplemented("state", "texture data short");
+        continue;
+      }
+      const std::shared_ptr<TextureImage> image = textures_->acquire(*texture);
+      if (!textures_->valid()) {
+        fail(textures_->error());
+        return false;
+      }
+      if (!image) continue;
+      reference(image);
+      if (std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
+        UploadRef staging;
+        if (!allocUpload(texture->data_size, staging)) return false;
+        // Guest texels are big-endian words A, R, G, B in memory; byte swapped they are B8G8R8A8 texels.
+        const std::uint8_t* source = draw.texture_data.data() + texture->data_offset;
+        for (std::size_t i = 0; i + 4 <= texture->data_size; i += 4) {
+          std::uint32_t word;
+          std::memcpy(&word, source + i, 4);
+          word = std::byteswap(word);
+          std::memcpy(staging.data + i, &word, 4);
+        }
+        textures_->recordUpload(cmd, *image, staging.buffer, staging.offset, texture->pitch / 4);
+        uploaded.push_back(image.get());
+        stats_.texture_uploads++;
+      }
+      view = textures_->view(*image, texture->remap);
+    }
+
+    const VkSampler sampler = textures_->sampler(*texture);
+    if (!textures_->valid()) {
+      fail(textures_->error());
+      return false;
+    }
+    if (view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) continue;
+    infos[unit] = {sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  }
+  return true;
 }
 
 // Draw path. Everything that records outside a rendering instance (target creation, the placeholder
@@ -766,6 +932,12 @@ void RsxRenderer::recordDraw(const RsxDraw& draw) {
     return;
   }
 
+  // Textures are prepared before the rendering instance begins: uploads, copies and layout changes
+  // cannot be recorded inside it.
+  VkDescriptorImageInfo image_infos[kFpTextureUnitCount];
+  float texture_scale[kFpTextureUnitCount][4];
+  if (!prepareTextures(draw, shaders, *color, image_infos, texture_scale)) return;
+
   // Uniform data: vertex constants, fragment constants, the per-draw block shared by both stages.
   constexpr std::size_t kVpConstantBytes = kRsxVpConstantCount * 16;
   UploadRef vp_constants, fp_constants, draw_block;
@@ -799,7 +971,7 @@ void RsxRenderer::recordDraw(const RsxDraw& draw) {
   fp.alpha_func = raster.alpha_test ? (raster.alpha_func & 7u) : 7u;
   fp.alpha_ref = static_cast<float>(raster.alpha_ref) / 255.0f;
   fp.flags = kFpFlagRound8Bit | (raster.two_sided_lighting ? kFpFlagTwoSided : 0u);
-  for (auto& scale : fp.texture_scale) scale[0] = scale[1] = scale[2] = scale[3] = 1.0f;
+  std::memcpy(fp.texture_scale, texture_scale, sizeof(texture_scale));
   std::memcpy(draw_block.data, &vp, sizeof(vp));
   std::memcpy(draw_block.data + kFpDrawBlockOffset, &fp, sizeof(fp));
 
@@ -865,11 +1037,6 @@ void RsxRenderer::recordDraw(const RsxDraw& draw) {
   VkDescriptorBufferInfo buffer_infos[3] = {{vp_constants.buffer, vp_constants.offset, kVpConstantBytes},
                                             {fp_constants.buffer, fp_constants.offset, fp_entries * 16},
                                             {draw_block.buffer, draw_block.offset, kDrawBlockBytes}};
-  // One image info per unit: each sampled unit gets its own texture once textures are uploaded.
-  VkDescriptorImageInfo image_infos[kFpTextureUnitCount];
-  for (VkDescriptorImageInfo& info : image_infos) {
-    info = {placeholder_sampler_, placeholder_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-  }
   VkWriteDescriptorSet writes[3 + kFpTextureUnitCount]{};
   std::uint32_t write_count = 0;
   for (std::uint32_t i = 0; i < 3; i++) {
@@ -1103,6 +1270,7 @@ bool RsxRenderer::ensureReadback(FrameSlot& slot, VkDeviceSize size) {
 // GPU work. A buffer that was never a render target reads back as black.
 void RsxRenderer::recordFlip(const RsxFlip& flip) {
   stats_.flips++;
+  textures_->trim();
   FrameSlot& slot = *slots_[current_slot_];
   const auto it = color_targets_.find(TargetKey{0, flip.offset});
   display_black_ = it == color_targets_.end();

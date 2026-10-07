@@ -40,8 +40,8 @@ struct Programs {
   std::vector<std::uint32_t> fragment{0x00010000, 0, 0, 0};
 };
 
-// The 2x2 texture, row by row: red, green / blue, white (ARGB).
-inline constexpr std::array<std::uint32_t, 4> kTexturePixels = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF};
+// The 2x2 texture, row by row: red, green / blue, half-transparent white (ARGB).
+inline constexpr std::array<std::uint32_t, 4> kTexturePixels = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0x80FFFFFF};
 
 class SyntheticMemory final : public RsxMemoryView {
  public:
@@ -157,12 +157,24 @@ class SceneBuilder {
       memory_.putWord(0, kTextureOffset + (i / kTextureSize) * (kTextureSize * 4) + (i % kTextureSize) * 4,
                       kTexturePixels[i]);
     }
+    bindTexture(kTextureOffset, kTextureSize, kTextureSize);
+  }
+
+  // Unit 0 reads an A8R8G8B8 linear texture of `width` x `height` at `offset` in local memory; with an
+  // offset of a render target it aliases the target. Identity remap, NEAREST filters, WRAP addressing.
+  // A pitch of 0 means width * 4; `format_flags` adds bits to the format field (0x40 = unnormalized).
+  void bindTexture(std::uint32_t offset, std::uint32_t width, std::uint32_t height, std::uint32_t pitch = 0,
+                   std::uint32_t format_flags = 0) {
     constexpr std::uint32_t kFormatA8R8G8B8Linear = 0x85 | 0x20;
-    write(kMethodNv4097SetTextureOffset, kTextureOffset);
-    write(kMethodNv4097SetTextureFormat, 1u | (2u << 4) | (kFormatA8R8G8B8Linear << 8) | (1u << 16));
+    write(kMethodNv4097SetTextureOffset, offset);
+    write(kMethodNv4097SetTextureFormat,
+          1u | (2u << 4) | ((kFormatA8R8G8B8Linear | format_flags) << 8) | (1u << 16));
     write(kMethodNv4097SetTextureControl0, 0x80000000);
-    write(kMethodNv4097SetTextureImageRect, (kTextureSize << 16) | kTextureSize);
-    write(kMethodNv4097SetTextureControl3, kTextureSize * 4);
+    write(kMethodNv4097SetTextureControl1, 0xAAE4);
+    write(kMethodNv4097SetTextureFilter, (1u << 16) | (1u << 24));
+    write(kMethodNv4097SetTextureAddress, 1u | (1u << 8) | (1u << 16));
+    write(kMethodNv4097SetTextureImageRect, (width << 16) | height);
+    write(kMethodNv4097SetTextureControl3, pitch != 0 ? pitch : width * 4);
   }
 
   // Ends the frame with a flip of buffer 0 and returns the file image.

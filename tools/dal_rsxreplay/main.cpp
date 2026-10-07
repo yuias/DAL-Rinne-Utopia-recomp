@@ -3,8 +3,10 @@
 // frame as a PNG and prints the summary line, the unimplemented census section and the validation result.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -26,10 +28,14 @@ namespace {
 
 void printUsage() {
   std::fputs(
-      "usage: dal_rsxreplay CAPTURE [--out DIR] [--compare PNG] [--no-validation] [--shader-cache DIR]\n"
+      "usage: dal_rsxreplay CAPTURE [--out DIR] [--compare PNG [--max-diff N] [--max-mean X] [--max-differing P]]\n"
+      "                      [--no-validation] [--shader-cache DIR]\n"
       "  CAPTURE  a .dalcap file written by dal_game --rsx-capture\n"
       "  --out DIR           write the displayed frame as DIR/<capture name>.png\n"
       "  --compare PNG       diff the displayed frame against PNG\n"
+      "  --max-diff N        with --compare: fail when the largest channel difference exceeds N\n"
+      "  --max-mean X        with --compare: fail when the mean difference exceeds X\n"
+      "  --max-differing P   with --compare: fail when more than P percent of the pixels differ\n"
       "  --no-validation     do not enable the Vulkan validation layer\n"
       "  --shader-cache DIR  directory of the on-disk SPIR-V cache\n",
       stderr);
@@ -95,10 +101,23 @@ int main(int argc, char** argv) {
   std::string compare_path;
   std::string shader_cache;
   bool validation = true;
+  // Thresholds of --compare; a NaN limit is not checked.
+  double max_diff = std::nan(""), max_mean = std::nan(""), max_differing = std::nan("");
   for (int i = 1; i < argc; i++) {
     const std::string_view arg = argv[i];
     if (arg == "--no-validation") {
       validation = false;
+      continue;
+    }
+    if (arg == "--max-diff" || arg == "--max-mean" || arg == "--max-differing") {
+      char* end = nullptr;
+      const double value = i + 1 < argc ? std::strtod(argv[i + 1], &end) : 0.0;
+      if (i + 1 >= argc || end == argv[i + 1] || *end != '\0') {
+        printUsage();
+        return 2;
+      }
+      (arg == "--max-diff" ? max_diff : arg == "--max-mean" ? max_mean : max_differing) = value;
+      i++;
       continue;
     }
     if (arg == "--out" || arg == "--compare" || arg == "--shader-cache") {
@@ -116,7 +135,8 @@ int main(int argc, char** argv) {
     }
     capture_path = std::string(arg);
   }
-  if (capture_path.empty()) {
+  const bool has_threshold = !std::isnan(max_diff) || !std::isnan(max_mean) || !std::isnan(max_differing);
+  if (capture_path.empty() || (has_threshold && compare_path.empty())) {
     printUsage();
     return 2;
   }
@@ -191,6 +211,12 @@ int main(int argc, char** argv) {
             std::snprintf(text, sizeof(text), "; diff max %u mean %.3f differing %.3f%%", diff.max, diff.mean,
                           diff.differing_percent);
             diff_text = text;
+            const auto exceeded = [](double value, double limit) { return !std::isnan(limit) && value > limit; };
+            if (exceeded(diff.max, max_diff) || exceeded(diff.mean, max_mean) ||
+                exceeded(diff.differing_percent, max_differing)) {
+              std::fprintf(stderr, "error: frame differs from the reference beyond the thresholds (%s)\n", text + 2);
+              exit_code = 1;
+            }
           } else {
             std::fprintf(stderr, "error: %s\n", error.c_str());
             exit_code = 1;

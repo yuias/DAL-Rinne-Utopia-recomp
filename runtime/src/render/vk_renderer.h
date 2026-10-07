@@ -1,7 +1,7 @@
 #pragma once
 
-// RSX command executor on Vulkan: render target cache, clears, draws and flips. Textures are not
-// uploaded yet: every sampled unit reads a 1x1 magenta placeholder.
+// RSX command executor on Vulkan: render target cache, clears, draws with textures and flips. A sampled
+// unit without a usable texture reads a 1x1 magenta placeholder.
 
 #include <array>
 #include <cstdint>
@@ -13,8 +13,10 @@
 #include <utility>
 #include <vector>
 
+#include "render/fp_translator.h"
 #include "render/vk_context.h"
 #include "render/vk_pipelines.h"
+#include "render/vk_textures.h"
 #include "rsx/rsx_frame.h"
 
 namespace dal {
@@ -30,6 +32,8 @@ struct RendererStats {
   std::uint64_t draws = 0;          // draws handled: recorded into a command buffer, or dropped with an empty scissor
   std::uint64_t draws_skipped = 0;  // draws seen but not rendered (unimplemented state, program or primitive)
   std::uint64_t flips = 0;
+  std::uint64_t texture_uploads = 0;  // texture images written from guest bytes (once per image per draw)
+  std::uint64_t feedback_copies = 0;  // render target copies made for draws that sample their own target
 };
 
 // Single-threaded: execute, readDisplay and stats are called from one thread. The renderer never
@@ -80,6 +84,8 @@ class RsxRenderer {
   // slot's fence has signaled. False (and fail()) when the allocation fails.
   bool allocUpload(std::size_t size, UploadRef& out);
   bool ensurePlaceholder();
+  bool prepareTextures(const RsxDraw& draw, const DrawShaders& shaders, RenderTarget& color,
+                       VkDescriptorImageInfo (&infos)[kFpTextureUnitCount], float (&scales)[kFpTextureUnitCount][4]);
   bool vertexFormatSupported(VkFormat format);
 
   void recordClear(const RsxClear& clear);
@@ -98,9 +104,10 @@ class RsxRenderer {
   TargetMap depth_targets_;
 
   std::unique_ptr<DrawPipelines> pipelines_;
+  std::unique_ptr<TextureCache> textures_;
   std::map<VkFormat, bool> vertex_format_support_;
 
-  // Bound to every sampled texture unit until textures are uploaded.
+  // Bound to a sampled texture unit that has no usable texture.
   VkImage placeholder_image_ = VK_NULL_HANDLE;
   VmaAllocation placeholder_allocation_ = nullptr;
   VkImageView placeholder_view_ = VK_NULL_HANDLE;
