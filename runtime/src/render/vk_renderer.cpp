@@ -192,6 +192,7 @@ struct RsxRenderer::FrameSlot {
 RsxRenderer::RsxRenderer(VkContext& context, RenderOptions options)
     : context_(context), options_(std::move(options)) {
   if (!options_.shader_cache.empty()) setShaderCacheDir(options_.shader_cache);
+  if (!options_.dump_dir.empty()) dumper_ = std::make_unique<FrameDumper>();
   pipelines_ = std::make_unique<DrawPipelines>(context_);
   if (!pipelines_->valid()) {
     fail(pipelines_->error());
@@ -1415,21 +1416,28 @@ bool RsxRenderer::dumpDue() const {
   return !options_.dump_dir.empty() && stats_.flips % std::max<std::uint32_t>(options_.dump_every, 1) == 0;
 }
 
-// PNG encoding runs on the calling (RSX) thread, outside the guest lock. A failed write is counted and
-// reported once; the run goes on.
+// Only the readback happens on the calling (RSX) thread; the dump worker converts, encodes and writes. A
+// full queue drops the frame instead of making the flip wait.
 void RsxRenderer::dumpDisplay() {
-  std::vector<std::uint8_t> bgra;
-  std::uint32_t width = 0;
-  std::uint32_t height = 0;
-  if (!readDisplay(bgra, width, height)) return;
-  const std::filesystem::path path = options_.dump_dir / std::format("frame_{:06}.png", stats_.flips);
-  std::string error;
-  if (writePngRgb(path, rgbFromBgra(bgra, width, height), error)) {
-    stats_.dumped++;
+  if (!dumper_->hasRoom()) {
+    dumper_->countSkipped();
+    logOnce(LogLevel::Warn, "render-dump-skipped", "dal: render: dump skipped (queue full) at flip {}", stats_.flips);
     return;
   }
-  stats_.dump_failures++;
-  logOnce(LogLevel::Warn, "render-dump-failed", "dal: render: cannot write {}: {}", path.generic_string(), error);
+  DumpFrame frame;
+  frame.bgra = dumper_->takeBuffer();
+  if (!readDisplay(frame.bgra, frame.width, frame.height)) {
+    dumper_->recycleBuffer(std::move(frame.bgra));
+    return;
+  }
+  frame.path = options_.dump_dir / std::format("frame_{:06}.png", stats_.flips);
+  dumper_->submit(std::move(frame));
+}
+
+DumpCounts RsxRenderer::dumpCounts() const { return dumper_ ? dumper_->counts() : DumpCounts{}; }
+
+std::uint64_t RsxRenderer::flushDumps(std::chrono::milliseconds timeout) {
+  return dumper_ ? dumper_->flush(timeout) : 0;
 }
 
 bool RsxRenderer::readDisplay(std::vector<std::uint8_t>& bgra, std::uint32_t& width, std::uint32_t& height) {

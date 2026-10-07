@@ -4,6 +4,7 @@
 // unit without a usable texture reads a 1x1 magenta placeholder.
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "render/fp_translator.h"
+#include "render/frame_dump.h"
 #include "render/vk_context.h"
 #include "render/vk_pipelines.h"
 #include "render/vk_textures.h"
@@ -40,8 +42,6 @@ struct RendererStats {
   std::uint64_t flips = 0;
   std::uint64_t texture_uploads = 0;  // texture images written from guest bytes (once per image per draw)
   std::uint64_t feedback_copies = 0;  // render target copies made for draws that sample their own target
-  std::uint64_t dumped = 0;           // frames written to the dump directory
-  std::uint64_t dump_failures = 0;
 };
 
 // Single-threaded: execute, readDisplay and stats are called from one thread. The renderer never
@@ -68,6 +68,13 @@ class RsxRenderer {
   bool readDisplay(std::vector<std::uint8_t>& bgra, std::uint32_t& width, std::uint32_t& height);
 
   const RendererStats& stats() const { return stats_; }
+
+  // Frames written, failed or dropped by the dump worker so far (all zero without a dump directory).
+  // Any thread.
+  DumpCounts dumpCounts() const;
+  // Waits until the dumps queued so far are written, at most `timeout`; returns how many are still
+  // pending (0 when all are done). Any thread.
+  std::uint64_t flushDumps(std::chrono::milliseconds timeout);
 
   // Every flip is also blitted to the presenter's next swapchain image (letterboxed 16:9) and presented.
   // Not owned; null (the default) presents nothing. Call before the first flip.
@@ -122,6 +129,7 @@ class RsxRenderer {
   RenderOptions options_;
   std::string error_;
   RendererStats stats_;
+  std::unique_ptr<FrameDumper> dumper_;  // null without a dump directory
 
   // Color and depth targets live in separate maps: a surface of each kind may share an offset.
   TargetMap color_targets_;

@@ -497,12 +497,20 @@ void onStop() {
     const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
     logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
   }
-  if (const RsxExecutor* executor = g_executor.load(std::memory_order_acquire)) {
+  if (RsxExecutor* executor = g_executor.load(std::memory_order_acquire)) {
+    // The process ends without destructors, so the dump worker's queue is written here. The bound keeps a
+    // stuck disk from delaying the exit; frames still pending after it are lost and reported below.
+    constexpr auto kFlushTimeout = std::chrono::milliseconds(2000);
+    const std::uint64_t unflushed = executor->flushOutput(kFlushTimeout);
     const RsxRenderCounts r = executor->counts();
-    logInfo("dal: render: {} clears, {} draws rendered, {} skipped, {} flips, {} frames dumped, validation {}{}",
-            r.clears, r.draws, r.draws_skipped, r.flips, r.frames_dumped,
+    logInfo("dal: render: {} clears, {} draws rendered, {} skipped, {} flips, {} frames dumped, "
+            "{} dumps skipped (queue full), {} dumps failed, validation {}{}",
+            r.clears, r.draws, r.draws_skipped, r.flips, r.frames_dumped, r.dumps_skipped, r.dumps_failed,
             r.validation ? std::format("{} errors", r.validation_errors) : std::string("off"),
             r.failed ? ", renderer stopped after an error" : "");
+    if (unflushed != 0) {
+      logWarn("dal: render: frame dump flush timed out, {} queued frame(s) were not written", unflushed);
+    }
   }
   const std::uint32_t written = g_captures_written.load();
   if (written < g_capture_frames.size()) {

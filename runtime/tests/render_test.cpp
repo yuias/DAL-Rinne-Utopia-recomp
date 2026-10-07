@@ -2,12 +2,15 @@
 
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -343,14 +346,77 @@ void testFrameDump() {
   small.rgb.resize(4 * 3 * 3);
   CHECK(!dal::diffImages(image, small, diff, error));
   CHECK(!dal::readPngRgb(dir / "missing.png", read, error));
+
+  // The dump worker writes the same bytes as converting and encoding on the calling thread.
+  {
+    constexpr std::uint32_t kW = 7;
+    constexpr std::uint32_t kH = 5;
+    std::vector<std::uint8_t> pixels(kW * kH * 4);
+    for (std::size_t i = 0; i < pixels.size(); i++) pixels[i] = static_cast<std::uint8_t>(i * 13 + 5);
+    CHECK(dal::writePngRgb(dir / "direct.png", dal::rgbFromBgra(pixels, kW, kH), error));
+
+    dal::FrameDumper dumper(2);
+    for (int i = 0; i < 3; i++) {
+      dal::DumpFrame frame;
+      frame.bgra = dumper.takeBuffer();  // recycled after the first frame
+      frame.bgra.assign(pixels.begin(), pixels.end());
+      frame.width = kW;
+      frame.height = kH;
+      frame.path = dir / "dumper" / std::format("{}.png", i);
+      CHECK(dumper.hasRoom() && dumper.submit(std::move(frame)));
+      CHECK(dumper.flush(std::chrono::seconds(10)) == 0);
+    }
+    CHECK(dumper.counts().written == 3 && dumper.counts().failed == 0 && dumper.counts().skipped == 0);
+
+    // flush waits for the frames submitted before the call, failed ones included, and reports what is
+    // still pending when the timeout passes.
+    CHECK(dumper.flush(std::chrono::milliseconds(0)) == 0);  // nothing submitted since the last flush
+    dal::DumpFrame bad;  // no pixels: the encoder refuses it
+    bad.path = dir / "dumper" / "bad.png";
+    CHECK(dumper.submit(std::move(bad)));
+    dal::DumpFrame good;
+    good.bgra = pixels;
+    good.width = kW;
+    good.height = kH;
+    good.path = dir / "dumper" / "after_bad.png";
+    CHECK(dumper.submit(std::move(good)));
+    CHECK(dumper.flush(std::chrono::milliseconds(0)) <= 2);
+    CHECK(dumper.flush(std::chrono::seconds(10)) == 0);
+    CHECK(dumper.counts().written == 4 && dumper.counts().failed == 1);
+    CHECK(std::filesystem::exists(dir / "dumper" / "after_bad.png") && !std::filesystem::exists(dir / "dumper" / "bad.png"));
+    const auto bytesOf = [](const std::filesystem::path& file) {
+      std::ifstream in(file, std::ios::binary);
+      return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::vector<char> direct = bytesOf(dir / "direct.png");
+    CHECK(!direct.empty());
+    for (int i = 0; i < 3; i++) CHECK(bytesOf(dir / "dumper" / std::format("{}.png", i)) == direct);
+
+    // A full queue drops the frame and counts it; capacity 0 is always full.
+    dal::FrameDumper full(0);
+    dal::DumpFrame dropped;
+    dropped.bgra = pixels;
+    dropped.width = kW;
+    dropped.height = kH;
+    dropped.path = dir / "dropped.png";
+    CHECK(!full.hasRoom() && !full.submit(std::move(dropped)));
+    CHECK(full.counts().skipped == 1 && full.counts().written == 0);
+    CHECK(!std::filesystem::exists(dir / "dropped.png"));
+  }
   std::filesystem::remove_all(dir, ec);
+}
+
+dal::RenderOptions readbackAllOptions() {
+  dal::RenderOptions options;
+  options.readback_all = true;
+  return options;
 }
 
 // Clear-only captures through the renderer: the display equals the clear color, across more frames
 // than there are frames in flight, and a flip of an unseen buffer reads back black.
 void testRendererClear(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
+  dal::RsxRenderer renderer(ctx, readbackAllOptions());
   CHECK(renderer.valid());
 
   std::vector<std::uint8_t> bgra;
@@ -411,7 +477,10 @@ void testRendererReadbackGate(dal::VkContext& ctx) {
     // The dumped flips read back too; an odd one was gated off.
     CHECK(renderer.readDisplay(bgra, width, height) == (flip % 2 == 0));
   }
-  CHECK(renderer.stats().dumped == 2 && renderer.stats().dump_failures == 0);
+  // The dump worker writes in the background.
+  CHECK(renderer.flushDumps(std::chrono::seconds(10)) == 0);
+  const dal::DumpCounts dumps = renderer.dumpCounts();
+  CHECK(dumps.written == 2 && dumps.failed == 0 && dumps.skipped == 0);
   CHECK(std::filesystem::exists(dir / "frame_000002.png") && std::filesystem::exists(dir / "frame_000004.png"));
   CHECK(!std::filesystem::exists(dir / "frame_000001.png") && !std::filesystem::exists(dir / "frame_000003.png"));
   dal::RgbImage image;
@@ -447,7 +516,7 @@ std::vector<std::uint8_t> makeScissoredClearCapture(std::uint32_t first, std::ui
 // masked channels. Depth and stencil values are not checked: the renderer has no depth readback.
 void testRendererScissorAndMask(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
+  dal::RsxRenderer renderer(ctx, readbackAllOptions());
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;
@@ -795,7 +864,7 @@ void checkQuadPixels(const std::vector<std::uint8_t>& bgra, std::uint32_t width,
 // attribute values.
 void testRendererQuad(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
+  dal::RsxRenderer renderer(ctx, readbackAllOptions());
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;
@@ -1057,7 +1126,7 @@ std::vector<std::uint8_t> makeChangedTextureCapture() {
 
 void testRendererTextures(dal::VkContext& ctx) {
   using namespace dal::rsx_synthetic;
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
+  dal::RsxRenderer renderer(ctx, readbackAllOptions());
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;

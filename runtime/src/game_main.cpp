@@ -93,7 +93,6 @@ class VulkanExecutor final : public dal::RsxExecutor {
     skipped_.store(stats.draws_skipped, std::memory_order_relaxed);
     clears_.store(stats.clears, std::memory_order_relaxed);
     flips_.store(stats.flips, std::memory_order_relaxed);
-    dumped_.store(stats.dumped, std::memory_order_relaxed);
     if (!renderer_->valid()) {
       failed_.store(true, std::memory_order_relaxed);
       dal::logError("dal: render: renderer stopped: {}", renderer_->error());
@@ -106,18 +105,24 @@ class VulkanExecutor final : public dal::RsxExecutor {
     counts.draws_skipped = skipped_.load(std::memory_order_relaxed);
     counts.clears = clears_.load(std::memory_order_relaxed);
     counts.flips = flips_.load(std::memory_order_relaxed);
-    counts.frames_dumped = dumped_.load(std::memory_order_relaxed);
+    // The dump worker keeps its own atomic counters, so these are current without the RSX thread's help.
+    const dal::DumpCounts dumps = renderer_->dumpCounts();
+    counts.frames_dumped = dumps.written;
+    counts.dumps_skipped = dumps.skipped;
+    counts.dumps_failed = dumps.failed;
     counts.validation = context_->validationEnabled();
     counts.validation_errors = context_->validationErrorCount();
     counts.failed = failed_.load(std::memory_order_relaxed);
     return counts;
   }
 
+  std::uint64_t flushOutput(std::chrono::milliseconds timeout) override { return renderer_->flushDumps(timeout); }
+
  private:
   std::unique_ptr<dal::VkContext> context_;
   std::unique_ptr<dal::Presenter> presenter_;
   std::unique_ptr<dal::RsxRenderer> renderer_;
-  std::atomic<std::uint64_t> draws_{0}, skipped_{0}, clears_{0}, flips_{0}, dumped_{0};
+  std::atomic<std::uint64_t> draws_{0}, skipped_{0}, clears_{0}, flips_{0};
   std::atomic<bool> failed_{false};
 };
 
