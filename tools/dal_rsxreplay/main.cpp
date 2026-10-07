@@ -1,9 +1,12 @@
 // dal_rsxreplay: feeds a .dalcap capture (see rsx/rsx_capture.h) through the RSX frame builder without
-// the game and prints the commands it produces, the summary line and the unimplemented census section.
+// the game, prints the commands it produces, renders them headless on Vulkan, writes the displayed
+// frame as a PNG and prints the summary line, the unimplemented census section and the validation result.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -11,6 +14,9 @@
 #include <vector>
 
 #include "core/census.h"
+#include "render/frame_dump.h"
+#include "render/vk_context.h"
+#include "render/vk_renderer.h"
 #include "rsx/rsx_capture.h"
 #include "rsx/rsx_frame.h"
 #include "rsx/rsx_frame_builder.h"
@@ -22,7 +28,10 @@ void printUsage() {
   std::fputs(
       "usage: dal_rsxreplay CAPTURE [--out DIR] [--compare PNG] [--no-validation] [--shader-cache DIR]\n"
       "  CAPTURE  a .dalcap file written by dal_game --rsx-capture\n"
-      "  Only the command list is printed for now; the other options are accepted and ignored.\n",
+      "  --out DIR           write the displayed frame as DIR/<capture name>.png\n"
+      "  --compare PNG       diff the displayed frame against PNG\n"
+      "  --no-validation     do not enable the Vulkan validation layer\n"
+      "  --shader-cache DIR  directory of the on-disk SPIR-V cache\n",
       stderr);
 }
 
@@ -82,15 +91,23 @@ void printDraw(const dal::RsxDraw& draw, std::span<const dal::RsxSurface> surfac
 
 int main(int argc, char** argv) {
   std::string capture_path;
+  std::string out_dir;
+  std::string compare_path;
+  std::string shader_cache;
+  bool validation = true;
   for (int i = 1; i < argc; i++) {
     const std::string_view arg = argv[i];
-    if (arg == "--no-validation") continue;
+    if (arg == "--no-validation") {
+      validation = false;
+      continue;
+    }
     if (arg == "--out" || arg == "--compare" || arg == "--shader-cache") {
       if (i + 1 >= argc) {
         printUsage();
         return 2;
       }
-      i++;
+      std::string& target = arg == "--out" ? out_dir : arg == "--compare" ? compare_path : shader_cache;
+      target = argv[++i];
       continue;
     }
     if (arg.starts_with("--") || !capture_path.empty()) {
@@ -116,7 +133,7 @@ int main(int argc, char** argv) {
   dal::ReplayRsxMemoryView memory;
   dal::RsxFrameBuilder builder(memory);
   dal::replayCapture(reader, memory, builder);
-  const std::vector<dal::RsxCommand> commands = builder.takeCommands();
+  std::vector<dal::RsxCommand> commands = builder.takeCommands();
 
   std::size_t draws = 0;
   for (const dal::RsxCommand& command : commands) {
@@ -130,10 +147,73 @@ int main(int argc, char** argv) {
       std::printf("flip buffer=%u %ux%u@0x%x\n", flip.buffer, flip.width, flip.height, flip.offset);
     }
   }
-  // Nothing is skipped until a renderer exists to refuse commands.
-  std::printf("replay: %zu commands, %zu draws, 0 skipped\n", commands.size(), draws);
+
+  // Without a Vulkan device the replay still prints the command list and counts every draw as skipped.
+  dal::VkContextOptions context_options;
+  context_options.validation = validation;
+  std::unique_ptr<dal::VkContext> context = dal::createVkContext(context_options, error);
+  if (!context) std::printf("render: unavailable: %s\n", error.c_str());
+
+  int exit_code = 0;
+  std::size_t skipped = draws;
+  std::string diff_text;
+  std::string png_text;
+  std::uint32_t validation_errors = 0;
+  bool validation_active = false;
+  if (context) {
+    dal::RenderOptions render_options;
+    render_options.shader_cache = shader_cache;
+    {
+      dal::RsxRenderer renderer(*context, render_options);
+      renderer.execute(commands);
+      skipped = renderer.stats().draws_skipped;
+
+      std::vector<std::uint8_t> bgra;
+      std::uint32_t width = 0;
+      std::uint32_t height = 0;
+      if (renderer.valid() && renderer.readDisplay(bgra, width, height)) {
+        const dal::RgbImage image = dal::rgbFromBgra(bgra, width, height);
+        if (!out_dir.empty()) {
+          const std::filesystem::path png_path =
+              std::filesystem::path(out_dir) / (std::filesystem::path(capture_path).stem().string() + ".png");
+          if (dal::writePngRgb(png_path, image, error)) {
+            png_text = "png: " + png_path.generic_string();
+          } else {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            exit_code = 1;
+          }
+        }
+        if (!compare_path.empty()) {
+          dal::RgbImage reference;
+          dal::ImageDiff diff;
+          if (dal::readPngRgb(compare_path, reference, error) && dal::diffImages(image, reference, diff, error)) {
+            char text[128];
+            std::snprintf(text, sizeof(text), "; diff max %u mean %.3f differing %.3f%%", diff.max, diff.mean,
+                          diff.differing_percent);
+            diff_text = text;
+          } else {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            exit_code = 1;
+          }
+        }
+      } else {
+        std::fprintf(stderr, "error: no frame to display%s%s\n", renderer.valid() ? "" : ": ",
+                     renderer.error().c_str());
+        exit_code = 1;
+      }
+    }
+    // Read after the renderer is gone so errors from its teardown count too.
+    validation_active = context->validationEnabled();
+    validation_errors = context->validationErrorCount();
+  }
+
+  std::printf("replay: %zu commands, %zu draws, %zu skipped%s\n", commands.size(), draws, skipped, diff_text.c_str());
   // The game's census omits an empty section; a replay says so explicitly.
   const std::string section = unimplementedSection();
   std::printf("%s\n", section.empty() ? "census: rsx unimplemented 0 kinds" : section.c_str());
-  return 0;
+  if (!png_text.empty()) std::printf("%s\n", png_text.c_str());
+  const char* validation_state = !validation ? "disabled" : validation_active ? "active" : "inactive";
+  std::printf("validation: %s, %u errors\n", validation_state, validation_errors);
+  if (validation_errors != 0) exit_code = 1;
+  return exit_code;
 }

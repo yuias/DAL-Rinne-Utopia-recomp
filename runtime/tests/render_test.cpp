@@ -10,8 +10,15 @@
 #include <system_error>
 #include <vector>
 
+#include "render/frame_dump.h"
 #include "render/shader_compiler.h"
 #include "render/vk_context.h"
+#include "render/vk_renderer.h"
+#include "rsx/rsx_capture.h"
+#include "rsx/rsx_frame_builder.h"
+#include "rsx/rsx_registers.h"
+#include "rsx/rsx_unimplemented.h"
+#include "rsx_synthetic.h"
 
 namespace {
 
@@ -263,12 +270,208 @@ void testClearAndReadback(dal::VkContext& ctx) {
   if (image != VK_NULL_HANDLE) vmaDestroyImage(ctx.allocator(), image, image_alloc);
 }
 
+std::uint64_t unimplementedCount(const std::string& kind) {
+  for (const auto& [name, count] : dal::rsxUnimplementedSnapshot()) {
+    if (name == kind) return count;
+  }
+  return 0;
+}
+
+std::vector<dal::RsxCommand> replaySynthetic(const std::vector<std::uint8_t>& file) {
+  dal::RsxCaptureReader reader;
+  std::string error;
+  CHECK(reader.parse(file, error));
+  dal::ReplayRsxMemoryView view;
+  dal::RsxFrameBuilder builder(view);
+  dal::replayCapture(reader, view, builder);
+  return builder.takeCommands();
+}
+
+bool displayIsUniform(const std::vector<std::uint8_t>& bgra, std::uint32_t width, std::uint32_t height,
+                      const std::uint8_t (&expected)[4]) {
+  if (bgra.size() != static_cast<std::size_t>(width) * height * 4) return false;
+  for (std::size_t i = 0; i < bgra.size(); i += 4) {
+    if (std::memcmp(bgra.data() + i, expected, 4) != 0) return false;
+  }
+  return true;
+}
+
+// Needs no Vulkan device.
+void testFrameDump() {
+  dal::RgbImage image;
+  image.width = 5;
+  image.height = 3;
+  image.rgb.resize(5 * 3 * 3);
+  for (std::size_t i = 0; i < image.rgb.size(); i++) image.rgb[i] = static_cast<std::uint8_t>(i * 7);
+
+  // BGRA to RGB drops alpha and swaps the first and third channel.
+  const std::uint8_t bgra[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const dal::RgbImage converted = dal::rgbFromBgra(bgra, 2, 1);
+  CHECK(converted.rgb == std::vector<std::uint8_t>({3, 2, 1, 7, 6, 5}));
+
+  std::error_code ec;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "dal_frame_dump_test";
+  std::filesystem::remove_all(dir, ec);
+  const std::filesystem::path path = dir / "nested" / "image.png";
+  std::string error;
+  CHECK(dal::writePngRgb(path, image, error));
+  dal::RgbImage read;
+  CHECK(dal::readPngRgb(path, read, error));
+  CHECK(read.width == 5 && read.height == 3 && read.rgb == image.rgb);
+
+  dal::ImageDiff diff;
+  CHECK(dal::diffImages(image, read, diff, error));
+  CHECK(diff.max == 0 && diff.mean == 0.0 && diff.differing_percent == 0.0);
+
+  // One pixel off by 10 in one channel, another by 2 (not counted as differing).
+  dal::RgbImage other = image;
+  other.rgb[0] = static_cast<std::uint8_t>(other.rgb[0] + 10);
+  other.rgb[3 * 4 + 1] = static_cast<std::uint8_t>(other.rgb[3 * 4 + 1] + 2);
+  CHECK(dal::diffImages(image, other, diff, error));
+  CHECK(diff.max == 10);
+  CHECK(diff.mean > 12.0 / 45.0 - 1e-9 && diff.mean < 12.0 / 45.0 + 1e-9);
+  CHECK(diff.differing_percent > 100.0 / 15.0 - 1e-9 && diff.differing_percent < 100.0 / 15.0 + 1e-9);
+
+  dal::RgbImage small = image;
+  small.width = 4;
+  small.rgb.resize(4 * 3 * 3);
+  CHECK(!dal::diffImages(image, small, diff, error));
+  CHECK(!dal::readPngRgb(dir / "missing.png", read, error));
+  std::filesystem::remove_all(dir, ec);
+}
+
+// Clear-only captures through the renderer: the display equals the clear color, across more frames
+// than there are frames in flight, and a flip of an unseen buffer reads back black.
+void testRendererClear(dal::VkContext& ctx) {
+  dal::rsxUnimplementedReset();
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  CHECK(renderer.valid());
+
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  CHECK(!renderer.readDisplay(bgra, width, height));
+
+  constexpr std::uint32_t kColors[] = {0xFF102030, 0xFF405060, 0x80FF0000, 0xFF000000};
+  for (const std::uint32_t argb : kColors) {
+    std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(argb));
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height));
+    CHECK(width == dal::rsx_synthetic::kSurfaceSize && height == dal::rsx_synthetic::kSurfaceSize);
+    const std::uint8_t expected[4] = {static_cast<std::uint8_t>(argb), static_cast<std::uint8_t>(argb >> 8),
+                                      static_cast<std::uint8_t>(argb >> 16), static_cast<std::uint8_t>(argb >> 24)};
+    CHECK(displayIsUniform(bgra, width, height, expected));
+  }
+  CHECK(renderer.stats().clears == std::size(kColors) && renderer.stats().flips == std::size(kColors));
+  CHECK(unimplementedCount("state surface resize") == 0);
+
+  // A buffer no clear or draw touched: black, and counted.
+  std::vector<dal::RsxCommand> flip_only;
+  dal::RsxFlip flip;
+  flip.offset = 0x40000;
+  flip.width = 8;
+  flip.height = 4;
+  flip_only.emplace_back(flip);
+  renderer.execute(flip_only);
+  CHECK(renderer.readDisplay(bgra, width, height));
+  CHECK(width == 8 && height == 4);
+  CHECK(displayIsUniform(bgra, width, height, {0, 0, 0, 0xFF}));
+  CHECK(unimplementedCount("state flip of non-render-target") == 1);
+  CHECK(renderer.valid());
+  dal::rsxUnimplementedReset();
+}
+
+std::uint32_t pixelArgb(const std::vector<std::uint8_t>& bgra, std::uint32_t width, std::uint32_t x,
+                        std::uint32_t y) {
+  const std::uint8_t* p = bgra.data() + (static_cast<std::size_t>(y) * width + x) * 4;
+  return (static_cast<std::uint32_t>(p[3]) << 24) | (static_cast<std::uint32_t>(p[2]) << 16) |
+         (static_cast<std::uint32_t>(p[1]) << 8) | p[0];
+}
+
+// Clear to `first`, then clear with `mask` to `second` inside the scissor rectangle (x, y, w, h).
+std::vector<std::uint8_t> makeScissoredClearCapture(std::uint32_t first, std::uint32_t second, std::uint32_t mask,
+                                                    std::uint32_t x, std::uint32_t y, std::uint32_t w,
+                                                    std::uint32_t h) {
+  dal::rsx_synthetic::SceneBuilder scene;
+  scene.setSurface();
+  scene.clear(first);
+  scene.write(dal::kMethodNv4097SetScissorHorizontal, x | (w << 16));
+  scene.write(dal::kMethodNv4097SetScissorVertical, y | (h << 16));
+  scene.write(dal::kMethodNv4097SetColorClearValue, second);
+  scene.write(dal::kMethodNv4097ClearSurface, mask);
+  return scene.finish();
+}
+
+// A clear inside a sub-rectangle changes only that rectangle; a partial color mask changes nothing
+// and is counted. Depth and stencil values are not checked: the renderer has no depth readback.
+void testRendererScissorAndMask(dal::VkContext& ctx) {
+  dal::rsxUnimplementedReset();
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  CHECK(renderer.valid());
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+
+  constexpr std::uint32_t kA = 0xFF102030;
+  constexpr std::uint32_t kB = 0xFF405060;
+  std::vector<dal::RsxCommand> commands = replaySynthetic(makeScissoredClearCapture(kA, kB, 0xF3, 8, 16, 16, 8));
+  renderer.execute(commands);
+  CHECK(renderer.readDisplay(bgra, width, height) && width == 64 && height == 64);
+  if (bgra.size() == 64 * 64 * 4) {
+    CHECK(pixelArgb(bgra, width, 8, 16) == kB);
+    CHECK(pixelArgb(bgra, width, 23, 23) == kB);
+    CHECK(pixelArgb(bgra, width, 15, 20) == kB);
+    CHECK(pixelArgb(bgra, width, 7, 16) == kA);
+    CHECK(pixelArgb(bgra, width, 24, 16) == kA);
+    CHECK(pixelArgb(bgra, width, 8, 15) == kA);
+    CHECK(pixelArgb(bgra, width, 8, 24) == kA);
+    CHECK(pixelArgb(bgra, width, 0, 0) == kA && pixelArgb(bgra, width, 63, 63) == kA);
+  }
+  CHECK(unimplementedCount("state partial color clear mask") == 0);
+
+  // Red and green only (0x30): not modelled, so color A stays.
+  commands = replaySynthetic(makeScissoredClearCapture(kA, kB, 0x30, 0, 0, 64, 64));
+  renderer.execute(commands);
+  CHECK(renderer.readDisplay(bgra, width, height));
+  const std::uint8_t expected_a[4] = {0x30, 0x20, 0x10, 0xFF};
+  CHECK(displayIsUniform(bgra, width, height, expected_a));
+  CHECK(unimplementedCount("state partial color clear mask") == 1);
+  CHECK(renderer.valid());
+  dal::rsxUnimplementedReset();
+}
+
+// A clear that includes stencil under a write mask other than 0 or 0xFF is counted by the frame
+// builder (the renderer clears the whole byte).
+void testPartialStencilNote() {
+  const auto clearWithStencilMask = [](std::uint32_t stencil_mask) {
+    dal::rsx_synthetic::SceneBuilder scene;
+    scene.setSurface();
+    scene.write(dal::kMethodNv4097SetStencilMask, stencil_mask);
+    scene.clear(0xFF000000);
+    // Recording runs a frame builder of its own; only the replay's notes are counted.
+    const std::vector<std::uint8_t> file = scene.finish();
+    dal::rsxUnimplementedReset();
+    return replaySynthetic(file);
+  };
+  clearWithStencilMask(0xFF);
+  CHECK(unimplementedCount("state partial stencil clear mask") == 0);
+  clearWithStencilMask(0x00);
+  CHECK(unimplementedCount("state partial stencil clear mask") == 0);
+  const std::vector<dal::RsxCommand> commands = clearWithStencilMask(0x0F);
+  CHECK(commands.size() == 2 && std::get<dal::RsxClear>(commands[0]).mask == 0xF3);
+  CHECK(unimplementedCount("state partial stencil clear mask") == 1);
+  dal::rsxUnimplementedReset();
+}
+
 }  // namespace
 
 int main() {
   const bool layer = dal::vkValidationLayerAvailable();
   std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
   testShaderCompiler();
+  testFrameDump();
+  testPartialStencilNote();
 
   dal::VkContextOptions options;
   options.validation = true;
@@ -288,6 +491,8 @@ int main() {
   CHECK(layer == ctx->validationEnabled());
 
   testClearAndReadback(*ctx);
+  testRendererClear(*ctx);
+  testRendererScissorAndMask(*ctx);
   CHECK(ctx->validationErrorCount() == 0);
 
   ctx.reset();

@@ -60,8 +60,10 @@ function(dal_render_add)
 
   add_library(dal_render STATIC
     runtime/src/render/fp_translator.cpp
+    runtime/src/render/frame_dump.cpp
     runtime/src/render/shader_compiler.cpp
     runtime/src/render/vk_context.cpp
+    runtime/src/render/vk_renderer.cpp
     runtime/src/render/vp_translator.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
@@ -75,6 +77,8 @@ function(dal_render_add)
     VMA_VULKAN_VERSION=1003000)
   target_link_libraries(dal_render PUBLIC volk dal_runtime_core)
   target_link_libraries(dal_render PRIVATE shaderc_combined)
+  # PRIVATE: libpng types stay inside frame_dump.cpp.
+  target_link_libraries(dal_render PRIVATE png_static)
 
   add_executable(dal_render_tests runtime/tests/render_test.cpp)
   target_compile_options(dal_render_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
@@ -104,10 +108,11 @@ function(dal_render_add)
   set_tests_properties(fp_translator PROPERTIES
     PASS_REGULAR_EXPRESSION "fp translator tests: [0-9]+ passed, 0 failed")
 
-  # Replays a capture without the game; for now it prints the command list from the frame builder.
+  # Replays a capture without the game: prints the command list from the frame builder, renders it
+  # headless and writes the displayed frame as a PNG.
   add_executable(dal_rsxreplay tools/dal_rsxreplay/main.cpp)
   target_compile_options(dal_rsxreplay PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_rsxreplay PRIVATE dal_runtime_core)
+  target_link_libraries(dal_rsxreplay PRIVATE dal_render)
 
   include("${CMAKE_SOURCE_DIR}/cmake/rsx_replay.cmake")
   set(replay_capture
@@ -116,7 +121,8 @@ function(dal_render_add)
     add_test(NAME rsx_replay
       COMMAND dal_rsxreplay "${replay_capture}" --out "${CMAKE_BINARY_DIR}/replay")
     set_tests_properties(rsx_replay PROPERTIES
-      PASS_REGULAR_EXPRESSION "replay: [0-9]+ commands, [0-9]+ draws, [0-9]+ skipped")
+      PASS_REGULAR_EXPRESSION "replay: [0-9]+ commands, [0-9]+ draws, [0-9]+ skipped"
+      FAIL_REGULAR_EXPRESSION "validation: [a-z]+, [1-9][0-9]* errors;error: ")
   else()
     message(STATUS "DAL: rsx_replay test not registered "
       "(generated/rsx/captures/${DAL_RSX_REPLAY_CAPTURE}.dalcap not found)")

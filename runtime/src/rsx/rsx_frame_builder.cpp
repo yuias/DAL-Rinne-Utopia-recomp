@@ -228,6 +228,11 @@ void RsxFrameBuilder::clear(const RsxRegisters& regs, std::uint32_t mask) {
   if (c.scissor[2] == 0 || c.scissor[3] == 0) return;
 
   if ((mask & kColorBits) != 0 && c.surfaces.color.format == RsxColorFormat::A8R8G8B8) noteSurface(c.surfaces.color);
+  // RPCS3 clears a partially masked stencil with a shader pass; RsxClear carries no stencil mask, so
+  // the renderer clears the whole byte.
+  if ((mask & kRsxClearStencil) != 0 && (regs.reg(kMethodNv4097SetStencilMask) & 0xFF) != 0xFF) {
+    rsxNoteUnimplemented("state", "partial stencil clear mask");
+  }
   commands_.emplace_back(std::move(c));
 }
 
