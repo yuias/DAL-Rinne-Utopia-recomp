@@ -1,0 +1,50 @@
+# Third-party notices
+
+## FFmpeg
+
+The runtime decodes movies with FFmpeg (`libavcodec`, `libavutil`, `libswscale`). FFmpeg is not
+part of this repository and no FFmpeg binary is tracked. `tools/fetch-ffmpeg.ps1` downloads a
+pinned, SHA-256 verified build into `generated/deps/ffmpeg`; the pin is in `cmake/ffmpeg.cmake`.
+
+| | |
+| --- | --- |
+| Version | FFmpeg `n9.0.2-22-g46d8f462ee` (release/9.0 branch, 22 commits after tag `n9.0.2`) |
+| Build | BtbN FFmpeg-Builds, `win64-lgpl-shared`, release `autobuild-2026-10-06-13-06` |
+| Licence | GNU Lesser General Public License, version 3 or later (see below) |
+
+### Licence
+
+FFmpeg is licensed under the GNU Lesser General Public License, version 2.1 or later. This build
+is configured with `--enable-version3`, so the resulting libraries are distributed under the LGPL
+version 3 or later. It is not configured with `--enable-gpl` or `--enable-nonfree`, and no GPL or
+non-free component is included. The full licence text ships with the build as `LICENSE.txt` and must
+accompany any redistributed copy of the DLLs.
+
+### Dynamic loading and replacement
+
+The FFmpeg DLLs are not linked into the executables. The runtime loads them at run time with
+`LoadLibrary` from the application directory, so they can be replaced by another build of the same
+major versions (`avcodec-63`, `avutil-61`, `swscale-10`) without rebuilding this project. Without
+the DLLs the runtime logs the problem and plays movies without decoding them.
+
+### Source code
+
+- FFmpeg source at the exact commit of the build:
+  <https://github.com/FFmpeg/FFmpeg/tree/46d8f462eeb87ee1f704d8c44a0ee24fca471ad1>
+  (commit `46d8f462eeb87ee1f704d8c44a0ee24fca471ad1`).
+- Build scripts (toolchain, patches and the configuration of every bundled library) at the tag of
+  the pinned release:
+  <https://github.com/BtbN/FFmpeg-Builds/tree/autobuild-2026-10-06-13-06>.
+- The pinned release: <https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-10-06-13-06>.
+
+### Libraries bundled in the build
+
+The `ffmpeg -version` configuration of the pinned build enables these external components, which
+are statically included in the DLLs under their own licences (see the build scripts above): iconv,
+zlib, libxml2, libvmaf, fontconfig, harfbuzz, freetype, fribidi, lcms2, Vulkan, dav1d, vorbis,
+rav1e, librsvg, gmp, lzma, liblcevc-dec, OpenCL, AMF, aom, chromaprint, ffnvcodec, libgme,
+kvazaar, aribb24, aribcaption, libass, libbluray, libjxl, mp3lame, opus, libplacebo, librist,
+libssh, theora, vpx, webp, zmq, lv2, libvpl, OpenAL, liboapv, opencore-amr (narrowband and
+wideband), openh264, openjpeg, openmpt, schannel, SDL2, snappy, soxr, srt, svtav1, twolame, uavs3d,
+VA-API, VapourSynth, vvenc, zimg and zvbi. This project uses only the H.264 and ATRAC3plus decoders
+and the colour conversion of `libswscale`.
