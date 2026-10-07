@@ -30,6 +30,8 @@ namespace {
 constexpr std::uint64_t kFenceTimeoutNs = 10'000'000'000ull;
 constexpr std::size_t kUploadAlignment = 256;  // covers every uniform and vertex buffer offset alignment
 constexpr std::size_t kUploadBlockSize = 8u << 20;
+// The only operations that write a swapchain image: the black clear and the blit.
+constexpr VkPipelineStageFlags2 kPresentWriteStages = VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT;
 constexpr std::uint32_t kIdentityRemap = 0xAAE4;  // RSX_TEXTURE_REMAP_IDENTITY (RPCS3 `gcm_enums.h`)
 
 bool formatHasStencil(VkFormat format) {
@@ -303,6 +305,21 @@ bool RsxRenderer::submitFrame() {
   submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
   submit.commandBufferInfoCount = 1;
   submit.pCommandBufferInfos = &cmd_submit;
+  // Only the blit waits for the swapchain image; the draws recorded before it start right away.
+  VkSemaphoreSubmitInfo wait{};
+  VkSemaphoreSubmitInfo signal{};
+  if (present_pending_) {
+    wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait.semaphore = present_target_.acquire_semaphore;
+    wait.stageMask = kPresentWriteStages;
+    signal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signal.semaphore = present_target_.render_semaphore;
+    signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    submit.waitSemaphoreInfoCount = 1;
+    submit.pWaitSemaphoreInfos = &wait;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signal;
+  }
   if (vkQueueSubmit2(context_.graphicsQueue(), 1, &submit, slot.fence) != VK_SUCCESS) {
     fail("vkQueueSubmit2 failed");
     return false;
@@ -311,6 +328,10 @@ bool RsxRenderer::submitFrame() {
   recording_ = false;
   display_slot_ = current_slot_;
   current_slot_ = (current_slot_ + 1) % kFramesInFlight;
+  if (present_pending_) {
+    present_pending_ = false;
+    presenter_->present(present_target_);
+  }
   return true;
 }
 
@@ -1311,7 +1332,67 @@ void RsxRenderer::recordFlip(const RsxFlip& flip) {
     }
   }
   if (!valid()) return;
+  if (presenter_ != nullptr) recordPresentBlit(slot, display_black_ ? nullptr : it->second.get());
   if (submitFrame()) has_flip_ = true;
+}
+
+// Acquires a swapchain image and records the copy of the display buffer into it (a black frame when
+// `source` is null). Without an image (minimised window, timeout) nothing is recorded and the frame is
+// submitted as usual. FIFO presentation can make the acquire block; the presenter measures it.
+void RsxRenderer::recordPresentBlit(FrameSlot& slot, RenderTarget* source) {
+  if (!presenter_->acquire(current_slot_, present_target_)) return;
+  present_pending_ = true;
+  const Presenter::Target& dst = present_target_;
+  const VkCommandBuffer cmd = slot.cmd;
+
+  VkImageMemoryBarrier2 barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = dst.image;
+  barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkDependencyInfo dependency{};
+  dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+  dependency.imageMemoryBarrierCount = 1;
+  dependency.pImageMemoryBarriers = &barrier;
+  const auto barrierTo = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src_stage,
+                             VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    barrier.oldLayout = from;
+    barrier.newLayout = to;
+    barrier.srcStageMask = src_stage;
+    barrier.srcAccessMask = src_access;
+    barrier.dstStageMask = dst_stage;
+    barrier.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  };
+  constexpr VkPipelineStageFlags2 kTransfer = kPresentWriteStages;  // also the acquire semaphore wait in submitFrame
+  barrierTo(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kTransfer, 0, kTransfer,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+  const PixelRect rect = letterboxRect(dst.width, dst.height, 16, 9);
+  const bool covers_image = rect.width == dst.width && rect.height == dst.height;
+  if (source == nullptr || !covers_image) {
+    const VkClearColorValue black = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    if (source != nullptr) {
+      barrierTo(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kTransfer,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, kTransfer, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+  }
+  if (source != nullptr && rect.width != 0) {
+    transition(*source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffsets[1] = {static_cast<std::int32_t>(source->width), static_cast<std::int32_t>(source->height), 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffsets[0] = {rect.x, rect.y, 0};
+    region.dstOffsets[1] = {rect.x + static_cast<std::int32_t>(rect.width), rect.y + static_cast<std::int32_t>(rect.height), 1};
+    vkCmdBlitImage(cmd, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &region, VK_FILTER_LINEAR);
+  }
+  barrierTo(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, kTransfer, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_NONE, 0);
 }
 
 void RsxRenderer::execute(std::span<RsxCommand> commands) {

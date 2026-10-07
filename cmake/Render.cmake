@@ -67,6 +67,7 @@ function(dal_render_add)
     runtime/src/render/vk_pipelines.cpp
     runtime/src/render/vk_renderer.cpp
     runtime/src/render/vk_textures.cpp
+    runtime/src/render/vk_window.cpp
     runtime/src/render/vp_translator.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)

@@ -17,6 +17,7 @@
 #include "render/vk_context.h"
 #include "render/vk_pipelines.h"
 #include "render/vk_textures.h"
+#include "render/vk_window.h"
 #include "rsx/rsx_frame.h"
 
 namespace dal {
@@ -68,14 +69,25 @@ class RsxRenderer {
 
   const RendererStats& stats() const { return stats_; }
 
+  // Every flip is also blitted to the presenter's next swapchain image (letterboxed 16:9) and presented.
+  // Not owned; null (the default) presents nothing. Call before the first flip.
+  void setPresenter(Presenter* presenter) {
+    if (presenter != nullptr && presenter->frameSlots() < kFramesInFlight) {
+      fail("the presenter has fewer frame slots than the renderer");
+      return;
+    }
+    presenter_ = presenter;
+  }
+
+  // Frames recorded before a slot is reused; a presenter needs one acquire semaphore per slot.
+  static constexpr std::size_t kFramesInFlight = 2;
+
  private:
   struct RenderTarget;
   struct FrameSlot;
   struct UploadRef;
   using TargetKey = std::pair<std::uint32_t, std::uint32_t>;  // location, offset
   using TargetMap = std::map<TargetKey, std::shared_ptr<RenderTarget>>;
-
-  static constexpr std::size_t kFramesInFlight = 2;
 
   void fail(std::string message);
   bool beginFrame();
@@ -101,6 +113,7 @@ class RsxRenderer {
   void recordMaskedColorClear(const RsxClear& clear, RenderTarget& color, std::uint32_t color_bits);
   void recordDraw(const RsxDraw& draw);
   void recordFlip(const RsxFlip& flip);
+  void recordPresentBlit(FrameSlot& slot, RenderTarget* source);
   bool ensureReadback(FrameSlot& slot, VkDeviceSize size);
   bool dumpDue() const;
   void dumpDisplay();
@@ -128,6 +141,10 @@ class RsxRenderer {
   std::array<std::unique_ptr<FrameSlot>, kFramesInFlight> slots_;
   std::size_t current_slot_ = 0;
   bool recording_ = false;
+
+  Presenter* presenter_ = nullptr;
+  Presenter::Target present_target_;  // acquired for the frame being recorded
+  bool present_pending_ = false;      // present_target_ is valid and its submit has not been queued yet
 
   bool has_flip_ = false;
   bool display_black_ = false;

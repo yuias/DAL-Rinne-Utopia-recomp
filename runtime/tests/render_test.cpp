@@ -1225,11 +1225,35 @@ void testPartialStencilNote() {
   dal::rsxUnimplementedReset();
 }
 
+bool sameRect(const dal::PixelRect& rect, std::int32_t x, std::int32_t y, std::uint32_t width, std::uint32_t height) {
+  return rect.x == x && rect.y == y && rect.width == width && rect.height == height;
+}
+
+void testLetterbox() {
+  CHECK(sameRect(dal::letterboxRect(1280, 720, 16, 9), 0, 0, 1280, 720));
+  CHECK(sameRect(dal::letterboxRect(1920, 1080, 16, 9), 0, 0, 1920, 1080));
+  // Wider than 16:9: pillarbox bars left and right.
+  CHECK(sameRect(dal::letterboxRect(1600, 720, 16, 9), 160, 0, 1280, 720));
+  // Taller than 16:9: letterbox bars above and below.
+  CHECK(sameRect(dal::letterboxRect(1280, 1024, 16, 9), 0, 152, 1280, 720));
+  CHECK(sameRect(dal::letterboxRect(800, 800, 16, 9), 0, 175, 800, 450));
+  // Odd sizes round down; the margins differ by at most one pixel.
+  CHECK(sameRect(dal::letterboxRect(641, 361, 16, 9), 0, 0, 641, 360));
+  // Empty areas and ratios give an empty rectangle.
+  CHECK(sameRect(dal::letterboxRect(0, 720, 16, 9), 0, 0, 0, 0));
+  CHECK(sameRect(dal::letterboxRect(1280, 0, 16, 9), 0, 0, 0, 0));
+  CHECK(sameRect(dal::letterboxRect(1280, 720, 0, 9), 0, 0, 0, 0));
+  CHECK(sameRect(dal::letterboxRect(1, 1, 16, 9), 0, 0, 0, 0));  // 1 x 0 after rounding
+  // A very large area does not overflow.
+  CHECK(sameRect(dal::letterboxRect(0xFFFFFFFFu, 0xFFFFFFFFu, 16, 9), 0, 939524096, 0xFFFFFFFFu, 2415919103u));
+}
+
 }  // namespace
 
 int main() {
   const bool layer = dal::vkValidationLayerAvailable();
   std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
+  testLetterbox();
   testShaderCompiler();
   testTextureMapping();
   testFrameDump();

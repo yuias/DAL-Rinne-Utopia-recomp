@@ -29,6 +29,7 @@
 #include "lv2/vfs_config.h"
 #include "render/vk_context.h"
 #include "render/vk_renderer.h"
+#include "render/vk_window.h"
 #include "rsx/rsx_thread.h"
 
 namespace {
@@ -51,6 +52,7 @@ struct Options {
   std::optional<bool> render_flag;  // --render as given; the final mode is settled after all arguments
   bool dump_every_given = false;
   bool vk_validation = false;
+  bool window = false;
   std::string dump_frames;
   std::uint32_t dump_frames_every = 1;
   std::string shader_cache;
@@ -61,11 +63,19 @@ struct Options {
 // counters are published for the census, which reads them from another one.
 class VulkanExecutor final : public dal::RsxExecutor {
  public:
-  VulkanExecutor(std::unique_ptr<dal::VkContext> context, const dal::RenderOptions& options)
-      : context_(std::move(context)), renderer_(std::make_unique<dal::RsxRenderer>(*context_, options)) {}
+  // `presenter` may be null (no window).
+  VulkanExecutor(std::unique_ptr<dal::VkContext> context, std::unique_ptr<dal::Presenter> presenter,
+                 const dal::RenderOptions& options)
+      : context_(std::move(context)),
+        presenter_(std::move(presenter)),
+        renderer_(std::make_unique<dal::RsxRenderer>(*context_, options)) {
+    renderer_->setPresenter(presenter_.get());
+  }
 
   ~VulkanExecutor() override {
-    renderer_.reset();  // before the device it was created from
+    // The renderer and the swapchain go before the device they were created from.
+    renderer_.reset();
+    presenter_.reset();
     context_.reset();
   }
 
@@ -103,6 +113,7 @@ class VulkanExecutor final : public dal::RsxExecutor {
 
  private:
   std::unique_ptr<dal::VkContext> context_;
+  std::unique_ptr<dal::Presenter> presenter_;
   std::unique_ptr<dal::RsxRenderer> renderer_;
   std::atomic<std::uint64_t> draws_{0}, skipped_{0}, clears_{0}, flips_{0}, dumped_{0};
   std::atomic<bool> failed_{false};
@@ -113,6 +124,7 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
   const auto start = std::chrono::steady_clock::now();
   dal::VkContextOptions context_options;
   context_options.validation = opt.vk_validation;
+  context_options.window = opt.window;
   std::unique_ptr<dal::VkContext> context = dal::createVkContext(context_options, error);
   if (!context) return nullptr;
   const std::uint32_t api = context->deviceProperties().apiVersion;
@@ -128,7 +140,18 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
   render_options.dump_every = opt.dump_frames_every;
   render_options.shader_cache = opt.shader_cache.empty() ? std::filesystem::path("generated") / "shader_cache"
                                                          : std::filesystem::path(opt.shader_cache);
-  auto executor = std::make_unique<VulkanExecutor>(std::move(context), render_options);
+  std::unique_ptr<dal::Presenter> presenter;
+  if (opt.window) {
+    dal::PresenterOptions presenter_options;
+    presenter_options.frame_slots = dal::RsxRenderer::kFramesInFlight;
+    presenter_options.on_close = [] { dal::stopProcess(dal::ExitCode::ProcessExit, "dal: stop: window closed"); };
+    presenter = dal::Presenter::create(*context, std::move(presenter_options), error);
+    if (!presenter) {
+      error = "window: " + error;
+      return nullptr;
+    }
+  }
+  auto executor = std::make_unique<VulkanExecutor>(std::move(context), std::move(presenter), render_options);
   if (!executor->valid()) {
     error = executor->error();
     return nullptr;
@@ -166,7 +189,7 @@ void printUsage() {
       "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
-      "                [--vk-validation]\n",
+      "                [--vk-validation] [--window]\n",
       stderr);
 }
 
@@ -239,6 +262,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.shader_cache)) return false;
     } else if (arg == "--vk-validation") {
       opt.vk_validation = true;
+    } else if (arg == "--window") {
+      opt.window = true;
     } else if (arg == "--seconds") {
       std::string text;
       if (!value(text)) return false;
@@ -262,14 +287,15 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     std::fputs("error: --game-dir or --vfs-config is required\n", stderr);
     return false;
   }
-  // --dump-frames implies vulkan; an explicit "--render none" (anywhere on the line) overrides that and
-  // then conflicts with it. The other options have no effect without a renderer.
-  opt.render_vulkan = opt.render_flag.value_or(!opt.dump_frames.empty());
+  // --dump-frames and --window imply vulkan; an explicit "--render none" (anywhere on the line) overrides
+  // that and then conflicts with it. The other options have no effect without a renderer.
+  opt.render_vulkan = opt.render_flag.value_or(!opt.dump_frames.empty() || opt.window);
   const bool render_option = !opt.dump_frames.empty() || opt.dump_every_given || !opt.shader_cache.empty() ||
-                             opt.vk_validation;
+                             opt.vk_validation || opt.window;
   if (render_option && !opt.render_vulkan) {
-    std::fputs("error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need --render vulkan\n",
-               stderr);
+    std::fputs(
+        "error: --dump-frames, --dump-frames-every, --shader-cache, --vk-validation and --window need --render vulkan\n",
+        stderr);
     return false;
   }
   return true;
