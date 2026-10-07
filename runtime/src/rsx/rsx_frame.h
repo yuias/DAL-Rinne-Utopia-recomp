@@ -40,7 +40,8 @@ struct RsxVertexAttrib {
 
 struct RsxTextureDesc {
   std::uint8_t unit = 0, format = 0 /* raw 8-bit */, mips = 0, dimension = 0;
-  bool linear_layout = false, normalized = true;
+  bool linear_layout = false, normalized = true, cubemap = false;
+  // remap/filter/address/border are the raw SET_TEXTURE_CONTROL1/FILTER/ADDRESS/BORDER_COLOR words.
   std::uint32_t location = 0, offset = 0, pitch = 0, width = 0, height = 0, remap = 0, filter = 0, address = 0,
                 border = 0;
   std::int32_t rt_alias = -1;  // index into the builder's known surfaces, -1 = bytes in texture_data

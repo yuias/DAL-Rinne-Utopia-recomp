@@ -29,6 +29,8 @@ struct CensusState {
   std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> unknown_targets;
   ThreadCensusFn thread_fn = nullptr;
   RsxCensusFn rsx_fn = nullptr;
+  RsxUnimplementedFn unimplemented_fn = nullptr;
+  CensusResetFn unimplemented_reset = nullptr;
   CensusWriterFn rsx_arg_writer = nullptr;
 };
 
@@ -145,6 +147,13 @@ void setRsxCensusProvider(RsxCensusFn fn) {
   s.rsx_fn = fn;
 }
 
+void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.unimplemented_fn = fn;
+  s.unimplemented_reset = reset;
+}
+
 void setRsxArgCensusWriter(CensusWriterFn fn) {
   CensusState& s = state();
   std::lock_guard lock(s.mutex);
@@ -156,6 +165,7 @@ std::string formatCensus() {
   std::string out;
   ThreadCensusFn thread_fn = nullptr;
   RsxCensusFn rsx_fn = nullptr;
+  RsxUnimplementedFn unimplemented_fn = nullptr;
   {
     std::lock_guard lock(s.mutex);
 
@@ -198,6 +208,7 @@ std::string formatCensus() {
     }
     thread_fn = s.thread_fn;
     rsx_fn = s.rsx_fn;
+    unimplemented_fn = s.unimplemented_fn;
   }
 
   if (rsx_fn != nullptr) {
@@ -213,6 +224,19 @@ std::string formatCensus() {
     }
     for (const RsxMethodCount& m : rsx.methods) {
       out += std::format("\n  method {:#x}{}{}: {}", m.method, m.name.empty() ? "" : " ", m.name, m.count);
+    }
+  }
+
+  if (unimplemented_fn != nullptr) {
+    const RsxUnimplementedCensus unimplemented = unimplemented_fn();
+    if (!unimplemented.kinds.empty() || unimplemented.dropped != 0) {
+      out += std::format("\ncensus: rsx unimplemented {} kinds", unimplemented.kinds.size());
+      for (const auto& [name, count] : unimplemented.kinds) {
+        out += std::format("\n  {}: {}", name, count);
+      }
+      if (unimplemented.dropped != 0) {
+        out += std::format("\n  other kinds (limit reached): {}", unimplemented.dropped);
+      }
     }
   }
 
@@ -254,13 +278,20 @@ void installCensus() { setCensusPrinter(&printCensus); }
 
 void resetCensus() {
   CensusState& s = state();
-  std::lock_guard lock(s.mutex);
-  s.syscalls.clear();
-  s.hle.clear();
-  s.unknown_targets.clear();
-  s.thread_fn = nullptr;
-  s.rsx_fn = nullptr;
-  s.rsx_arg_writer = nullptr;
+  CensusResetFn unimplemented_reset = nullptr;
+  {
+    std::lock_guard lock(s.mutex);
+    s.syscalls.clear();
+    s.hle.clear();
+    s.unknown_targets.clear();
+    s.thread_fn = nullptr;
+    s.rsx_fn = nullptr;
+    s.rsx_arg_writer = nullptr;
+    s.unimplemented_fn = nullptr;
+    unimplemented_reset = s.unimplemented_reset;
+    s.unimplemented_reset = nullptr;
+  }
+  if (unimplemented_reset != nullptr) unimplemented_reset();
 }
 
 }  // namespace dal

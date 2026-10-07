@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dal {
@@ -62,6 +63,19 @@ struct RsxCensus {
 // runs without the census lock and may be called from any thread.
 using RsxCensusFn = RsxCensus (*)();
 void setRsxCensusProvider(RsxCensusFn fn);
+
+// What the RSX layer could not handle: one entry per "<category> <key>" with its count, most frequent
+// first, and the occurrences of kinds beyond the layer's cap.
+struct RsxUnimplementedCensus {
+  std::vector<std::pair<std::string, std::uint64_t>> kinds;
+  std::uint64_t dropped = 0;
+};
+
+// The section is printed only while a provider is set and it reports something. `reset` runs from
+// resetCensus() before the providers are forgotten. Both run without the census lock.
+using RsxUnimplementedFn = RsxUnimplementedCensus (*)();
+using CensusResetFn = void (*)();
+void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset);
 
 // Called once by printCensus() after the text census, on the stop path; the RSX consumer uses it to
 // write its argument census (--rsx-census). Runs without the census lock.

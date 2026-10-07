@@ -14,6 +14,7 @@
 #include "core/census.h"
 #include "core/log.h"
 #include "rsx/fifo_parser.h"
+#include "rsx/rsx_decode.h"
 
 namespace dal {
 namespace {
@@ -369,42 +370,6 @@ const char* locationName(std::uint32_t location) {
   }
 }
 
-const char* primitiveName(std::uint32_t v) {
-  static constexpr const char* kNamesByValue[] = {"END",         "POINTS",         "LINES",      "LINE_LOOP",
-                                                  "LINE_STRIP",  "TRIANGLES",      "TRIANGLE_STRIP",
-                                                  "TRIANGLE_FAN", "QUADS",         "QUAD_STRIP", "POLYGON"};
-  return v < std::size(kNamesByValue) ? kNamesByValue[v] : nullptr;
-}
-
-const char* surfaceColorName(std::uint32_t v) {
-  switch (v) {
-    case 1: return "X1R5G5B5_Z1R5G5B5";
-    case 2: return "X1R5G5B5_O1R5G5B5";
-    case 3: return "R5G6B5";
-    case 4: return "X8R8G8B8_Z8R8G8B8";
-    case 5: return "X8R8G8B8_O8R8G8B8";
-    case 8: return "A8R8G8B8";
-    case 9: return "B8";
-    case 10: return "G8B8";
-    case 11: return "F_W16Z16Y16X16";
-    case 12: return "F_W32Z32Y32X32";
-    case 13: return "F_X32";
-    case 14: return "X8B8G8R8_Z8B8G8R8";
-    case 15: return "X8B8G8R8_O8B8G8R8";
-    case 16: return "A8B8G8R8";
-    default: return nullptr;
-  }
-}
-
-const char* surfaceDepthName(std::uint32_t v) {
-  switch (v) {
-    case 0: return "none";
-    case 1: return "Z16";
-    case 2: return "Z24S8";
-    default: return nullptr;
-  }
-}
-
 const char* surfaceTypeName(std::uint32_t v) {
   switch (v) {
     case 1: return "linear";
@@ -423,58 +388,9 @@ const char* antialiasName(std::uint32_t v) {
   }
 }
 
-const char* vertexTypeName(std::uint32_t v) {
-  switch (v) {
-    case 0: return "ub256(0)";
-    case 1: return "s1";
-    case 2: return "f";
-    case 3: return "sf";
-    case 4: return "ub";
-    case 5: return "s32k";
-    case 6: return "cmp";
-    case 7: return "ub256";
-    default: return nullptr;
-  }
-}
-
 const char* compareName(std::uint32_t v) {
   static constexpr const char* kFuncs[] = {"NEVER", "LESS", "EQUAL", "LEQUAL", "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS"};
   return v >= 0x200 && v < 0x208 ? kFuncs[v - 0x200] : nullptr;
-}
-
-const char* blendFactorName(std::uint32_t v) {
-  switch (v) {
-    case 0: return "ZERO";
-    case 1: return "ONE";
-    case 0x300: return "SRC_COLOR";
-    case 0x301: return "ONE_MINUS_SRC_COLOR";
-    case 0x302: return "SRC_ALPHA";
-    case 0x303: return "ONE_MINUS_SRC_ALPHA";
-    case 0x304: return "DST_ALPHA";
-    case 0x305: return "ONE_MINUS_DST_ALPHA";
-    case 0x306: return "DST_COLOR";
-    case 0x307: return "ONE_MINUS_DST_COLOR";
-    case 0x308: return "SRC_ALPHA_SATURATE";
-    case 0x8001: return "CONSTANT_COLOR";
-    case 0x8002: return "ONE_MINUS_CONSTANT_COLOR";
-    case 0x8003: return "CONSTANT_ALPHA";
-    case 0x8004: return "ONE_MINUS_CONSTANT_ALPHA";
-    default: return nullptr;
-  }
-}
-
-const char* blendEquationName(std::uint32_t v) {
-  switch (v) {
-    case 0x8006: return "ADD";
-    case 0x8007: return "MIN";
-    case 0x8008: return "MAX";
-    case 0x800A: return "SUBTRACT";
-    case 0x800B: return "REVERSE_SUBTRACT";
-    case 0xF005: return "REVERSE_SUBTRACT_SIGNED";
-    case 0xF006: return "ADD_SIGNED";
-    case 0xF007: return "REVERSE_ADD_SIGNED";
-    default: return nullptr;
-  }
 }
 
 const char* logicOpName(std::uint32_t v) {
@@ -525,12 +441,12 @@ std::string colorMaskName(std::uint32_t v) {
 
 std::string clearFlags(std::uint32_t v) {
   std::string out;
-  if ((v & 0x01) != 0) out += 'Z';
-  if ((v & 0x02) != 0) out += 'S';
-  if ((v & 0x10) != 0) out += 'R';
-  if ((v & 0x20) != 0) out += 'G';
-  if ((v & 0x40) != 0) out += 'B';
-  if ((v & 0x80) != 0) out += 'A';
+  if ((v & kRsxClearDepth) != 0) out += 'Z';
+  if ((v & kRsxClearStencil) != 0) out += 'S';
+  if ((v & kRsxClearRed) != 0) out += 'R';
+  if ((v & kRsxClearGreen) != 0) out += 'G';
+  if ((v & kRsxClearBlue) != 0) out += 'B';
+  if ((v & kRsxClearAlpha) != 0) out += 'A';
   return out.empty() ? "none" : out;
 }
 
@@ -584,7 +500,7 @@ std::string rsxMethodName(std::uint32_t method) {
 
 std::string rsxTextureFormatName(std::uint32_t format) {
   const char* base = nullptr;
-  switch (format & 0x9F) {
+  switch (format & kRsxTextureBaseMask) {
     case 0x81: base = "B8"; break;
     case 0x82: base = "A1R5G5B5"; break;
     case 0x83: base = "A4R4G4B4"; break;
@@ -614,9 +530,9 @@ std::string rsxTextureFormatName(std::uint32_t format) {
     case 0x9F: base = "Y16_X16_FLOAT"; break;
     default: break;
   }
-  std::string out = base != nullptr ? std::string(base) : std::format("?{:#x}", format & 0x9F);
-  out += (format & 0x20) != 0 ? "_LN" : "_SZ";
-  out += (format & 0x40) != 0 ? "_UN" : "_NR";
+  std::string out = base != nullptr ? std::string(base) : std::format("?{:#x}", format & kRsxTextureBaseMask);
+  out += (format & kRsxTextureLinearFlag) != 0 ? "_LN" : "_SZ";
+  out += (format & kRsxTextureUnnormalizedFlag) != 0 ? "_UN" : "_NR";
   return out;
 }
 
@@ -640,8 +556,8 @@ std::string rsxDecodeArgument(std::uint32_t method, std::uint32_t value) {
   const auto is = [&](std::uint32_t reg) { return base == reg; };
 
   if (is(0x0208)) {
-    return std::format("color={} depth={} type={} aa={} size={}x{}", named(surfaceColorName(value & 0x1F), value & 0x1F),
-                       named(surfaceDepthName((value >> 5) & 7), (value >> 5) & 7),
+    return std::format("color={} depth={} type={} aa={} size={}x{}", named(rsxSurfaceColorName(value & 0x1F), value & 0x1F),
+                       named(rsxSurfaceDepthName((value >> 5) & 7), (value >> 5) & 7),
                        named(surfaceTypeName((value >> 8) & 0xF), (value >> 8) & 0xF),
                        named(antialiasName((value >> 12) & 0xF), (value >> 12) & 0xF), 1u << ((value >> 16) & 0xFF),
                        1u << ((value >> 24) & 0xFF));
@@ -680,13 +596,13 @@ std::string rsxDecodeArgument(std::uint32_t method, std::uint32_t value) {
   if (is(0x1A18) || is(0x0918)) return std::format("width={} height={}", value >> 16, value & 0xFFFF);
   if (is(0x1840) || is(0x0910)) return std::format("pitch={} depth={}", value & 0xFFFF, value >> 20);
   if (is(0x1740)) {
-    return std::format("type={} size={} stride={} frequency={}", named(vertexTypeName(value & 7), value & 7), (value >> 4) & 0xF,
+    return std::format("type={} size={} stride={} frequency={}", named(rsxVertexTypeName(value & 7), value & 7), (value >> 4) & 0xF,
                        (value >> 8) & 0xFF, value >> 16);
   }
   if (is(0x1680)) {
     return std::format("location={} offset={:#x}", value >> 31 != 0 ? "main" : "local", value & 0x7FFFFFFF);
   }
-  if (is(0x1808)) return named(primitiveName(value), value);
+  if (is(0x1808)) return named(rsxPrimitiveName(value), value);
   if (is(0x1814) || is(0x1824)) return std::format("first={} count={}", value & 0xFFFFFF, (value >> 24) + 1);
   if (is(0x1820)) {
     const std::uint32_t loc = value & 0xF;
@@ -694,8 +610,8 @@ std::string rsxDecodeArgument(std::uint32_t method, std::uint32_t value) {
   }
   if (is(0x1800)) return std::format("type={} offset={:#x}", value >> 24, value & 0xFFFFFF);
   if (is(0x1D94)) return clearFlags(value);
-  if (is(0x0314) || is(0x0318)) return pairDecode(value, blendFactorName);
-  if (is(0x0320)) return pairDecode(value, blendEquationName);
+  if (is(0x0314) || is(0x0318)) return pairDecode(value, rsxBlendFactorName);
+  if (is(0x0320)) return pairDecode(value, rsxBlendEquationName);
   if (is(0x0308) || is(0x0A6C) || is(0x0330) || is(0x0350)) return named(compareName(value), value);
   if (is(0x0324)) return colorMaskName(value);
   if (is(0x0378)) return named(logicOpName(value), value);
@@ -781,7 +697,7 @@ void RsxArgCensus::addText(const std::string& category, const std::string& key) 
 }
 
 void RsxArgCensus::addSize(const std::string& category, std::uint32_t count) {
-  const char* primitive = primitiveName(primitive_);
+  const char* primitive = rsxPrimitiveName(primitive_);
   const std::uint32_t bucket = std::bit_ceil(std::max<std::uint32_t>(count, 1));
   addText(category + ".by_primitive", std::format("{} <= {}", primitive != nullptr ? primitive : "?", bucket));
 }
@@ -921,7 +837,7 @@ void RsxArgCensus::onBegin() {
   draws_++;
   frame_draws_++;
   bump(draws_per_second_, systemTimeUs());
-  addText("draw.primitive", named(primitiveName(primitive_), primitive_));
+  addText("draw.primitive", named(rsxPrimitiveName(primitive_), primitive_));
   addText("draw.surface", rsxDecodeArgument(kMethodNv4097SetSurfaceFormat, regs_[kMethodNv4097SetSurfaceFormat >> 2]) +
                               " target=" + surfaceTargetName(regs_[0x0220 >> 2]));
 
@@ -931,7 +847,7 @@ void RsxArgCensus::onBegin() {
     if (((format >> 4) & 0xF) == 0) continue;
     const std::uint32_t offset = regs_[(kMethodNv4097SetVertexDataArrayOffset >> 2) + slot];
     layout += std::format("{}{}:{}x{}/stride{}/freq{}@{}", layout.empty() ? "" : " ", slot,
-                          named(vertexTypeName(format & 7), format & 7), (format >> 4) & 0xF, (format >> 8) & 0xFF, format >> 16,
+                          named(rsxVertexTypeName(format & 7), format & 7), (format >> 4) & 0xF, (format >> 8) & 0xFF, format >> 16,
                           (offset >> 31) != 0 ? "main" : "local");
   }
   addText("draw.vertex_layout", layout.empty() ? "(none)" : layout);

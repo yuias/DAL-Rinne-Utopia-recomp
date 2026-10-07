@@ -46,10 +46,12 @@
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_census.h"
+#include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame.h"
 #include "rsx/rsx_registers.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
+#include "rsx/rsx_unimplemented.h"
 #include "zlib.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -4583,6 +4585,211 @@ void testRsxRegisters() {
   CHECK(static_cast<int>(dal::RsxPrimitive::Points) == 1 && static_cast<int>(dal::RsxPrimitive::Polygon) == 10);
 }
 
+std::uint64_t unimplementedCount(const std::string& name) {
+  for (const auto& [key, count] : dal::rsxUnimplementedSnapshot()) {
+    if (key == name) return count;
+  }
+  return 0;
+}
+
+void testRsxDecode() {
+  auto regs = std::make_unique<dal::RsxRegisters>();
+  regs->reset();
+  dal::rsxUnimplementedReset();
+
+  // Surface: A8R8G8B8 1280x720 pitch 0x1400 with Z24S8 on the first target in local memory.
+  regs->apply(0x0200, 1280u << 16);
+  regs->apply(0x0204, 720u << 16);
+  regs->apply(0x0208, 8u | (2u << 5) | (1u << 8) | (11u << 16) | (10u << 24));
+  regs->apply(0x020C, 0x1400);
+  regs->apply(0x0210, 0x100000);
+  regs->apply(0x0214, 0x900000);
+  regs->apply(0x022C, 0x1400);
+  regs->apply(0x0220, 1);
+  const dal::RsxSurfaceState surface = dal::decodeSurfaceState(*regs);
+  CHECK(surface.has_color && surface.color.format == dal::RsxColorFormat::A8R8G8B8);
+  CHECK(surface.color.width == 1280 && surface.color.height == 720 && surface.color.pitch == 0x1400);
+  CHECK(surface.color.offset == 0x100000 && surface.color.location == 0);
+  CHECK(surface.depth_format == dal::RsxDepthFormat::Z24S8 && surface.depth.offset == 0x900000);
+  CHECK(surface.depth.pitch == 0x1400 && surface.depth.width == 1280 && surface.depth.height == 720);
+  CHECK(surface.clip_x == 0 && surface.clip_y == 0 && surface.clip_w == 1280 && surface.clip_h == 720);
+  CHECK(dal::rsxUnimplementedSnapshot().empty());
+
+  // Target B, main memory, an unsupported color format and no depth.
+  regs->apply(0x0218, 0x2000);
+  regs->apply(0x021C, 0x800);
+  regs->apply(0x018C, dal::kRsxContextDmaMain);
+  regs->apply(0x0220, 2);
+  regs->apply(0x0208, 3u | (1u << 8));
+  const dal::RsxSurfaceState other = dal::decodeSurfaceState(*regs);
+  CHECK(other.has_color && other.color.offset == 0x2000 && other.color.pitch == 0x800 && other.color.location == 1);
+  CHECK(other.color.format == dal::RsxColorFormat::Unsupported && other.depth_format == dal::RsxDepthFormat::None);
+  CHECK(unimplementedCount("surface format R5G6B5") == 1);
+  regs->apply(0x0220, 0);
+  CHECK(!dal::decodeSurfaceState(*regs).has_color);
+  regs->apply(0x0220, 0x13);
+  CHECK(dal::decodeSurfaceState(*regs).has_color && unimplementedCount("state multiple render targets 0x13") == 1);
+  regs->apply(0x0208, 8u | (5u << 5) | (1u << 8));
+  CHECK(dal::decodeSurfaceState(*regs).depth_format == dal::RsxDepthFormat::Unsupported);
+  CHECK(unimplementedCount("depth format ?0x5") == 1);
+
+  // Vertex arrays: slots 0, 2, 3 and 8 are float3, float3, ubyte4 and float2 with stride 36 in main memory.
+  dal::rsxUnimplementedReset();
+  const auto format = [](std::uint32_t type, std::uint32_t size) { return type | (size << 4) | (36u << 8); };
+  regs->apply(0x1740, format(2, 3));
+  regs->apply(0x1740 + 2 * 4, format(2, 3));
+  regs->apply(0x1740 + 3 * 4, format(4, 4));
+  regs->apply(0x1740 + 8 * 4, format(2, 2));
+  regs->apply(0x1680, 0x80001000);
+  regs->apply(0x1680 + 2 * 4, 0x8000100C);
+  regs->apply(0x1680 + 3 * 4, 0x80001018);
+  regs->apply(0x1680 + 8 * 4, 0x8000101C);
+  const std::vector<dal::RsxVertexAttrib> attribs = dal::decodeVertexAttribs(*regs);
+  CHECK(attribs.size() == 4);
+  if (attribs.size() == 4) {
+    const std::uint8_t slots[] = {0, 2, 3, 8}, types[] = {2, 2, 4, 2}, sizes[] = {3, 3, 4, 2};
+    const std::uint32_t offsets[] = {0x1000, 0x100C, 0x1018, 0x101C};
+    for (std::size_t i = 0; i < 4; i++) {
+      CHECK(attribs[i].slot == slots[i] && attribs[i].type == types[i] && attribs[i].size == sizes[i]);
+      CHECK(attribs[i].stride == 36 && attribs[i].location == 1 && attribs[i].offset == offsets[i]);
+      CHECK(attribs[i].data_offset == 0);
+    }
+  }
+  CHECK(dal::rsxUnimplementedSnapshot().empty());
+  regs->apply(0x1740 + 5 * 4, 6u | (1u << 4));  // CMP32
+  CHECK(dal::decodeVertexAttribs(*regs).size() == 5 && unimplementedCount("vertex type cmp") == 1);
+  regs->apply(0x1740 + 5 * 4, 2);
+
+  // Default attributes: slot 2 of SET_VERTEX_DATA4F_M.
+  const float constants[] = {1.0f, 2.5f, -3.0f, 4.0f};
+  for (std::uint32_t i = 0; i < 4; i++) regs->apply(0x1C00 + 2 * 16 + i * 4, std::bit_cast<std::uint32_t>(constants[i]));
+  const auto defaults = dal::decodeDefaultAttribs(*regs);
+  CHECK(defaults[8] == 1.0f && defaults[9] == 2.5f && defaults[10] == -3.0f && defaults[11] == 4.0f);
+  CHECK(defaults[0] == 0.0f && defaults[12] == 0.0f);
+
+  // Texture unit 0: A8R8G8B8 linear, normalized, one mip, 1024x512 in main memory, wrap and linear filters.
+  dal::rsxUnimplementedReset();
+  CHECK(!dal::rsxTextureEnabled(*regs, 0));
+  regs->apply(0x1A0C, 0x80060000);
+  CHECK(dal::rsxTextureEnabled(*regs, 0) && !dal::rsxTextureEnabled(*regs, 1));
+  regs->apply(0x1A00, 0x40000);
+  regs->apply(0x1A04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+  regs->apply(0x1A14, 0x02022000);
+  regs->apply(0x1A18, (1024u << 16) | 512u);
+  regs->apply(0x1840, 0x1000);
+  const dal::RsxTextureDesc texture = dal::decodeTexture(*regs, 0);
+  CHECK(texture.unit == 0 && texture.format == 0xA5 && texture.mips == 1 && texture.dimension == 2);
+  CHECK(texture.linear_layout && texture.normalized && !texture.cubemap);
+  CHECK(texture.location == 1 && texture.offset == 0x40000 && texture.pitch == 0x1000);
+  CHECK(texture.width == 1024 && texture.height == 512 && texture.rt_alias == -1);
+  CHECK(dal::rsxTextureWrapS(texture.address) == 1 && dal::rsxTextureWrapT(texture.address) == 1);
+  CHECK(dal::rsxTextureMinFilter(texture.filter) == 2 && dal::rsxTextureMagFilter(texture.filter) == 2);
+  CHECK(texture.remap == 0xAAE4);
+  CHECK(dal::rsxUnimplementedSnapshot().empty());
+  // The 20-bit pitch field, a compressed format and unnormalized coordinates.
+  regs->apply(0x1840 + 4, 0x12345);
+  CHECK(dal::decodeTexture(*regs, 1).pitch == 0x12345);
+  regs->apply(0x1A04 + 0x20, 1u | (2u << 4) | (0x86u << 8) | (1u << 16));
+  CHECK(!dal::decodeTexture(*regs, 1).linear_layout);
+  CHECK(unimplementedCount("texture format DXT1_SZ_NR") == 1);
+  regs->apply(0x1A04, 1u | (2u << 4) | ((0x85u | 0x20u | 0x40u) << 8) | (1u << 16));
+  CHECK(!dal::decodeTexture(*regs, 0).normalized);
+  CHECK(unimplementedCount("texture format A8R8G8B8_LN_UN") == 1);
+
+  // Fixed-function state: blend SRC_ALPHA / ONE_MINUS_SRC_ALPHA with ADD for color and MAX for alpha,
+  // alpha test NOTEQUAL 0, back-face culling with counter-clockwise front faces.
+  dal::rsxUnimplementedReset();
+  regs->apply(0x0310, 1);
+  regs->apply(0x0314, 0x302u | (0x302u << 16));
+  regs->apply(0x0318, 0x303u | (0x303u << 16));
+  regs->apply(0x0320, 0x8006u | (0x8008u << 16));
+  regs->apply(0x0304, 1);
+  regs->apply(0x0308, 0x205);
+  regs->apply(0x030C, 0);
+  regs->apply(0x183C, 1);
+  regs->apply(0x0A20 + 4, std::bit_cast<std::uint32_t>(360.0f));
+  regs->apply(0x0A30 + 4, std::bit_cast<std::uint32_t>(-360.0f));
+  regs->apply(0x08C0, 1280u << 16);
+  regs->apply(0x08C4, (720u << 16) | 16u);
+  const dal::RsxRasterState raster = dal::decodeRasterState(*regs);
+  CHECK(raster.blend && raster.alpha_test && !raster.depth_test && raster.depth_write && raster.cull);
+  CHECK(raster.blend_sfactor_rgb == 0x302 && raster.blend_sfactor_a == 0x302);
+  CHECK(raster.blend_dfactor_rgb == 0x303 && raster.blend_dfactor_a == 0x303);
+  CHECK(raster.blend_eq_rgb == 0x8006 && raster.blend_eq_a == 0x8008);
+  CHECK(raster.alpha_func == 0x205 && raster.alpha_ref == 0);
+  CHECK(raster.cull_face == 0x405 && raster.front_face == 0x901 && raster.shade_model == 0x1D01);
+  CHECK(raster.depth_func == 0x201 && raster.color_mask == 0x1010101);
+  CHECK(raster.viewport_offset[1] == 360.0f && raster.viewport_scale[1] == -360.0f);
+  CHECK(raster.viewport_scale[0] == 2048.0f && raster.viewport_scale[2] == 0.5f);
+  CHECK(raster.scissor_x == 0 && raster.scissor_w == 1280 && raster.scissor_y == 16 && raster.scissor_h == 720);
+  CHECK(raster.window_origin == 1 && raster.pixel_center == 0);
+  CHECK(dal::rsxUnimplementedSnapshot().empty());
+  regs->apply(0x030C, 0x12345680);
+  CHECK(dal::decodeRasterState(*regs).alpha_ref == 0x80);
+  regs->apply(0x0320, 0xF005u | (0x800Bu << 16));
+  regs->apply(0x0328, 1);
+  const dal::RsxRasterState signed_equation = dal::decodeRasterState(*regs);
+  CHECK(signed_equation.blend_eq_rgb == 0xF005 && signed_equation.blend_eq_a == 0x800B);
+  CHECK(unimplementedCount("blend equation REVERSE_SUBTRACT_SIGNED") == 1);
+  CHECK(unimplementedCount("state stencil test") == 1);
+
+  // Index array, draw range, primitive and clear.
+  regs->apply(0x181C, 0x1000);
+  regs->apply(0x1820, 1u | (1u << 4));
+  const dal::RsxIndexArray index = dal::decodeIndexArray(*regs);
+  CHECK(index.location == 1 && index.offset == 0x1000 && index.type == dal::kRsxIndexTypeU16);
+  const dal::RsxDrawRange range = dal::decodeDrawRange(0x03000010);
+  CHECK(range.first == 0x10 && range.count == 4);
+  CHECK(dal::decodeDrawRange(0xFF000000).count == 256);
+  dal::RsxPrimitive primitive = dal::RsxPrimitive::Points;
+  CHECK(dal::decodePrimitive(5, primitive) && primitive == dal::RsxPrimitive::Triangles);
+  CHECK(dal::decodePrimitive(10, primitive) && primitive == dal::RsxPrimitive::Polygon);
+  CHECK(!dal::decodePrimitive(0, primitive) && primitive == dal::RsxPrimitive::Polygon);
+  CHECK(unimplementedCount("primitive ?0xb") == 0);
+  CHECK(!dal::decodePrimitive(11, primitive) && unimplementedCount("primitive ?0xb") == 1);
+
+  regs->apply(0x1D90, 0xFF102030);
+  regs->apply(0x1D8C, 0xFFFFFF00);
+  const dal::RsxClear clear = dal::decodeClear(*regs, 0xF3);
+  CHECK(clear.mask == 0xF3 && clear.color_argb == 0xFF102030 && clear.depth_stencil == 0xFFFFFF00);
+  CHECK(clear.scissor[0] == 0 && clear.scissor[1] == 16 && clear.scissor[2] == 1280 && clear.scissor[3] == 720);
+  CHECK(clear.surfaces.clip_w == 1280);
+
+  // Written methods with render semantics that the builder ignores.
+  CHECK(std::string_view(dal::rsxIgnoredMethodName(0x1500)) == "NV4097_SET_VERTEX_DATA3F_M");
+  CHECK(dal::rsxIgnoredMethodName(0x15FC) != nullptr && dal::rsxIgnoredMethodName(0x1600) == nullptr);
+  CHECK(dal::rsxIgnoredMethodName(0x1C00) == nullptr && dal::rsxIgnoredMethodName(0x1814) == nullptr);
+  CHECK(dal::rsxIgnoredMethodName(0x1818) != nullptr && dal::rsxIgnoredMethodName(0xC40C) != nullptr);
+
+  // The census prints the section once something was noted, most frequent first.
+  dal::rsxUnimplementedReset();
+  dal::setRsxUnimplementedProvider(
+      [] { return dal::RsxUnimplementedCensus{dal::rsxUnimplementedSnapshot(), dal::rsxUnimplementedDropped()}; },
+      &dal::rsxUnimplementedReset);
+  CHECK(dal::formatCensus().find("rsx unimplemented") == std::string::npos);
+  dal::rsxNoteUnimplemented("texture format", "DXT1");
+  dal::rsxNoteUnimplemented("fp opcode", "DDX");
+  dal::rsxNoteUnimplemented("texture format", "DXT1");
+  const std::string census = dal::formatCensus();
+  const std::size_t header = census.find("census: rsx unimplemented 2 kinds\n  texture format DXT1: 2\n  fp opcode DDX: 1");
+  CHECK(header != std::string::npos);
+
+  // Past the cap of distinct kinds, new kinds are only summed and the header counts real kinds.
+  dal::rsxUnimplementedReset();
+  for (int i = 0; i < 1030; i++) dal::rsxNoteUnimplemented("state", std::to_string(i));
+  CHECK(dal::rsxUnimplementedSnapshot().size() == 1024 && dal::rsxUnimplementedDropped() == 6);
+  const std::string capped = dal::formatCensus();
+  CHECK(capped.find("census: rsx unimplemented 1024 kinds\n") != std::string::npos);
+  CHECK(capped.find("\n  other kinds (limit reached): 6") != std::string::npos);
+
+  // resetCensus() clears the counts through the provider and forgets it.
+  dal::resetCensus();
+  CHECK(dal::rsxUnimplementedSnapshot().empty() && dal::rsxUnimplementedDropped() == 0);
+  dal::rsxNoteUnimplemented("state", "after reset");
+  CHECK(dal::formatCensus().find("rsx unimplemented") == std::string::npos);
+  dal::rsxUnimplementedReset();
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -5985,6 +6192,7 @@ int main(int argc, char** argv) {
   testFifoParser();
   testRsxArgCensus();
   testRsxRegisters();
+  testRsxDecode();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();

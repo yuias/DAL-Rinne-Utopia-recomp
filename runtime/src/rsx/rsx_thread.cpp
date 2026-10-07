@@ -20,6 +20,7 @@
 #include "dal/ppu_context.h"
 #include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_state.h"
+#include "rsx/rsx_unimplemented.h"
 
 namespace dal {
 namespace {
@@ -383,6 +384,8 @@ RsxCensus consumerCensus() {
   return result;
 }
 
+RsxUnimplementedCensus unimplementedCensus() { return {rsxUnimplementedSnapshot(), rsxUnimplementedDropped()}; }
+
 void writeArgCensus() {
   if (g_consumer != nullptr && g_consumer->argCensus() != nullptr) g_consumer->argCensus()->writeFiles();
 }
@@ -456,6 +459,7 @@ void startRsxThread(std::uint8_t* base) {
   // Leaked: the thread runs until the process ends.
   g_consumer = new RsxConsumer(base);
   setRsxCensusProvider(&consumerCensus);
+  setRsxUnimplementedProvider(&unimplementedCensus, &rsxUnimplementedReset);
   if (!g_arg_census_file.empty()) {
     g_consumer->enableArgCensus(g_arg_census_file, std::filesystem::path("generated") / "rsx");
     setRsxArgCensusWriter(&writeArgCensus);
