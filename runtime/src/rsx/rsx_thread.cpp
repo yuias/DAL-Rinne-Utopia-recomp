@@ -264,7 +264,8 @@ bool RsxConsumer::execute(std::uint32_t method, std::uint32_t value) {
       userCommand(value);
       return true;
     case kMethodGcmFlipCommand:
-      return flip(value);
+      flip(value);
+      return true;
     default:
       return true;
   }
@@ -357,12 +358,12 @@ void RsxConsumer::getReport(std::uint32_t value) {
   dalWrite32(base_, ea + 12, 0);
 }
 
-bool RsxConsumer::flip(std::uint32_t buffer) {
+void RsxConsumer::flip(std::uint32_t buffer) {
   RsxState& state = rsxState();
-  // The frame ends when the parser reaches the command, not when the flip completes; a retry while it
-  // waits for VBlank must not end it again.
-  if (builder_ != nullptr && !flip_reached_) {
-    flip_reached_ = true;
+  // A flip from the command buffer completes where the command executes and never waits for a VBlank
+  // (RPCS3 `flip_command` -> `request_emu_flip` -> `handle_emu_flip`; the VBlank wait there belongs to the
+  // non-default "PS3" frame limit mode). The vsync mode only selects the present mode of the back end.
+  if (builder_ != nullptr) {
     static constexpr RsxDisplayBuffer kNoBuffer{};
     builder_->onFlip(*regs_, buffer, buffer < kRsxDisplayBufferCount ? state.display[buffer] : kNoBuffer);
     if (capture_ != nullptr) finishCapture(buffer);
@@ -370,17 +371,6 @@ bool RsxConsumer::flip(std::uint32_t buffer) {
     // RPCS3 resets the method registers where the command executes (`flip_command` -> `thread::reset`).
     regs_->contextReset();
   }
-  // With vsync the flip completes on the first VBlank after it was reached.
-  if (state.requested_vsync) {
-    if (!flip_armed_) {
-      flip_armed_ = true;
-      flip_vblank_ = state.vblank_count;
-      return false;
-    }
-    if (state.vblank_count == flip_vblank_) return false;
-  }
-  flip_armed_ = false;
-  flip_reached_ = false;
 
   if (flips_.fetch_add(1, std::memory_order_relaxed) == 0) {
     logInfo("dal: rsx: first flip of buffer {}: put={:#x} get={:#x} parser={:#x}", buffer,
@@ -395,7 +385,6 @@ bool RsxConsumer::flip(std::uint32_t buffer) {
   // RPCS3 resets the method registers on every flip; the context DMA objects are the ones that matter.
   resetDmaRegisters();
   signalInterrupt(RsxInterrupt::Flip, 1);
-  return true;
 }
 
 void RsxConsumer::userCommand(std::uint32_t cause) {

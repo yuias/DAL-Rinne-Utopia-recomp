@@ -91,7 +91,8 @@ struct RsxState {
   std::array<RsxTile, kRsxTileCount> tiles{};
   std::array<RsxZcull, kRsxZcullCount> zculls{};
 
-  // Flips are paced by vsync until the game asks for hsync (RPCS3 `requested_vsync`).
+  // The game's flip mode (RPCS3 `requested_vsync`); selects the present mode of the back end and does
+  // not delay flips.
   bool requested_vsync = true;
   std::uint32_t flip_status = kRsxFlipStatusDone;
   // Microseconds on the system-time clock, set back by one second as RPCS3 does at RSX thread start

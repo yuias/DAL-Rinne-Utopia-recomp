@@ -5548,32 +5548,40 @@ void testRsxConsumer() {
   emit(dal::kMethodNv4097GetReport, {0x00000020});
   CHECK(run() == FifoStatus::Idle && dalRead64(base, report + 0x20) > first);
 
-  // A flip with vsync waits for a VBlank; it clears the flip label and notifies the hook.
+  // A flip completes where its command executes, with vsync too: it clears the flip label, notifies the
+  // hook, and the writes behind it are consumed before the next VBlank.
   dal::RsxState& state = dal::rsxState();
+  state.requested_vsync = true;
   state.flip_status = dal::kRsxFlipStatusWaiting;
   dalWrite32(base, kLabels + 0x10, 0x1111);
   dal::setRsxInterruptHook(&recordInterrupt);
   emit(dal::kMethodGcmFlipCommand, {1});
-  CHECK(run() == FifoStatus::Waiting && consumer.census().flips == 0);
-  CHECK(state.flip_status == dal::kRsxFlipStatusWaiting && label(0x10) == 0x1111);
-  // The frame builder ends the frame when the command is reached, once, however often it is retried.
+  emit(dal::kMethodNv4097SetSemaphoreOffset, {0x50});
+  emit(dal::kMethodNv4097TextureReadSemaphoreRelease, {0x55667788});
+  CHECK(run() == FifoStatus::Idle && consumer.census().flips == 1);
+  CHECK(state.vblank_count == 0 && label(0x50) == 0x55667788);
+  CHECK(state.flip_status == dal::kRsxFlipStatusDone && label(0x10) == 0);
+  CHECK(dalRead32(base, kControl + 4) == at);  // get follows put
+  CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::Flip, 1}}));
+  CHECK(countContaining(lines, "dal: rsx: first flip") == 1);
+  // The frame builder ends the frame at the command, once.
   std::vector<dal::RsxCommand> built = consumer.takeCommands();
   CHECK(built.size() == 1 && std::holds_alternative<dal::RsxFlip>(built[0]));
   CHECK(std::get<dal::RsxFlip>(built[0]).buffer == 1 && std::get<dal::RsxFlip>(built[0]).flip_index == 0);
-  CHECK(run() == FifoStatus::Waiting && consumer.takeCommands().empty());
+  CHECK(run() == FifoStatus::Idle && consumer.takeCommands().empty());
+  // A VBlank neither completes nor repeats a flip.
   consumer.vblankTick();
-  CHECK(state.vblank_count == 1);
-  CHECK(consumer.pump(100) == FifoStatus::Idle);
-  CHECK(consumer.takeCommands().empty());
-  CHECK(consumer.census().flips == 1 && state.flip_status == dal::kRsxFlipStatusDone && label(0x10) == 0);
-  CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::VBlank, 1}, {dal::RsxInterrupt::Flip, 1}}));
-  CHECK(countContaining(lines, "dal: rsx: first flip") == 1);
-  // Without vsync it completes at once.
+  CHECK(state.vblank_count == 1 && consumer.census().flips == 1);
+  CHECK(consumer.pump(100) == FifoStatus::Idle && consumer.takeCommands().empty());
+  CHECK((g_interrupts == Interrupts{{dal::RsxInterrupt::Flip, 1}, {dal::RsxInterrupt::VBlank, 1}}));
+  // Two flips in a row (hsync) complete in one run as well.
   state.requested_vsync = false;
   emit(dal::kMethodGcmFlipCommand, {2});
-  CHECK(run() == FifoStatus::Idle && consumer.census().flips == 2);
+  emit(dal::kMethodGcmFlipCommand, {2});
+  CHECK(run() == FifoStatus::Idle && consumer.census().flips == 3);
   built = consumer.takeCommands();
-  CHECK(built.size() == 1 && std::get<dal::RsxFlip>(built[0]).buffer == 2 && std::get<dal::RsxFlip>(built[0]).flip_index == 1);
+  CHECK(built.size() == 2 && std::get<dal::RsxFlip>(built[0]).buffer == 2 && std::get<dal::RsxFlip>(built[0]).flip_index == 1);
+  CHECK(std::get<dal::RsxFlip>(built[1]).flip_index == 2);
 
   // User commands reach the hook; without one they are only logged.
   g_interrupts.clear();
@@ -5586,7 +5594,7 @@ void testRsxConsumer() {
   CHECK(run() == FifoStatus::Idle);
   CHECK(countContaining(lines, "pending user command cause 3") == 1);
 
-  // The census counts completed writes by register: the waiting flip counts once.
+  // The census counts completed writes by register: a flip counts once.
   const dal::RsxCensus census = consumer.census();
   const auto countOf = [&](std::uint32_t method) -> std::uint64_t {
     for (const auto& m : census.methods) {
@@ -5594,8 +5602,8 @@ void testRsxConsumer() {
     }
     return 0;
   };
-  CHECK(countOf(dal::kMethodGcmFlipCommand) == 2 && countOf(dal::kMethodGcmSetUserCommand) == 2);
-  CHECK(countOf(dal::kMethodNv4097SetSemaphoreOffset) == 3 && countOf(dal::kMethodNv4097GetReport) == 2);
+  CHECK(countOf(dal::kMethodGcmFlipCommand) == 3 && countOf(dal::kMethodGcmSetUserCommand) == 2);
+  CHECK(countOf(dal::kMethodNv4097SetSemaphoreOffset) == 4 && countOf(dal::kMethodNv4097GetReport) == 2);
   CHECK(countOf(0x1234) == 0 && census.headers > 10);
 
   // A jump into unmapped IO space faults once; after that nothing is consumed.

@@ -280,7 +280,7 @@ void gcmSetDisplayBuffer(DalPpuContext* ctx, std::uint8_t*) {
   setResultCode(ctx, kCellOk);
 }
 
-// cellGcmSetFlipMode(mode): void. Only vsync paces the flips; any other mode flips at once.
+// cellGcmSetFlipMode(mode): void. Recorded only; it does not delay flips.
 void gcmSetFlipMode(DalPpuContext* ctx, std::uint8_t*) {
   rsxState().requested_vsync = argU32(ctx, 0) == kRsxDisplayVsync;
 }

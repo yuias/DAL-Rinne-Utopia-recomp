@@ -97,7 +97,7 @@ class RsxConsumer final : public RsxSink {
   void releaseNv406e(std::uint32_t value);
   void releaseNv4097(std::uint32_t value, bool swizzle);
   void getReport(std::uint32_t value);
-  bool flip(std::uint32_t buffer);
+  void flip(std::uint32_t buffer);
   void userCommand(std::uint32_t cause);
   void publishGet(std::uint32_t get);
   // Effective address of `offset` in the context DMA `location`; false when out of range or not
@@ -120,8 +120,6 @@ class RsxConsumer final : public RsxSink {
   std::uint32_t offset_406e_ = 0x30, offset_4097_ = 0;
   std::uint32_t dma_406e_ = 0, dma_semaphore_ = 0, dma_report_ = 0;
 
-  bool flip_armed_ = false;
-  std::uint64_t flip_vblank_ = 0;
   std::uint64_t last_timestamp_ns_ = 0;
 
   std::atomic<std::uint64_t> headers_{0}, flips_{0}, user_commands_{0};
@@ -132,7 +130,6 @@ class RsxConsumer final : public RsxSink {
   std::unique_ptr<RsxRegisters> regs_;
   std::unique_ptr<GuestRsxMemoryView> memory_view_;
   std::unique_ptr<RsxFrameBuilder> builder_;
-  bool flip_reached_ = false;  // the flip command was seen and is waiting for its VBlank
   std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0};
 
   void startCapture(std::uint32_t frame);
