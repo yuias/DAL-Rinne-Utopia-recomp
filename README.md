@@ -3,9 +3,9 @@
 Static recompilation of the PS3 title *Date A Live: Rinne Utopia* (BLJM61048) for
 Windows, built from your own copy of the game.
 
-This repository contains no game data. No executables, keys, or decrypted binaries are
-included or accepted by version control; you supply your own `EBOOT.elf`, and all tool
-output is written to ignored directories.
+This repository contains no game data (see "Licence and legal notice"). No executables, keys,
+or decrypted binaries are included or accepted by version control; you supply your own
+`EBOOT.elf`, and all tool output is written to ignored directories.
 
 Current state: build scaffold, analysis tools for the PPU executable (ELF summary, SPU probe,
 disassembler, Ghidra cross-check, NID and syscall name tables, function recovery), an emitter
@@ -1136,3 +1136,23 @@ results are only trusted for the expected build.
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |
 | `build/` | Build output (git-ignored) |
 | `game/` | Suggested place for your own `EBOOT.elf` (git-ignored) |
+
+## Licence and legal notice
+
+The code in this repository is licensed under 0BSD; see `LICENSE`. Third-party components keep
+their own licences; see `THIRD_PARTY_NOTICES.md`.
+
+This is an unofficial fan project. It is not affiliated with, authorised by or endorsed by any
+rights holder of the game or of the *Date A Live* franchise, including:
+
+- Compile Heart, the publisher, and Sting, the developer, of *Date A Live: Rinne Utopia*
+- Koushi Tachibana and Tsunako, the author and illustrator of the original *Date A Live* light
+  novels, and their publisher Fujimi Shobo (KADOKAWA)
+- Sony Interactive Entertainment, for the PlayStation 3 platform
+
+*Date A Live*, *Date A Live: Rinne Utopia*, PlayStation and all related names and logos are
+trademarks or registered trademarks of their respective owners. They are used here only to
+identify the game and platform this project works with.
+
+No game files, keys or other copyrighted game data are included in this repository, and none
+will be provided. Please do not ask for them.
