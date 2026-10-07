@@ -192,6 +192,9 @@ void resetCellSail();
 // Handlers of the cellPamf module: cellPamfReaderGetNumberOfSpecificStreams.
 std::span<const HleEntry> cellPamfHandlers();
 
+// Handlers of the cellAtrac module: cellAtracSetDataAndGetMemSize only (a placeholder).
+std::span<const HleEntry> cellAtracHandlers();
+
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();
 
