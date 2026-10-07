@@ -87,7 +87,7 @@ struct RsxDraw {
   std::vector<std::uint32_t> vp_constants;  // full constant snapshot, kRsxVpConstantCount * 4 words
   std::uint64_t fp_hash = 0;                // hash of the ucode with inline constants zeroed
   std::vector<std::uint32_t> fp_ucode;      // decoded words
-  std::vector<std::uint32_t> fp_constants;  // inline constants in program order
+  std::vector<std::uint32_t> fp_constants;  // inline constants in program order; halves still swapped, apply fpFixupWord before use
   std::uint32_t fp_control = 0, texcoord_control = 0;  // SHADER_CONTROL, texcoord 2D/3D/centroid masks
 };
 
