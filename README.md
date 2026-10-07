@@ -12,10 +12,13 @@ disassembler, Ghidra cross-check, NID and syscall name tables, function recovery
 that turns the recovered functions into C source, an SDAT decryption tool (`dal_sdat`), and a
 runtime (`dal_game`) that loads the executable, runs it through the generated code on real guest
 threads, serves a first set of lv2 system calls and HLE modules, and runs a fake RSX that
-consumes the game's command buffer without drawing. The game boots, runs its frame loop at the
-60 Hz vertical-blank rate and loads its assets, then waits for modules that are still
-default-handled. Nothing is rendered, played or decoded yet. See "Emitting C" and "Running the
-game" for what is and is not implemented.
+consumes the game's command buffer. With `--render vulkan` a renderer on Vulkan 1.3 draws what
+the RSX commands describe, either into a window (`--window`) or into PNG files
+(`--dump-frames`); a capture and replay tool (`dal_rsxreplay`) renders single recorded frames
+without the game. The game boots, runs its frame loop at the 60 Hz vertical-blank rate, loads its
+assets and draws its title screens. Audio and movies are not implemented: the modules for them
+are still default-handled. See "Emitting C", "Running the game" and "Rendering" for what is and
+is not implemented.
 
 ## Prerequisites
 
@@ -23,9 +26,18 @@ game" for what is and is not implemented.
 - PowerShell 7 and the `VSSetup` module (`Install-Module VSSetup -Scope CurrentUser`)
 - clang and clang++ with lld (a standalone LLVM install; see `-LlvmBin` below)
 - CMake 3.29 or newer
-- git, with the submodules initialised: `git submodule update --init` (spdlog, libpng, zlib and yyjson under `externals/`;
-  clone with `--recurse-submodules` to do it in one step)
+- git, with the submodules initialised: `git submodule update --init` (spdlog, libpng, zlib, yyjson,
+  Vulkan-Headers, volk and VulkanMemoryAllocator under `externals/`; clone with
+  `--recurse-submodules` to do it in one step)
 - Ninja
+- The Vulkan SDK, with the `VULKAN_SDK` environment variable set. The renderer compiles shaders at
+  run time with the SDK's static shaderc, so CMake looks for `$VULKAN_SDK/Lib/shaderc_combined.lib`
+  (release) and `$VULKAN_SDK/Lib/shaderc_combinedd.lib` (debug) and for
+  `$VULKAN_SDK/Include/shaderc/shaderc.hpp`, and configuration fails when they are missing. The
+  Vulkan headers and loader code come from the submodules, not from the SDK. The validation layer
+  that `--vk-validation` enables is part of the SDK as well.
+- To run the renderer: a Vulkan 1.3 device and driver with dynamic rendering, synchronization2 and
+  shader demote-to-helper-invocation (see "Rendering")
 - Python 3.10 or newer (the analysis tools use only the standard library)
 - Optional, for `ghidra-export` only: Ghidra 12.x and a JDK 21 (see below). `recover` does
   not need Ghidra, because the Ghidra results it uses are committed.
@@ -53,9 +65,11 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
 - `-Clean` removes that preset's build directory before configuring.
 - `-Test` runs CTest after the build: a runtime version check, a `musttail` support
   check, the contract header check (`ppu_header_check`), the semantics harness
-  (`ppu_semantics`), the runtime core unit tests (`runtime_core`), the Python unit tests, and,
+  (`ppu_semantics`), the runtime core unit tests (`runtime_core`), the renderer tests
+  (`render_core`, `vp_translator`, `fp_translator`; see "Rendering"), the Python unit tests, and,
   with `-PpuDir`, the link check of the generated code (`ppu_link`). With `-PpuDir`,
-  `-EbootElf` and `-GameDir` together it also runs `game_boot`; see "Running the game".
+  `-EbootElf` and `-GameDir` together it also runs `game_boot`; see "Running the game". When a
+  local capture and reference image exist it also runs `rsx_replay`; see "Capture and replay".
 - `-EbootElf <path>` passes the decrypted ELF to the tests so the checks against the real
   executable run instead of being skipped.
 - `-PpuDir <dir>` compiles the C tree written by `emit --out <dir>` into the static library
@@ -468,14 +482,17 @@ PPU thread the way RPCS3 does and calls the entry function through the generated
 built only when `DAL_PPU_GENERATED_DIR` is set (`-PpuDir`), because it links the generated
 functions. The runtime core (`dal_runtime_core`, everything under `runtime/src/core`,
 `runtime/src/lv2`, `runtime/src/hle` and `runtime/src/rsx`) does not reference generated symbols and is always
-built, together with its unit tests (`runtime_core`). Only `runtime/src/game_main.cpp` passes the
-generated tables to the core. The executable is checked against the SHA-256 that the generated
+built, together with its unit tests (`runtime_core`). The renderer (`dal_render`, `runtime/src/render`)
+is a separate library on top of it, so the core itself needs no GPU. Only `runtime/src/game_main.cpp`
+passes the generated tables to the core. The executable is checked against the SHA-256 that the generated
 code was emitted from.
 
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
          [--seconds N] [--strict] [--log FILE] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
          [--png-dump DIR]
+         [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
+         [--shader-cache DIR] [--vk-validation] [--window]
 ```
 
 | Option | Meaning |
@@ -493,6 +510,18 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
 | `--pad none\|neutral` | Input source: `neutral` (the default) connects a standard pad on port 0 that never changes, `none` connects no pad. |
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
+| `--render none\|vulkan` | Whether the RSX commands are drawn (default `none`, unless `--dump-frames` or `--window` is given, which imply `vulkan`). See "Rendering". |
+| `--window` | Show the frames in a window. See "Rendering". |
+| `--dump-frames DIR` | Write displayed frames as PNG files to `DIR`. See "Rendering". |
+| `--dump-frames-every K` | Dump every `K`-th flip instead of every one (default 1). |
+| `--shader-cache DIR` | Directory of the SPIR-V cache (default `generated/shader_cache`). |
+| `--vk-validation` | Enable the Vulkan validation layer, if it is installed. |
+| `--rsx-capture N[,M...]` | Record the given frames (1-based flip numbers) as `.dalcap` files. See "Capture and replay". |
+
+The renderer options are a usage error (exit code 2) when the renderer is off. `--dump-frames` and
+`--window` switch it on; `--dump-frames-every`, `--shader-cache` and `--vk-validation` need one of
+them or `--render vulkan`; an explicit `--render none` conflicts with all of them.
+`--rsx-capture` does not need the renderer.
 
 No tracked file contains a game path: they are command-line arguments or live in a user-local
 VFS configuration (`config/vfs.example.json` shows the format with placeholders). The build
@@ -538,10 +567,12 @@ census: hle 118 calls, 21 distinct, 10 default-handled
   sysPrxForUser::sys_lwmutex_lock: 29 [impl]
   cellSysmodule::cellSysmoduleLoadModule: 15 [default]
 census: unknown targets 0 distinct
-census: rsx 280820 headers, 264 distinct methods, 679 flips
-  interrupt handler calls: vblank 1201, flip 0, user 679
-  method 0x324: 5582
-  method 0xfeac GCM_FLIP_COMMAND: 679
+census: rsx 383050 headers, 264 distinct methods, 836 flips, rendered 2761 draws, skipped 0
+  interrupt handler calls: vblank 1492, flip 0, user 836
+  method 0x324: 7912
+  method 0xfeac GCM_FLIP_COMMAND: 836
+census: rsx unimplemented 1 kinds
+  state zpass report constant: 1673
 census: threads 5 created, 5 live
   0x01000000 main_thread: running
   0x01000001 _SPU_printf_server: blocked in sys_event_queue_receive
@@ -551,7 +582,9 @@ census: threads 5 created, 5 live
 `[impl]` marks a call that an implemented handler served and `[default]` one that the default
 handler took (see below). An unknown target is printed as `0x<target> from 0x<site>: count`. A default-handled import is
 followed by `ptr r3,r5,...`, the argument registers that held a pointer to committed guest memory
-(an out-pointer candidate, see "Default handlers"). The `rsx` section is described under "Fake RSX".
+(an out-pointer candidate, see "Default handlers"). The `rsx` section is described under "Fake RSX";
+the `, rendered ... draws, skipped ...` part appears when the renderer runs, and the
+`rsx unimplemented` section under "Rendering".
 Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
 each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
 the game runs; these lines are the progress markers that `game_boot` checks.
@@ -819,7 +852,8 @@ dal_game --game-dir <game-dir> --sdata-cache <cache-dir> ...
 ### Fake RSX
 
 `cellGcmSys` initialization creates the RSX state and starts two things that stand in for the
-graphics hardware. Nothing is drawn: there is no GPU, no shader or texture handling and no window.
+graphics hardware. Without `--render` (or `--rsx-capture`) the FIFO is only parsed and nothing is
+drawn; with `--render vulkan` the same thread also feeds a renderer (see "Rendering").
 
 - The RSX thread is a host thread without a guest context. It follows the `put` pointer that the
   game writes into the control register, parses the FIFO (`runtime/src/rsx/fifo_parser.cpp`:
@@ -827,7 +861,9 @@ graphics hardware. Nothing is drawn: there is no GPU, no shader or texture handl
   synchronization methods: semaphores and labels, reports and timestamps, `ref`, the flip
   command and the user command. It then publishes `get`. Method semantics follow RPCS3's
   `Emu/RSX/NV47/HW` sources. Every register write is counted for the census, and the thread
-  raises one vertical-blank event every 1/60 s.
+  raises one vertical-blank event every 1/60 s. A flip from the command buffer completes where
+  the command executes, as in RPCS3, and does not wait for a vertical blank. Where the game's
+  frame rate comes from is described under "Rendering".
 - `_gcm_intr_thread` is a guest service thread, created as in RPCS3. The RSX thread queues the
   interrupts and this thread runs the handlers the game registered with
   `cellGcmSetVBlankHandler`, `cellGcmSetFlipHandler` and `cellGcmSetUserHandler`, with the guest
@@ -836,8 +872,132 @@ graphics hardware. Nothing is drawn: there is no GPU, no shader or texture handl
 
 The method census (the `rsx` section of the census) lists the number of FIFO headers, the number
 of distinct methods and flips, how often each interrupt handler ran, and the count per method,
-named when the method has a known name. It is the work list for the drawing code: a method that
-the game writes often and that has no effect yet is a candidate for the first renderer.
+named when the method has a known name. With the renderer on, it also gives the number of draws
+rendered and skipped.
+
+### Rendering
+
+The renderer is optional and off by default. `--render vulkan` (implied by `--dump-frames` and
+`--window`) creates it on the RSX thread when that thread starts; the RSX thread then hands each
+frame's commands to it outside the guest lock, so rendering does not hold up guest threads. The
+code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the renderer).
+
+- **Frame builder** (`rsx_frame_builder.cpp`). It keeps a host copy of the RSX register file and the
+  vertex program and constant stores (`rsx_registers.cpp`), applies every completed register write
+  to it, and turns the stream into three kinds of plain commands: clear, draw and flip. The state
+  decoders (`rsx_decode.cpp`) read surface, blend, depth, texture, vertex and program state from
+  the register file. Each command carries every guest byte it needs (vertex and index data,
+  texture texels, shader ucode), so the renderer never touches guest memory. Draw boundaries,
+  addressing and register meanings follow RPCS3's `Emu/RSX` sources. At a flip the registers are
+  reset the way RPCS3 resets them, so the next frame starts from the same state.
+- **Renderer** (`vk_renderer.cpp` and neighbours). Vulkan 1.3 with dynamic rendering, the loader
+  through volk (`externals/volk`, loaded at run time, so no import library is linked) and memory
+  through VulkanMemoryAllocator (`externals/VulkanMemoryAllocator`). Colour and depth surfaces are
+  kept in a render target cache keyed by memory location and offset. A texture whose address is
+  a known render target is sampled from that target (render target aliasing), and a draw that
+  samples the target it renders to reads a copy of it. Other textures are uploaded from the
+  guest bytes into B8G8R8A8 images; a unit without a usable texture reads a 1x1 magenta image.
+  Cull mode, depth state, viewport, scissor, topology and blend constants are dynamic state;
+  pipelines are cached by what is baked into them.
+- **Readback** is gated. Copying the display buffer back to the host costs 8 MiB per flip at 1080p,
+  so a live run does it only for flips that are dumped (`--dump-frames`). `dal_rsxreplay` always
+  reads the last flip back.
+- **Shader translation** (`vp_translator.cpp`, `fp_translator.cpp`). Vertex and fragment programs
+  are translated from RSX microcode to GLSL 4.50 and compiled with shaderc (the SDK's static
+  library) to SPIR-V 1.6 for Vulkan 1.3, without optimisation. The result is cached on disk in
+  `generated/shader_cache` (`--shader-cache DIR` changes it) as
+  `<stage>_<program hash>_<GLSL hash>_<translator version>.spv`. A missing or corrupt file is
+  recompiled and rewritten, and the translator version in the name keeps SPIR-V from an older
+  translation from being reused. A program with an opcode that is not translated skips its draw
+  and is counted.
+- **Flips and vsync.** A flip is done when the command executes (see "Fake RSX"). With `--window`
+  the displayed buffer is also blitted, letterboxed to 16:9, to a swapchain with the FIFO present
+  mode, so the display's refresh is what paces the RSX thread; presenting runs outside the guest
+  lock. Without a window nothing waits for a vertical blank in the renderer, and the game's own
+  waits on the 60 Hz vblank handler set its frame rate.
+- **`rsx unimplemented` census.** The decoders, the frame builder and the renderer count what they
+  meet but cannot handle yet (surface, depth and texture formats, texture layouts, vertex types,
+  primitives, vertex and fragment opcodes, blend modes, other state and unknown methods) under
+  `<category> <key>`. The stop census prints them as a `census: rsx unimplemented N kinds`
+  section, most frequent first (omitted when empty). It is the work list for later scenes: a draw
+  that depends on one of them is skipped or drawn incompletely, and the `skipped` count in the
+  `rsx` section says which.
+
+#### Using the renderer
+
+```sh
+dal_game --game-dir <game-dir> --sdata-cache <cache-dir> --hdd-dir <hdd-dir> --window
+dal_game --game-dir <game-dir> --sdata-cache <cache-dir> --hdd-dir <hdd-dir> --seconds 30 --dump-frames out/frames --dump-frames-every 30
+```
+
+- `--window` opens a resizable window on its own thread (initial client size 1280x720) and shows
+  every flipped frame. Closing the window stops the run with exit code 0 and the stop line
+  `dal: stop: window closed`.
+- `--dump-frames DIR` writes the displayed frame of every flip as `DIR/frame_<flip>.png` (flips
+  counted from 1, six digits; RGB, 8 bits), with no window. `DIR` is created. A file that cannot
+  be written is reported once and counted, and the run goes on. `--dump-frames-every K` writes
+  every `K`-th flip only.
+- `--shader-cache DIR` sets the SPIR-V cache directory (default `generated/shader_cache`).
+- `--vk-validation` turns on the Khronos validation layer. It needs the layer to be installed (it
+  comes with the Vulkan SDK); otherwise `dal_game` logs a warning and goes on without it.
+- The log says which Vulkan device was chosen and how long the device and renderer took to
+  start. If no device meets the requirements below, or the window cannot be created, the RSX
+  thread logs the reason and the game goes on without rendering.
+
+Requirements on the device: Vulkan 1.3, and the dynamic rendering, synchronization2 and shader
+demote-to-helper-invocation features (the translated shaders use `discard`, which glslang
+compiles to a demote). A window also needs the Win32 surface and swapchain extensions, which any
+Windows driver with Vulkan support provides.
+
+#### Capture and replay
+
+`--rsx-capture N[,M...]` records the RSX inputs of the given frames: the numbers are 1-based flip
+numbers, and each capture is written when its frame's flip completes, to
+`generated/rsx/captures/frame_<N>.dalcap` (relative to the working directory). A capture holds the
+register writes from the previous flip to this one, the guest bytes the frame builder read while
+handling them, and the register and surface state the frame started from. It needs no renderer
+and no window. Captures are derived from the game, so they are git-ignored with the rest of
+`generated/`.
+
+`dal_rsxreplay` replays a capture through the frame builder and the renderer without the game:
+
+```sh
+dal_rsxreplay CAPTURE [--out DIR] [--compare PNG [--max-diff N] [--max-mean X] [--max-differing P]]
+                      [--no-validation] [--shader-cache DIR]
+```
+
+| Option | Meaning |
+| --- | --- |
+| `CAPTURE` | A `.dalcap` file. |
+| `--out DIR` | Write the displayed frame of the last flip as `DIR/<capture name>.png`. |
+| `--compare PNG` | Compare that frame with a reference image. The sizes must match. |
+| `--max-diff N` | With `--compare`: fail when the largest per-channel difference exceeds `N`. |
+| `--max-mean X` | With `--compare`: fail when the mean per-channel difference exceeds `X`. |
+| `--max-differing P` | With `--compare`: fail when more than `P` percent of the pixels differ (by more than 2 in any channel). |
+| `--no-validation` | Do not enable the Vulkan validation layer, which is on by default. |
+| `--shader-cache DIR` | SPIR-V cache directory. Without it nothing is cached. |
+
+The thresholds are optional and unchecked unless given, and they need `--compare`. The tool prints
+the commands the frame builder produced (`clear`, `draw`, `flip`), then a summary line
+`replay: N commands, N draws, N skipped` (with the diff figures when comparing), the
+`rsx unimplemented` section (`census: rsx unimplemented 0 kinds` when it is empty), the path of
+the PNG, and `validation: active|inactive|disabled, N errors`. The exit code is 1 when a
+threshold is exceeded, a file cannot be read or written, there is no frame to display or the
+validation layer reported an error, and 2 for a usage error. Without a usable Vulkan device it
+still prints the command list and counts every draw as skipped.
+
+The CTest entry `rsx_replay` runs `dal_rsxreplay` on `generated/rsx/captures/title.dalcap` with
+the options pinned in `cmake/rsx_replay.cmake`: a SHA-256 for the reference image
+`generated/rsx/reference/title.png` and the thresholds (largest difference 8, at most 0.5 percent
+of the pixels differing). Both files are game-derived and git-ignored, so the test is registered
+only when the capture exists and the reference exists and matches the pinned hash; configuration
+prints the reason otherwise. It passes when the summary line is printed and the validation layer
+reports no error. To make a capture, run `dal_game` with `--rsx-capture` on the frame you want
+and copy the file to `generated/rsx/captures/title.dalcap`.
+
+Three further renderer tests are registered: `render_core` (renders synthetic command lists, and
+skips itself when there is no Vulkan device), and `vp_translator` and `fp_translator` (need no
+GPU; they also check programs dumped under `generated/rsx` and skip those when absent).
 
 ### The `game_boot` test
 
@@ -872,19 +1032,24 @@ and starts the game's helper threads (21 guest threads over a 20 s run, 13 of th
 end). It initializes GCM and the fake RSX, completes the game-data handshake, loads its
 assets (the decrypted `.sdat` files and the texture files its decode threads open), reads the
 pad, registers the trophy context, runs the save-data load (a first boot finds no data, which the
-game accepts), and drives its frame loop: about 280000 FIFO headers and 679 flips in 20 s, with
-the vblank handler running at 60 Hz. The run ends at the watchdog (exit code 5) with the main
-thread waiting on an event flag. The `cellPngDec` and `cellAudio` imports it calls are still
-default-handled, and the game also imports `cellSail`, `cellPamf` and `cellAtrac`, which have no
-handler. The decoded images and the audio port that the game waits for never appear. Without the
-`.sdat` cache the game stops earlier, at its error dialog for the missing file.
+game accepts), and drives its frame loop: with `--render vulkan`, about 380000 FIFO headers, 836
+flips and 2761 rendered draws (none skipped) in 25 s, with the vblank handler running at 60 Hz.
+Its only entry in the `rsx unimplemented` census is the constant ZPASS report value. The run ends
+at the watchdog (exit code 5). The `cellAudio` and `cellSail` imports it calls are still
+default-handled, and the game also imports `cellPamf` and `cellAtrac`, which have no handler, so
+no sound is produced and the movies do not play (see "Not implemented"). Without the `.sdat`
+cache the game stops earlier, at its error dialog for the missing file.
 
 ### Not implemented
 
-- Graphics: the RSX consumes the command buffer but draws nothing; there is no GPU backend,
-  window or video output, and flips only advance the display state.
+- Graphics beyond the first scenes: only what the game's title screens use is drawn. Whatever
+  the renderer meets and cannot handle is listed in the `rsx unimplemented` census (see
+  "Rendering"). Known gaps are the ZPASS report values (the constant 0 is written, no occlusion
+  query runs) and user clip planes (the vertex translator does not write the clip distances).
+  Without `--render` nothing is drawn, and the renderer needs a Vulkan 1.3 device.
+- Movies: `cellSail`, `cellPamf` and `cellAtrac` have no handler, so no video is decoded. The
+  logo movies after the warning screen show as black.
 - Audio: `cellAudio` and the mixer are default-handled, no sound is produced.
-- Image and media decoding: `cellPngDec`, `cellSail`, `cellPamf` and `cellAtrac` have no handler.
 - Input: only the `neutral` and `none` pad providers; no keyboard or gamepad backend.
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are
   not scheduled.
@@ -950,6 +1115,10 @@ results are only trusted for the expected build.
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
 | `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used only to parse the VFS configuration |
+| `externals/Vulkan-Headers`, `externals/volk`, `externals/VulkanMemoryAllocator` | Vulkan headers, the run-time loader and the memory allocator of the renderer |
+| `runtime/src/render/` | The renderer (`dal_render`): Vulkan context, render targets, textures, pipelines, window and swapchain, vertex program and fragment program translators, shader compiler and cache, PNG output; see "Rendering" |
+| `tools/dal_rsxreplay/` | `dal_rsxreplay`, which replays an RSX capture without the game; see "Capture and replay" |
+| `cmake/Render.cmake`, `cmake/rsx_replay.cmake` | Renderer targets and tests, and the pin file of the `rsx_replay` test |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
