@@ -141,6 +141,14 @@ void RsxConsumer::enableFrameBuilder() {
   builder_ = std::make_unique<RsxFrameBuilder>(*recording_view_);
 }
 
+void RsxConsumer::disableFrameBuilder() {
+  if (builder_ == nullptr || capture_ != nullptr || !capture_frames_.empty() || flips_reached_ != 0) return;
+  builder_.reset();
+  recording_view_.reset();
+  memory_view_.reset();
+  regs_.reset();
+}
+
 void RsxConsumer::enableCapture(std::vector<std::uint32_t> frames) {
   enableFrameBuilder();
   std::sort(frames.begin(), frames.end());
@@ -463,6 +471,9 @@ namespace {
 
 RsxConsumer* g_consumer = nullptr;
 std::string g_arg_census_file;
+RsxExecutorFactory g_executor_factory;
+// Published by the RSX thread once the executor exists; the thread never ends, so it is never cleared.
+std::atomic<RsxExecutor*> g_executor{nullptr};
 
 RsxCensus consumerCensus() {
   RsxCensus result = g_consumer != nullptr ? g_consumer->census() : RsxCensus{};
@@ -470,6 +481,12 @@ RsxCensus consumerCensus() {
   result.vblank_handler_runs = calls.vblank;
   result.flip_handler_runs = calls.flip;
   result.user_handler_runs = calls.user;
+  if (const RsxExecutor* executor = g_executor.load(std::memory_order_acquire)) {
+    const RsxRenderCounts counts = executor->counts();
+    result.rendering = true;
+    result.draws_rendered = counts.draws;
+    result.draws_skipped = counts.draws_skipped;
+  }
   return result;
 }
 
@@ -488,6 +505,13 @@ void onStop() {
     const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
     logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
   }
+  if (const RsxExecutor* executor = g_executor.load(std::memory_order_acquire)) {
+    const RsxRenderCounts r = executor->counts();
+    logInfo("dal: render: {} clears, {} draws rendered, {} skipped, {} flips, {} frames dumped, validation {}{}",
+            r.clears, r.draws, r.draws_skipped, r.flips, r.frames_dumped,
+            r.validation ? std::format("{} errors", r.validation_errors) : std::string("off"),
+            r.failed ? ", renderer stopped after an error" : "");
+  }
   const std::uint32_t written = g_captures_written.load();
   if (written < g_capture_frames.size()) {
     logWarn("dal: rsx: {} of {} requested captures written", written, g_capture_frames.size());
@@ -497,9 +521,10 @@ void onStop() {
 
 // Counts the commands built so far and hands them to the sink. Same thread as the pump, so nothing
 // else touches the builder in between.
-void dispatchCommands(RsxConsumer* consumer, std::vector<RsxCommand> commands) {
+void dispatchCommands(RsxConsumer* consumer, RsxExecutor* executor, std::vector<RsxCommand> commands) {
   if (commands.empty()) return;
   consumer->countCommands(commands);
+  if (executor != nullptr) executor->execute(commands);
   if (g_command_sink) g_command_sink(std::move(commands));
 }
 
@@ -547,6 +572,21 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
   constexpr auto kPeriod = std::chrono::microseconds(kRsxVBlankPeriodUs);
   constexpr auto kPollInterval = std::chrono::milliseconds(1);
   Sleeper sleeper;
+
+  // The device and renderer belong to this thread. They are created before the first command is
+  // consumed, so a failure can still drop the frame builder.
+  std::unique_ptr<RsxExecutor> executor;
+  if (g_executor_factory) {
+    std::string error;
+    executor = g_executor_factory(error);
+    if (executor) {
+      g_executor.store(executor.get(), std::memory_order_release);
+    } else {
+      logWarn("dal: render: {}; continuing without rendering", error.empty() ? "initialisation failed" : error);
+      consumer->disableFrameBuilder();
+    }
+  }
+
   // The put word is the one guest word read without the lock: aligned, and a stale value only
   // delays work until the next pass.
   std::atomic_ref<std::uint32_t> put_word(*reinterpret_cast<std::uint32_t*>(base + kRsxControlAddr + kControlPut));
@@ -580,7 +620,7 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
         commands = consumer->takeCommands();
         captures = consumer->takeCaptures();
       }
-      dispatchCommands(consumer, std::move(commands));
+      dispatchCommands(consumer, executor.get(), std::move(commands));
       if (!captures.empty()) writeCaptures(captures);
     } while (status == FifoStatus::Budget);
   }
@@ -593,6 +633,11 @@ void setRsxArgCensusFile(std::string json_path) { g_arg_census_file = std::move(
 void setRsxCommandSink(RsxCommandSink sink) { g_command_sink = std::move(sink); }
 
 void setRsxFrameBuilderEnabled(bool enabled) { g_frame_builder_enabled = enabled; }
+
+void setRsxExecutorFactory(RsxExecutorFactory factory) {
+  g_executor_factory = std::move(factory);
+  if (g_executor_factory) g_frame_builder_enabled = true;
+}
 
 void setRsxCaptureFrames(std::vector<std::uint32_t> frames, std::filesystem::path dir) {
   std::sort(frames.begin(), frames.end());

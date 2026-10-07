@@ -537,6 +537,51 @@ void testCensus() {
   dal::resetCensus();
 }
 
+bool g_fake_rendering = false;
+
+dal::RsxCensus fakeRenderingCensus() {
+  dal::RsxCensus census;
+  census.headers = 10;
+  census.flips = 2;
+  census.rendering = g_fake_rendering;
+  census.draws_rendered = 7;
+  census.draws_skipped = 3;
+  return census;
+}
+
+// The rsx census line ends with the draw counts only while a renderer runs.
+void testCensusRenderSuffix() {
+  dal::resetCensus();
+  dal::setRsxCensusProvider(&fakeRenderingCensus);
+
+  g_fake_rendering = false;
+  std::string census = dal::formatCensus();
+  CHECK(census.find("census: rsx 10 headers, 0 distinct methods, 2 flips") != std::string::npos);
+  CHECK(census.find("rendered") == std::string::npos);
+
+  g_fake_rendering = true;
+  census = dal::formatCensus();
+  CHECK(census.find("census: rsx 10 headers, 0 distinct methods, 2 flips, rendered 7 draws, skipped 3\n") !=
+        std::string::npos);
+  dal::resetCensus();
+}
+
+void testDisableFrameBuilder() {
+  dal::RsxConsumer plain(nullptr);  // the base is only dereferenced when commands are parsed
+  CHECK(!plain.frameBuilderEnabled());
+  plain.enableFrameBuilder();
+  CHECK(plain.frameBuilderEnabled());
+  plain.disableFrameBuilder();
+  CHECK(!plain.frameBuilderEnabled());
+  CHECK(plain.takeCommands().empty());
+
+  dal::RsxConsumer capturing(nullptr);
+  capturing.enableCapture({2});
+  CHECK(capturing.frameBuilderEnabled());
+  capturing.disableFrameBuilder();  // a capture needs the builder
+  CHECK(capturing.frameBuilderEnabled());
+}
+
 void testSyscalls() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -6847,6 +6892,8 @@ int main(int argc, char** argv) {
   testElfLoader();
   testDispatch();
   testCensus();
+  testCensusRenderSuffix();
+  testDisableFrameBuilder();
   testSyscalls();
   testHle();
   testHleOutPointerHints();

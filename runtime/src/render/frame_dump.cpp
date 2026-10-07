@@ -148,10 +148,20 @@ bool writePngRgb(const std::filesystem::path& path, const RgbImage& image, std::
 
   std::error_code ec;
   if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  // Written beside the target and renamed, so a stop in the middle never leaves a truncated PNG there.
+  std::filesystem::path temp = path;
+  temp += ".tmp";
+  std::ofstream file(temp, std::ios::binary | std::ios::trunc);
   file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
   file.close();
   if (!file) {
+    std::filesystem::remove(temp, ec);
+    error = std::format("cannot write {}", path.string());
+    return false;
+  }
+  std::filesystem::rename(temp, path, ec);
+  if (ec) {
+    std::filesystem::remove(temp, ec);
     error = std::format("cannot write {}", path.string());
     return false;
   }

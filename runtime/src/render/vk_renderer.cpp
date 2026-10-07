@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <string>
@@ -12,7 +13,9 @@
 #include <variant>
 #include <vector>
 
+#include "core/log.h"
 #include "render/fp_translator.h"
+#include "render/frame_dump.h"
 #include "render/shader_compiler.h"
 #include "render/vertex_convert.h"
 #include "render/vk_textures.h"
@@ -1265,25 +1268,30 @@ bool RsxRenderer::ensureReadback(FrameSlot& slot, VkDeviceSize size) {
   return true;
 }
 
-// The display buffer is the color target at (location 0, offset). Its pixels are copied into the
-// slot's readback buffer here, inside the frame's command buffer, so readDisplay needs no further
-// GPU work. A buffer that was never a render target reads back as black.
+// The display buffer is the color target at (location 0, offset). When the flip is read back (every flip
+// with readback_all, otherwise only a dumped one) its pixels are copied into the slot's readback buffer
+// here, inside the frame's command buffer, so readDisplay needs no further GPU work. A buffer that was
+// never a render target reads back as black.
 void RsxRenderer::recordFlip(const RsxFlip& flip) {
   stats_.flips++;
   textures_->trim();
   FrameSlot& slot = *slots_[current_slot_];
+  const bool read_back = options_.readback_all || dumpDue();
+  display_copied_ = false;
   const auto it = color_targets_.find(TargetKey{0, flip.offset});
   display_black_ = it == color_targets_.end();
   if (display_black_) {
     rsxNoteUnimplemented("state", "flip of non-render-target");
     display_width_ = flip.width;
     display_height_ = flip.height;
+    display_copied_ = read_back;
   } else {
     const std::shared_ptr<RenderTarget> target = it->second;
     touch(target);
     display_width_ = target->width;
     display_height_ = target->height;
-    if (ensureReadback(slot, static_cast<VkDeviceSize>(display_width_) * display_height_ * 4)) {
+    if (read_back && ensureReadback(slot, static_cast<VkDeviceSize>(display_width_) * display_height_ * 4)) {
+      display_copied_ = true;
       transition(*target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
       VkBufferImageCopy region{};
       region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -1315,13 +1323,36 @@ void RsxRenderer::execute(std::span<RsxCommand> commands) {
       recordDraw(*draw);
     } else {
       recordFlip(std::get<RsxFlip>(command));
+      if (valid() && dumpDue()) dumpDisplay();
     }
     if (!valid()) return;
   }
 }
 
+// The flip number counts from 1; stats_.flips already includes the flip being recorded.
+bool RsxRenderer::dumpDue() const {
+  return !options_.dump_dir.empty() && stats_.flips % std::max<std::uint32_t>(options_.dump_every, 1) == 0;
+}
+
+// PNG encoding runs on the calling (RSX) thread, outside the guest lock. A failed write is counted and
+// reported once; the run goes on.
+void RsxRenderer::dumpDisplay() {
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  if (!readDisplay(bgra, width, height)) return;
+  const std::filesystem::path path = options_.dump_dir / std::format("frame_{:06}.png", stats_.flips);
+  std::string error;
+  if (writePngRgb(path, rgbFromBgra(bgra, width, height), error)) {
+    stats_.dumped++;
+    return;
+  }
+  stats_.dump_failures++;
+  logOnce(LogLevel::Warn, "render-dump-failed", "dal: render: cannot write {}: {}", path.generic_string(), error);
+}
+
 bool RsxRenderer::readDisplay(std::vector<std::uint8_t>& bgra, std::uint32_t& width, std::uint32_t& height) {
-  if (!has_flip_ || !valid() || display_width_ == 0 || display_height_ == 0) return false;
+  if (!has_flip_ || !valid() || !display_copied_ || display_width_ == 0 || display_height_ == 0) return false;
   width = display_width_;
   height = display_height_;
   const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;

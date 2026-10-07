@@ -1,11 +1,14 @@
 // dal_game: loads the decrypted EBOOT.elf and runs it through the generated PPU code.
 
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -25,6 +28,7 @@
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
 #include "render/vk_context.h"
+#include "render/vk_renderer.h"
 #include "rsx/rsx_thread.h"
 
 namespace {
@@ -44,8 +48,100 @@ struct Options {
   bool quiet_hle = false;
   bool load_only = false;
   bool render_vulkan = false;
+  std::optional<bool> render_flag;  // --render as given; the final mode is settled after all arguments
+  bool dump_every_given = false;
+  bool vk_validation = false;
+  std::string dump_frames;
+  std::uint32_t dump_frames_every = 1;
+  std::string shader_cache;
   std::vector<std::uint32_t> rsx_capture_frames;
 };
+
+// The Vulkan device and the renderer for the RSX thread. Built and destroyed on that thread; the
+// counters are published for the census, which reads them from another one.
+class VulkanExecutor final : public dal::RsxExecutor {
+ public:
+  VulkanExecutor(std::unique_ptr<dal::VkContext> context, const dal::RenderOptions& options)
+      : context_(std::move(context)), renderer_(std::make_unique<dal::RsxRenderer>(*context_, options)) {}
+
+  ~VulkanExecutor() override {
+    renderer_.reset();  // before the device it was created from
+    context_.reset();
+  }
+
+  bool valid() const { return renderer_->valid(); }
+  const std::string& error() const { return renderer_->error(); }
+  const dal::VkContext& context() const { return *context_; }
+
+  void execute(std::span<dal::RsxCommand> commands) override {
+    if (!renderer_->valid()) return;
+    renderer_->execute(commands);
+    const dal::RendererStats& stats = renderer_->stats();
+    draws_.store(stats.draws, std::memory_order_relaxed);
+    skipped_.store(stats.draws_skipped, std::memory_order_relaxed);
+    clears_.store(stats.clears, std::memory_order_relaxed);
+    flips_.store(stats.flips, std::memory_order_relaxed);
+    dumped_.store(stats.dumped, std::memory_order_relaxed);
+    if (!renderer_->valid()) {
+      failed_.store(true, std::memory_order_relaxed);
+      dal::logError("dal: render: renderer stopped: {}", renderer_->error());
+    }
+  }
+
+  dal::RsxRenderCounts counts() const override {
+    dal::RsxRenderCounts counts;
+    counts.draws = draws_.load(std::memory_order_relaxed);
+    counts.draws_skipped = skipped_.load(std::memory_order_relaxed);
+    counts.clears = clears_.load(std::memory_order_relaxed);
+    counts.flips = flips_.load(std::memory_order_relaxed);
+    counts.frames_dumped = dumped_.load(std::memory_order_relaxed);
+    counts.validation = context_->validationEnabled();
+    counts.validation_errors = context_->validationErrorCount();
+    counts.failed = failed_.load(std::memory_order_relaxed);
+    return counts;
+  }
+
+ private:
+  std::unique_ptr<dal::VkContext> context_;
+  std::unique_ptr<dal::RsxRenderer> renderer_;
+  std::atomic<std::uint64_t> draws_{0}, skipped_{0}, clears_{0}, flips_{0}, dumped_{0};
+  std::atomic<bool> failed_{false};
+};
+
+// Runs on the RSX thread; a null result makes the consumer continue without rendering.
+std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::string& error) {
+  const auto start = std::chrono::steady_clock::now();
+  dal::VkContextOptions context_options;
+  context_options.validation = opt.vk_validation;
+  std::unique_ptr<dal::VkContext> context = dal::createVkContext(context_options, error);
+  if (!context) return nullptr;
+  const std::uint32_t api = context->deviceProperties().apiVersion;
+  dal::logInfo("dal: render: vulkan device {} (api {}.{}.{}, d24s8 {})", context->deviceName(),
+               VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api),
+               context->hasD24S8() ? "yes" : "no");
+  if (opt.vk_validation && !context->validationEnabled()) {
+    dal::logWarn("dal: render: validation layer requested but not installed");
+  }
+
+  dal::RenderOptions render_options;
+  render_options.dump_dir = opt.dump_frames;
+  render_options.dump_every = opt.dump_frames_every;
+  render_options.shader_cache = opt.shader_cache.empty() ? std::filesystem::path("generated") / "shader_cache"
+                                                         : std::filesystem::path(opt.shader_cache);
+  auto executor = std::make_unique<VulkanExecutor>(std::move(context), render_options);
+  if (!executor->valid()) {
+    error = executor->error();
+    return nullptr;
+  }
+  const auto init_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+  dal::logInfo("dal: render: device and renderer ready in {} ms", init_ms);
+  if (!render_options.dump_dir.empty()) {
+    dal::logInfo("dal: render: dumping every {} flip(s) to {}", render_options.dump_every,
+                 render_options.dump_dir.generic_string());
+  }
+  return executor;
+}
 
 bool parseFrameList(std::string_view list, std::vector<std::uint32_t>& frames) {
   while (!list.empty()) {
@@ -68,7 +164,9 @@ void printUsage() {
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
-      "                [--render none|vulkan] [--rsx-capture N[,M...]]\n",
+      "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
+      "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
+      "                [--vk-validation]\n",
       stderr);
 }
 
@@ -125,7 +223,22 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         std::fprintf(stderr, "error: --render needs none or vulkan\n");
         return false;
       }
-      opt.render_vulkan = name == "vulkan";
+      opt.render_flag = name == "vulkan";
+    } else if (arg == "--dump-frames") {
+      if (!value(opt.dump_frames)) return false;
+    } else if (arg == "--dump-frames-every") {
+      std::string text;
+      if (!value(text)) return false;
+      const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), opt.dump_frames_every);
+      if (ec != std::errc{} || end != text.data() + text.size() || opt.dump_frames_every == 0) {
+        std::fprintf(stderr, "error: --dump-frames-every needs a positive integer\n");
+        return false;
+      }
+      opt.dump_every_given = true;
+    } else if (arg == "--shader-cache") {
+      if (!value(opt.shader_cache)) return false;
+    } else if (arg == "--vk-validation") {
+      opt.vk_validation = true;
     } else if (arg == "--seconds") {
       std::string text;
       if (!value(text)) return false;
@@ -147,6 +260,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
   }
   if (opt.game_dir.empty() && opt.vfs_config.empty()) {
     std::fputs("error: --game-dir or --vfs-config is required\n", stderr);
+    return false;
+  }
+  // --dump-frames implies vulkan; an explicit "--render none" (anywhere on the line) overrides that and
+  // then conflicts with it. The other options have no effect without a renderer.
+  opt.render_vulkan = opt.render_flag.value_or(!opt.dump_frames.empty());
+  const bool render_option = !opt.dump_frames.empty() || opt.dump_every_given || !opt.shader_cache.empty() ||
+                             opt.vk_validation;
+  if (render_option && !opt.render_vulkan) {
+    std::fputs("error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need --render vulkan\n",
+               stderr);
     return false;
   }
   return true;
@@ -290,23 +413,10 @@ int main(int argc, char** argv) {
     return static_cast<int>(dal::ExitCode::ProcessExit);
   }
 
-  // Kept alive for the whole run; the process ends without unwinding main.
-  std::unique_ptr<dal::VkContext> render_context;
+  // The device is created on the RSX thread when it starts, so it belongs to that thread.
   if (opt.render_vulkan) {
-    // No renderer consumes the commands yet: the frame builder runs and its output is counted.
-    dal::setRsxFrameBuilderEnabled(true);
-    dal::logInfo("dal: render: renderer not available; recording frame commands only");
-    std::string render_error;
-    render_context = dal::createVkContext({}, render_error);
-    if (render_context) {
-      const std::uint32_t api = render_context->deviceProperties().apiVersion;
-      dal::logInfo("dal: render: vulkan device {} (api {}.{}.{}, d24s8 {})",
-                   render_context->deviceName(), VK_API_VERSION_MAJOR(api),
-                   VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api),
-                   render_context->hasD24S8() ? "yes" : "no");
-    } else {
-      dal::logWarn("dal: render: {}; continuing without rendering", render_error);
-    }
+    dal::setRsxExecutorFactory(
+        [opt](std::string& error) { return createVulkanExecutor(opt, error); });
   }
 
   // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").

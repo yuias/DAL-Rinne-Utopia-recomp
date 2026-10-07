@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,8 @@ class RsxConsumer final : public RsxSink {
   // write.
   void enableFrameBuilder();
   bool frameBuilderEnabled() const { return builder_ != nullptr; }
+  // Drops the frame builder again. Only while nothing was written yet and no capture is enabled.
+  void disableFrameBuilder();
   // Commands built since the last call; with the guest lock held, like write().
   std::vector<RsxCommand> takeCommands();
   // Counts the commands by kind for the stop line; any thread.
@@ -147,6 +150,35 @@ class RsxConsumer final : public RsxSink {
 // Without a sink they are counted and dropped. Call before startRsxThread.
 using RsxCommandSink = std::function<void(std::vector<RsxCommand>&&)>;
 void setRsxCommandSink(RsxCommandSink sink);
+
+// What a renderer reports for the census and the stop line; read from any thread.
+struct RsxRenderCounts {
+  std::uint64_t draws = 0;          // draws rendered
+  std::uint64_t draws_skipped = 0;  // draws seen and not rendered
+  std::uint64_t clears = 0;
+  std::uint64_t flips = 0;
+  std::uint64_t frames_dumped = 0;
+  std::uint32_t validation_errors = 0;
+  bool validation = false;  // the validation layer is active
+  bool failed = false;      // the renderer stopped after an error
+};
+
+// A renderer owned by the RSX thread: created, used and destroyed there, so a device-bound object never
+// changes thread.
+class RsxExecutor {
+ public:
+  virtual ~RsxExecutor() = default;
+  // Runs on the RSX thread without the guest lock; the commands carry every byte they need.
+  virtual void execute(std::span<RsxCommand> commands) = 0;
+  // Any thread.
+  virtual RsxRenderCounts counts() const = 0;
+};
+
+// Called once on the RSX thread before the first command is consumed. A null result (with the reason in
+// `error`) leaves the run without rendering and drops the frame builder unless a capture needs it. Enables
+// the frame builder. Call before startRsxThread.
+using RsxExecutorFactory = std::function<std::unique_ptr<RsxExecutor>(std::string& error)>;
+void setRsxExecutorFactory(RsxExecutorFactory factory);
 
 // Turns the frame builder on for the consumer startRsxThread creates. Call before startRsxThread.
 void setRsxFrameBuilderEnabled(bool enabled);

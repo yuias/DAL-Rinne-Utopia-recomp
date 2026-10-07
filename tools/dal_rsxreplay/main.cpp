@@ -183,6 +183,7 @@ int main(int argc, char** argv) {
   if (context) {
     dal::RenderOptions render_options;
     render_options.shader_cache = shader_cache;
+    render_options.readback_all = true;  // the replay reads the display after its last flip
     {
       dal::RsxRenderer renderer(*context, render_options);
       renderer.execute(commands);

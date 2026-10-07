@@ -22,9 +22,14 @@
 namespace dal {
 
 struct RenderOptions {
+  // Every dump_every-th flip (counted from 1) is written to `<dump_dir>/frame_<flip number>.png`. An
+  // empty directory disables dumping.
   std::filesystem::path dump_dir;
   std::uint32_t dump_every = 1;
   std::filesystem::path shader_cache;
+  // Copy the display buffer back at every flip so readDisplay works after each one (replay, tests). The
+  // copy is 8 MiB at 1080p, so a live run leaves this off and only reads back the flips that are dumped.
+  bool readback_all = false;
 };
 
 struct RendererStats {
@@ -34,6 +39,8 @@ struct RendererStats {
   std::uint64_t flips = 0;
   std::uint64_t texture_uploads = 0;  // texture images written from guest bytes (once per image per draw)
   std::uint64_t feedback_copies = 0;  // render target copies made for draws that sample their own target
+  std::uint64_t dumped = 0;           // frames written to the dump directory
+  std::uint64_t dump_failures = 0;
 };
 
 // Single-threaded: execute, readDisplay and stats are called from one thread. The renderer never
@@ -54,7 +61,9 @@ class RsxRenderer {
   void execute(std::span<RsxCommand> commands);
 
   // BGRA8 rows of the display buffer of the last flip (waits for the GPU). A flip whose buffer is
-  // not a known render target reads back as opaque black at the flip's size. False before any flip.
+  // not a known render target reads back as opaque black at the flip's size. False (outputs untouched)
+  // before any flip, and when the last flip was gated off: without `readback_all` the pixels are only
+  // copied for flips that are dumped, and a dump due at that flip reads them itself.
   bool readDisplay(std::vector<std::uint8_t>& bgra, std::uint32_t& width, std::uint32_t& height);
 
   const RendererStats& stats() const { return stats_; }
@@ -93,6 +102,8 @@ class RsxRenderer {
   void recordDraw(const RsxDraw& draw);
   void recordFlip(const RsxFlip& flip);
   bool ensureReadback(FrameSlot& slot, VkDeviceSize size);
+  bool dumpDue() const;
+  void dumpDisplay();
 
   VkContext& context_;
   RenderOptions options_;
@@ -120,6 +131,7 @@ class RsxRenderer {
 
   bool has_flip_ = false;
   bool display_black_ = false;
+  bool display_copied_ = false;  // the last flip's pixels are in its slot's readback buffer
   std::size_t display_slot_ = 0;
   std::uint32_t display_width_ = 0;
   std::uint32_t display_height_ = 0;

@@ -350,7 +350,7 @@ void testFrameDump() {
 // than there are frames in flight, and a flip of an unseen buffer reads back black.
 void testRendererClear(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
   CHECK(renderer.valid());
 
   std::vector<std::uint8_t> bgra;
@@ -388,6 +388,40 @@ void testRendererClear(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
 }
 
+// Without readback_all the display is only copied for dumped flips: readDisplay reports false for the
+// others, and the dumped ones land in the directory as frame_<flip number>.png.
+void testRendererReadbackGate(dal::VkContext& ctx) {
+  dal::rsxUnimplementedReset();
+  std::error_code ec;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "dal_render_test_dump";
+  std::filesystem::remove_all(dir, ec);
+
+  dal::RenderOptions options;
+  options.dump_dir = dir;
+  options.dump_every = 2;
+  dal::RsxRenderer renderer(ctx, options);
+  CHECK(renderer.valid());
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  for (std::uint32_t flip = 1; flip <= 4; flip++) {
+    std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(0xFF102030));
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    // The dumped flips read back too; an odd one was gated off.
+    CHECK(renderer.readDisplay(bgra, width, height) == (flip % 2 == 0));
+  }
+  CHECK(renderer.stats().dumped == 2 && renderer.stats().dump_failures == 0);
+  CHECK(std::filesystem::exists(dir / "frame_000002.png") && std::filesystem::exists(dir / "frame_000004.png"));
+  CHECK(!std::filesystem::exists(dir / "frame_000001.png") && !std::filesystem::exists(dir / "frame_000003.png"));
+  dal::RgbImage image;
+  std::string error;
+  CHECK(dal::readPngRgb(dir / "frame_000002.png", image, error) && image.width == width && image.height == height);
+  CHECK(image.rgb.size() >= 3 && image.rgb[0] == 0x10 && image.rgb[1] == 0x20 && image.rgb[2] == 0x30);
+  std::filesystem::remove_all(dir, ec);
+  dal::rsxUnimplementedReset();
+}
+
 std::uint32_t pixelArgb(const std::vector<std::uint8_t>& bgra, std::uint32_t width, std::uint32_t x,
                         std::uint32_t y) {
   const std::uint8_t* p = bgra.data() + (static_cast<std::size_t>(y) * width + x) * 4;
@@ -413,7 +447,7 @@ std::vector<std::uint8_t> makeScissoredClearCapture(std::uint32_t first, std::ui
 // masked channels. Depth and stencil values are not checked: the renderer has no depth readback.
 void testRendererScissorAndMask(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;
@@ -761,7 +795,7 @@ void checkQuadPixels(const std::vector<std::uint8_t>& bgra, std::uint32_t width,
 // attribute values.
 void testRendererQuad(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;
@@ -1023,7 +1057,7 @@ std::vector<std::uint8_t> makeChangedTextureCapture() {
 
 void testRendererTextures(dal::VkContext& ctx) {
   using namespace dal::rsx_synthetic;
-  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{.readback_all = true});
   CHECK(renderer.valid());
   std::vector<std::uint8_t> bgra;
   std::uint32_t width = 0;
@@ -1221,6 +1255,7 @@ int main() {
 
   testClearAndReadback(*ctx);
   testRendererClear(*ctx);
+  testRendererReadbackGate(*ctx);
   testRendererScissorAndMask(*ctx);
   testRendererQuad(*ctx);
   testRendererTextures(*ctx);
