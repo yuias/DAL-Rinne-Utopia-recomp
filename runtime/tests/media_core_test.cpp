@@ -1519,6 +1519,26 @@ void testMoviePlayerOrderAndTiming() {
   CHECK(!player.takeDueVideo(origin + 1000000).has_value());
 }
 
+void testMoviePlayerDecodeTime() {
+  PlayerFixture fx;
+  fx.options.video_queue_frames = 64;
+  fx.shared.video_delay_ms = 3;
+  const TempMovie movie(makePlayerStream(6, 0));
+  dal::MoviePlayer player(fx.options);
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.stats().video_decode_ns == 0 && player.stats().video_decode_max_ns == 0);
+  CHECK(player.start());
+  CHECK(pollFor([&] { return decodeFinished(player); }));
+  // Six sends of at least 3 ms each; the longest call is one of them and cannot exceed the sum.
+  const dal::MoviePlayerStats stats = player.stats();
+  CHECK(stats.video_decoded == 6);
+  CHECK(stats.video_decode_ns >= 6 * 3'000'000ull);
+  CHECK(stats.video_decode_max_ns >= 3'000'000ull && stats.video_decode_max_ns <= stats.video_decode_ns);
+  // Re-opening resets the counters.
+  CHECK(player.open(movie.path, {}, {}).has_value());
+  CHECK(player.stats().video_decode_ns == 0 && player.stats().video_decode_max_ns == 0);
+}
+
 void testMoviePlayerBackpressure() {
   PlayerFixture fx;
   const TempMovie movie(makePlayerStream(40, 0));
@@ -2110,6 +2130,7 @@ int main() {
   testPamfDemuxSynthetic();
   testPamfDemuxDamage();
   testMoviePlayerOrderAndTiming();
+  testMoviePlayerDecodeTime();
   testMoviePlayerBackpressure();
   testMoviePlayerUnpulledAudio();
   testMoviePlayerAudioHardCap();

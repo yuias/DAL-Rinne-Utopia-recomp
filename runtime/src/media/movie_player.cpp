@@ -135,6 +135,7 @@ std::expected<PamfInfo, std::string> MoviePlayer::open(const std::filesystem::pa
     codec_error_.clear();
   }
   counters_.video_decoded = counters_.video_delivered = counters_.video_dropped = counters_.video_rejected = 0;
+  counters_.video_decode_ns = counters_.video_decode_max_ns = 0;
   counters_.audio_decoded_frames = counters_.audio_delivered_frames = counters_.audio_silence_frames = 0;
   counters_.audio_underruns = 0;
   counters_.audio_rejected = counters_.audio_bad_chunks = counters_.audio_overflow_frames = 0;
@@ -328,6 +329,8 @@ MoviePlayerStats MoviePlayer::stats() const {
   s.video_delivered = counters_.video_delivered;
   s.video_dropped = counters_.video_dropped;
   s.video_rejected = counters_.video_rejected;
+  s.video_decode_ns = counters_.video_decode_ns;
+  s.video_decode_max_ns = counters_.video_decode_max_ns;
   s.audio_decoded_frames = counters_.audio_decoded_frames;
   s.audio_delivered_frames = counters_.audio_delivered_frames;
   s.audio_silence_frames = counters_.audio_silence_frames;
@@ -477,6 +480,16 @@ void MoviePlayer::runGuarded() {
   const std::uint32_t frame_bytes = audioFrameBytes();
   const std::int64_t rate = audio_format_.sample_rate;
   std::int64_t audio_expected_pts = static_cast<std::int64_t>(info_.start_pts);
+  // Runs one video decoder call and charges its duration to the decode-time counters.
+  auto timedVideo = [this](auto&& call) {
+    const auto begin = std::chrono::steady_clock::now();
+    const bool result = call();
+    const auto ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+    counters_.video_decode_ns += ns;
+    if (ns > counters_.video_decode_max_ns.load(std::memory_order_relaxed)) counters_.video_decode_max_ns = ns;
+    return result;
+  };
 
   // Each pass moves at most one access unit per stream, so a stop request is seen within one pass. A
   // decoded frame that does not fit in its queue is held, which stops further input to that decoder;
@@ -503,7 +516,7 @@ void MoviePlayer::runGuarded() {
     bool video_idle = false, audio_idle = false;
     if (video && !held_video) {
       VideoFrame frame;
-      if (video->receive(frame)) {
+      if (timedVideo([&] { return video->receive(frame); })) {
         counters_.video_decoded++;
         held_video = std::move(frame);
         progress = true;
@@ -542,7 +555,7 @@ void MoviePlayer::runGuarded() {
         starved = false;
       } else if (!flushed) {
         if (auto au = demux.next(*video_index_)) {
-          if (!video->send(au->bytes, au->pts, au->dts)) counters_.video_rejected++;
+          if (!timedVideo([&] { return video->send(au->bytes, au->pts, au->dts); })) counters_.video_rejected++;
           progress = true;
           starved = false;
         }

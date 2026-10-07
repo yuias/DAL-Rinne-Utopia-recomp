@@ -96,6 +96,9 @@ struct MoviePlayerStats {
   std::int64_t duration_ticks = 0;
   std::int64_t played_ticks = 0;  // clock progress seen by takeDueVideo/atEnd, at most the duration
   std::uint64_t video_decoded = 0, video_delivered = 0, video_dropped = 0, video_rejected = 0;
+  // Time the decode thread spent inside the video decoder's send() and receive() (decode and colour
+  // conversion), summed, and the longest single call. Blocking on the queues is not counted.
+  std::uint64_t video_decode_ns = 0, video_decode_max_ns = 0;
   std::uint64_t audio_decoded_frames = 0, audio_delivered_frames = 0, audio_silence_frames = 0;
   std::uint64_t audio_underruns = 0;  // takeAudio calls that had to pad the block with silence
   std::uint64_t audio_rejected = 0, audio_bad_chunks = 0;
@@ -159,6 +162,7 @@ class MoviePlayer {
  private:
   struct Counters {
     std::atomic<std::uint64_t> video_decoded{0}, video_delivered{0}, video_dropped{0}, video_rejected{0};
+    std::atomic<std::uint64_t> video_decode_ns{0}, video_decode_max_ns{0};
     std::atomic<std::uint64_t> audio_decoded_frames{0}, audio_delivered_frames{0}, audio_silence_frames{0};
     std::atomic<std::uint64_t> audio_underruns{0};
     std::atomic<std::uint64_t> audio_rejected{0}, audio_bad_chunks{0}, audio_overflow_frames{0};

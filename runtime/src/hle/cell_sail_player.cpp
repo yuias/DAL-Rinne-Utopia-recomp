@@ -150,6 +150,8 @@ struct Stream {
   std::uint32_t video_tag = 0, sound_tag = 0;
 
   std::uint64_t get_frame_calls = 0, frames_rejected = 0;
+  // Time of the frame copy into guest memory, summed and longest (the copy runs under the guest lock).
+  std::uint64_t frame_copy_ns = 0, frame_copy_max_ns = 0;
   // Wall-clock window of the playback and the flips that happened in it.
   std::uint64_t start_us = 0, end_us = 0, start_flips = 0, end_flips = 0;
   std::uint64_t start_skipped = 0, end_skipped = 0;
@@ -837,12 +839,17 @@ void recordSummary(Stream& stream) {
         static_cast<double>(stats.duration_ticks) / kTicksPerSecond);
     logDebug(
         "dal: sail: movie {} details: video {} rejected {}, audio decoded {} delivered {} silence {} stale {} "
-        "overflow {} rejected {} bad {}, demux errors {}, read errors {}, GetFrame frames refused {}, codecs: {}",
+        "overflow {} rejected {} bad {}, demux errors {}, read errors {}, GetFrame frames refused {}, codecs: {}, "
+        "decode {:.2f} ms/frame (longest call {:.2f} ms), frame copy {:.2f} ms/frame (longest {:.2f} ms)",
         stream.guest_path, stats.video_decoder ? "decoded" : "black", stats.video_rejected,
         stats.audio_decoded_frames, stats.audio_delivered_frames, stats.audio_silence_frames,
         stats.audio_stale_frames, stats.audio_overflow_frames, stats.audio_rejected, stats.audio_bad_chunks,
         stats.demux_errors, stats.read_errors, stream.frames_rejected,
-        stats.codec_error.empty() ? "ok" : stats.codec_error);
+        stats.codec_error.empty() ? "ok" : stats.codec_error,
+        stats.video_decoded != 0 ? static_cast<double>(stats.video_decode_ns) / 1e6 / stats.video_decoded : 0.0,
+        static_cast<double>(stats.video_decode_max_ns) / 1e6,
+        stats.video_delivered != 0 ? static_cast<double>(stream.frame_copy_ns) / 1e6 / stats.video_delivered : 0.0,
+        static_cast<double>(stream.frame_copy_max_ns) / 1e6);
   }
   logInfo("dal: sail: {}", line);
   if (stream.start_us != 0 && stream.ended && stream.end_us > stream.start_us) {
@@ -1177,7 +1184,13 @@ std::optional<VideoFrameResult> takeVideoFrame(std::uint8_t* base, std::uint32_t
     } else {
       const std::uint32_t buffer = stream.frames[stream.next_frame];
       stream.next_frame = (stream.next_frame + 1) % static_cast<std::uint32_t>(stream.frames.size());
+      const auto copy_begin = std::chrono::steady_clock::now();
       std::memcpy(base + buffer, frame.bytes.data(), frame.bytes.size());
+      const auto copy_ns = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copy_begin)
+              .count());
+      stream.frame_copy_ns += copy_ns;
+      stream.frame_copy_max_ns = std::max(stream.frame_copy_max_ns, copy_ns);
       result = VideoFrameResult{buffer, stream.session_id, ++stream.video_tag, frame.pts};
     }
   }
