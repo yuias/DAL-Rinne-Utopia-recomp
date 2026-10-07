@@ -97,6 +97,7 @@ struct MoviePlayerStats {
   std::int64_t played_ticks = 0;  // clock progress seen by takeDueVideo/atEnd, at most the duration
   std::uint64_t video_decoded = 0, video_delivered = 0, video_dropped = 0, video_rejected = 0;
   std::uint64_t audio_decoded_frames = 0, audio_delivered_frames = 0, audio_silence_frames = 0;
+  std::uint64_t audio_underruns = 0;  // takeAudio calls that had to pad the block with silence
   std::uint64_t audio_rejected = 0, audio_bad_chunks = 0;
   std::uint64_t audio_stale_frames = 0;     // unread PCM dropped because the clock had passed its end
   std::uint64_t audio_overflow_frames = 0;  // unread PCM dropped at the hard cap, still in the future
@@ -159,6 +160,7 @@ class MoviePlayer {
   struct Counters {
     std::atomic<std::uint64_t> video_decoded{0}, video_delivered{0}, video_dropped{0}, video_rejected{0};
     std::atomic<std::uint64_t> audio_decoded_frames{0}, audio_delivered_frames{0}, audio_silence_frames{0};
+    std::atomic<std::uint64_t> audio_underruns{0};
     std::atomic<std::uint64_t> audio_rejected{0}, audio_bad_chunks{0}, audio_overflow_frames{0};
     std::atomic<std::uint64_t> audio_stale_frames{0};
     std::atomic<std::uint64_t> demux_errors{0}, read_errors{0};

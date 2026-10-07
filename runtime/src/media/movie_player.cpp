@@ -136,6 +136,7 @@ std::expected<PamfInfo, std::string> MoviePlayer::open(const std::filesystem::pa
   }
   counters_.video_decoded = counters_.video_delivered = counters_.video_dropped = counters_.video_rejected = 0;
   counters_.audio_decoded_frames = counters_.audio_delivered_frames = counters_.audio_silence_frames = 0;
+  counters_.audio_underruns = 0;
   counters_.audio_rejected = counters_.audio_bad_chunks = counters_.audio_overflow_frames = 0;
   counters_.audio_stale_frames = 0;
   counters_.demux_errors = counters_.read_errors = 0;
@@ -287,6 +288,7 @@ MovieAudioBlock MoviePlayer::takeAudio(std::uint32_t frames) {
     audio_anchor_frames_ += frames;
     counters_.audio_delivered_frames += block.real_frames;
     counters_.audio_silence_frames += frames - block.real_frames;
+    if (block.real_frames < frames) counters_.audio_underruns++;
     // The queue limit counts sample frames, so any read can make room.
     if (block.real_frames != 0) generation_++;
   }
@@ -329,6 +331,7 @@ MoviePlayerStats MoviePlayer::stats() const {
   s.audio_decoded_frames = counters_.audio_decoded_frames;
   s.audio_delivered_frames = counters_.audio_delivered_frames;
   s.audio_silence_frames = counters_.audio_silence_frames;
+  s.audio_underruns = counters_.audio_underruns;
   s.audio_rejected = counters_.audio_rejected;
   s.audio_bad_chunks = counters_.audio_bad_chunks;
   s.audio_overflow_frames = counters_.audio_overflow_frames;

@@ -34,7 +34,7 @@
 // Object state lives host-side, keyed by the address of the guest object; the game allocates the
 // player and the adapters and the HLE never writes them. Only the descriptor block and a small
 // scratch block (format copies, the frame pointer array and the sound frame buffer, which the
-// callbacks need as guest memory) are allocated here, through the game's own allocator callbacks.
+// callbacks need as guest memory; the decoded PCM is copied into the latter) are allocated here, through the game's own allocator callbacks.
 // Everything runs under the guest lock. The descriptor's allocator callbacks and the scratch block's
 // allocation run on the calling guest thread, which is how the game expects them to be called. The
 // service thread runs the notify callback, both adapters' format-changed callbacks, the graphics
@@ -106,7 +106,7 @@ constexpr std::uint32_t kMaxAudioChannels = 8;
 
 // Layout of the scratch block allocated at OpenStream. The callbacks and the sound info need guest
 // memory: copies of the formats for pFormatChanged, the pointer array for pAlloc and pFree, and the
-// sound frame buffer. Nothing writes the sound buffer, so it stays silent.
+// sound frame buffer (valid until the next SoundAdapterGetFrame, as the game expects).
 constexpr std::uint32_t kScratchVideoFormat = 0;
 constexpr std::uint32_t kScratchSoundFormat = 32;
 constexpr std::uint32_t kScratchFramePointers = 64;  // room for 8 pointers
@@ -149,7 +149,7 @@ struct Stream {
   std::uint32_t next_frame = 0;
   std::uint32_t video_tag = 0, sound_tag = 0;
 
-  std::uint64_t get_frame_calls = 0, frames_rejected = 0, sound_frames = 0;
+  std::uint64_t get_frame_calls = 0, frames_rejected = 0;
   // Wall-clock window of the playback and the flips that happened in it.
   std::uint64_t start_us = 0, end_us = 0, start_flips = 0, end_flips = 0;
   std::uint64_t start_skipped = 0, end_skipped = 0;
@@ -743,8 +743,18 @@ void chooseFormats(Stream& stream, const PamfInfo* info, const std::optional<sai
                                     : audio_stream != nullptr && audio_stream->sample_rate != 0
                                         ? audio_stream->sample_rate
                                         : kDefaultSampleRate;
-  stream.audio_format.float32 = true;  // the only sample format the game asks for
+  // CELL_SAIL_AUDIO_CODING_LPCM_FLOAT32 is the only coding cellSail defines, so the coding field needs
+  // no mapping: the decoder always delivers interleaved big-endian float, which is what the game reads.
+  stream.audio_format.float32 = true;
   stream.audio_frame_bytes = channels * 4;
+  // No resampling or remixing happens, so a stream that differs from the game's format plays as the
+  // decoder produces it (counted in the decoder statistics).
+  if (audio_stream != nullptr && snd &&
+      ((audio_stream->sample_rate != 0 && audio_stream->sample_rate != stream.audio_format.sample_rate) ||
+       (audio_stream->channels != 0 && audio_stream->channels != channels))) {
+    logWarn("dal: sail: the audio stream ({} Hz, {} ch) differs from the sound adapter's format ({} Hz, {} ch)",
+            audio_stream->sample_rate, audio_stream->channels, stream.audio_format.sample_rate, channels);
+  }
   stream.pcm_frames = snd ? kMaxSoundFrames : 0;
 }
 
@@ -820,10 +830,10 @@ void recordSummary(Stream& stream) {
     const MoviePlayerStats stats = stream.movie.stats();
     const double fps = stats.frame_rate_den != 0 ? static_cast<double>(stats.frame_rate_num) / stats.frame_rate_den : 0.0;
     line = std::format(
-        "movie {}: {}x{} {:.2f} fps, {} decoded, {} delivered, {} dropped, audio {} samples, played {:.2f} s of "
-        "{:.2f} s",
+        "movie {}: {}x{} {:.2f} fps, {} decoded, {} delivered, {} dropped, audio {} samples ({} underruns), "
+        "played {:.2f} s of {:.2f} s",
         stream.guest_path, stats.width, stats.height, fps, stats.video_decoded, stats.video_delivered,
-        stats.video_dropped, stream.sound_frames, static_cast<double>(stats.played_ticks) / kTicksPerSecond,
+        stats.video_dropped, stats.audio_delivered_frames, stats.audio_underruns, static_cast<double>(stats.played_ticks) / kTicksPerSecond,
         static_cast<double>(stats.duration_ticks) / kTicksPerSecond);
     logDebug(
         "dal: sail: movie {} details: video {} rejected {}, audio decoded {} delivered {} silence {} stale {} "
@@ -1175,7 +1185,7 @@ std::optional<VideoFrameResult> takeVideoFrame(std::uint8_t* base, std::uint32_t
   return result;
 }
 
-std::uint32_t takeSoundFrame(std::uint8_t*, std::uint32_t player_address, std::uint32_t frames,
+std::uint32_t takeSoundFrame(std::uint8_t* base, std::uint32_t player_address, std::uint32_t frames,
                              SoundFrameResult& out) {
   Player* player = findPlayer(player_address);
   if (player == nullptr || !player->stream) return sail::kErrorInvalidState;
@@ -1184,14 +1194,24 @@ std::uint32_t takeSoundFrame(std::uint8_t*, std::uint32_t player_address, std::u
   if (!stream.running || stream.scratch == 0 || stream.pcm_frames == 0) {
     return static_cast<std::uint32_t>(sail::kSyncNoFrame);
   }
-  // The block is only read for its timestamp and to keep the audio queue draining; the guest buffer
-  // stays silent until decoded audio is handed over.
+  const std::uint32_t buffer = stream.scratch + kScratchPcm;
+  const std::uint32_t bytes = frames * stream.audio_frame_bytes;
+  // Checked before the queue is touched, so a refused call does not consume PCM.
+  if (frames > stream.pcm_frames || !guestMapped(buffer, bytes)) {
+    return static_cast<std::uint32_t>(sail::kSyncNoFrame);
+  }
+  // The block is already in the game's format (interleaved big-endian float32) and padded with silence
+  // when the decoder fell behind or failed; the sizes can only differ if the player were reconfigured.
   const MovieAudioBlock block = stream.movie.takeAudio(frames);
-  out.buffer = stream.scratch + kScratchPcm;
+  if (block.bytes.size() == bytes) {
+    std::memcpy(base + buffer, block.bytes.data(), bytes);
+  } else {
+    std::memset(base + buffer, 0, bytes);
+  }
+  out.buffer = buffer;
   out.session_id = stream.session_id;
   out.tag = ++stream.sound_tag;
   out.pts = block.pts;
-  stream.sound_frames += frames;
   checkStreamEnd(player_address, *player, stream);
   return static_cast<std::uint32_t>(sail::kSyncNextOnTime);
 }

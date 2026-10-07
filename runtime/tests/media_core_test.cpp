@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -909,7 +910,8 @@ void testSailPlayback() {
   const std::string census = dal::formatCensus();
   CHECK(census.find("census: sail 1 movies") != std::string::npos);
   CHECK(census.find("movie " + movie_guest + ": 1280x720 29.97 fps") != std::string::npos);
-  CHECK(census.find("audio 512 samples, played 0.30 s of 0.30 s") != std::string::npos);
+  // No codecs here: both sound pulls were silence, counted as underruns.
+  CHECK(census.find("audio 0 samples (2 underruns), played 0.30 s of 0.30 s") != std::string::npos);
   CHECK(call("cellSailPlayerFinalize", {player}) == sail::kErrorInvalidState);
   CHECK(call("cellSailGraphicsAdapterUpdateAvSync", {gfx, 1, 1}) == 0);  // the adapter outlives the player
   CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == 0);
@@ -1250,10 +1252,28 @@ struct FakeShared {
   std::atomic<int> video_delay_ms{0};
   std::atomic<std::int64_t> format_start_pts{-12345};
   bool fail_video = false, fail_audio = false;
+  // With `audio_pattern` the audio chunks carry the known PCM of fakePatternPcm in the format the
+  // player asked for (recorded in audio_channels and audio_rate); without it they are filled with
+  // the chunk's index.
+  std::atomic<bool> audio_pattern{false};
+  std::atomic<std::uint32_t> audio_channels{0}, audio_rate{0};
 };
 
 constexpr std::uint32_t kFakeChunkFrames = 2048;  // sample frames per fake ATRAC3plus chunk
 constexpr std::uint32_t kFakeFrameBytes = 8;      // stereo float32
+
+// Interleaved big-endian float32 samples whose value identifies the sample frame and the channel, so
+// a misplaced, swapped or repeated sample shows up in a byte comparison.
+void fakePatternPcm(std::uint8_t* out, std::uint64_t first_frame, std::uint32_t frames, std::uint32_t channels) {
+  for (std::uint32_t i = 0; i < frames; i++) {
+    for (std::uint32_t c = 0; c < channels; c++) {
+      const float value = static_cast<float>(first_frame + i) * 0.5f + static_cast<float>(c) * 0.25f;
+      std::uint32_t bits;
+      std::memcpy(&bits, &value, sizeof bits);
+      for (int b = 0; b < 4; b++) *out++ = static_cast<std::uint8_t>(bits >> (24 - 8 * b));
+    }
+  }
+}
 
 class FakeVideoDecoder : public dal::VideoDecoder {
  public:
@@ -1288,13 +1308,19 @@ class FakeVideoDecoder : public dal::VideoDecoder {
 
 class FakeAudioDecoder : public dal::AudioDecoder {
  public:
-  explicit FakeAudioDecoder(FakeShared* shared) : shared_(shared) {}
+  FakeAudioDecoder(FakeShared* shared, std::uint32_t channels) : shared_(shared), channels_(channels) {}
   bool send(std::span<const std::uint8_t>, std::int64_t pts) override {
     const int index = shared_->audio_sent++;
     dal::AudioChunk chunk;
     chunk.pts = pts;
     chunk.frames = kFakeChunkFrames;
-    chunk.bytes.assign(std::size_t{kFakeChunkFrames} * kFakeFrameBytes, static_cast<std::uint8_t>(index + 1));
+    if (shared_->audio_pattern) {
+      chunk.bytes.resize(std::size_t{kFakeChunkFrames} * channels_ * 4);
+      fakePatternPcm(chunk.bytes.data(), std::uint64_t{kFakeChunkFrames} * static_cast<std::uint32_t>(index),
+                     kFakeChunkFrames, channels_);
+    } else {
+      chunk.bytes.assign(std::size_t{kFakeChunkFrames} * kFakeFrameBytes, static_cast<std::uint8_t>(index + 1));
+    }
     pending_.push_back(std::move(chunk));
     return true;
   }
@@ -1308,6 +1334,7 @@ class FakeAudioDecoder : public dal::AudioDecoder {
 
  private:
   FakeShared* shared_;
+  std::uint32_t channels_;
   std::vector<dal::AudioChunk> pending_;
 };
 
@@ -1323,13 +1350,15 @@ class FakeFactory : public dal::MediaCodecFactory {
     }
     return std::make_unique<FakeVideoDecoder>(shared_);
   }
-  std::unique_ptr<dal::AudioDecoder> createAudio(const dal::PamfStream&, const dal::AudioOutputFormat&,
+  std::unique_ptr<dal::AudioDecoder> createAudio(const dal::PamfStream&, const dal::AudioOutputFormat& format,
                                                  std::string& error) override {
+    shared_->audio_channels = format.channels;
+    shared_->audio_rate = format.sample_rate;
     if (shared_->fail_audio) {
       error = "fake audio failure";
       return nullptr;
     }
-    return std::make_unique<FakeAudioDecoder>(shared_);
+    return std::make_unique<FakeAudioDecoder>(shared_, format.channels);
   }
 
  private:
@@ -1760,6 +1789,173 @@ void testMoviePlayerPartialCodecs() {
   }
 }
 
+// SoundAdapterGetFrame with a fake ATRAC3plus decoder: the PCM reaches the game's buffer byte for byte
+// in the format the game asked for, silence pads what the decoder did not deliver, and the summary
+// counts delivered samples and underruns. Video is black (no decoder), so the audio decode waits for
+// this test's pulls instead of running ahead.
+void testSailSoundDelivery() {
+  namespace sail = dal::sail;
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::resetHostFunctions();
+  dal::resetCellSail();
+  FakeShared shared;
+  shared.fail_video = true;
+  shared.audio_pattern = true;
+  dal::setMediaCodecFactory(std::make_unique<FakeFactory>(&shared));
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x100000, 0x10000);
+  CHECK(scratch != 0);
+  g_notify_events.clear();
+  g_alloc_calls.clear();
+  g_free_calls.clear();
+  g_bump_next = scratch + 0x20000;
+
+  const std::uint32_t tls_image = scratch + 0x100, allocator = scratch + 0x1000, funcs = scratch + 0x1010,
+                      attribute = scratch + 0x1020, resource = scratch + 0x1040, sound_funcs = scratch + 0x1060,
+                      audio_format = scratch + 0x1140, uri = scratch + 0x1200, pp_desc = scratch + 0x1480,
+                      command = scratch + 0x1640, info = scratch + 0x1700, player = scratch + 0x2000,
+                      sound = scratch + 0x2800, stack = scratch + 0x9000;
+  constexpr std::uint64_t kAllocArg = 0xA11C, kNotifyArg = 0xCB, kSoundArg = 0x5D;
+
+  const TempMovie movie(makePlayerStream(8, 5), "dal_sail_sound_test.pam");
+  const std::string movie_guest = "/dev_bdvd/PS3_GAME/USRDIR/Movie/dal_sail_sound_test.pam";
+  dal::VfsLayout layout;
+  layout.files.push_back({movie_guest, movie.path, true});
+  dal::configureVfs(layout);
+  std::memcpy(base + uri, ("x-cell-fs://" + movie_guest).c_str(), movie_guest.size() + 13);
+
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+  DalPpuContext* ctx = boot_ctx.get();
+  ctx->gpr[1] = stack;
+  const std::uint32_t notify_opd = dal::registerHostFunction("sailFakeNotify", sailFakeNotify);
+  const std::uint32_t alloc_opd = dal::registerHostFunction("sailFakeBumpAlloc", sailFakeBumpAlloc);
+  const std::uint32_t free_opd = dal::registerHostFunction("sailFakeFree", sailFakeFree);
+  CHECK(notify_opd != 0 && alloc_opd != 0 && free_opd != 0);
+  const auto call = [&](std::string_view name, std::initializer_list<std::uint64_t> args) {
+    const dal::GuestHandler handler = sailHandlerNamed(name);
+    CHECK(handler != nullptr);
+    if (handler == nullptr) return std::uint32_t{0xdeadbeef};
+    int reg = 3;
+    for (const std::uint64_t value : args) ctx->gpr[reg++] = value;
+    handler(ctx, base);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  const auto waitForEvents = [&](std::size_t count) {
+    return waitUntil([&] { return g_notify_events.size() >= count; });
+  };
+
+  dalWrite32(base, funcs, alloc_opd);
+  dalWrite32(base, funcs + 4, free_opd);
+  CHECK(call("cellSailMemAllocatorInitialize", {allocator, funcs, kAllocArg}) == 0);
+  dalWrite32(base, attribute, 6);
+  dalWrite32(base, attribute + 4, 1);
+  dalWrite32(base, attribute + 8, 1);
+  std::memset(base + sound_funcs, 0, sail::kSoundAdapterFuncsSize);
+
+  // One movie played to the end of its decoded audio, for a sound adapter asking for `channels` channels
+  // at `rate` Hz. The stream's own PTS arithmetic holds only for 48 kHz, so the PTS is compared there.
+  const auto playStream = [&](std::int32_t channels, std::int32_t rate) {
+    const std::uint32_t frame_bytes = static_cast<std::uint32_t>(channels) * 4;
+    const bool check_pts = rate == 48000;
+    shared.audio_sent = 0;
+    shared.audio_channels = 0;
+    shared.audio_rate = 0;
+    std::memset(base + audio_format, 0xff, sail::kAudioFormatSize);
+    dalWrite8(base, audio_format, sail::kAudioCodingLpcmFloat32);
+    dalWrite8(base, audio_format + 1, static_cast<std::uint8_t>(channels));
+    dalWrite32(base, audio_format + sail::kAudioFormatFs, static_cast<std::uint32_t>(rate));
+
+    std::size_t seen = g_notify_events.size();
+    CHECK(call("cellSailPlayerInitialize2", {player, allocator, notify_opd, kNotifyArg, attribute, resource}) == 0);
+    CHECK(call("cellSailSoundAdapterInitialize", {sound, sound_funcs, kSoundArg}) == 0);
+    CHECK(call("cellSailSoundAdapterSetPreferredFormat", {sound, audio_format}) == 0);
+    CHECK(call("cellSailPlayerSetSoundAdapter", {player, 0, sound}) == 0);
+    CHECK(call("cellSailPlayerBoot", {player, 0}) == 0);
+    CHECK(call("cellSailPlayerCreateDescriptor", {player, 0, 0, uri, pp_desc}) == 0);
+    const std::uint32_t desc = dalRead32(base, pp_desc);
+    CHECK(call("cellSailPlayerAddDescriptor", {player, desc}) == 0);
+    CHECK(waitForEvents(seen += 4));
+    CHECK(call("cellSailPlayerOpenStream", {player, 0}) == 0);
+    CHECK(waitForEvents(seen += 4));
+    CHECK(call("cellSailPlayerStart", {player, command, 0}) == 0);
+    CHECK(waitForEvents(seen += 4));
+
+    // The decoder was asked for the game's format.
+    CHECK(shared.audio_channels == static_cast<std::uint32_t>(channels) &&
+          shared.audio_rate == static_cast<std::uint32_t>(rate));
+    // Let the decode thread queue every chunk (five packs of two chunks), so that the pulls below do
+    // not race with it.
+    constexpr int kChunks = 10;
+    for (int i = 0; i < 2000 && shared.audio_sent < kChunks; i++) pauseUnlocked();
+    for (int i = 0; i < 50; i++) pauseUnlocked();
+    CHECK(shared.audio_sent == kChunks);
+    const std::uint64_t total = std::uint64_t{kChunks} * kFakeChunkFrames;
+
+    // A request over the buffer's capacity (or of nothing) is refused and takes nothing from the queue.
+    CHECK(call("cellSailSoundAdapterGetFrame", {sound, 2049, info}) == sail::kErrorInvalidArg);
+    CHECK(call("cellSailSoundAdapterGetFrame", {sound, 0, info}) == sail::kErrorInvalidArg);
+
+    // Pulls of mixed sizes cross chunk boundaries, then run past the end of the decoded audio.
+    constexpr std::uint32_t kSizes[] = {1000, 256, 1500, 2048};
+    std::uint64_t consumed = 0, position = 0, underruns = 0;
+    bool bytes_exact = true, pts_exact = true, info_ok = true;
+    for (std::uint32_t pull = 0; pull < 30; pull++) {
+      const std::uint32_t n = kSizes[pull % 4];
+      const auto real = static_cast<std::uint32_t>(std::min<std::uint64_t>(n, total - consumed));
+      std::vector<std::uint8_t> expected(std::size_t{n} * frame_bytes, 0);
+      fakePatternPcm(expected.data(), consumed, real, static_cast<std::uint32_t>(channels));
+      std::memset(base + info, 0xee, sail::kFrameInfoSize);  // the game does not clear it
+      const std::uint32_t result = call("cellSailSoundAdapterGetFrame", {sound, n, info});
+      const std::uint32_t buffer = dalRead32(base, info + sail::kFrameInfoBuffer);
+      info_ok = info_ok && result == static_cast<std::uint32_t>(sail::kSyncNextOnTime) && buffer != 0 &&
+                dalRead32(base, info + sail::kFrameInfoStatus) == 0 &&
+                dalRead32(base, info + sail::kFrameInfoTag) == pull + 1 &&
+                dalRead32(base, info + sail::kFrameInfoSessionId) != 0;
+      bytes_exact = bytes_exact && p.memory.isCommitted(buffer, n * frame_bytes) &&
+                    std::memcmp(base + buffer, expected.data(), expected.size()) == 0;
+      pts_exact = pts_exact && dalRead64(base, info + sail::kFrameInfoPts) ==
+                                   static_cast<std::uint64_t>(kPlayerStartPts - 3840 + position * 90000 / 48000);
+      consumed += real;
+      position += n;
+      if (real < n) underruns++;
+    }
+    CHECK(info_ok);
+    CHECK(bytes_exact);
+    if (check_pts) CHECK(pts_exact);
+    CHECK(consumed == total && underruns >= 2);
+
+    // The summary reports the samples that were real PCM and the pulls that needed silence.
+    CHECK(call("cellSailPlayerFinalize", {player}) == 0);
+    const std::string census = dal::formatCensus();
+    CHECK(census.find(std::format("audio {} samples ({} underruns), played", total, underruns)) != std::string::npos);
+    CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == 0);
+    CHECK(call("cellSailSoundAdapterFinalize", {sound}) == 0);
+    dal::resetCellSail();  // forgets the summary, so the next run's line is the only one
+  };
+
+  playStream(2, 48000);  // what the game asks for
+  playStream(1, 44100);  // a format the decoder has to be configured for
+
+  dal::stopSailService();
+  dal::resetCellSail();
+  dal::configureVfs(dal::VfsLayout{});
+  dal::setMediaCodecFactory(nullptr);
+  dal::resetHostFunctions();
+  dal::resetSyncObjects();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 struct GameFile {
   const char* name;
   // The first three counts are from the whole-file statistics of the format description;
@@ -1920,6 +2116,7 @@ int main() {
   testMoviePlayerStop();
   testMoviePlayerWithoutCodecs();
   testMoviePlayerPartialCodecs();
+  testSailSoundDelivery();
   testPamfGameFiles();
   std::printf("media core tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed != 0 ? 1 : 0;
