@@ -1,8 +1,12 @@
 // Self-checking tests for the run-time FFmpeg loader.
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -10,6 +14,7 @@
 
 #include "core/log.h"
 #include "media/ffmpeg_api.h"
+#include "media/ffmpeg_codecs.h"
 
 namespace {
 
@@ -149,6 +154,195 @@ void testLoad() {
   CHECK(&dal::defaultFfmpeg() == &loaded);
 }
 
+int clampByte(double value) {
+  return value < 0 ? 0 : value > 255 ? 255 : static_cast<int>(value + 0.5);
+}
+
+// Limited-range YUV to full-range RGB from the BT.601 and BT.709 definitions, independent of swscale.
+void expectedRgb(bool bt709, int y, int u, int v, int rgb[3]) {
+  const double luma = 1.164383 * (y - 16);
+  const double cb = u - 128, cr = v - 128;
+  if (bt709) {
+    rgb[0] = clampByte(luma + 1.792741 * cr);
+    rgb[1] = clampByte(luma - 0.213249 * cb - 0.532909 * cr);
+    rgb[2] = clampByte(luma + 2.112402 * cb);
+  } else {
+    rgb[0] = clampByte(luma + 1.596027 * cr);
+    rgb[1] = clampByte(luma - 0.391762 * cb - 0.812968 * cr);
+    rgb[2] = clampByte(luma + 2.017232 * cb);
+  }
+}
+
+// A 16x16 picture made of four flat 8x8 blocks, so chroma interpolation at the block edges does
+// not enter the comparison: only pixels inside each block are checked.
+void testYuvToRgb() {
+  const auto& loaded = dal::defaultFfmpeg();
+  CHECK(loaded.has_value());
+  if (!loaded) return;
+
+  struct Block {
+    int y, u, v;
+  };
+  constexpr Block kBlocks[4] = {{81, 90, 240}, {145, 54, 34}, {41, 240, 110}, {200, 100, 160}};
+  constexpr int kSize = 16;
+  std::vector<std::uint8_t> luma(kSize * kSize), cb(kSize * kSize / 4), cr(kSize * kSize / 4);
+  for (int y = 0; y < kSize; ++y) {
+    for (int x = 0; x < kSize; ++x) {
+      const Block& block = kBlocks[(y / 8) * 2 + x / 8];
+      luma[static_cast<std::size_t>(y * kSize + x)] = static_cast<std::uint8_t>(block.y);
+      if (y % 2 == 0 && x % 2 == 0) {
+        cb[static_cast<std::size_t>(y / 2 * (kSize / 2) + x / 2)] = static_cast<std::uint8_t>(block.u);
+        cr[static_cast<std::size_t>(y / 2 * (kSize / 2) + x / 2)] = static_cast<std::uint8_t>(block.v);
+      }
+    }
+  }
+
+  AVFrame* frame = loaded->av_frame_alloc();
+  CHECK(frame != nullptr);
+  if (!frame) return;
+  frame->format = AV_PIX_FMT_YUV420P;
+  frame->width = frame->height = kSize;
+  frame->color_range = AVCOL_RANGE_MPEG;
+  frame->data[0] = luma.data();
+  frame->data[1] = cb.data();
+  frame->data[2] = cr.data();
+  frame->linesize[0] = kSize;
+  frame->linesize[1] = frame->linesize[2] = kSize / 2;
+
+  dal::FfmpegVideoConverter converter(*loaded);
+  for (const bool bt709 : {false, true}) {
+    for (const dal::VideoCoding coding : {dal::VideoCoding::Argb, dal::VideoCoding::Rgba}) {
+      dal::VideoOutputFormat format;
+      format.coding = coding;
+      format.bt709 = bt709;
+      format.alpha = 0x80;
+      format.pitch = kSize * 4 + 16;  // a padded pitch must be honoured
+      dal::VideoFrame out;
+      std::string error;
+      CHECK(converter.convert(*frame, format, out, error));
+      CHECK(out.width == kSize && out.height == kSize && out.pitch == format.pitch);
+      CHECK(out.bytes.size() == std::size_t{format.pitch} * kSize);
+      if (out.bytes.size() != std::size_t{format.pitch} * kSize) continue;
+
+      const std::size_t alpha_at = coding == dal::VideoCoding::Argb ? 0 : 3;
+      const std::size_t red_at = coding == dal::VideoCoding::Argb ? 1 : 0;
+      int worst = 0;
+      bool alpha_ok = true;
+      for (int by = 0; by < 2; ++by) {
+        for (int bx = 0; bx < 2; ++bx) {
+          const Block& block = kBlocks[by * 2 + bx];
+          int want[3];
+          expectedRgb(bt709, block.y, block.u, block.v, want);
+          for (int y = by * 8 + 2; y < by * 8 + 6; ++y) {
+            for (int x = bx * 8 + 2; x < bx * 8 + 6; ++x) {
+              const std::uint8_t* pixel =
+                  out.bytes.data() + std::size_t{format.pitch} * static_cast<std::size_t>(y) +
+                  static_cast<std::size_t>(x) * 4;
+              if (pixel[alpha_at] != 0x80) alpha_ok = false;
+              for (int c = 0; c < 3; ++c) {
+                worst = std::max(worst, std::abs(int{pixel[red_at + static_cast<std::size_t>(c)]} - want[c]));
+              }
+            }
+          }
+        }
+      }
+      std::printf("yuv->%s %s: largest difference %d\n", coding == dal::VideoCoding::Argb ? "argb" : "rgba",
+                  bt709 ? "bt709" : "bt601", worst);
+      CHECK(worst <= 2);
+      CHECK(alpha_ok);
+    }
+  }
+
+  // The two matrices must give visibly different colours for these blocks.
+  int a[3], b[3];
+  expectedRgb(false, kBlocks[0].y, kBlocks[0].u, kBlocks[0].v, a);
+  expectedRgb(true, kBlocks[0].y, kBlocks[0].u, kBlocks[0].v, b);
+  CHECK(std::abs(a[1] - b[1]) > 8);
+
+  // Planar output keeps the decoder's planes: Y, then U, then V, without padding at pitch 0.
+  dal::VideoOutputFormat planar;
+  planar.coding = dal::VideoCoding::Yuv420Planar;
+  dal::VideoFrame out;
+  std::string error;
+  CHECK(converter.convert(*frame, planar, out, error));
+  CHECK(out.pitch == kSize && out.bytes.size() == luma.size() + cb.size() + cr.size());
+  if (out.bytes.size() == luma.size() + cb.size() + cr.size()) {
+    CHECK(std::equal(luma.begin(), luma.end(), out.bytes.begin()));
+    CHECK(std::equal(cb.begin(), cb.end(), out.bytes.begin() + static_cast<std::ptrdiff_t>(luma.size())));
+    CHECK(std::equal(cr.begin(), cr.end(),
+                     out.bytes.begin() + static_cast<std::ptrdiff_t>(luma.size() + cb.size())));
+  }
+
+  // A pitch below the row size is refused.
+  dal::VideoOutputFormat narrow;
+  narrow.pitch = kSize * 4 - 1;
+  CHECK(!converter.convert(*frame, narrow, out, error));
+
+  // The format comes from guest memory: absurd values are refused before any allocation.
+  dal::VideoOutputFormat huge;
+  huge.width = 100000;
+  CHECK(!converter.convert(*frame, huge, out, error));
+  huge = {};
+  huge.height = 0x7fffffff;
+  CHECK(!converter.convert(*frame, huge, out, error));
+  huge = {};
+  huge.pitch = 1u << 20;
+  CHECK(!converter.convert(*frame, huge, out, error));
+  huge = {};
+  huge.pitch = 0xffffffffu;
+  huge.coding = dal::VideoCoding::Yuv420Planar;
+  CHECK(!converter.convert(*frame, huge, out, error));
+  huge = {};
+  huge.coding = dal::VideoCoding::Yuv420Planar;
+  huge.width = huge.height = 8192;  // within the limits per axis, but the frame is over the byte cap
+  huge.pitch = 4 * 8192;
+  CHECK(!converter.convert(*frame, huge, out, error));
+  // The converter is still usable after refusals.
+  CHECK(converter.convert(*frame, planar, out, error));
+
+  loaded->av_frame_free(&frame);
+}
+
+// The decoder must survive end of stream and be reusable, with or without data in it.
+void testVideoDecoderLifecycle() {
+  const auto& loaded = dal::defaultFfmpeg();
+  CHECK(loaded.has_value());
+  if (!loaded) return;
+
+  dal::FfmpegCodecFactory factory(*loaded);
+  dal::PamfStream stream;
+  stream.codec = dal::PamfCodec::Avc;
+  stream.codec_info.assign(32, 0);
+  stream.codec_info[2] = 4;  // frame-rate code 3 (30000/1001) plus one
+  std::string error;
+  std::unique_ptr<dal::VideoDecoder> decoder = factory.createVideo(stream, {}, error);
+  CHECK(decoder != nullptr);
+  if (!decoder) return;
+
+  dal::VideoFrame frame;
+  CHECK(!decoder->receive(frame));
+  decoder->flush();
+  const std::uint8_t plain[] = {1, 2, 3, 4};  // no start code: the parser only buffers it
+  CHECK(!decoder->send(plain, -1, -1));  // refused while draining
+  CHECK(!decoder->receive(frame));       // fully drained
+  CHECK(decoder->send(plain, -1, -1));   // and usable again
+
+  // Garbage with start codes reaches the decoder; errors must not leave it stuck.
+  const std::uint8_t junk[] = {0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0xff, 0xee,
+                               0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x41, 0x9a, 0x11, 0x22};
+  decoder->send(junk, 90000, 87000);
+  decoder->flush();
+  for (int i = 0; i < 100 && decoder->receive(frame); ++i) {
+  }
+  CHECK(decoder->send(plain, -1, -1));
+  decoder->flush();
+  CHECK(!decoder->receive(frame));
+  CHECK(decoder->send(plain, -1, -1));
+
+  // Audio is not provided yet and says so.
+  CHECK(factory.createAudio(stream, {}, error) == nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -158,6 +352,8 @@ int main(int argc, char** argv) {
     testPartialLoadIsUnmapped(std::filesystem::absolute(argv[0], ec).parent_path());
   }
   testLoad();
+  testYuvToRgb();
+  testVideoDecoderLifecycle();
   std::printf("media ffmpeg tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;
 }

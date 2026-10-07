@@ -59,7 +59,7 @@ endfunction()
 function(dal_media_add)
   dal_media_find_ffmpeg()
 
-  add_library(dal_media STATIC runtime/src/media/ffmpeg_api.cpp)
+  add_library(dal_media STATIC runtime/src/media/ffmpeg_api.cpp runtime/src/media/ffmpeg_codecs.cpp)
   target_compile_options(dal_media PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_media PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   # SYSTEM keeps the FFmpeg headers out of our warnings; nothing links against FFmpeg itself.
@@ -103,4 +103,30 @@ function(dal_media_add)
   add_test(NAME media_ffmpeg COMMAND dal_media_ffmpeg_tests)
   set_tests_properties(media_ffmpeg PROPERTIES
     PASS_REGULAR_EXPRESSION "media ffmpeg tests: [0-9]+ passed, 0 failed")
+
+  # Decodes a movie headless. Writes PNGs only where told. dal_render is defined after this function
+  # runs; target names resolve at generate time. It supplies the PNG writer.
+  add_executable(dal_moviedump tools/dal_moviedump/main.cpp)
+  target_compile_options(dal_moviedump PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_moviedump PRIVATE dal_media dal_render)
+  add_dependencies(dal_moviedump dal_ffmpeg_runtime)
+
+  include("${CMAKE_SOURCE_DIR}/cmake/movie_decode.cmake")
+  set(movie_path "${DAL_GAME_DIR}/${DAL_MOVIE_DECODE_MOVIE}")
+  if("${DAL_GAME_DIR}" STREQUAL "")
+    message(STATUS "DAL: movie_decode test not registered (DAL_GAME_DIR is empty)")
+  elseif(NOT EXISTS "${movie_path}")
+    message(STATUS "DAL: movie_decode test not registered (${DAL_MOVIE_DECODE_MOVIE} not found in the game directory)")
+  else()
+    set(movie_args "${movie_path}" --frames ${DAL_MOVIE_DECODE_FRAMES}
+      --expect-frames ${DAL_MOVIE_DECODE_EXPECTED_FRAMES})
+    foreach(pin ${DAL_MOVIE_DECODE_YUV_SHA256})
+      list(APPEND movie_args --expect-yuv "${pin}")
+    endforeach()
+    foreach(pin ${DAL_MOVIE_DECODE_RGB_SHA256})
+      list(APPEND movie_args --expect-rgb "${pin}")
+    endforeach()
+    add_test(NAME movie_decode COMMAND dal_moviedump ${movie_args})
+    set_tests_properties(movie_decode PROPERTIES PASS_REGULAR_EXPRESSION "moviedump ok")
+  endif()
 endfunction()

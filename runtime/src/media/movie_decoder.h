@@ -15,12 +15,15 @@ namespace dal {
 
 enum class VideoCoding : std::uint8_t { Argb, Rgba, Yuv420Planar };
 
-// What the game asked for. `pitch` is in bytes; `bt709` selects the colour matrix.
+// What the game asked for. `pitch` is in bytes; `bt709` selects the colour matrix. A width or height
+// of 0 keeps the decoded size and a pitch of 0 packs the rows tightly.
 struct VideoOutputFormat {
   VideoCoding coding = VideoCoding::Argb;
   std::uint32_t width = 0, height = 0, pitch = 0;
   std::uint8_t alpha = 0xff;
   bool bt709 = false;
+  // The file's start PTS: the anchor for the first decoded frame when no timestamp has been seen yet.
+  std::int64_t start_pts = 0;
 };
 
 // Interleaved samples, big-endian as the game reads them.
@@ -31,6 +34,7 @@ struct AudioOutputFormat {
 
 struct VideoFrame {
   std::int64_t pts = -1;           // 90 kHz
+  std::uint32_t width = 0, height = 0, pitch = 0;  // of `bytes`; pitch is the luma pitch when planar
   std::vector<std::uint8_t> bytes;  // guest layout, ready to memcpy
 };
 
@@ -44,9 +48,15 @@ struct AudioChunk {
 class VideoDecoder {
  public:
   virtual ~VideoDecoder() = default;
-  // `es` is any split of the elementary stream; `pts` belongs to its first byte.
-  virtual bool send(std::span<const std::uint8_t> es, std::int64_t pts) = 0;
+  // `es` is any split of the elementary stream (one PES payload); `pts` and `dts` belong to the
+  // access unit that begins in it, -1 when the PES header carries none. False when data was rejected;
+  // the rest of the stream stays decodable.
+  virtual bool send(std::span<const std::uint8_t> es, std::int64_t pts, std::int64_t dts) = 0;
+  // False when no frame is ready; call again after more input. After flush(), false means the
+  // decoder is fully drained.
   virtual bool receive(VideoFrame& out) = 0;
+  // End of stream: pending data is decoded and its frames become available through receive(). When
+  // they are all taken the decoder is ready for a new stream.
   virtual void flush() = 0;
 };
 
