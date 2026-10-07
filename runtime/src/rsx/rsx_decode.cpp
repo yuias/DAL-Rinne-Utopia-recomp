@@ -405,8 +405,8 @@ RsxTextureDesc decodeTexture(const RsxRegisters& regs, std::uint32_t unit) {
   t.address = regs.reg(kMethodNv4097SetTextureAddress + base);
   t.border = regs.reg(kMethodNv4097SetTextureBorderColor + base);
 
-  // Unnormalized coordinates need a per-unit coordinate scale that the renderer does not provide.
-  if ((format & kRsxTextureBaseMask) != kRsxTextureA8R8G8B8 || !t.normalized) {
+  // Unnormalized coordinates are supported: the renderer scales them by 1 / size.
+  if ((format & kRsxTextureBaseMask) != kRsxTextureA8R8G8B8) {
     rsxNoteUnimplemented("texture format", rsxTextureFormatName(format));
   }
   return t;

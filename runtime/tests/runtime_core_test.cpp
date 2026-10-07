@@ -4745,7 +4745,7 @@ void testRsxDecode() {
   CHECK(unimplementedCount("texture format DXT1_SZ_NR") == 1);
   regs->apply(0x1A04, 1u | (2u << 4) | ((0x85u | 0x20u | 0x40u) << 8) | (1u << 16));
   CHECK(!dal::decodeTexture(*regs, 0).normalized);
-  CHECK(unimplementedCount("texture format A8R8G8B8_LN_UN") == 1);
+  CHECK(unimplementedCount("texture format A8R8G8B8_LN_UN") == 0);  // the renderer scales the coordinates
 
   // Fixed-function state: blend SRC_ALPHA / ONE_MINUS_SRC_ALPHA with ADD for color and MAX for alpha,
   // alpha test NOTEQUAL 0, back-face culling with counter-clockwise front faces.

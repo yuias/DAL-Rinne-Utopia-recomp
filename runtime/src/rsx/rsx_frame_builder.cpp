@@ -293,8 +293,7 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
     if (t.mips > 1) rsxNoteUnimplemented("texture layout", std::format("mips {}", t.mips));
     if (t.dimension != 2) rsxNoteUnimplemented("texture layout", std::format("dimension {}", t.dimension));
 
-    const bool supported_format =
-        (t.format & kRsxTextureBaseMask) == kRsxTextureA8R8G8B8 && t.normalized;
+    const bool supported_format = (t.format & kRsxTextureBaseMask) == kRsxTextureA8R8G8B8;
     const bool supported_layout = t.linear_layout && !t.cubemap && t.mips <= 1 && t.dimension == 2;
     if (supported_format && supported_layout && t.width != 0 && t.height != 0) {
       const std::uint64_t row = static_cast<std::uint64_t>(t.width) * 4;
