@@ -350,7 +350,10 @@ void RsxConsumer::getReport(std::uint32_t value) {
     logOnce("rsx-report-bad-address", "dal: rsx: NV4097_GET_REPORT {:#010x} in DMA {:#010x} ignored", value, dma_report_);
     return;
   }
-  // No zpass or zcull statistics are gathered; only the timer is real.
+  // No zpass or zcull statistics are gathered; only the timer is real. The value 0 is what RPCS3 writes
+  // when no counting is active (`thread::get_zcull_stats` with disable_zcull_queries, and
+  // `ZCULL_control::read_report` with no query ever started); this title never enables pixel counting.
+  rsxNoteUnimplemented("state", "zpass report constant");
   const std::uint64_t now_ns = systemTimeUs() * 1000;
   last_timestamp_ns_ = std::max(now_ns, last_timestamp_ns_ + 1);
   dalWrite64(base_, ea, last_timestamp_ns_);
