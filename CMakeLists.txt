@@ -13,6 +13,7 @@ include(cmake/CompilerChecks.cmake)
 include(cmake/PpuCodegen.cmake)
 include(cmake/Runtime.cmake)
 include(cmake/Render.cmake)
+include(cmake/Media.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -31,6 +32,7 @@ set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
 
 dal_ppu_add_generated_tree()
 dal_runtime_add_core()
+dal_media_add()
 dal_render_add()
 if(TARGET dal_game)
   target_link_libraries(dal_game PRIVATE dal_render)
