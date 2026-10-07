@@ -1,7 +1,5 @@
 # Virtual file system
 
-## Virtual file system
-
 Guest paths map to host directories (`runtime/src/lv2/vfs.cpp`, following RPCS3's mount table):
 
 | Guest path | Host directory | Access |
@@ -20,7 +18,7 @@ The table is the layout the command-line options produce. A VFS configuration fi
 Windows. The `sys_fs_*` system calls and the `cellFs*` imports share one object table. The
 virtual root lists the mounted devices.
 
-### VFS configuration file
+## VFS configuration file
 
 `--vfs-config FILE` reads a JSON file (strict JSON, no comments) that replaces the fixed layout
 above. `config/vfs.example.json` is a tracked example with placeholder paths; keep real

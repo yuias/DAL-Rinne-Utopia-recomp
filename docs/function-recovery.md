@@ -1,7 +1,5 @@
 # Function recovery
 
-## Function recovery
-
 Function recovery uses Ghidra for function starts and data references, and this
 repository's own decoder for function extents. Ghidra truncates some functions at the
 Cell-only vector load/store instructions (`lvlx`, `lvrx`, `stvlx`, `stvrx` and their `l`
@@ -9,7 +7,7 @@ variants) that it cannot decode, so `recover` re-derives every function body its
 seeds. It also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
 numbers over the recovered control-flow graph and reports coverage.
 
-### Commands
+## Commands
 
 ```sh
 python tools/ps3tool.py ghidra-export  <elf>
@@ -44,7 +42,7 @@ python tools/ps3tool.py recover        <elf> -o config/functions.json
 with 8 if the partition does not converge within `--max-rounds`. In the second case the
 function database is not written.
 
-### Extra seeds
+## Extra seeds
 
 `config/extra_seeds.json` lists function starts that neither Ghidra nor the `bl` scan
 provides:
@@ -62,7 +60,7 @@ provides:
 - `ghidra-feedback`, for starts that Ghidra reported only after being given the recovered
   starts (see below).
 
-### Feeding recovered starts back to Ghidra
+## Feeding recovered starts back to Ghidra
 
 `recover` writes the starts it found that Ghidra's summary lacks to `--seeds-out`. Passing
 that file to `ghidra-export --seeds-file` seeds a second Ghidra run with them. The file
@@ -80,7 +78,7 @@ candidates for `config/extra_seeds.json` with the reason `ghidra-feedback`. The 
 `config/ghidra_summary.json` always comes from the base export (entry point and exports as
 the only seeds), so it does not depend on an earlier recovery run.
 
-### Committed files and regeneration
+## Committed files and regeneration
 
 | File | Produced by | Notes |
 | --- | --- | --- |
@@ -102,7 +100,7 @@ python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghi
 python tools/ps3tool.py recover        <elf> -o config/functions.json
 ```
 
-### Function database
+## Function database
 
 `config/functions.json` contains:
 
@@ -119,7 +117,7 @@ python tools/ps3tool.py recover        <elf> -o config/functions.json
   and targets;
 - `unresolved_indirect`: indirect branches that were not resolved, each with a reason.
 
-### Report
+## Report
 
 The report is JSON; the same information is summarised on stdout, one line per topic. Its
 top-level sections:

@@ -1,7 +1,5 @@
 # Emitting C
 
-## Emitting C
-
 `emit` turns the function database and the ELF into C source. The flow is `recover`, then
 `emit`, then a build with `-PpuDir`:
 
@@ -21,7 +19,7 @@ trampolines `imp_<address>` that call the runtime hook `dalHleCall` with an inde
 generated import table. The output is deterministic: two runs on the same inputs write
 byte-identical files, and a file is only rewritten when its content changes.
 
-### Output
+## Output
 
 Everything goes to `--out` (default `generated/ppu`; git-ignored):
 
@@ -56,7 +54,7 @@ more than `N` words are emitted as unhandled. For the committed function databas
 pinned ELF, the code range holds 206065 words of 168 distinct mnemonics in 2531 functions,
 `emit` writes 16 chunks and 166 import trampolines, and `--max-unhandled 0` exits with 0.
 
-### Contract header and stub runtime
+## Contract header and stub runtime
 
 Generated code depends only on the headers in `runtime/include/dal/` (`dal/ppu.h` includes
 all of them). `ppu_context.h` is the contract between generated code and a runtime:
@@ -81,7 +79,7 @@ an error status. Syscalls only set `r3` to 0. `ppu_stub.h` holds test-only addit
 is only for the link check, the header check and the semantics harness; the runtime that runs the
 game is described in [Running the game](../README.md#running-the-game).
 
-### Semantics harness
+## Semantics harness
 
 `tools/tests/ppu_semantics/` holds hand-written cases, one module per instruction group
 (`cases_<group>.py`). `tools/tests/ppu_semantics/gen.py` assembles each case, runs it through
@@ -105,7 +103,7 @@ architecture rule the expected value comes from), the instruction words (built w
 extra callee functions and switch targets. Expected values are derived by hand, not by
 running the emitter.
 
-### What is and is not implemented
+## What is and is not implemented
 
 Every instruction word in the code range of the pinned ELF has an emitter handler, so
 `unhandled` in the report is 0. Known deviations from the architecture or from RPCS3:

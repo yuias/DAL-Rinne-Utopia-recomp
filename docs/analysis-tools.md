@@ -1,7 +1,5 @@
 # Analysis tools
 
-## Analysis tools
-
 `tools/ps3tool.py` has nine subcommands. Each takes the path to the decrypted ELF, except
 `nidgen`, which reads an RPCS3 checkout.
 
@@ -44,7 +42,7 @@ python tools/ps3tool.py nidgen --rpcs3 DIR [--source-commit COMMIT] [--nids-out 
 
 Run `python tools/ps3tool.py <command> --help` for the full option list.
 
-### Ghidra cross-check
+## Ghidra cross-check
 
 `ghidra-export` runs Ghidra headless on the ELF and writes a JSON file with the function
 list and a per-word listing of the code range. `ghidra-diff` then compares that listing
