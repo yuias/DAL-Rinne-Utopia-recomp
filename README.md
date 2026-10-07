@@ -1,6 +1,6 @@
 # DAL Rinne Utopia Recomp
 
-Static recompilation of the PS3 title *Date A Live: Rinne Utopia* (BLJM61048) for
+Static recompilation of the PS3 title *デート・ア・ライブ 凜祢ユートピア* (BLJM61048) for
 Windows, built from your own copy of the game.
 
 This repository contains no game data (see "Licence and legal notice"). No executables, keys,
@@ -1143,14 +1143,14 @@ The code in this repository is licensed under 0BSD; see `LICENSE`. Third-party c
 their own licences; see `THIRD_PARTY_NOTICES.md`.
 
 This is an unofficial fan project. It is not affiliated with, authorised by or endorsed by any
-rights holder of the game or of the *Date A Live* franchise, including:
+rights holder of the game or of the *デート・ア・ライブ* franchise, including:
 
-- Compile Heart, the publisher, and Sting, the developer, of *Date A Live: Rinne Utopia*
-- Koushi Tachibana and Tsunako, the author and illustrator of the original *Date A Live* light
-  novels, and their publisher Fujimi Shobo (KADOKAWA)
+- COMPILE HEART, the publisher, and STING, the developer, of *デート・ア・ライブ 凜祢ユートピア*
+- 橘公司 and つなこ, the author and illustrator of the original *デート・ア・ライブ* light
+  novels, and their publisher 富士見書房 (KADOKAWA)
 - Sony Interactive Entertainment, for the PlayStation 3 platform
 
-*Date A Live*, *Date A Live: Rinne Utopia*, PlayStation and all related names and logos are
+*デート・ア・ライブ*, *デート・ア・ライブ 凜祢ユートピア*, PlayStation and all related names and logos are
 trademarks or registered trademarks of their respective owners. They are used here only to
 identify the game and platform this project works with.
 
