@@ -27,6 +27,8 @@
 #include "hle/hle.h"
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
+#include "media/ffmpeg_codecs.h"
+#include "media/movie_decoder.h"
 #include "render/vk_context.h"
 #include "render/vk_renderer.h"
 #include "render/vk_window.h"
@@ -321,6 +323,18 @@ bool parseArgs(int argc, char** argv, Options& opt) {
   return true;
 }
 
+// The movies decode through FFmpeg DLLs loaded at run time. Without them the factory stays unset
+// and every movie plays as black frames and silence for its duration.
+void installMovieCodecs() {
+  std::string error;
+  std::unique_ptr<dal::MediaCodecFactory> factory = dal::createFfmpegCodecFactory(error);
+  if (!factory) {
+    dal::logWarn("dal: sail: codecs unavailable: {}", error);
+    return;
+  }
+  dal::setMediaCodecFactory(std::move(factory));
+}
+
 // Video and audio out report what the game's PARAM.SFO allows. A missing or broken file keeps the
 // defaults of gameParamSfo().
 void loadGameParamSfo() {
@@ -458,6 +472,8 @@ int main(int argc, char** argv) {
   if (opt.load_only) {
     return static_cast<int>(dal::ExitCode::ProcessExit);
   }
+
+  installMovieCodecs();
 
   // The device is created on the RSX thread when it starts, so it belongs to that thread.
   if (opt.render_vulkan) {

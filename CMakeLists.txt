@@ -35,7 +35,10 @@ dal_runtime_add_core()
 dal_media_add()
 dal_render_add()
 if(TARGET dal_game)
-  target_link_libraries(dal_game PRIVATE dal_render)
+  # dal_media supplies the FFmpeg codec factory that game_main installs for the cellSail movies; the
+  # FFmpeg DLLs it loads at run time are copied next to the executable by dal_ffmpeg_runtime.
+  target_link_libraries(dal_game PRIVATE dal_render dal_media)
+  add_dependencies(dal_game dal_ffmpeg_runtime)
 endif()
 
 add_executable(dal_ppu_header_check runtime/tests/ppu_header_check.c)

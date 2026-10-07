@@ -32,6 +32,7 @@ struct CensusState {
   RsxUnimplementedFn unimplemented_fn = nullptr;
   CensusResetFn unimplemented_reset = nullptr;
   CensusWriterFn rsx_stop_writer = nullptr;
+  SailCensusFn sail_fn = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -147,6 +148,22 @@ void setRsxCensusProvider(RsxCensusFn fn) {
   s.rsx_fn = fn;
 }
 
+RsxCensus rsxCensusSnapshot() {
+  CensusState& s = state();
+  RsxCensusFn fn = nullptr;
+  {
+    std::lock_guard lock(s.mutex);
+    fn = s.rsx_fn;
+  }
+  return fn != nullptr ? fn() : RsxCensus{};
+}
+
+void setSailCensusProvider(SailCensusFn fn) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.sail_fn = fn;
+}
+
 void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset) {
   CensusState& s = state();
   std::lock_guard lock(s.mutex);
@@ -166,6 +183,7 @@ std::string formatCensus() {
   ThreadCensusFn thread_fn = nullptr;
   RsxCensusFn rsx_fn = nullptr;
   RsxUnimplementedFn unimplemented_fn = nullptr;
+  SailCensusFn sail_fn = nullptr;
   {
     std::lock_guard lock(s.mutex);
 
@@ -209,6 +227,7 @@ std::string formatCensus() {
     thread_fn = s.thread_fn;
     rsx_fn = s.rsx_fn;
     unimplemented_fn = s.unimplemented_fn;
+    sail_fn = s.sail_fn;
   }
 
   if (rsx_fn != nullptr) {
@@ -239,6 +258,16 @@ std::string formatCensus() {
       }
       if (unimplemented.dropped != 0) {
         out += std::format("\n  other kinds (limit reached): {}", unimplemented.dropped);
+      }
+    }
+  }
+
+  if (sail_fn != nullptr) {
+    const std::vector<std::string> movies = sail_fn();
+    if (!movies.empty()) {
+      out += std::format("\ncensus: sail {} movies", movies.size());
+      for (const std::string& movie : movies) {
+        out += "\n  " + movie;
       }
     }
   }
@@ -291,6 +320,7 @@ void resetCensus() {
     s.rsx_fn = nullptr;
     s.rsx_stop_writer = nullptr;
     s.unimplemented_fn = nullptr;
+    s.sail_fn = nullptr;
     unimplemented_reset = s.unimplemented_reset;
     s.unimplemented_reset = nullptr;
   }

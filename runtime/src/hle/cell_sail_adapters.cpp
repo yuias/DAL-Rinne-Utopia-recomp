@@ -1,13 +1,18 @@
-// HLE handlers of the cellSail graphics and sound adapters: Initialize, Finalize, SetPreferredFormat
-// and GetFormat. Behaviour follows RPCS3 `Emu/Cell/Modules/cellSail.cpp` (functions of the same
-// names): Initialize on an initialised adapter and Finalize on an uninitialised or still registered
-// one return CELL_SAIL_ERROR_INVALID_STATE, GetFormat returns what SetPreferredFormat stored. The
-// adapter state lives host-side, keyed by the address of the guest object (which the game allocates
-// and the HLE never writes), so a freed and reused address starts clean once Finalize ran.
+// HLE handlers of the cellSail graphics and sound adapters: Initialize, Finalize, SetPreferredFormat,
+// GetFormat, GetFrame and UpdateAvSync. Behaviour follows RPCS3 `Emu/Cell/Modules/cellSail.cpp`
+// (functions of the same names): Initialize on an initialised adapter and Finalize on an
+// uninitialised or still registered one return CELL_SAIL_ERROR_INVALID_STATE, GetFormat returns
+// what SetPreferredFormat stored (or what the player's OpenStream replaced it with). The adapter
+// state lives host-side, keyed by the address of the guest object (which the game allocates and the
+// HLE never writes), so a freed and reused address starts clean once Finalize ran.
 //
-// Deviation from RPCS3: GraphicsAdapterInitialize there marks the adapter registered, which would
-// make Finalize fail for every caller; here only the player's SetXAdapter registers an adapter.
-// The adapters' makeup, cleanup and format-changed callbacks are stored but not called yet.
+// Deviations from RPCS3:
+// - GraphicsAdapterInitialize there marks the adapter registered, which would make Finalize fail for
+//   every caller; here only the player's SetXAdapter registers an adapter.
+// - GetFrame and SoundAdapterGetFrame return a frame-status word: RPCS3 stubs them to CELL_OK, but
+//   the game treats CELL_OK as "no frame" and consumes a frame only for a result >= 0x100 (the
+//   CELL_SAIL_SYNC_* classes, OR-ed with the sync status).
+// The adapters' makeup and cleanup callbacks are stored but not called; the game's are empty stubs.
 //
 // Everything here runs under the guest lock.
 
@@ -15,6 +20,8 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
+#include <span>
 
 #include "core/guest_memory.h"
 #include "core/log.h"
@@ -38,6 +45,7 @@ struct GraphicsAdapter {
   std::array<std::uint8_t, sail::kVideoFormatSize> preferred;
   std::array<std::uint8_t, sail::kVideoFormatSize> format;
   std::uint32_t player = 0;  // address of the player the adapter is registered with, 0 if none
+  std::uint64_t av_sync_updates = 0;
 };
 
 struct SoundAdapter {
@@ -46,6 +54,7 @@ struct SoundAdapter {
   std::array<std::uint8_t, sail::kAudioFormatSize> preferred;
   std::array<std::uint8_t, sail::kAudioFormatSize> format;
   std::uint32_t player = 0;
+  std::uint64_t av_sync_updates = 0;
 };
 
 std::map<std::uint32_t, GraphicsAdapter> g_graphics;
@@ -96,6 +105,8 @@ void graphicsFinalize(DalPpuContext* ctx, std::uint8_t*) {
     setResultCode(ctx, sail::kErrorInvalidState);
     return;
   }
+  logDebug("dal: sail: graphics adapter {:#010x} finalized after {} av-sync updates", it->first,
+           it->second.av_sync_updates);
   g_graphics.erase(it);
   setResultCode(ctx, kCellOk);
 }
@@ -164,6 +175,8 @@ void soundFinalize(DalPpuContext* ctx, std::uint8_t*) {
     setResultCode(ctx, sail::kErrorInvalidState);
     return;
   }
+  logDebug("dal: sail: sound adapter {:#010x} finalized after {} av-sync updates", it->first,
+           it->second.av_sync_updates);
   g_sound.erase(it);
   setResultCode(ctx, kCellOk);
 }
@@ -201,15 +214,98 @@ void soundGetFormat(DalPpuContext* ctx, std::uint8_t* base) {
   setResultCode(ctx, kCellOk);
 }
 
+// The game does not clear the sound info, so every field is written on every path.
+void writeFrameInfo(std::uint8_t* base, std::uint32_t info, std::uint32_t buffer, std::uint32_t session_id,
+                    std::uint32_t tag, std::int64_t pts) {
+  dalWrite32(base, info + sail::kFrameInfoBuffer, buffer);
+  dalWrite32(base, info + sail::kFrameInfoSessionId, session_id);
+  dalWrite32(base, info + sail::kFrameInfoTag, tag);
+  dalWrite32(base, info + sail::kFrameInfoStatus, 0);
+  dalWrite64(base, info + sail::kFrameInfoPts, static_cast<std::uint64_t>(pts));
+}
+
+// cellSailGraphicsAdapterGetFrame(adapter, CellSailGraphicsFrameInfo* info)
+// The game polls this once per tick from its movie thread and copies the buffer at once, so the
+// frame is written into one of the buffers the player allocated and the call returns.
+void graphicsGetFrame(DalPpuContext* ctx, std::uint8_t* base) {
+  const auto it = g_graphics.find(argU32(ctx, 0));
+  if (it == g_graphics.end() || it->second.player == 0) {
+    setResultCode(ctx, sail::kErrorInvalidState);
+    return;
+  }
+  const std::uint32_t info = argU32(ctx, 1);
+  if (!guestMapped(info, sail::kFrameInfoSize)) {
+    setResultCode(ctx, sail::kErrorInvalidArg);
+    return;
+  }
+  const auto frame = sail_hle::takeVideoFrame(base, it->second.player);
+  if (!frame) {
+    writeFrameInfo(base, info, 0, 0, 0, 0);
+    setResultCode(ctx, static_cast<std::uint32_t>(sail::kSyncNoFrame));
+    return;
+  }
+  writeFrameInfo(base, info, frame->buffer, frame->session_id, frame->tag, frame->pts);
+  setResultCode(ctx, static_cast<std::uint32_t>(sail::kSyncNextOnTime));
+}
+
+// cellSailGraphicsAdapterUpdateAvSync(adapter, u32 tag, u64 time)
+// The game reports the flip time of the frame it drew. The player's clock is the host clock, so the
+// report is only counted.
+void graphicsUpdateAvSync(DalPpuContext* ctx, std::uint8_t*) {
+  const auto it = g_graphics.find(argU32(ctx, 0));
+  if (it == g_graphics.end()) {
+    setResultCode(ctx, sail::kErrorInvalidState);
+    return;
+  }
+  it->second.av_sync_updates++;
+  setResultCode(ctx, kCellOk);
+}
+
+// cellSailSoundAdapterGetFrame(adapter, u32 samples, CellSailSoundFrameInfo* info)
+void soundGetFrame(DalPpuContext* ctx, std::uint8_t* base) {
+  const auto it = g_sound.find(argU32(ctx, 0));
+  if (it == g_sound.end() || it->second.player == 0) {
+    setResultCode(ctx, sail::kErrorInvalidState);
+    return;
+  }
+  const std::uint32_t info = argU32(ctx, 2);
+  if (!guestMapped(info, sail::kFrameInfoSize)) {
+    setResultCode(ctx, sail::kErrorInvalidArg);
+    return;
+  }
+  writeFrameInfo(base, info, 0, 0, 0, 0);
+  sail_hle::SoundFrameResult frame;
+  const std::uint32_t result = sail_hle::takeSoundFrame(base, it->second.player, argU32(ctx, 1), frame);
+  if (result == static_cast<std::uint32_t>(sail::kSyncNextOnTime)) {
+    writeFrameInfo(base, info, frame.buffer, frame.session_id, frame.tag, frame.pts);
+  }
+  setResultCode(ctx, result);
+}
+
+// cellSailSoundAdapterUpdateAvSync(adapter, u32 tag, u64 time)
+void soundUpdateAvSync(DalPpuContext* ctx, std::uint8_t*) {
+  const auto it = g_sound.find(argU32(ctx, 0));
+  if (it == g_sound.end()) {
+    setResultCode(ctx, sail::kErrorInvalidState);
+    return;
+  }
+  it->second.av_sync_updates++;
+  setResultCode(ctx, kCellOk);
+}
+
 constexpr HleEntry kHandlers[] = {
     {kModule, 0x1c983864, "cellSailGraphicsAdapterInitialize", graphicsInitialize},
     {kModule, 0x76488bb1, "cellSailGraphicsAdapterFinalize", graphicsFinalize},
     {kModule, 0x2e3ccb5e, "cellSailGraphicsAdapterSetPreferredFormat", graphicsSetPreferredFormat},
     {kModule, 0xffd58aa4, "cellSailGraphicsAdapterGetFormat", graphicsGetFormat},
+    {kModule, 0x0247c69e, "cellSailGraphicsAdapterGetFrame", graphicsGetFrame},
+    {kModule, 0x44a20e79, "cellSailGraphicsAdapterUpdateAvSync", graphicsUpdateAvSync},
     {kModule, 0x3d0d3b72, "cellSailSoundAdapterInitialize", soundInitialize},
     {kModule, 0xd1462438, "cellSailSoundAdapterFinalize", soundFinalize},
     {kModule, 0x1c9d5e5a, "cellSailSoundAdapterSetPreferredFormat", soundSetPreferredFormat},
     {kModule, 0xf25f197d, "cellSailSoundAdapterGetFormat", soundGetFormat},
+    {kModule, 0x7eb8d6b5, "cellSailSoundAdapterGetFrame", soundGetFrame},
+    {kModule, 0xeec22809, "cellSailSoundAdapterUpdateAvSync", soundUpdateAvSync},
 };
 
 }  // namespace
@@ -244,6 +340,48 @@ void unbindAdapters(std::uint32_t player) {
 void resetAdapters() {
   g_graphics.clear();
   g_sound.clear();
+}
+
+std::optional<GraphicsBinding> graphicsBoundTo(std::uint32_t player) {
+  for (const auto& [address, adapter] : g_graphics) {
+    if (adapter.player != player) continue;
+    GraphicsBinding binding;
+    binding.arg = adapter.arg;
+    binding.format_changed = adapter.format_changed;
+    binding.alloc = adapter.alloc;
+    binding.free = adapter.free;
+    binding.preferred = adapter.preferred;
+    return binding;
+  }
+  return std::nullopt;
+}
+
+std::optional<SoundBinding> soundBoundTo(std::uint32_t player) {
+  for (const auto& [address, adapter] : g_sound) {
+    if (adapter.player != player) continue;
+    SoundBinding binding;
+    binding.arg = adapter.arg;
+    binding.format_changed = adapter.format_changed;
+    binding.preferred = adapter.preferred;
+    return binding;
+  }
+  return std::nullopt;
+}
+
+void setGraphicsFormat(std::uint32_t player, std::span<const std::uint8_t> format) {
+  for (auto& [address, adapter] : g_graphics) {
+    if (adapter.player == player && format.size() == adapter.format.size()) {
+      std::memcpy(adapter.format.data(), format.data(), format.size());
+    }
+  }
+}
+
+void setSoundFormat(std::uint32_t player, std::span<const std::uint8_t> format) {
+  for (auto& [address, adapter] : g_sound) {
+    if (adapter.player == player && format.size() == adapter.format.size()) {
+      std::memcpy(adapter.format.data(), format.data(), format.size());
+    }
+  }
 }
 
 }  // namespace sail_hle

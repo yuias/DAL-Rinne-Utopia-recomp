@@ -80,6 +80,16 @@ using RsxUnimplementedFn = RsxUnimplementedCensus (*)();
 using CensusResetFn = void (*)();
 void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset);
 
+// The RSX provider's current numbers, empty without a provider. Any thread; for callers that want
+// the flip count at a point in time (the movie player's per-movie windows).
+RsxCensus rsxCensusSnapshot();
+
+// One line per movie the cellSail player has finished, in the order they ended. The section
+// "census: sail <n> movies" is printed only while a provider is set and it returns lines. The
+// provider runs without the census lock and may be called from any thread.
+using SailCensusFn = std::vector<std::string> (*)();
+void setSailCensusProvider(SailCensusFn fn);
+
 // Called once by printCensus() after the text census, on the stop path; the RSX consumer uses it to
 // log the frame-builder totals and write its argument census (--rsx-census). Runs without the census
 // lock.

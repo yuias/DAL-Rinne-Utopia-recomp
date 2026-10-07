@@ -610,6 +610,375 @@ void testSailPlayerHandlers() {
   dal::resetLogOnce();
 }
 
+struct FrameAllocCall {
+  std::uint64_t arg, size, num, pointers;
+};
+struct FrameFreeCall {
+  std::uint64_t arg, num;
+  std::vector<std::uint32_t> pointers;
+};
+struct FormatChangedCall {
+  std::uint64_t arg, format, session;
+};
+std::vector<FrameAllocCall> g_frame_allocs;
+std::vector<FrameFreeCall> g_frame_frees;
+std::vector<FormatChangedCall> g_format_changes;
+std::vector<std::uint32_t> g_frame_buffers;  // what pAlloc returned
+std::uint32_t g_bump_next = 0;
+
+std::uint32_t bumpAllocate(std::uint64_t size) {
+  const std::uint32_t result = g_bump_next;
+  g_bump_next += static_cast<std::uint32_t>((size + 0xff) & ~0xffull);
+  return result;
+}
+
+// The game's allocator callback: pAlloc(arg, boundary, size).
+DAL_PPU_FUNC(sailFakeBumpAlloc) {
+  (void)base;
+  g_alloc_calls.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]});
+  ctx->gpr[3] = bumpAllocate(ctx->gpr[5]);
+}
+
+// The graphics adapter's frame callbacks: pAlloc(arg, size, num, ppFrame) and pFree(arg, num, ppFrame).
+DAL_PPU_FUNC(sailFakeFrameAlloc) {
+  g_frame_allocs.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6]});
+  for (std::uint32_t i = 0; i < ctx->gpr[5]; i++) {
+    const std::uint32_t buffer = bumpAllocate(ctx->gpr[4]);
+    g_frame_buffers.push_back(buffer);
+    dalWrite32(base, static_cast<std::uint32_t>(ctx->gpr[6]) + 4 * i, buffer);
+  }
+  ctx->gpr[3] = 0;
+}
+
+DAL_PPU_FUNC(sailFakeFrameFree) {
+  FrameFreeCall call{ctx->gpr[3], ctx->gpr[4], {}};
+  for (std::uint32_t i = 0; i < ctx->gpr[4]; i++) {
+    call.pointers.push_back(dalRead32(base, static_cast<std::uint32_t>(ctx->gpr[5]) + 4 * i));
+  }
+  g_frame_frees.push_back(std::move(call));
+  ctx->gpr[3] = 0;
+}
+
+// pFormatChanged(arg, format, sessionId) of either adapter.
+DAL_PPU_FUNC(sailFakeFormatChanged) {
+  (void)base;
+  g_format_changes.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]});
+  ctx->gpr[3] = 0;
+}
+
+// A header like makePamfHeader's whose movie lasts 0.3 s, so the wall-clock end arrives quickly.
+Bytes makeShortPamfHeader() {
+  Bytes h = makePamfHeader(0);
+  put32(h, 0x5E, 89310 + 27000);
+  put32(h, 0x7C, 89310 + 27000);
+  return h;
+}
+
+void testSailPlayback() {
+  namespace sail = dal::sail;
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::resetHostFunctions();
+  dal::resetCellSail();
+  dal::setMediaCodecFactory(nullptr);  // black frames: no FFmpeg here
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  constexpr std::uint32_t kArena = 0x2000000;  // two streams of three frames of 3,686,400 bytes, and the small blocks
+  const std::uint32_t scratch = p.main.allocate(kArena, 0x10000);
+  CHECK(scratch != 0);
+  g_notify_events.clear();
+  g_alloc_calls.clear();
+  g_free_calls.clear();
+  g_frame_allocs.clear();
+  g_frame_frees.clear();
+  g_format_changes.clear();
+  g_frame_buffers.clear();
+  g_bump_next = scratch + 0x20000;
+
+  const std::uint32_t tls_image = scratch + 0x100, allocator = scratch + 0x1000, funcs = scratch + 0x1010,
+                      attribute = scratch + 0x1020, resource = scratch + 0x1040, sound_funcs = scratch + 0x1060,
+                      gfx_funcs = scratch + 0x1070, video_format = scratch + 0x1100,
+                      audio_format = scratch + 0x1140, format_out = scratch + 0x1180, uri = scratch + 0x1200,
+                      uri_missing = scratch + 0x1380, pp_desc = scratch + 0x1480, database = scratch + 0x1500,
+                      command = scratch + 0x1640, info = scratch + 0x1700, player = scratch + 0x2000,
+                      player_b = scratch + 0x2400, sound = scratch + 0x2800, gfx = scratch + 0x2900,
+                      sound_b = scratch + 0x2a00, gfx_b = scratch + 0x2b00, stack = scratch + 0x9000;
+  constexpr std::uint64_t kAllocArg = 0xA11C, kNotifyArg = 0xCB, kSoundArg = 0x5D, kGfxArg = 0x6F;
+
+  std::error_code ec;
+  const std::filesystem::path movie_path = std::filesystem::temp_directory_path(ec) / "dal_sail_playback_test.pam";
+  {
+    const Bytes header = makeShortPamfHeader();
+    std::ofstream out(movie_path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+  }
+  const std::string movie_guest = "/dev_bdvd/PS3_GAME/USRDIR/Movie/dal_sail_playback_test.pam";
+  dal::VfsLayout layout;
+  layout.files.push_back({movie_guest, movie_path, true});
+  dal::configureVfs(layout);
+  auto putString = [&](std::uint32_t addr, const std::string& text) {
+    std::memcpy(base + addr, text.c_str(), text.size() + 1);
+  };
+  putString(uri, "x-cell-fs://" + movie_guest);
+  putString(uri_missing, "x-cell-fs:///dev_bdvd/PS3_GAME/USRDIR/Movie/dal_sail_playback_missing.pam");
+
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+  DalPpuContext* ctx = boot_ctx.get();
+  ctx->gpr[1] = stack;
+  const std::uint32_t notify_opd = dal::registerHostFunction("sailFakeNotify", sailFakeNotify);
+  const std::uint32_t alloc_opd = dal::registerHostFunction("sailFakeBumpAlloc", sailFakeBumpAlloc);
+  const std::uint32_t free_opd = dal::registerHostFunction("sailFakeFree", sailFakeFree);
+  const std::uint32_t frame_alloc_opd = dal::registerHostFunction("sailFakeFrameAlloc", sailFakeFrameAlloc);
+  const std::uint32_t frame_free_opd = dal::registerHostFunction("sailFakeFrameFree", sailFakeFrameFree);
+  const std::uint32_t changed_opd = dal::registerHostFunction("sailFakeFormatChanged", sailFakeFormatChanged);
+  CHECK(notify_opd != 0 && alloc_opd != 0 && free_opd != 0 && frame_alloc_opd != 0 && frame_free_opd != 0 &&
+        changed_opd != 0);
+
+  const auto call = [&](std::string_view name, std::initializer_list<std::uint64_t> args) {
+    const dal::GuestHandler handler = sailHandlerNamed(name);
+    CHECK(handler != nullptr);
+    if (handler == nullptr) return std::uint32_t{0xdeadbeef};
+    int reg = 3;
+    for (const std::uint64_t value : args) ctx->gpr[reg++] = value;
+    handler(ctx, base);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  const auto waitForEvents = [&](std::size_t count) {
+    return waitUntil([&] { return g_notify_events.size() >= count; });
+  };
+  const auto stateEvent = [](std::uint32_t state) { return std::pair{sail::makeEvent(3, 0), std::uint64_t{state}}; };
+  const auto eventIs = [&](std::size_t index, std::pair<std::uint64_t, std::uint64_t> expected) {
+    return index < g_notify_events.size() && g_notify_events[index].event == expected.first &&
+           g_notify_events[index].arg0 == expected.second && g_notify_events[index].arg == kNotifyArg &&
+           g_notify_events[index].on_service;
+  };
+
+  // The objects the game builds before it opens a stream, for the player at `player_address`.
+  const auto bootPlayer = [&](std::uint32_t player_address, std::uint32_t sound_address,
+                              std::uint32_t gfx_address, std::uint32_t uri_address) {
+    CHECK(call("cellSailPlayerInitialize2",
+               {player_address, allocator, notify_opd, kNotifyArg, attribute, resource}) == 0);
+    CHECK(call("cellSailSoundAdapterInitialize", {sound_address, sound_funcs, kSoundArg}) == 0);
+    CHECK(call("cellSailSoundAdapterSetPreferredFormat", {sound_address, audio_format}) == 0);
+    CHECK(call("cellSailPlayerSetSoundAdapter", {player_address, 0, sound_address}) == 0);
+    CHECK(call("cellSailGraphicsAdapterInitialize", {gfx_address, gfx_funcs, kGfxArg}) == 0);
+    CHECK(call("cellSailGraphicsAdapterSetPreferredFormat", {gfx_address, video_format}) == 0);
+    CHECK(call("cellSailPlayerSetGraphicsAdapter", {player_address, 0, gfx_address}) == 0);
+    CHECK(call("cellSailPlayerBoot", {player_address, 0}) == 0);
+    CHECK(call("cellSailPlayerCreateDescriptor", {player_address, 0, 0, uri_address, pp_desc}) == 0);
+    const std::uint32_t desc = dalRead32(base, pp_desc);
+    CHECK(call("cellSailPlayerAddDescriptor", {player_address, desc}) == 0);
+    return desc;
+  };
+
+  dalWrite32(base, funcs, alloc_opd);
+  dalWrite32(base, funcs + 4, free_opd);
+  CHECK(call("cellSailMemAllocatorInitialize", {allocator, funcs, kAllocArg}) == 0);
+  dalWrite32(base, attribute, 6);
+  dalWrite32(base, attribute + 4, 1);
+  dalWrite32(base, attribute + 8, 1);
+  // The game's callbacks: only the sound format change and the graphics format and frame callbacks do
+  // anything here.
+  dalWrite32(base, sound_funcs + 0, 0);
+  dalWrite32(base, sound_funcs + 4, 0);
+  dalWrite32(base, sound_funcs + 8, changed_opd);
+  dalWrite32(base, gfx_funcs + 0, 0);
+  dalWrite32(base, gfx_funcs + 4, 0);
+  dalWrite32(base, gfx_funcs + 8, changed_opd);
+  dalWrite32(base, gfx_funcs + 12, frame_alloc_opd);
+  dalWrite32(base, gfx_funcs + 16, frame_free_opd);
+  std::memset(base + video_format, 0xff, sail::kVideoFormatSize);  // as the game: ARGB, alpha 255
+  dalWrite8(base, video_format, sail::kVideoCodingArgbInterleaved);
+  dalWrite32(base, video_format + sail::kVideoFormatAlpha, 255);
+  std::memset(base + audio_format, 0xff, sail::kAudioFormatSize);
+  dalWrite8(base, audio_format, sail::kAudioCodingLpcmFloat32);
+  dalWrite8(base, audio_format + 1, 2);
+  dalWrite32(base, audio_format + sail::kAudioFormatFs, 48000);
+
+  const std::uint32_t desc = bootPlayer(player, sound, gfx, uri);
+  CHECK(waitForEvents(4));  // INITIALIZED and the three Boot events
+  const std::size_t booted = g_notify_events.size();
+
+  // Calls out of order are refused.
+  CHECK(call("cellSailPlayerStart", {player, command, 0}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailGraphicsAdapterGetFrame", {gfx, info}) == static_cast<std::uint32_t>(sail::kSyncNoFrame));
+  CHECK(call("cellSailPlayerOpenStream", {player_b, 0}) == sail::kErrorInvalidState);
+
+  // OpenStream: the format and the frame buffers are there before the completion arrives.
+  CHECK(call("cellSailPlayerOpenStream", {player, 0}) == 0);
+  CHECK(call("cellSailPlayerOpenStream", {player, 0}) == sail::kErrorInvalidState);  // not Closed any more
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailGraphicsAdapterGetFormat", {gfx, format_out}) == 0);
+  CHECK(dalRead8(base, format_out + sail::kVideoFormatCoding) == sail::kVideoCodingArgbInterleaved);
+  CHECK(dalRead16(base, format_out + sail::kVideoFormatWidth) == 1280 &&
+        dalRead16(base, format_out + sail::kVideoFormatHeight) == 720 &&
+        dalRead32(base, format_out + sail::kVideoFormatPitch) == 5120 &&
+        dalRead32(base, format_out + sail::kVideoFormatAlpha) == 255);
+  CHECK(dalRead8(base, format_out + sail::kVideoFormatFrameRate) == sail::kVideoFrameRate30000Over1001);
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailSoundAdapterGetFormat", {sound, format_out}) == 0);
+  CHECK(dalRead8(base, format_out + sail::kAudioFormatChNum) == 2 &&
+        dalRead32(base, format_out + sail::kAudioFormatFs) == 48000);
+  CHECK(waitForEvents(booted + 4));
+  CHECK(g_notify_events.size() == booted + 4 && eventIs(booted, stateEvent(3)) &&
+        eventIs(booted + 1, {sail::makeEvent(4, 0), 0}) && eventIs(booted + 2, stateEvent(4)) &&
+        eventIs(booted + 3, {sail::makeEvent(2, sail::kCallOpenStream), 0}));
+  // Both format callbacks ran before the completion and the frames were requested once: 3 buffers
+  // of one tightly packed 1280x720 ARGB frame, pitch 5120.
+  CHECK(g_format_changes.size() == 2 && g_format_changes[0].arg == kSoundArg && g_format_changes[1].arg == kGfxArg);
+  CHECK(g_frame_allocs.size() == 1 && g_frame_buffers.size() == 3);
+  if (g_frame_allocs.size() == 1) {
+    CHECK(g_frame_allocs[0].arg == kGfxArg && g_frame_allocs[0].size == 5120 * 720 && g_frame_allocs[0].num == 3);
+  }
+  // One scratch block for the formats, the pointer array and the sound frame, from the game's allocator
+  // (after the descriptor's block).
+  CHECK(g_alloc_calls.size() == 2 && g_alloc_calls[1].arg == kAllocArg && g_alloc_calls[1].boundary == 0x10 &&
+        g_alloc_calls[1].value == 96 + 2048 * 8);
+
+  // Nothing is delivered before Start.
+  CHECK(call("cellSailGraphicsAdapterGetFrame", {gfx, info}) == static_cast<std::uint32_t>(sail::kSyncNoFrame));
+  CHECK(call("cellSailSoundAdapterGetFrame", {sound, 256, info}) == static_cast<std::uint32_t>(sail::kSyncNoFrame));
+
+  // Start: START_TRANSITION, SESSION_STARTED, RUNNING, then the completion, and RUNNING first.
+  const std::size_t opened = g_notify_events.size();
+  CHECK(call("cellSailPlayerStart", {player, command, 0}) == 0);
+  CHECK(call("cellSailPlayerStart", {player, command, 0}) == sail::kErrorInvalidState);
+  CHECK(waitForEvents(opened + 4));
+  CHECK(g_notify_events.size() == opened + 4 && eventIs(opened, stateEvent(5)) &&
+        eventIs(opened + 1, {sail::makeEvent(6, 0), 0}) && eventIs(opened + 2, stateEvent(6)) &&
+        eventIs(opened + 3, {sail::makeEvent(2, sail::kCallStart), 0}));
+
+  // The first frame: the black frame of a movie without codecs, in one of the game's buffers.
+  const std::uint32_t frame_taken = call("cellSailGraphicsAdapterGetFrame", {gfx, info});
+  CHECK(frame_taken == static_cast<std::uint32_t>(sail::kSyncNextOnTime));
+  const std::uint32_t buffer = dalRead32(base, info + sail::kFrameInfoBuffer);
+  CHECK(std::ranges::find(g_frame_buffers, buffer) != g_frame_buffers.end());
+  CHECK(dalRead32(base, info + sail::kFrameInfoTag) == 1 && dalRead32(base, info + sail::kFrameInfoStatus) == 0 &&
+        dalRead32(base, info + sail::kFrameInfoSessionId) != 0);
+  CHECK(dalRead64(base, info + sail::kFrameInfoPts) == 89310);
+  // ARGB black with alpha 255, all the way down to the last pixel.
+  CHECK(dalRead8(base, buffer) == 255 && dalRead8(base, buffer + 1) == 0 && dalRead8(base, buffer + 3) == 0 &&
+        dalRead8(base, buffer + 5120 * 720 - 4) == 255);
+  CHECK(call("cellSailGraphicsAdapterGetFrame", {gfx, info}) == static_cast<std::uint32_t>(sail::kSyncNoFrame));
+  CHECK(dalRead32(base, info + sail::kFrameInfoBuffer) == 0);  // every field written
+  CHECK(call("cellSailGraphicsAdapterUpdateAvSync", {gfx, 1, 12345}) == 0);
+
+  // Sound frames: silence of the requested length, timestamped along the clock.
+  std::memset(base + info, 0xee, sail::kFrameInfoSize);  // the game does not clear this one
+  CHECK(call("cellSailSoundAdapterGetFrame", {sound, 256, info}) == static_cast<std::uint32_t>(sail::kSyncNextOnTime));
+  const std::uint32_t pcm = dalRead32(base, info + sail::kFrameInfoBuffer);
+  CHECK(pcm != 0 && dalRead32(base, info + sail::kFrameInfoStatus) == 0 &&
+        dalRead32(base, info + sail::kFrameInfoTag) == 1 && dalRead64(base, info + sail::kFrameInfoPts) == 89310);
+  bool silent = true;
+  for (std::uint32_t i = 0; i < 256 * 8; i++) silent = silent && dalRead8(base, pcm + i) == 0;
+  CHECK(silent);
+  CHECK(call("cellSailSoundAdapterGetFrame", {sound, 256, info}) == static_cast<std::uint32_t>(sail::kSyncNextOnTime));
+  CHECK(dalRead64(base, info + sail::kFrameInfoPts) == 89310 + 256 * 90000 / 48000);
+  CHECK(call("cellSailSoundAdapterGetFrame", {sound, 4096, info}) == sail::kErrorInvalidArg);
+  CHECK(call("cellSailSoundAdapterUpdateAvSync", {sound, 2, 99}) == 0);
+
+  // The end comes from the wall clock, seen by a frame poll: SOURCE_EOS, STOP_TRANSITION, OPENED.
+  const std::size_t running = g_notify_events.size();
+  for (int i = 0; i < 400 && g_notify_events.size() < running + 3; i++) {
+    call("cellSailGraphicsAdapterGetFrame", {gfx, info});
+    pauseUnlocked();
+  }
+  CHECK(waitForEvents(running + 3));
+  CHECK(g_notify_events.size() == running + 3 && eventIs(running, {sail::makeEvent(8, 0), 0}) &&
+        eventIs(running + 1, stateEvent(7)) && eventIs(running + 2, stateEvent(4)));
+  CHECK(call("cellSailGraphicsAdapterGetFrame", {gfx, info}) == static_cast<std::uint32_t>(sail::kSyncNoFrame));
+  CHECK(g_notify_events.size() == running + 3);  // the end is reported once
+
+  // Finalize hands every buffer back: the frames through the adapter, the scratch block through the
+  // allocator, and it reports the movie.
+  const std::size_t frees = g_free_calls.size();
+  CHECK(call("cellSailPlayerFinalize", {player}) == 0);
+  CHECK(g_frame_frees.size() == 1);
+  if (g_frame_frees.size() == 1) {
+    CHECK(g_frame_frees[0].arg == kGfxArg && g_frame_frees[0].num == 3 && g_frame_frees[0].pointers == g_frame_buffers);
+  }
+  // The scratch block is the one allocated after the descriptor's 0x100-byte block.
+  CHECK(g_free_calls.size() == frees + 1 && g_free_calls[frees].arg == kAllocArg &&
+        g_free_calls[frees].value == scratch + 0x20000 + 0x100);
+  const std::string census = dal::formatCensus();
+  CHECK(census.find("census: sail 1 movies") != std::string::npos);
+  CHECK(census.find("movie " + movie_guest + ": 1280x720 29.97 fps") != std::string::npos);
+  CHECK(census.find("audio 512 samples, played 0.30 s of 0.30 s") != std::string::npos);
+  CHECK(call("cellSailPlayerFinalize", {player}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailGraphicsAdapterUpdateAvSync", {gfx, 1, 1}) == 0);  // the adapter outlives the player
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == 0);
+  CHECK(call("cellSailSoundAdapterFinalize", {sound}) == 0);
+  CHECK(call("cellSailGraphicsAdapterFinalize", {gfx}) == 0);
+
+  // A descriptor whose file is missing: OpenStream completes anyway, with the default format and no
+  // buffers; the game then fails at CreateDatabase. Start refuses the stream.
+  const std::size_t before_missing = g_notify_events.size();
+  const std::size_t allocs = g_frame_allocs.size();
+  const std::uint32_t missing = bootPlayer(player_b, sound_b, gfx_b, uri_missing);
+  CHECK(waitForEvents(before_missing + 4));
+  const std::size_t booted_b = g_notify_events.size();
+  CHECK(call("cellSailPlayerOpenStream", {player_b, 0}) == 0);
+  CHECK(waitForEvents(booted_b + 4));
+  CHECK(eventIs(booted_b + 3, {sail::makeEvent(2, sail::kCallOpenStream), 0}));
+  CHECK(g_frame_allocs.size() == allocs);
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailGraphicsAdapterGetFormat", {gfx_b, format_out}) == 0);
+  CHECK(dalRead16(base, format_out + sail::kVideoFormatWidth) == 1280 &&
+        dalRead32(base, format_out + sail::kVideoFormatPitch) == 5120);
+  CHECK(call("cellSailDescriptorCreateDatabase", {missing, database, 0x80, 0}) == sail::kErrorInvalidFd);
+  CHECK(call("cellSailPlayerStart", {player_b, command, 0}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerFinalize", {player_b}) == 0);
+  CHECK(dal::formatCensus().find("census: sail 2 movies") != std::string::npos);
+  CHECK(dal::formatCensus().find("dal_sail_playback_missing.pam: not played") != std::string::npos);
+
+  // Finalize right after Start, before the service thread has drained: whatever was queued before it
+  // is delivered, nothing follows, and the frames and the scratch block are handed back exactly once.
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player_b, missing}) == 0);
+  CHECK(call("cellSailSoundAdapterFinalize", {sound_b}) == 0);
+  CHECK(call("cellSailGraphicsAdapterFinalize", {gfx_b}) == 0);
+  const std::size_t frames_before = g_frame_buffers.size();
+  const std::size_t frame_frees_before = g_frame_frees.size();
+  const std::size_t scratch_frees_before = g_free_calls.size();
+  const std::size_t events_before_c = g_notify_events.size();
+  bootPlayer(player_b, sound_b, gfx_b, uri);
+  CHECK(waitForEvents(events_before_c + 4));
+  const std::size_t booted_c = g_notify_events.size();
+  const std::uint32_t expected_scratch = g_bump_next;  // the next block the game's allocator hands out
+  CHECK(call("cellSailPlayerOpenStream", {player_b, 0}) == 0);
+  CHECK(waitForEvents(booted_c + 4));
+  CHECK(g_frame_buffers.size() == frames_before + 3);
+  CHECK(call("cellSailPlayerStart", {player_b, command, 0}) == 0);
+  CHECK(call("cellSailPlayerFinalize", {player_b}) == 0);
+  const std::size_t events_after_finalize = g_notify_events.size();
+  for (int i = 0; i < 50; i++) pauseUnlocked();
+  CHECK(g_notify_events.size() == events_after_finalize);
+  CHECK(g_frame_frees.size() == frame_frees_before + 1);
+  if (g_frame_frees.size() == frame_frees_before + 1 && g_frame_buffers.size() == frames_before + 3) {
+    const std::vector<std::uint32_t> second(g_frame_buffers.end() - 3, g_frame_buffers.end());
+    CHECK(g_frame_frees.back().arg == kGfxArg && g_frame_frees.back().pointers == second);
+  }
+  CHECK(g_free_calls.size() == scratch_frees_before + 1 && g_free_calls.back().value == expected_scratch);
+  CHECK(call("cellSailGraphicsAdapterGetFrame", {gfx_b, info}) == sail::kErrorInvalidState);  // unbound
+  CHECK(dal::formatCensus().find("census: sail 3 movies") != std::string::npos);
+
+  dal::stopSailService();
+  dal::resetCellSail();
+  dal::configureVfs(dal::VfsLayout{});
+  std::filesystem::remove(movie_path, ec);
+  dal::resetHostFunctions();
+  dal::resetSyncObjects();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 void appendTimestamp(Bytes& v, int prefix, std::int64_t ts) {
   v.push_back(static_cast<std::uint8_t>((prefix << 4) | (((ts >> 30) & 7) << 1) | 1));
   v.push_back(static_cast<std::uint8_t>(ts >> 22));
@@ -1541,6 +1910,7 @@ int main() {
   testSailService();
   testPamfHeader();
   testSailPlayerHandlers();
+  testSailPlayback();
   testPamfDemuxSynthetic();
   testPamfDemuxDamage();
   testMoviePlayerOrderAndTiming();
