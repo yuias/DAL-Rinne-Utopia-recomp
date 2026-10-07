@@ -9,6 +9,7 @@
 #include <format>
 #include <string>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -120,6 +121,13 @@ bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
   if (builder_ != nullptr) {
     regs_->apply(method, value);
     builder_->onWrite(*regs_, method, value);
+    // After the builder, so the memory it read is recorded ahead of the write that caused the read.
+    if (capture_ != nullptr) capture_->onWrite(method, value);
+    // Only a completed flip command gets here. The next frame starts from the state this flip left,
+    // which includes its context reset and this write.
+    if (method == kMethodGcmFlipCommand && capture_ == nullptr && captureWanted(flips_reached_ + 1)) {
+      startCapture(static_cast<std::uint32_t>(flips_reached_ + 1));
+    }
   }
   return true;
 }
@@ -129,8 +137,42 @@ void RsxConsumer::enableFrameBuilder() {
   regs_ = std::make_unique<RsxRegisters>();
   regs_->reset();
   memory_view_ = std::make_unique<GuestRsxMemoryView>(base_);
-  builder_ = std::make_unique<RsxFrameBuilder>(*memory_view_);
+  recording_view_ = std::make_unique<RsxRecordingMemoryView>(*memory_view_);
+  builder_ = std::make_unique<RsxFrameBuilder>(*recording_view_);
 }
+
+void RsxConsumer::enableCapture(std::vector<std::uint32_t> frames) {
+  enableFrameBuilder();
+  std::sort(frames.begin(), frames.end());
+  frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+  capture_frames_ = std::move(frames);
+  if (capture_ == nullptr && captureWanted(1)) startCapture(1);
+}
+
+bool RsxConsumer::captureWanted(std::uint32_t frame) const {
+  return std::binary_search(capture_frames_.begin(), capture_frames_.end(), frame);
+}
+
+void RsxConsumer::startCapture(std::uint32_t frame) {
+  capture_frame_ = frame;
+  capture_ = std::make_unique<RsxCaptureWriter>(frame - 1, *regs_, builder_->knownSurfaces());
+  recording_view_->setWriter(capture_.get());
+}
+
+void RsxConsumer::finishCapture(std::uint32_t buffer) {
+  capture_->onFlip(buffer);
+  const RsxState& state = rsxState();
+  FinishedCapture done;
+  done.frame = capture_frame_;
+  done.writes = capture_->writeCount();
+  done.ranges = capture_->rangeCount();
+  done.file = capture_->finish(state.display, state.display_count);
+  finished_captures_.push_back(std::move(done));
+  recording_view_->setWriter(nullptr);
+  capture_.reset();
+}
+
+std::vector<RsxConsumer::FinishedCapture> RsxConsumer::takeCaptures() { return std::exchange(finished_captures_, {}); }
 
 std::vector<RsxCommand> RsxConsumer::takeCommands() {
   return builder_ != nullptr ? builder_->takeCommands() : std::vector<RsxCommand>{};
@@ -315,6 +357,8 @@ bool RsxConsumer::flip(std::uint32_t buffer) {
     flip_reached_ = true;
     static constexpr RsxDisplayBuffer kNoBuffer{};
     builder_->onFlip(*regs_, buffer, buffer < kRsxDisplayBufferCount ? state.display[buffer] : kNoBuffer);
+    if (capture_ != nullptr) finishCapture(buffer);
+    flips_reached_++;
     // RPCS3 resets the method registers where the command executes (`flip_command` -> `thread::reset`).
     regs_->contextReset();
   }
@@ -433,6 +477,9 @@ RsxUnimplementedCensus unimplementedCensus() { return {rsxUnimplementedSnapshot(
 
 RsxCommandSink g_command_sink;
 bool g_frame_builder_enabled = false;
+std::vector<std::uint32_t> g_capture_frames;
+std::filesystem::path g_capture_dir;
+std::atomic<std::uint32_t> g_captures_written{0};
 
 // Runs once on the stop path, after the text census.
 void onStop() {
@@ -440,6 +487,10 @@ void onStop() {
   if (g_consumer->frameBuilderEnabled()) {
     const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
     logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
+  }
+  const std::uint32_t written = g_captures_written.load();
+  if (written < g_capture_frames.size()) {
+    logWarn("dal: rsx: {} of {} requested captures written", written, g_capture_frames.size());
   }
   if (g_consumer->argCensus() != nullptr) g_consumer->argCensus()->writeFiles();
 }
@@ -450,6 +501,21 @@ void dispatchCommands(RsxConsumer* consumer, std::vector<RsxCommand> commands) {
   if (commands.empty()) return;
   consumer->countCommands(commands);
   if (g_command_sink) g_command_sink(std::move(commands));
+}
+
+// File I/O stays out of the guest lock; a failed write is reported and the run goes on.
+void writeCaptures(const std::vector<RsxConsumer::FinishedCapture>& captures) {
+  for (const RsxConsumer::FinishedCapture& capture : captures) {
+    const std::filesystem::path path = g_capture_dir / std::format("frame_{}.dalcap", capture.frame);
+    std::string error;
+    if (!writeCaptureFile(path, capture.file, error)) {
+      logWarn("dal: rsx: capture of frame {} failed: {}", capture.frame, error);
+      continue;
+    }
+    g_captures_written.fetch_add(1);
+    logInfo("dal: rsx: captured frame {} -> {} ({} bytes, {} writes, {} ranges)", capture.frame, path.generic_string(),
+            capture.file.size(), capture.writes, capture.ranges);
+  }
 }
 
 // A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
@@ -503,6 +569,7 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
     FifoStatus status;
     do {
       std::vector<RsxCommand> commands;
+      std::vector<RsxConsumer::FinishedCapture> captures;
       {
         std::lock_guard<GuestLock> lock(guestLock());
         if (pending_tick) {
@@ -511,8 +578,10 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
         }
         status = consumer->pump(kPumpBudgetWords);
         commands = consumer->takeCommands();
+        captures = consumer->takeCaptures();
       }
       dispatchCommands(consumer, std::move(commands));
+      if (!captures.empty()) writeCaptures(captures);
     } while (status == FifoStatus::Budget);
   }
 }
@@ -525,6 +594,14 @@ void setRsxCommandSink(RsxCommandSink sink) { g_command_sink = std::move(sink); 
 
 void setRsxFrameBuilderEnabled(bool enabled) { g_frame_builder_enabled = enabled; }
 
+void setRsxCaptureFrames(std::vector<std::uint32_t> frames, std::filesystem::path dir) {
+  std::sort(frames.begin(), frames.end());
+  frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+  g_capture_frames = std::move(frames);
+  g_capture_dir = std::move(dir);
+  if (!g_capture_frames.empty()) g_frame_builder_enabled = true;
+}
+
 void startRsxThread(std::uint8_t* base) {
   if (g_consumer != nullptr) return;
   // Leaked: the thread runs until the process ends.
@@ -535,6 +612,7 @@ void startRsxThread(std::uint8_t* base) {
     g_consumer->enableArgCensus(g_arg_census_file, std::filesystem::path("generated") / "rsx");
   }
   if (g_frame_builder_enabled) g_consumer->enableFrameBuilder();
+  if (!g_capture_frames.empty()) g_consumer->enableCapture(g_capture_frames);
   if (!g_arg_census_file.empty() || g_frame_builder_enabled) setRsxStopWriter(&onStop);
   std::thread(consumerLoop, g_consumer, base).detach();
 }

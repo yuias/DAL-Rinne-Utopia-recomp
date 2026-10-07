@@ -57,6 +57,9 @@ class RsxFrameBuilder {
   std::span<const RsxSurface> knownSurfaces() const { return known_surfaces_; }
   void setKnownSurfaces(std::vector<RsxSurface> surfaces) { known_surfaces_ = std::move(surfaces); }
 
+  // Index the next flip command gets; a replay continues the numbering of the run it was captured from.
+  void setFlipIndex(std::uint64_t index) { flips_ = index; }
+
  private:
   struct Range {
     std::uint32_t first = 0, count = 0;

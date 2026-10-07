@@ -17,6 +17,7 @@
 
 #include "core/census.h"
 #include "rsx/fifo_parser.h"
+#include "rsx/rsx_capture.h"
 #include "rsx/rsx_census.h"
 #include "rsx/rsx_frame.h"
 #include "rsx/rsx_frame_builder.h"
@@ -72,6 +73,18 @@ class RsxConsumer final : public RsxSink {
   };
   CommandCounts commandCounts() const;
 
+  // Records the listed frames (1 = the writes up to and including the first flip command, N = those
+  // after flip N-1 up to flip N) for rsx/rsx_capture.h. Enables the frame builder; call before the
+  // first write.
+  void enableCapture(std::vector<std::uint32_t> frames);
+  struct FinishedCapture {
+    std::uint32_t frame = 0;
+    std::uint64_t writes = 0, ranges = 0;
+    RsxCaptureFile file;
+  };
+  // Captures completed since the last call; with the guest lock held, like write().
+  std::vector<FinishedCapture> takeCaptures();
+
   bool faulted() const { return faulted_; }
   std::uint32_t parserGet() const { return get_; }
 
@@ -118,6 +131,16 @@ class RsxConsumer final : public RsxSink {
   std::unique_ptr<RsxFrameBuilder> builder_;
   bool flip_reached_ = false;  // the flip command was seen and is waiting for its VBlank
   std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0};
+
+  void startCapture(std::uint32_t frame);
+  void finishCapture(std::uint32_t buffer);
+  bool captureWanted(std::uint32_t frame) const;
+  std::unique_ptr<RsxRecordingMemoryView> recording_view_;  // between the builder and memory_view_
+  std::vector<std::uint32_t> capture_frames_;
+  std::unique_ptr<RsxCaptureWriter> capture_;  // the frame being recorded
+  std::uint32_t capture_frame_ = 0;
+  std::uint64_t flips_reached_ = 0;  // flip commands the parser has reached (the builder's flip index)
+  std::vector<FinishedCapture> finished_captures_;
 };
 
 // Receives the commands the frame builder produced, in order, on the RSX thread without the guest lock.
@@ -127,6 +150,10 @@ void setRsxCommandSink(RsxCommandSink sink);
 
 // Turns the frame builder on for the consumer startRsxThread creates. Call before startRsxThread.
 void setRsxFrameBuilderEnabled(bool enabled);
+
+// Captures the listed frames (see RsxConsumer::enableCapture) into `<dir>/frame_<N>.dalcap`, written on
+// the RSX thread after the guest lock is released. Implies the frame builder. Call before startRsxThread.
+void setRsxCaptureFrames(std::vector<std::uint32_t> frames, std::filesystem::path dir);
 
 // Turns the argument census on for the consumer startRsxThread creates; written to `json_path` (the
 // program dumps go to generated/rsx) when the process stops. Call before startRsxThread.

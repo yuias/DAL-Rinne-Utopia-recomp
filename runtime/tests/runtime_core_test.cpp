@@ -45,6 +45,7 @@
 #include "lv2/sys_sync.h"
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
+#include "rsx/rsx_capture.h"
 #include "rsx/rsx_census.h"
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame.h"
@@ -5052,6 +5053,256 @@ void testRsxFrameBuilder() {
   dal::rsxUnimplementedReset();
 }
 
+bool sameSurface(const dal::RsxSurface& a, const dal::RsxSurface& b) {
+  return a.location == b.location && a.offset == b.offset && a.pitch == b.pitch && a.width == b.width &&
+         a.height == b.height && a.format == b.format;
+}
+
+bool sameSurfaceState(const dal::RsxSurfaceState& a, const dal::RsxSurfaceState& b) {
+  return sameSurface(a.color, b.color) && a.has_color == b.has_color && sameSurface(a.depth, b.depth) &&
+         a.depth_format == b.depth_format && a.clip_x == b.clip_x && a.clip_y == b.clip_y && a.clip_w == b.clip_w &&
+         a.clip_h == b.clip_h;
+}
+
+bool sameCommand(const dal::RsxCommand& left, const dal::RsxCommand& right) {
+  if (left.index() != right.index()) return false;
+  if (const auto* a = std::get_if<dal::RsxClear>(&left)) {
+    const auto& b = std::get<dal::RsxClear>(right);
+    return sameSurfaceState(a->surfaces, b.surfaces) && a->mask == b.mask && a->color_argb == b.color_argb &&
+           a->depth_stencil == b.depth_stencil && std::equal(a->scissor, a->scissor + 4, b.scissor);
+  }
+  if (const auto* a = std::get_if<dal::RsxFlip>(&left)) {
+    const auto& b = std::get<dal::RsxFlip>(right);
+    return a->buffer == b.buffer && a->offset == b.offset && a->pitch == b.pitch && a->width == b.width &&
+           a->height == b.height && a->flip_index == b.flip_index;
+  }
+  const auto& a = std::get<dal::RsxDraw>(left);
+  const auto& b = std::get<dal::RsxDraw>(right);
+  if (!sameSurfaceState(a.surfaces, b.surfaces) || a.primitive != b.primitive || a.indexed != b.indexed ||
+      a.index_type != b.index_type || a.first != b.first || a.count != b.count || a.min_index != b.min_index ||
+      a.attribs.size() != b.attribs.size() || a.textures.size() != b.textures.size() ||
+      a.vertex_data != b.vertex_data || a.index_data != b.index_data || a.texture_data != b.texture_data ||
+      a.vp_hash != b.vp_hash || a.vp_ucode != b.vp_ucode || a.vp_constants != b.vp_constants ||
+      a.fp_hash != b.fp_hash || a.fp_ucode != b.fp_ucode || a.fp_constants != b.fp_constants ||
+      a.fp_control != b.fp_control || a.texcoord_control != b.texcoord_control || a.raster.cull != b.raster.cull ||
+      a.default_attribs != b.default_attribs) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.textures.size(); i++) {
+    const auto& x = a.textures[i];
+    const auto& y = b.textures[i];
+    if (x.unit != y.unit || x.rt_alias != y.rt_alias || x.offset != y.offset || x.pitch != y.pitch ||
+        x.width != y.width || x.height != y.height || x.data_offset != y.data_offset || x.data_size != y.data_size) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < a.attribs.size(); i++) {
+    const auto& x = a.attribs[i];
+    const auto& y = b.attribs[i];
+    if (x.slot != y.slot || x.type != y.type || x.size != y.size || x.stride != y.stride ||
+        x.location != y.location || x.offset != y.offset || x.data_offset != y.data_offset ||
+        x.has_data != y.has_data) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void testRsxCapture() {
+  dal::rsxUnimplementedReset();
+  auto regs = std::make_unique<dal::RsxRegisters>();
+  regs->reset();
+  const auto initial = std::make_unique<dal::RsxRegisters>(*regs);
+  FakeRsxMemory memory;
+  dal::RsxRecordingMemoryView recording(memory);
+  dal::RsxFrameBuilder builder(recording);
+  dal::RsxCaptureWriter writer(7, *regs, builder.knownSurfaces());
+  builder.setFlipIndex(7);  // the capture header says this frame ends with flip 7
+  recording.setWriter(&writer);
+  std::vector<dal::RsxCommand> live;
+  const auto write = [&](std::uint32_t method, std::uint32_t value) {
+    regs->apply(method, value);
+    builder.onWrite(*regs, method, value);
+    writer.onWrite(method, value);
+  };
+  const auto collect = [&]() {
+    for (dal::RsxCommand& command : builder.takeCommands()) live.push_back(std::move(command));
+  };
+
+  // A frame with a clear, an indexed draw, a draw sampling the cleared surface and a draw with a
+  // texture copied from memory.
+  write(0x0200, 1280u << 16);
+  write(0x0204, 720u << 16);
+  write(0x0208, 8u | (2u << 5) | (1u << 8));
+  write(0x020C, 0x1400);
+  write(0x0210, 0x100000);
+  write(0x0214, 0x900000);
+  write(0x022C, 0x1400);
+  write(0x0220, 1);
+  write(0x08C0, 1280u << 16);
+  write(0x08C4, 720u << 16);
+  write(0x1D90, 0xFF102030);
+  write(0x1D8C, 0xFFFFFF00);
+  write(0x1D94, 0xF3);
+
+  for (std::uint32_t i = 0; i < 96; i++) memory.main[0x1000 + i] = static_cast<std::uint8_t>(i * 3);
+  write(0x1740, 2u | (3u << 4) | (12u << 8));
+  write(0x1680, 0x80001000);
+  write(0x08E4, 0x2000 | 1);
+  memory.putWord(0, 0x2000, 0x00010000);
+  write(0x1D60, 0x40);
+  write(0x0B40 + 4, 1);
+  const std::uint16_t indices[] = {1, 2, 3, 2};
+  for (int i = 0; i < 4; i++) {
+    memory.main[0x2000 + i * 2] = static_cast<std::uint8_t>(indices[i] >> 8);
+    memory.main[0x2000 + i * 2 + 1] = static_cast<std::uint8_t>(indices[i]);
+  }
+  write(0x181C, 0x2000);
+  write(0x1820, 1u | (1u << 4));
+  write(0x1808, 5);
+  write(0x1824, 3u << 24);
+  write(0x1808, 0);
+
+  for (std::uint32_t i = 0; i < 256; i++) memory.local[0x3000 + i] = static_cast<std::uint8_t>(i ^ 0x5A);
+  const std::uint32_t format = 1u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16);
+  write(0x1A00, 0x100000);  // unit 0: alias of the cleared surface
+  write(0x1A04, format);
+  write(0x1A0C, 0x80000000);
+  write(0x1A18, (16u << 16) | 4u);
+  write(0x1840, 64);
+  write(0x1A00 + 0x20, 0x3000);  // unit 1: bytes
+  write(0x1A04 + 0x20, format);
+  write(0x1A0C + 0x20, 0x80000000);
+  write(0x1A18 + 0x20, (16u << 16) | 4u);
+  write(0x1840 + 4, 64);
+  write(0x1808, 5);
+  write(0x1814, 2u << 24);
+  write(0x1808, 0);
+  collect();
+  CHECK(live.size() == 3 && std::holds_alternative<dal::RsxClear>(live[0]) && std::holds_alternative<dal::RsxDraw>(live[1]));
+  CHECK(std::get<dal::RsxDraw>(live[2]).textures.size() == 2 && std::get<dal::RsxDraw>(live[2]).textures[0].rt_alias == 0);
+  CHECK(!std::get<dal::RsxDraw>(live[2]).texture_data.empty());
+
+  // The flip, as the consumer runs it: the builder and the writer see it, the context registers are
+  // reset, and only then does the flip method write itself land.
+  dal::RsxDisplayBuffer display;
+  display.offset = 0x400000;
+  display.pitch = 0x1400;
+  display.width = 1280;
+  display.height = 720;
+  builder.onFlip(*regs, 1, display);
+  writer.onFlip(1);
+  regs->contextReset();
+  write(dal::kMethodGcmFlipCommand, 1);
+
+  // The reset zeroed the surface offset and clip. A clear that rewrites the clip and pitch but not the
+  // offset must therefore land on offset 0, in the live run and in the replay.
+  write(0x0200, 1280u << 16);
+  write(0x0204, 720u << 16);
+  write(0x0208, 8u | (2u << 5) | (1u << 8));
+  write(0x020C, 0x1400);
+  write(0x0220, 1);
+  write(0x1D94, 0xF3);
+  collect();
+  CHECK(live.size() == 5 && std::holds_alternative<dal::RsxFlip>(live[3]) && std::holds_alternative<dal::RsxClear>(live[4]));
+  CHECK(std::get<dal::RsxClear>(live[4]).surfaces.color.offset == 0);
+  CHECK(std::get<dal::RsxClear>(live[0]).surfaces.color.offset == 0x100000);
+
+  std::array<dal::RsxDisplayBuffer, dal::kRsxDisplayBufferCount> displays{};
+  displays[1] = display;
+  recording.setWriter(nullptr);
+  const std::uint64_t live_writes = writer.writeCount();
+  const std::uint64_t live_ranges = writer.rangeCount();
+  const dal::RsxCaptureFile capture_file = writer.finish(displays, 2);
+  const std::vector<std::uint8_t> file = capture_file.flatten();
+  CHECK(capture_file.size() == file.size() && capture_file.tail.size() == 8);
+
+  dal::RsxCaptureReader reader;
+  std::string error;
+  CHECK(reader.parse(file, error));
+  CHECK(reader.flipIndex() == 7 && reader.displayCount() == 2 && reader.display()[1].offset == 0x400000);
+  CHECK(reader.writeCount() == live_writes && reader.rangeCount() == live_ranges && live_ranges > 0);
+  CHECK(reader.surfaces().empty());
+  CHECK(reader.startRegisters().regs == initial->regs && reader.startRegisters().vp_ucode == initial->vp_ucode);
+  const auto replayCommands = [](const dal::RsxCaptureReader& capture) {
+    dal::ReplayRsxMemoryView view;
+    dal::RsxFrameBuilder replay_builder(view);
+    dal::replayCapture(capture, view, replay_builder);
+    return std::pair{replay_builder.takeCommands(), std::vector<dal::RsxSurface>(replay_builder.knownSurfaces().begin(),
+                                                                                  replay_builder.knownSurfaces().end())};
+  };
+  const auto [replayed, replay_surfaces] = replayCommands(reader);
+  CHECK(replayed.size() == live.size() && std::get<dal::RsxFlip>(live[3]).flip_index == 7);
+  bool same = replayed.size() == live.size();
+  for (std::size_t i = 0; same && i < live.size(); i++) same = sameCommand(live[i], replayed[i]);
+  CHECK(same);
+  CHECK(replay_surfaces.size() == builder.knownSurfaces().size() &&
+        std::equal(replay_surfaces.begin(), replay_surfaces.end(), builder.knownSurfaces().begin(), sameSurface));
+  CHECK(unimplementedCount("capture missing range") == 0);
+
+  // The file survives a trip through the disk.
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / ("dal_rsx_capture_test_" + std::to_string(GetCurrentProcessId()));
+  const std::filesystem::path path = dir / "nested" / "frame.dalcap";
+  CHECK(dal::writeCaptureFile(path, capture_file, error));
+  dal::RsxCaptureReader from_disk;
+  CHECK(from_disk.load(path, error) && from_disk.events().size() == reader.events().size());
+  CHECK(!from_disk.load(dir / "missing.dalcap", error) && !error.empty());
+  std::error_code remove_ec;
+  std::filesystem::remove_all(dir, remove_ec);
+
+  // A frame that starts mid-run starts from non-default registers and known surfaces.
+  regs->vp_ucode[5] = 0x1234;
+  regs->vp_constants[9] = 0xABCD;
+  regs->vp_load = 3;
+  regs->vp_start = 4;
+  regs->constant_load = 6;
+  const dal::RsxSurface known{1, 0x2000, 0x800, 64, 32, dal::RsxColorFormat::A8R8G8B8};
+  dal::RsxCaptureWriter second(11, *regs, std::span<const dal::RsxSurface>(&known, 1));
+  dal::RsxCaptureReader second_reader;
+  CHECK(second_reader.parse(second.finish({}, 0).flatten(), error));
+  CHECK(second_reader.flipIndex() == 11 && second_reader.events().empty());
+  CHECK(second_reader.startRegisters().regs == regs->regs && second_reader.startRegisters().vp_ucode == regs->vp_ucode);
+  CHECK(second_reader.startRegisters().vp_constants == regs->vp_constants);
+  CHECK(second_reader.startRegisters().vp_load == 3 && second_reader.startRegisters().vp_start == 4 &&
+        second_reader.startRegisters().constant_load == 6);
+  CHECK(second_reader.surfaces().size() == 1 && sameSurface(second_reader.surfaces()[0], known));
+
+  // Malformed files are refused.
+  std::vector<std::uint8_t> bad = file;
+  bad[0] = 'X';
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad[8] = 2;  // version
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad.resize(bad.size() - 3);
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad.push_back(0);
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad[20] = 'Q';  // first chunk tag
+  CHECK(!reader.parse(bad, error));
+  bad.assign(file.begin(), file.begin() + 20);
+  CHECK(!reader.parse(bad, error));
+  CHECK(reader.parse(file, error));
+
+  // The replay view serves only what was recorded, across page borders, and counts the rest.
+  dal::ReplayRsxMemoryView view;
+  const std::uint8_t recorded[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  view.add(0, 4092, recorded);
+  std::uint8_t out[9] = {};
+  CHECK(view.read(0, 4092, std::span<std::uint8_t>(out, 8)) && std::equal(recorded, recorded + 8, out));
+  CHECK(view.read(0, 4094, std::span<std::uint8_t>(out, 4)) && out[0] == 3 && out[3] == 6);
+  CHECK(unimplementedCount("capture missing range") == 0);
+  CHECK(!view.read(0, 4092, std::span<std::uint8_t>(out, 9)));
+  CHECK(!view.read(1, 4092, std::span<std::uint8_t>(out, 8)));
+  CHECK(!view.read(0, 0xFFFFFFFCu, std::span<std::uint8_t>(out, 8)));
+  CHECK(unimplementedCount("capture missing range") == 3);
+  dal::rsxUnimplementedReset();
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -5195,6 +5446,66 @@ void testRsxConsumer() {
   CHECK(countContaining(lines, "command fifo fault") == 1);
   CHECK(run() == FifoStatus::Fault && countContaining(lines, "command fifo fault") == 1);
   CHECK(!consumer.hasWork(at + 4));
+
+  // Capturing through a consumer: frame 2 starts from what flip 1 left behind (its context reset
+  // applied, the surface cleared in frame 1 known) and replays to the commands built after that flip.
+  // The first consumer is done, so the second one starts at the current put.
+  {
+    state.display[1] = {0x400000, 0x1400, 1280, 720};
+    state.display_count = 2;
+    dalWrite32(base, kControl + 4, at);
+    dal::RsxConsumer capturing(base);
+    capturing.enableCapture({2});
+    emit(0x0200, {1280u << 16});
+    emit(0x0204, {720u << 16});
+    emit(0x0208, {8u | (2u << 5) | (1u << 8)});
+    emit(0x020C, {0x1400});
+    emit(0x0210, {0x100000});
+    emit(0x0214, {0x900000});
+    emit(0x022C, {0x1400});
+    emit(0x0220, {1});
+    emit(0x08C0, {1280u << 16});
+    emit(0x08C4, {720u << 16});
+    emit(0x1D90, {0xFF102030});
+    emit(0x1D8C, {0xFFFFFF00});
+    emit(0x1D94, {0xF3});
+    emit(dal::kMethodGcmFlipCommand, {1});
+    // Frame 2 leaves the surface offset unset, which the context reset made 0.
+    emit(0x0200, {1280u << 16});
+    emit(0x0204, {720u << 16});
+    emit(0x0208, {8u | (2u << 5) | (1u << 8)});
+    emit(0x020C, {0x1400});
+    emit(0x0220, {1});
+    emit(0x1D94, {0xF3});
+    emit(dal::kMethodGcmFlipCommand, {2});
+    dalWrite32(base, kControl, at);
+    CHECK(capturing.pump(200) == FifoStatus::Idle);
+    const std::vector<dal::RsxCommand> live = capturing.takeCommands();
+    CHECK(live.size() == 4 && std::holds_alternative<dal::RsxClear>(live[2]) &&
+          std::holds_alternative<dal::RsxFlip>(live[3]));
+    CHECK(std::get<dal::RsxClear>(live[0]).surfaces.color.offset == 0x100000);
+    CHECK(std::get<dal::RsxClear>(live[2]).surfaces.color.offset == 0);
+    CHECK(std::get<dal::RsxFlip>(live[3]).flip_index == 1);
+
+    std::vector<dal::RsxConsumer::FinishedCapture> captures = capturing.takeCaptures();
+    CHECK(captures.size() == 1 && captures[0].frame == 2);
+    dal::RsxCaptureReader reader;
+    std::string error;
+    CHECK(reader.parse(captures[0].file.flatten(), error));
+    CHECK(reader.flipIndex() == 1);
+    CHECK(reader.startRegisters().reg(0x0210) == 0 && reader.startRegisters().reg(0x0200) == 0);
+    CHECK(reader.startRegisters().reg(dal::kMethodGcmFlipCommand) == 1);  // the flip write itself landed
+    CHECK(reader.surfaces().size() == 1 && reader.surfaces()[0].offset == 0x100000 && reader.surfaces()[0].width == 1280);
+    CHECK(reader.displayCount() == 2 && reader.display()[1].offset == 0x400000);
+    CHECK(captures[0].writes == reader.writeCount() && captures[0].writes == 6);
+
+    dal::ReplayRsxMemoryView view;
+    dal::RsxFrameBuilder replay_builder(view);
+    dal::replayCapture(reader, view, replay_builder);
+    const std::vector<dal::RsxCommand> replayed = replay_builder.takeCommands();
+    CHECK(replayed.size() == 2 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]));
+    CHECK(capturing.takeCaptures().empty());
+  }
 
   // The census section is printed only while a provider is registered.
   CHECK(dal::formatCensus().find("census: rsx") == std::string::npos);
@@ -6465,6 +6776,7 @@ int main(int argc, char** argv) {
   testRsxRegisters();
   testRsxDecode();
   testRsxFrameBuilder();
+  testRsxCapture();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();

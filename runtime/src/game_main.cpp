@@ -10,6 +10,7 @@
 #include <system_error>
 #include <utility>
 #include <string_view>
+#include <vector>
 
 #include "core/boot.h"
 #include "core/census.h"
@@ -43,7 +44,23 @@ struct Options {
   bool quiet_hle = false;
   bool load_only = false;
   bool render_vulkan = false;
+  std::vector<std::uint32_t> rsx_capture_frames;
 };
+
+bool parseFrameList(std::string_view list, std::vector<std::uint32_t>& frames) {
+  while (!list.empty()) {
+    const std::size_t comma = list.find(',');
+    const std::string_view item = list.substr(0, comma);
+    std::uint32_t frame = 0;
+    const auto [end, ec] = std::from_chars(item.data(), item.data() + item.size(), frame);
+    if (item.empty() || ec != std::errc{} || end != item.data() + item.size() || frame == 0) return false;
+    frames.push_back(frame);
+    if (comma == std::string_view::npos) break;
+    list.remove_prefix(comma + 1);
+    if (list.empty()) return false;  // trailing comma
+  }
+  return !frames.empty();
+}
 
 void printUsage() {
   std::fputs(
@@ -51,7 +68,7 @@ void printUsage() {
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
-      "                [--render none|vulkan]\n",
+      "                [--render none|vulkan] [--rsx-capture N[,M...]]\n",
       stderr);
 }
 
@@ -80,6 +97,12 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.png_dump)) return false;
     } else if (arg == "--rsx-census") {
       if (!value(opt.rsx_census)) return false;
+    } else if (arg == "--rsx-capture") {
+      std::string list;
+      if (!value(list) || !parseFrameList(list, opt.rsx_capture_frames)) {
+        std::fprintf(stderr, "error: --rsx-capture needs frame numbers (1-based), e.g. 300,600\n");
+        return false;
+      }
     } else if (arg == "--log") {
       if (!value(opt.log_file)) return false;
     } else if (arg == "--dialog-answer") {
@@ -225,6 +248,9 @@ int main(int argc, char** argv) {
 
   loadGameParamSfo();
   if (!opt.rsx_census.empty()) dal::setRsxArgCensusFile(opt.rsx_census);
+  if (!opt.rsx_capture_frames.empty()) {
+    dal::setRsxCaptureFrames(opt.rsx_capture_frames, std::filesystem::path("generated") / "rsx" / "captures");
+  }
 
   dal::installFaultHandler();
   dal::Process& process = dal::process();
