@@ -99,17 +99,18 @@ bool startServiceThread(ServiceState& s) {
 
 }  // namespace
 
-void queueSailCall(SailCall call) {
+bool queueSailCall(SailCall call) {
   ServiceState& s = serviceState();
   if (s.thread_id == 0 && !s.start_failed && !startServiceThread(s)) s.start_failed = true;
   if (s.start_failed) {
     // The game would wait for events that never come; say so instead of failing silently.
     logOnce(LogLevel::Error, "sail-service-thread",
             "dal: sail: cannot create the {} thread; a queued call is dropped", kThreadName);
-    return;
+    return false;
   }
   s.queue.push_back(std::move(call));
   s.wake.notify_one();
+  return true;
 }
 
 void stopSailService() {

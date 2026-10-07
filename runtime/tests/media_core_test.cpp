@@ -33,6 +33,7 @@
 #include "hle/hle.h"
 #include "hle/sail_service.h"
 #include "lv2/sys_sync.h"
+#include "lv2/vfs.h"
 #include "media/movie_decoder.h"
 #include "media/movie_player.h"
 #include "media/pamf.h"
@@ -335,6 +336,278 @@ void testPamfHeader() {
   CHECK(fails([](Bytes& b) { put32(b, 0x76, 89311); }));  // grouping period start differs from the start PTS
   CHECK(fails([](Bytes& b) { put32(b, 0x70, 0x75); }));   // period does not fit in the sequence info
   CHECK(fails([](Bytes& b) { put32(b, 0x82, 0x63); }));   // group does not fit in the period
+}
+
+struct NotifyEvent {
+  std::uint64_t arg, event, arg0, arg1;
+  bool on_service;
+};
+std::vector<NotifyEvent> g_notify_events;  // written under the guest lock
+
+struct AllocatorCall {
+  std::uint64_t arg, boundary, value;  // size for pAlloc, pointer for pFree
+};
+std::vector<AllocatorCall> g_alloc_calls, g_free_calls;
+std::uint32_t g_alloc_next = 0;
+
+// The player's notify callback: (arg, event, arg0, arg1).
+DAL_PPU_FUNC(sailFakeNotify) {
+  (void)base;
+  const dal::GuestThread* thread = dal::currentThread();
+  const bool on_service = thread != nullptr && thread->service() && thread->name() == "_libsail-control";
+  g_notify_events.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], on_service});
+  g_calls_cv.notify_all();
+}
+
+// The game's allocator callbacks: pAlloc(arg, boundary, size) and pFree(arg, boundary, pointer).
+DAL_PPU_FUNC(sailFakeAlloc) {
+  (void)base;
+  g_alloc_calls.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]});
+  ctx->gpr[3] = g_alloc_next;
+  g_alloc_next += 0x100;
+}
+
+DAL_PPU_FUNC(sailFakeFree) {
+  (void)base;
+  g_free_calls.push_back({ctx->gpr[3], ctx->gpr[4], ctx->gpr[5]});
+  ctx->gpr[3] = 0;
+}
+
+dal::GuestHandler sailHandlerNamed(std::string_view name) {
+  for (const auto& list : {dal::cellSailPlayerHandlers(), dal::cellSailAdapterHandlers(), dal::cellPamfHandlers()}) {
+    for (const dal::HleEntry& entry : list) {
+      if (name == entry.name) return entry.handler;
+    }
+  }
+  return nullptr;
+}
+
+void testSailPlayerHandlers() {
+  namespace sail = dal::sail;
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetSyncObjects();
+  dal::resetHostFunctions();
+  dal::resetCellSail();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  g_notify_events.clear();
+  g_alloc_calls.clear();
+  g_free_calls.clear();
+  g_alloc_next = scratch + 0x4000;
+
+  // Guest objects the handlers read or write.
+  const std::uint32_t tls_image = scratch + 0x100, allocator = scratch + 0x1000,
+                      funcs = scratch + 0x1010, attribute = scratch + 0x1020, resource = scratch + 0x1040,
+                      sound_funcs = scratch + 0x1060, gfx_funcs = scratch + 0x1070,
+                      video_format = scratch + 0x1100, audio_format = scratch + 0x1140,
+                      format_out = scratch + 0x1180, uri = scratch + 0x1200, uri_bad = scratch + 0x1300,
+                      uri_missing = scratch + 0x1380, pp_desc = scratch + 0x1480, database = scratch + 0x1500,
+                      caps = scratch + 0x1600, command = scratch + 0x1640, player = scratch + 0x2000,
+                      player_b = scratch + 0x2400, sound = scratch + 0x2800, gfx = scratch + 0x2900,
+                      stack = scratch + 0x9000;
+  constexpr std::uint64_t kAllocArg = 0xA11C, kNotifyArg = 0xCB;
+
+  std::error_code ec;
+  const std::filesystem::path movie_path = std::filesystem::temp_directory_path(ec) / "dal_sail_player_test.pam";
+  {
+    const Bytes header = makePamfHeader(0);
+    std::ofstream out(movie_path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+  }
+  const std::string movie_guest = "/dev_bdvd/PS3_GAME/USRDIR/Movie/dal_sail_player_test.pam";
+  dal::VfsLayout layout;
+  layout.files.push_back({movie_guest, movie_path, true});
+  dal::configureVfs(layout);
+  auto putString = [&](std::uint32_t addr, const std::string& text) {
+    std::memcpy(base + addr, text.c_str(), text.size() + 1);
+  };
+  putString(uri, "x-cell-fs://" + movie_guest);
+  putString(uri_bad, "http://example.invalid/movie.pam");
+  putString(uri_missing, "x-cell-fs:///dev_bdvd/PS3_GAME/USRDIR/Movie/dal_sail_missing.pam");
+
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+  DalPpuContext* ctx = boot_ctx.get();
+  ctx->gpr[1] = stack;
+  const std::uint32_t notify_opd = dal::registerHostFunction("sailFakeNotify", sailFakeNotify);
+  const std::uint32_t alloc_opd = dal::registerHostFunction("sailFakeAlloc", sailFakeAlloc);
+  const std::uint32_t free_opd = dal::registerHostFunction("sailFakeFree", sailFakeFree);
+  CHECK(notify_opd != 0 && alloc_opd != 0 && free_opd != 0);
+
+  const auto call = [&](std::string_view name, std::initializer_list<std::uint64_t> args) {
+    const dal::GuestHandler handler = sailHandlerNamed(name);
+    CHECK(handler != nullptr);
+    if (handler == nullptr) return std::uint32_t{0xdeadbeef};
+    int reg = 3;
+    for (const std::uint64_t value : args) ctx->gpr[reg++] = value;
+    handler(ctx, base);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  const auto waitForEvents = [&](std::size_t count) {
+    return waitUntil([&] { return g_notify_events.size() >= count; });
+  };
+  const auto stateEvent = [](std::uint32_t state) { return std::pair{sail::makeEvent(3, 0), std::uint64_t{state}}; };
+  const auto eventIs = [&](std::size_t index, std::pair<std::uint64_t, std::uint64_t> expected) {
+    return index < g_notify_events.size() && g_notify_events[index].event == expected.first &&
+           g_notify_events[index].arg0 == expected.second && g_notify_events[index].arg == kNotifyArg &&
+           g_notify_events[index].on_service;
+  };
+
+  // Allocator object, then Initialize2: the allocator is copied and the INITIALIZED state is
+  // reported from the service thread.
+  dalWrite32(base, funcs, alloc_opd);
+  dalWrite32(base, funcs + 4, free_opd);
+  CHECK(call("cellSailMemAllocatorInitialize", {allocator, funcs, kAllocArg}) == 0);
+  CHECK(dalRead32(base, allocator) == funcs && dalRead32(base, allocator + 4) == kAllocArg);
+  CHECK(call("cellSailMemAllocatorInitialize", {0, funcs, kAllocArg}) == sail::kErrorInvalidArg);
+  dalWrite32(base, attribute, 6);
+  dalWrite32(base, attribute + 4, 1);
+  dalWrite32(base, attribute + 8, 1);
+  CHECK(call("cellSailPlayerInitialize2", {player, allocator, notify_opd, kNotifyArg, attribute, resource}) == 0);
+  CHECK(g_notify_events.empty());  // delivery is asynchronous
+  CHECK(waitForEvents(1) && eventIs(0, stateEvent(0)));
+  CHECK(call("cellSailPlayerInitialize2", {player, allocator, notify_opd, kNotifyArg, attribute, resource}) ==
+        sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerInitialize2", {0, allocator, notify_opd, kNotifyArg, attribute, resource}) ==
+        sail::kErrorInvalidArg);
+
+  // Adapters: initialise once, preferred format round trip, registration with the player.
+  for (std::uint32_t i = 0; i < 3; i++) dalWrite32(base, sound_funcs + 4 * i, 0x1000 + i);
+  for (std::uint32_t i = 0; i < 5; i++) dalWrite32(base, gfx_funcs + 4 * i, 0x2000 + i);
+  CHECK(call("cellSailSoundAdapterInitialize", {sound, sound_funcs, kNotifyArg}) == 0);
+  CHECK(call("cellSailSoundAdapterInitialize", {sound, sound_funcs, kNotifyArg}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailGraphicsAdapterInitialize", {gfx, gfx_funcs, kNotifyArg}) == 0);
+  CHECK(call("cellSailGraphicsAdapterInitialize", {gfx, gfx_funcs, kNotifyArg}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailGraphicsAdapterInitialize", {gfx + 0x100, 0, kNotifyArg}) == sail::kErrorInvalidArg);
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailGraphicsAdapterGetFormat", {gfx, format_out}) == 0);
+  CHECK(dalRead8(base, format_out) == 0xff);  // nothing preferred yet: unspecified
+  std::memset(base + video_format, 0xff, sail::kVideoFormatSize);
+  dalWrite8(base, video_format, sail::kVideoCodingArgbInterleaved);
+  dalWrite32(base, video_format + sail::kVideoFormatAlpha, 255);
+  CHECK(call("cellSailGraphicsAdapterSetPreferredFormat", {gfx, video_format}) == 0);
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailGraphicsAdapterGetFormat", {gfx, format_out}) == 0);
+  CHECK(std::memcmp(base + format_out, base + video_format, sail::kVideoFormatSize) == 0);
+  std::memset(base + audio_format, 0xff, sail::kAudioFormatSize);
+  dalWrite8(base, audio_format, sail::kAudioCodingLpcmFloat32);
+  dalWrite8(base, audio_format + 1, 2);
+  dalWrite32(base, audio_format + sail::kAudioFormatFs, 48000);
+  CHECK(call("cellSailSoundAdapterSetPreferredFormat", {sound, audio_format}) == 0);
+  std::memset(base + format_out, 0, 32);
+  CHECK(call("cellSailSoundAdapterGetFormat", {sound, format_out}) == 0);
+  CHECK(std::memcmp(base + format_out, base + audio_format, sail::kAudioFormatSize) == 0);
+  CHECK(call("cellSailSoundAdapterSetPreferredFormat", {sound + 0x100, audio_format}) == sail::kErrorInvalidState);
+
+  CHECK(call("cellSailPlayerSetSoundAdapter", {player, 0, sound}) == 0);
+  CHECK(call("cellSailPlayerSetGraphicsAdapter", {player, 0, gfx}) == 0);
+  CHECK(call("cellSailPlayerSetGraphicsAdapter", {player, 2, gfx}) == sail::kErrorInvalidArg);
+  CHECK(call("cellSailPlayerSetGraphicsAdapter", {player, 0, gfx + 0x100}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailSoundAdapterFinalize", {sound}) == sail::kErrorInvalidState);  // registered
+  CHECK(call("cellSailGraphicsAdapterFinalize", {gfx}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerSetRepeatMode", {player, 1, command}) == 0);
+  CHECK(call("cellSailPlayerSetRepeatMode", {player_b, 1, command}) == sail::kErrorInvalidState);
+
+  // Boot: BOOT_TRANSITION, CLOSED, then CALL_COMPLETED(BOOT), in order and only from INITIALIZED.
+  CHECK(call("cellSailPlayerBoot", {player, 0}) == 0);
+  CHECK(waitForEvents(4));
+  CHECK(g_notify_events.size() == 4 && eventIs(1, stateEvent(1)) && eventIs(2, stateEvent(2)) &&
+        eventIs(3, {sail::makeEvent(2, sail::kCallBoot), 0}));
+  CHECK(call("cellSailPlayerBoot", {player, 0}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerBoot", {player_b, 0}) == sail::kErrorInvalidState);
+
+  // Descriptor: the block comes from the game's allocator and the header is read through the VFS.
+  CHECK(call("cellSailPlayerCreateDescriptor", {player, 0, 0, uri_bad, pp_desc}) == sail::kErrorUnsupportedStream);
+  CHECK(dalRead32(base, pp_desc) == 0 && g_alloc_calls.empty());
+  CHECK(call("cellSailPlayerCreateDescriptor", {player, 1, 0, uri, pp_desc}) == sail::kErrorUnsupportedStream);
+  CHECK(call("cellSailPlayerCreateDescriptor", {player, 0, 0, uri, pp_desc}) == 0);
+  const std::uint32_t desc = dalRead32(base, pp_desc);
+  CHECK(desc == scratch + 0x4000 && g_alloc_calls.size() == 1);
+  if (g_alloc_calls.size() == 1) {
+    CHECK(g_alloc_calls[0].arg == kAllocArg && g_alloc_calls[0].boundary == 0x10 &&
+          g_alloc_calls[0].value == sail::kDescriptorMaxSize);
+  }
+  CHECK(call("cellSailPlayerAddDescriptor", {player, desc}) == 0);
+  CHECK(call("cellSailPlayerAddDescriptor", {player, desc}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerAddDescriptor", {player, desc + 0x10}) == sail::kErrorInvalidArg);
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == sail::kErrorInvalidState);  // still added
+
+  // Database: one video and one audio stream for the synthetic header.
+  std::memset(base + database, 0xaa, sail::kPamfReaderSize);
+  CHECK(call("cellSailDescriptorCreateDatabase", {desc, database, 0x40, 0}) == sail::kErrorInvalidArg);
+  CHECK(call("cellSailDescriptorCreateDatabase", {desc, database, 0x80, 0}) == 0);
+  const auto streams = [&](std::uint32_t type) {
+    return call("cellPamfReaderGetNumberOfSpecificStreams", {database, type});
+  };
+  CHECK(streams(sail::kPamfStreamTypeVideo) == 1 && streams(sail::kPamfStreamTypeAudio) == 1);
+  CHECK(streams(sail::kPamfStreamTypeAvc) == 1 && streams(sail::kPamfStreamTypeAtrac3plus) == 1);
+  CHECK(streams(sail::kPamfStreamTypeM2v) == 0 && streams(sail::kPamfStreamTypeLpcm) == 0 &&
+        streams(sail::kPamfStreamTypeAc3) == 0 && streams(sail::kPamfStreamTypeUserData) == 0);
+  CHECK(streams(sail::kPamfStreamTypePsmfAvc) == 0 && streams(sail::kPamfStreamTypeUnknown) == 0 &&
+        streams(99) == 0);
+  // The selector is a u8: higher bits of the register are ignored.
+  CHECK(call("cellPamfReaderGetNumberOfSpecificStreams", {database, 0x100000000ull | 21}) == 1);
+  CHECK(call("cellPamfReaderGetNumberOfSpecificStreams", {format_out, 21}) == 0);  // not a database
+
+  // Capabilities: four word outputs, all reported clear.
+  for (std::uint32_t i = 0; i < 4; i++) dalWrite32(base, caps + 4 * i, 0xdeadbeef);
+  CHECK(call("cellSailDescriptorGetCapabilities", {desc, caps, caps + 4, caps + 8, caps + 12}) == 0);
+  CHECK(dalRead32(base, caps) == 0 && dalRead32(base, caps + 12) == 0);
+  CHECK(call("cellSailDescriptorGetCapabilities", {desc, 0, 0, 0, 0}) == 0);
+
+  CHECK(call("cellSailDescriptorDestroyDatabase", {desc, database}) == 0);
+  CHECK(call("cellSailDescriptorDestroyDatabase", {desc, database}) == sail::kErrorInvalidArg);
+  CHECK(streams(sail::kPamfStreamTypeVideo) == 0);
+
+  // A file that is missing still gets a descriptor; the database call reports why.
+  CHECK(call("cellSailPlayerCreateDescriptor", {player, 0, 0, uri_missing, pp_desc}) == 0);
+  const std::uint32_t missing = dalRead32(base, pp_desc);
+  CHECK(missing != 0 && missing != desc);
+  CHECK(call("cellSailDescriptorCreateDatabase", {missing, database, 0x80, 0}) == sail::kErrorInvalidFd);
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player, missing}) == 0);  // never added
+  CHECK(g_free_calls.size() == 1 && g_free_calls[0].value == missing && g_free_calls[0].boundary == 0x10 &&
+        g_free_calls[0].arg == kAllocArg);
+
+  // Finalize waits for the queued events: the INITIALIZED report of a second player is delivered
+  // before it returns, and nothing follows.
+  const std::size_t before_b = g_notify_events.size();
+  CHECK(call("cellSailPlayerInitialize2", {player_b, allocator, notify_opd, kNotifyArg, attribute, resource}) == 0);
+  CHECK(call("cellSailPlayerFinalize", {player_b}) == 0);
+  CHECK(g_notify_events.size() == before_b + 1);
+  CHECK(call("cellSailPlayerFinalize", {player_b}) == sail::kErrorInvalidState);
+
+  // Finalize of the booted player releases its adapters and descriptors.
+  const std::size_t before_finalize = g_notify_events.size();
+  CHECK(call("cellSailPlayerFinalize", {player}) == 0);
+  CHECK(g_notify_events.size() == before_finalize);
+  CHECK(call("cellSailPlayerBoot", {player, 0}) == sail::kErrorInvalidState);
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == 0);
+  CHECK(g_free_calls.size() == 2 && g_free_calls[1].value == desc);
+  CHECK(call("cellSailPlayerDestroyDescriptor", {player, desc}) == sail::kErrorInvalidArg);
+  CHECK(call("cellSailSoundAdapterFinalize", {sound}) == 0);
+  CHECK(call("cellSailGraphicsAdapterFinalize", {gfx}) == 0);
+  CHECK(call("cellSailGraphicsAdapterFinalize", {gfx}) == sail::kErrorInvalidState);
+  // The address can be initialised again once the old state is gone.
+  CHECK(call("cellSailPlayerInitialize2", {player, allocator, notify_opd, kNotifyArg, attribute, resource}) == 0);
+  CHECK(call("cellSailPlayerFinalize", {player}) == 0);
+
+  dal::stopSailService();
+  dal::resetCellSail();
+  dal::configureVfs(dal::VfsLayout{});
+  std::filesystem::remove(movie_path, ec);
+  dal::resetHostFunctions();
+  dal::resetSyncObjects();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
 }
 
 void appendTimestamp(Bytes& v, int prefix, std::int64_t ts) {
@@ -1267,6 +1540,7 @@ int main() {
   testCodecFactory();
   testSailService();
   testPamfHeader();
+  testSailPlayerHandlers();
   testPamfDemuxSynthetic();
   testPamfDemuxDamage();
   testMoviePlayerOrderAndTiming();

@@ -19,8 +19,9 @@ using SailCall = std::function<void(DalPpuContext*, std::uint8_t*)>;
 
 // Appends `call` to a FIFO and wakes the thread; calls run one at a time, in order. Starts the
 // thread on first use. Needs the guest lock and an initialised guest TLS area (so it works from any
-// guest thread inside an HLE handler).
-void queueSailCall(SailCall call);
+// guest thread inside an HLE handler). Returns false, dropping `call`, when the thread cannot be
+// created; nothing queued will ever run then.
+bool queueSailCall(SailCall call);
 
 // Ends the thread, drops queued calls and forgets the thread so a later queueSailCall starts a new
 // one. Needs the guest lock, which is released while waiting for the thread. For tests.

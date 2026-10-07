@@ -176,6 +176,21 @@ void setPngDumpDirectory(std::optional<std::filesystem::path> dir);
 // Forgets the open handles and streams and the dump counter. Intended for tests.
 void resetCellPngDec();
 
+// Handlers of the cellSail module that build the player: the allocator, the player's init, boot and
+// descriptor calls and the descriptor's database and capabilities.
+std::span<const HleEntry> cellSailPlayerHandlers();
+
+// Handlers of the cellSail graphics and sound adapters (Initialize, Finalize, preferred and current
+// format).
+std::span<const HleEntry> cellSailAdapterHandlers();
+
+// Forgets every cellSail player, descriptor and adapter without calling into the guest. Intended for
+// tests.
+void resetCellSail();
+
+// Handlers of the cellPamf module: cellPamfReaderGetNumberOfSpecificStreams.
+std::span<const HleEntry> cellPamfHandlers();
+
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();
 
