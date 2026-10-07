@@ -62,7 +62,9 @@ function(dal_render_add)
     runtime/src/render/fp_translator.cpp
     runtime/src/render/frame_dump.cpp
     runtime/src/render/shader_compiler.cpp
+    runtime/src/render/vertex_convert.cpp
     runtime/src/render/vk_context.cpp
+    runtime/src/render/vk_pipelines.cpp
     runtime/src/render/vk_renderer.cpp
     runtime/src/render/vp_translator.cpp)
   target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)

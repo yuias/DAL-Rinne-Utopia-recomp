@@ -4,12 +4,17 @@
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "render/fp_translator.h"
 #include "render/shader_compiler.h"
+#include "render/vertex_convert.h"
+#include "render/vp_translator.h"
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_unimplemented.h"
 
@@ -17,6 +22,8 @@ namespace dal {
 namespace {
 
 constexpr std::uint64_t kFenceTimeoutNs = 10'000'000'000ull;
+constexpr std::size_t kUploadAlignment = 256;  // covers every uniform and vertex buffer offset alignment
+constexpr std::size_t kUploadBlockSize = 8u << 20;
 
 bool formatHasStencil(VkFormat format) {
   return format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -25,6 +32,91 @@ bool formatHasStencil(VkFormat format) {
 VkImageAspectFlags depthAspect(VkFormat format) {
   return formatHasStencil(format) ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                                   : VK_IMAGE_ASPECT_DEPTH_BIT;
+}
+
+// GCM blend factor words to Vulkan, as RPCS3 `VK/VKGSRender.cpp` `vk::get_blend_factor` (a word outside
+// the table was counted by the state decoder; it blends as ZERO here).
+VkBlendFactor blendFactor(std::uint32_t value) {
+  switch (value) {
+    case 1: return VK_BLEND_FACTOR_ONE;
+    case 0x300: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 0x301: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 0x302: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 0x303: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 0x304: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 0x305: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 0x306: return VK_BLEND_FACTOR_DST_COLOR;
+    case 0x307: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 0x308: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    case 0x8001: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 0x8002: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 0x8003: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 0x8004: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default: return VK_BLEND_FACTOR_ZERO;
+  }
+}
+
+// RPCS3 `vk::get_blend_op`: the signed equations are emulated with their unsigned counterparts.
+VkBlendOp blendOp(std::uint32_t value) {
+  switch (value) {
+    case 0x8007: return VK_BLEND_OP_MIN;
+    case 0x8008: return VK_BLEND_OP_MAX;
+    case 0x800A: return VK_BLEND_OP_SUBTRACT;
+    case 0x800B:
+    case 0xF005: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    default: return VK_BLEND_OP_ADD;  // ADD, ADD_SIGNED, REVERSE_ADD_SIGNED
+  }
+}
+
+// RPCS3 `VK/VKVertexBuffers.cpp` `vk::get_appropriate_topology`. Primitives RPCS3 emulates with index
+// expansion (line loop, quads, polygon) are not modelled and return false.
+bool topologyFor(RsxPrimitive primitive, VkPrimitiveTopology& topology, VkPrimitiveTopology& topology_class) {
+  switch (primitive) {
+    case RsxPrimitive::Points:
+      topology = topology_class = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+      return true;
+    case RsxPrimitive::Lines:
+      topology = topology_class = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      return true;
+    case RsxPrimitive::LineStrip:
+      topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+      topology_class = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      return true;
+    case RsxPrimitive::Triangles:
+      topology = topology_class = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      return true;
+    case RsxPrimitive::TriangleStrip:
+    case RsxPrimitive::QuadStrip:  // a quad strip rasterizes as a triangle strip
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      topology_class = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      return true;
+    case RsxPrimitive::TriangleFan:
+      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+      topology_class = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Color mask register layout: B bit 0, G bit 8, R bit 16, A bit 24 (RPCS3 `rsx_decode.h`
+// registers_decoder<NV4097_SET_COLOR_MASK>).
+VkColorComponentFlags colorWriteMask(std::uint32_t reg) {
+  VkColorComponentFlags mask = 0;
+  if ((reg & (1u << 16)) != 0) mask |= VK_COLOR_COMPONENT_R_BIT;
+  if ((reg & (1u << 8)) != 0) mask |= VK_COLOR_COMPONENT_G_BIT;
+  if ((reg & 1u) != 0) mask |= VK_COLOR_COMPONENT_B_BIT;
+  if ((reg & (1u << 24)) != 0) mask |= VK_COLOR_COMPONENT_A_BIT;
+  return mask;
+}
+
+// SET_BLEND_COLOR for 8-bit surfaces: blue bits 0..7, green 8..15, red 16..23, alpha 24..31
+// (`rsx_decode.h` registers_decoder<NV4097_SET_BLEND_COLOR>).
+void blendConstants(std::uint32_t reg, float (&out)[4]) {
+  out[0] = static_cast<float>((reg >> 16) & 0xFF) / 255.0f;
+  out[1] = static_cast<float>((reg >> 8) & 0xFF) / 255.0f;
+  out[2] = static_cast<float>(reg & 0xFF) / 255.0f;
+  out[3] = static_cast<float>(reg >> 24) / 255.0f;
 }
 
 }  // namespace
@@ -51,8 +143,25 @@ struct RsxRenderer::RenderTarget {
   }
 };
 
+// A region of a slot's upload block, already mapped for writing.
+struct RsxRenderer::UploadRef {
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize offset = 0;
+  std::uint8_t* data = nullptr;
+};
+
 struct RsxRenderer::FrameSlot {
+  struct UploadBlock {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    std::uint8_t* mapped = nullptr;
+    std::size_t size = 0;
+    std::size_t used = 0;
+  };
+
   VkCommandPool pool = VK_NULL_HANDLE;
+  // Linear allocators, reset when the slot's fence has signaled and its command buffer is rewritten.
+  std::vector<UploadBlock> uploads;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
   bool pending = false;  // submitted and not yet waited for
@@ -69,6 +178,11 @@ struct RsxRenderer::FrameSlot {
 RsxRenderer::RsxRenderer(VkContext& context, RenderOptions options)
     : context_(context), options_(std::move(options)) {
   if (!options_.shader_cache.empty()) setShaderCacheDir(options_.shader_cache);
+  pipelines_ = std::make_unique<DrawPipelines>(context_);
+  if (!pipelines_->valid()) {
+    fail(pipelines_->error());
+    return;
+  }
   const VkDevice device = context_.device();
   for (std::unique_ptr<FrameSlot>& slot_ptr : slots_) {
     slot_ptr = std::make_unique<FrameSlot>();
@@ -106,10 +220,17 @@ RsxRenderer::~RsxRenderer() {
   for (std::unique_ptr<FrameSlot>& slot : slots_) {
     if (!slot) continue;
     slot->in_use.clear();
+    for (FrameSlot::UploadBlock& block : slot->uploads) {
+      vmaDestroyBuffer(context_.allocator(), block.buffer, block.allocation);
+    }
     if (slot->readback != VK_NULL_HANDLE) vmaDestroyBuffer(context_.allocator(), slot->readback, slot->readback_allocation);
     if (slot->fence != VK_NULL_HANDLE) vkDestroyFence(device, slot->fence, nullptr);
     if (slot->pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, slot->pool, nullptr);
   }
+  pipelines_.reset();
+  if (placeholder_sampler_ != VK_NULL_HANDLE) vkDestroySampler(device, placeholder_sampler_, nullptr);
+  if (placeholder_view_ != VK_NULL_HANDLE) vkDestroyImageView(device, placeholder_view_, nullptr);
+  if (placeholder_image_ != VK_NULL_HANDLE) vmaDestroyImage(context_.allocator(), placeholder_image_, placeholder_allocation_);
   color_targets_.clear();
   depth_targets_.clear();
 }
@@ -138,6 +259,7 @@ bool RsxRenderer::beginFrame() {
   const VkDevice device = context_.device();
   vkResetFences(device, 1, &slot.fence);
   vkResetCommandPool(device, slot.pool, 0);
+  for (FrameSlot::UploadBlock& block : slot.uploads) block.used = 0;
   VkCommandBufferBeginInfo begin{};
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -151,6 +273,9 @@ bool RsxRenderer::beginFrame() {
 
 bool RsxRenderer::submitFrame() {
   FrameSlot& slot = *slots_[current_slot_];
+  for (const FrameSlot::UploadBlock& block : slot.uploads) {
+    if (block.used != 0) vmaFlushAllocation(context_.allocator(), block.allocation, 0, block.used);
+  }
   if (vkEndCommandBuffer(slot.cmd) != VK_SUCCESS) {
     fail("vkEndCommandBuffer failed");
     return false;
@@ -178,7 +303,9 @@ void RsxRenderer::touch(const std::shared_ptr<RenderTarget>& target) {
   if (std::find(in_use.begin(), in_use.end(), target) == in_use.end()) in_use.push_back(target);
 }
 
-// Conservative full barrier: the clears and the readback are not frequent enough to need tighter stages.
+// Conservative full barrier, also recorded before every draw and clear that begins a rendering instance
+// (even when the layout does not change, so successive passes over one target are ordered). Draws are
+// few enough per frame that tighter stages are not needed yet.
 void RsxRenderer::transition(RenderTarget& target, VkImageLayout layout) {
   VkImageMemoryBarrier2 barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -315,11 +442,465 @@ std::shared_ptr<RsxRenderer::RenderTarget> RsxRenderer::acquireDepth(const RsxSu
   }
 }
 
-// Draws are not rendered yet, but their targets are created so a flip of one reads back as a render
-// target (zero-filled) rather than as a missing one.
-void RsxRenderer::resolveDrawTargets(const RsxSurfaceState& surfaces) {
-  if (surfaces.has_color) acquireColor(surfaces.color);
-  acquireDepth(surfaces);
+bool RsxRenderer::allocUpload(std::size_t size, UploadRef& out) {
+  FrameSlot& slot = *slots_[current_slot_];
+  size = std::max<std::size_t>((size + kUploadAlignment - 1) & ~(kUploadAlignment - 1), kUploadAlignment);
+  FrameSlot::UploadBlock* block = nullptr;
+  for (FrameSlot::UploadBlock& candidate : slot.uploads) {
+    if (candidate.size - candidate.used >= size) {
+      block = &candidate;
+      break;
+    }
+  }
+  if (block == nullptr) {
+    FrameSlot::UploadBlock created;
+    created.size = std::max(kUploadBlockSize, size);
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = created.size;
+    buffer_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo mapped{};
+    if (vmaCreateBuffer(context_.allocator(), &buffer_info, &alloc_info, &created.buffer, &created.allocation,
+                        &mapped) != VK_SUCCESS ||
+        mapped.pMappedData == nullptr) {
+      fail("vmaCreateBuffer failed for the draw upload buffer");
+      return false;
+    }
+    created.mapped = static_cast<std::uint8_t*>(mapped.pMappedData);
+    slot.uploads.push_back(created);
+    block = &slot.uploads.back();
+  }
+  out.buffer = block->buffer;
+  out.offset = block->used;
+  out.data = block->mapped + block->used;
+  block->used += size;
+  return true;
+}
+
+// The placeholder texture is one magenta texel, written with a clear so no staging buffer is needed.
+bool RsxRenderer::ensurePlaceholder() {
+  if (placeholder_ready_) return true;
+  const VkDevice device = context_.device();
+
+  VkImageCreateInfo image_info{};
+  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  image_info.extent = {1, 1, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VmaAllocationCreateInfo alloc_info{};
+  alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  if (vmaCreateImage(context_.allocator(), &image_info, &alloc_info, &placeholder_image_, &placeholder_allocation_,
+                     nullptr) != VK_SUCCESS) {
+    placeholder_image_ = VK_NULL_HANDLE;
+    fail("vmaCreateImage failed for the placeholder texture");
+    return false;
+  }
+  VkImageViewCreateInfo view_info{};
+  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_info.image = placeholder_image_;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkSamplerCreateInfo sampler_info{};
+  sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  sampler_info.magFilter = VK_FILTER_NEAREST;
+  sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW =
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  if (vkCreateImageView(device, &view_info, nullptr, &placeholder_view_) != VK_SUCCESS) {
+    placeholder_view_ = VK_NULL_HANDLE;
+    fail("vkCreateImageView failed for the placeholder texture");
+    return false;
+  }
+  if (vkCreateSampler(device, &sampler_info, nullptr, &placeholder_sampler_) != VK_SUCCESS) {
+    placeholder_sampler_ = VK_NULL_HANDLE;
+    fail("vkCreateSampler failed");
+    return false;
+  }
+
+  const VkCommandBuffer cmd = slots_[current_slot_]->cmd;
+  const auto barrier = [&](VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 stage, VkAccessFlags2 access) {
+    VkImageMemoryBarrier2 b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = stage;
+    b.dstAccessMask = access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = placeholder_image_;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  };
+  barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+          VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkClearColorValue magenta{};
+  magenta.float32[0] = 1.0f;
+  magenta.float32[2] = 1.0f;
+  magenta.float32[3] = 1.0f;
+  const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdClearColorImage(cmd, placeholder_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &magenta, 1, &range);
+  barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  placeholder_ready_ = true;
+  return true;
+}
+
+// Scaled vertex formats are optional for buffers; the others used here are mandatory.
+bool RsxRenderer::vertexFormatSupported(VkFormat format) {
+  const auto it = vertex_format_support_.find(format);
+  if (it != vertex_format_support_.end()) return it->second;
+  VkFormatProperties props{};
+  vkGetPhysicalDeviceFormatProperties(context_.physicalDevice(), format, &props);
+  const bool supported = (props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+  vertex_format_support_[format] = supported;
+  return supported;
+}
+
+// Draw path. Everything that records outside a rendering instance (target creation, the placeholder
+// texture, uploads) happens before vkCmdBeginRendering. A draw that cannot be rendered is counted in
+// draws_skipped and, where a reason exists, with rsxNoteUnimplemented.
+//
+// Facts used, with their sources:
+//  - texture units a draw does not sample get no descriptor; the fragment translator reports the
+//    sampled ones (GlslResult::texture_units);
+//  - depth test and write are only enabled together with a depth target, and a write without the test
+//    stays off (RPCS3 `VK/VKGSRender.cpp` `decode_rsx_state`);
+//  - the viewport covers the surface clip rectangle with a positive height: the vertex program already
+//    applies the RSX viewport transform and does not flip y (RPCS3 `VKGSRender::set_viewport` uses
+//    x 0, y 0 and the clip size); depth range is 0..1, the vertex program remaps depth with clip_min and
+//    clip_max because the device does not enable unrestricted depth ranges (same function);
+//  - front face and cull face map one to one (`vk::get_front_face`, `vk::get_cull_face`);
+//  - GCM compare words 0x200..0x207 are in VkCompareOp order.
+void RsxRenderer::recordDraw(const RsxDraw& draw) {
+  const auto skip = [&](std::string_view category, std::string_view key) {
+    if (!category.empty()) rsxNoteUnimplemented(category, key);
+    stats_.draws_skipped++;
+  };
+
+  // The targets are created even for a draw that is skipped, so a flip of one reads back as a render
+  // target rather than as a missing one.
+  std::shared_ptr<RenderTarget> color;
+  if (draw.surfaces.has_color) color = acquireColor(draw.surfaces.color);
+  const std::shared_ptr<RenderTarget> depth = acquireDepth(draw.surfaces);
+  if (!valid()) return;
+  if (!color) return skip("state", "draw without color target");
+  if (draw.surfaces.clip_w == 0 || draw.surfaces.clip_h == 0) return skip("state", "draw with empty surface clip");
+
+  VkPrimitiveTopology topology{}, topology_class{};
+  if (!topologyFor(draw.primitive, topology, topology_class)) {
+    return skip("primitive", rsxPrimitiveName(static_cast<std::uint32_t>(draw.primitive)));
+  }
+
+  DrawShaders shaders;
+  if (!pipelines_->shaders(draw, shaders)) {
+    if (!pipelines_->valid()) fail(pipelines_->error());
+    return skip({}, {});  // the reasons were counted by the pipeline store
+  }
+
+  for (std::uint32_t unit = 0; unit < kFpTextureUnitCount; unit++) {
+    if ((shaders.texture_units & (1u << unit)) == 0) continue;
+    for (const RsxTextureDesc& texture : draw.textures) {
+      if (texture.unit == unit && (texture.dimension != 2 || texture.cubemap)) {
+        return skip("texture layout", std::format("sampled dimension {}", texture.dimension));
+      }
+    }
+  }
+
+  // The render area is the smaller of the attachments; the scissor is clipped to it, and an empty
+  // rectangle draws nothing (counted in `draws`, not skipped).
+  const RsxRasterState& raster = draw.raster;
+  std::uint32_t area_width = color->width, area_height = color->height;
+  if (depth) {
+    area_width = std::min(area_width, depth->width);
+    area_height = std::min(area_height, depth->height);
+  }
+  const std::uint32_t scissor_x = std::min(raster.scissor_x, area_width);
+  const std::uint32_t scissor_y = std::min(raster.scissor_y, area_height);
+  const std::uint32_t scissor_w = std::min(raster.scissor_w, area_width - scissor_x);
+  const std::uint32_t scissor_h = std::min(raster.scissor_h, area_height - scissor_y);
+  if (scissor_w == 0 || scissor_h == 0) {
+    stats_.draws++;
+    return;
+  }
+  if (draw.count == 0) return skip({}, {});
+
+  // The vertex range comes from the frame builder, which leaves the restart index out of it. A restart
+  // index is honoured through Vulkan's fixed restart value, for strips and fans only; the builder counts
+  // a restart it cannot express.
+  const bool is_u16 = draw.index_type == kRsxIndexTypeU16;
+  std::uint32_t vertex_count = draw.count;
+  std::uint32_t min_index = 0;
+  bool restart = false;
+  if (draw.indexed) {
+    min_index = draw.min_index;
+    const std::uint64_t span = static_cast<std::uint64_t>(draw.max_index) - draw.min_index + 1;
+    if (draw.max_index < draw.min_index || span > 0x7FFFFFFFull || min_index > 0x7FFFFFFFu) {
+      return skip("state", "index range out of bounds");
+    }
+    restart = draw.restart_used;
+    if (restart && !rsxPrimitiveRestartSupported(draw.primitive, draw.index_type, draw.restart_index)) {
+      return skip({}, {});
+    }
+    if (!indicesInRange(is_u16, draw.index_data, draw.count, draw.min_index, draw.max_index, restart,
+                        draw.restart_index)) {
+      return skip("state", "index outside the vertex range");
+    }
+    vertex_count = static_cast<std::uint32_t>(span);
+  }
+
+  if (!ensurePlaceholder() || !valid()) return;
+
+  // Vertex inputs: one binding per slot the vertex program reads, bound to the converted array or to
+  // the default value register of the slot.
+  PipelineKey key;
+  key.vp_hash = draw.vp_hash;
+  key.fp_hash = draw.fp_hash;
+  key.fp_control = draw.fp_control;
+  key.texcoord_control = draw.texcoord_control;
+  key.color_format = color->format;
+  key.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
+  key.topology_class = topology_class;
+  VkBuffer vertex_buffers[kPipelineVertexSlots] = {};
+  VkDeviceSize vertex_offsets[kPipelineVertexSlots] = {};
+
+  UploadRef defaults;
+  bool have_defaults = false;
+  for (std::uint32_t slot = 0; slot < kPipelineVertexSlots; slot++) {
+    if ((shaders.inputs_used & (1u << slot)) == 0) continue;
+
+    const RsxVertexAttrib* attrib = nullptr;
+    for (const RsxVertexAttrib& candidate : draw.attribs) {
+      if (candidate.slot == slot && candidate.has_data) attrib = &candidate;
+    }
+    std::optional<VertexAttribFormat> format;
+    if (attrib != nullptr) {
+      format = vertexAttribFormat(attrib->type, attrib->size);
+      // A scaled-integer format the device does not offer for vertex buffers is converted to floats.
+      if (format && !vertexFormatSupported(format->format)) format = widenedFormat(*format);
+      if (format && !vertexFormatSupported(format->format)) format.reset();
+      if (!format) {
+        // A type or size without a conversion: the draw cannot be drawn faithfully, so it is not
+        // drawn with a default in its place.
+        return skip("vertex type", std::format("{} size {}", rsxVertexTypeName(attrib->type), attrib->size));
+      }
+    }
+
+    if (format) {
+      const std::uint32_t stride = attrib->stride;
+      const std::size_t source_bytes =
+          attrib->data_offset <= draw.vertex_data.size() ? draw.vertex_data.size() - attrib->data_offset : 0;
+      const std::uint32_t needed = stride == 0 ? 1 : vertex_count;
+      if (vertexElementsAvailable(*format, stride, source_bytes) < needed) {
+        return skip("state", "vertex data short");
+      }
+      UploadRef ref;
+      if (!allocUpload(static_cast<std::size_t>(needed) * format->host_size, ref)) return;
+      convertVertexElements(*format,
+                            std::span<const std::uint8_t>(draw.vertex_data.data() + attrib->data_offset, source_bytes),
+                            stride, needed, std::span<std::uint8_t>(ref.data, static_cast<std::size_t>(needed) * format->host_size));
+      key.vertex_formats[slot] = format->format;
+      key.vertex_strides[slot] = static_cast<std::uint8_t>(stride == 0 ? 0 : format->host_size);
+      vertex_buffers[slot] = ref.buffer;
+      vertex_offsets[slot] = ref.offset;
+      continue;
+    }
+
+    // No array: the slot reads its default attribute register as written, or (0, 0, 0, 1) when the
+    // register was never written.
+    if (!have_defaults) {
+      if (!allocUpload(kPipelineVertexSlots * 16, defaults)) return;
+      std::array<float, kPipelineVertexSlots * 4> values = draw.default_attribs;
+      for (std::uint32_t s = 0; s < kPipelineVertexSlots; s++) {
+        if ((draw.default_written & (1u << s)) != 0) continue;
+        values[s * 4] = values[s * 4 + 1] = values[s * 4 + 2] = 0.0f;
+        values[s * 4 + 3] = 1.0f;
+      }
+      std::memcpy(defaults.data, values.data(), sizeof(values));
+      have_defaults = true;
+    }
+    key.vertex_formats[slot] = VK_FORMAT_R32G32B32A32_SFLOAT;
+    key.vertex_strides[slot] = 0;
+    vertex_buffers[slot] = defaults.buffer;
+    vertex_offsets[slot] = defaults.offset + slot * 16;
+  }
+
+  UploadRef indices;
+  if (draw.indexed) {
+    const std::size_t index_bytes = static_cast<std::size_t>(draw.count) * (is_u16 ? 2 : 4);
+    if (!allocUpload(index_bytes, indices)) return;
+    convertIndices(is_u16, draw.index_data, draw.count, std::span<std::uint8_t>(indices.data, index_bytes));
+  }
+
+  // Fixed-function state baked into the pipeline.
+  key.color_mask = colorWriteMask(raster.color_mask);
+  if (raster.blend) {
+    key.blend = true;
+    key.src_color = blendFactor(raster.blend_sfactor_rgb);
+    key.dst_color = blendFactor(raster.blend_dfactor_rgb);
+    key.src_alpha = blendFactor(raster.blend_sfactor_a);
+    key.dst_alpha = blendFactor(raster.blend_dfactor_a);
+    key.color_op = blendOp(raster.blend_eq_rgb);
+    key.alpha_op = blendOp(raster.blend_eq_a);
+  }
+  const VkPipeline pipeline = pipelines_->pipeline(key, shaders);
+  if (pipeline == VK_NULL_HANDLE) {
+    fail(pipelines_->error());
+    return;
+  }
+
+  // Uniform data: vertex constants, fragment constants, the per-draw block shared by both stages.
+  constexpr std::size_t kVpConstantBytes = kRsxVpConstantCount * 16;
+  UploadRef vp_constants, fp_constants, draw_block;
+  const std::size_t fp_entries = std::max<std::size_t>(draw.fp_constants.size() / 4, 1);
+  constexpr std::size_t kDrawBlockBytes = kFpDrawBlockOffset + sizeof(FpDrawUniforms);
+  if (!allocUpload(kVpConstantBytes, vp_constants) || !allocUpload(fp_entries * 16, fp_constants) ||
+      !allocUpload(kDrawBlockBytes, draw_block)) {
+    return;
+  }
+  std::memset(vp_constants.data, 0, kVpConstantBytes);
+  std::memcpy(vp_constants.data, draw.vp_constants.data(), std::min(draw.vp_constants.size() * 4, kVpConstantBytes));
+  std::memset(fp_constants.data, 0, fp_entries * 16);
+  for (std::size_t i = 0; i < draw.fp_constants.size(); i++) {
+    const std::uint32_t word = fpFixupWord(draw.fp_constants[i]);
+    std::memcpy(fp_constants.data + i * 4, &word, 4);
+  }
+
+  VpDrawUniforms vp{};
+  std::memcpy(vp.viewport_scale, raster.viewport_scale, sizeof(vp.viewport_scale));
+  std::memcpy(vp.viewport_offset, raster.viewport_offset, sizeof(vp.viewport_offset));
+  vp.clip_width = static_cast<float>(draw.surfaces.clip_w);
+  vp.clip_height = static_cast<float>(draw.surfaces.clip_h);
+  vp.clip_min = raster.clip_min;
+  vp.clip_max = raster.clip_max;
+  vp.output_mask = draw.vp_output_mask;
+  vp.point_size = raster.point_size > 0.0f ? raster.point_size : 1.0f;
+  // Output mask bits 6..11 enable the user clip distances, which the vertex translator does not write.
+  if ((draw.vp_output_mask & 0xFC0u) != 0) rsxNoteUnimplemented("state", "user clip");
+
+  FpDrawUniforms fp{};
+  fp.alpha_func = raster.alpha_test ? (raster.alpha_func & 7u) : 7u;
+  fp.alpha_ref = static_cast<float>(raster.alpha_ref) / 255.0f;
+  fp.flags = kFpFlagRound8Bit | (raster.two_sided_lighting ? kFpFlagTwoSided : 0u);
+  for (auto& scale : fp.texture_scale) scale[0] = scale[1] = scale[2] = scale[3] = 1.0f;
+  std::memcpy(draw_block.data, &vp, sizeof(vp));
+  std::memcpy(draw_block.data + kFpDrawBlockOffset, &fp, sizeof(fp));
+
+  const VkCommandBuffer cmd = slots_[current_slot_]->cmd;
+  transition(*color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  if (depth) transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+  VkRenderingAttachmentInfo color_attachment{};
+  color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  color_attachment.imageView = color->view;
+  color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingAttachmentInfo depth_attachment{};
+  if (depth) {
+    depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depth_attachment.imageView = depth->view;
+    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  }
+  VkRenderingInfo rendering{};
+  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering.renderArea = {{0, 0}, {area_width, area_height}};
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachments = &color_attachment;
+  rendering.pDepthAttachment = depth ? &depth_attachment : nullptr;
+  rendering.pStencilAttachment = depth && formatHasStencil(depth->format) ? &depth_attachment : nullptr;
+
+  vkCmdBeginRendering(cmd, &rendering);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+  const VkViewport viewport = {0.0f, 0.0f, static_cast<float>(draw.surfaces.clip_w),
+                               static_cast<float>(draw.surfaces.clip_h), 0.0f, 1.0f};
+  const VkRect2D scissor = {{static_cast<std::int32_t>(scissor_x), static_cast<std::int32_t>(scissor_y)},
+                            {scissor_w, scissor_h}};
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  constexpr std::uint32_t kCullFront = 0x404, kCullBack = 0x405, kFrontFaceCw = 0x900;
+  VkCullModeFlags cull = VK_CULL_MODE_NONE;
+  if (raster.cull) {
+    cull = raster.cull_face == kCullFront ? VK_CULL_MODE_FRONT_BIT
+           : raster.cull_face == kCullBack ? VK_CULL_MODE_BACK_BIT
+                                           : VK_CULL_MODE_FRONT_AND_BACK;
+  }
+  vkCmdSetCullMode(cmd, cull);
+  vkCmdSetFrontFace(cmd, raster.front_face == kFrontFaceCw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+  vkCmdSetPrimitiveTopology(cmd, topology);
+  vkCmdSetPrimitiveRestartEnable(cmd, restart ? VK_TRUE : VK_FALSE);
+  const bool depth_test = depth && raster.depth_test;
+  vkCmdSetDepthTestEnable(cmd, depth_test ? VK_TRUE : VK_FALSE);
+  vkCmdSetDepthWriteEnable(cmd, depth_test && raster.depth_write ? VK_TRUE : VK_FALSE);
+  vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(raster.depth_func & 7u));
+  float constants[4];
+  blendConstants(raster.blend_color, constants);
+  vkCmdSetBlendConstants(cmd, constants);
+
+  for (std::uint32_t slot = 0; slot < kPipelineVertexSlots; slot++) {
+    if (vertex_buffers[slot] != VK_NULL_HANDLE) vkCmdBindVertexBuffers(cmd, slot, 1, &vertex_buffers[slot], &vertex_offsets[slot]);
+  }
+
+  VkDescriptorBufferInfo buffer_infos[3] = {{vp_constants.buffer, vp_constants.offset, kVpConstantBytes},
+                                            {fp_constants.buffer, fp_constants.offset, fp_entries * 16},
+                                            {draw_block.buffer, draw_block.offset, kDrawBlockBytes}};
+  // One image info per unit: each sampled unit gets its own texture once textures are uploaded.
+  VkDescriptorImageInfo image_infos[kFpTextureUnitCount];
+  for (VkDescriptorImageInfo& info : image_infos) {
+    info = {placeholder_sampler_, placeholder_view_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  }
+  VkWriteDescriptorSet writes[3 + kFpTextureUnitCount]{};
+  std::uint32_t write_count = 0;
+  for (std::uint32_t i = 0; i < 3; i++) {
+    VkWriteDescriptorSet& write = writes[write_count++];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = i;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.pBufferInfo = &buffer_infos[i];
+  }
+  for (std::uint32_t unit = 0; unit < kFpTextureUnitCount; unit++) {
+    if ((shaders.texture_units & (1u << unit)) == 0) continue;
+    VkWriteDescriptorSet& write = writes[write_count++];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstBinding = kFpTextureBindingBase + unit;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_infos[unit];
+  }
+  vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines_->drawLayout(), 0, write_count, writes);
+
+  // Element 0 of every array is vertex min_index (rsx_frame.h), so indexed draws offset the vertex
+  // index by -min_index; array draws start at element 0.
+  if (draw.indexed) {
+    vkCmdBindIndexBuffer(cmd, indices.buffer, indices.offset, is_u16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, draw.count, 1, 0, -static_cast<std::int32_t>(min_index), 0);
+  } else {
+    vkCmdDraw(cmd, draw.count, 1, 0, 0);
+  }
+  vkCmdEndRendering(cmd);
+  stats_.draws++;
 }
 
 // Facts from RPCS3 `VK/VKGSRender.cpp` `VKGSRender::clear_surface`:
@@ -331,18 +912,24 @@ void RsxRenderer::resolveDrawTargets(const RsxSurfaceState& surfaces) {
 //    bits 8..31 and stencil in bits 0..7, Z16 uses bits 0..15 (`rsx_decode.h`
 //    `registers_decoder<NV4097_SET_ZSTENCIL_CLEAR_VALUE>`);
 //  - the aspects cleared follow the mask bits;
-//  - a color mask other than all four channels needs a shader pass, as does a stencil write mask
-//    other than 0xFF. Neither is modelled: a partial color clear is skipped and counted (the frame
-//    builder counts a partial stencil mask); the clear carries no stencil write mask, so the
-//    stencil is cleared in full.
+//  - a color mask other than all four channels needs a draw (RPCS3 attachment_clear_pass), done by
+//    recordMaskedColorClear; so does a stencil write mask other than 0xFF, which is not modelled (the
+//    frame builder counts a partial stencil mask; the clear carries no stencil write mask, so the
+//    stencil is cleared in full).
 void RsxRenderer::recordClear(const RsxClear& clear) {
   stats_.clears++;
   constexpr std::uint32_t kColorBits = kRsxClearRed | kRsxClearGreen | kRsxClearBlue | kRsxClearAlpha;
   const std::uint32_t color_bits = clear.mask & kColorBits;
-  if (color_bits != 0 && color_bits != kColorBits) rsxNoteUnimplemented("state", "partial color clear mask");
 
   std::shared_ptr<RenderTarget> color;
-  if (color_bits == kColorBits && clear.surfaces.has_color) color = acquireColor(clear.surfaces.color);
+  if (color_bits != 0 && clear.surfaces.has_color) {
+    color = acquireColor(clear.surfaces.color);
+    if (color && color_bits != kColorBits) {
+      recordMaskedColorClear(clear, *color, color_bits);
+      color.reset();
+    }
+  }
+  if (!valid()) return;
   std::shared_ptr<RenderTarget> depth;
   if ((clear.mask & (kRsxClearDepth | kRsxClearStencil)) != 0) depth = acquireDepth(clear.surfaces);
   if (!color && !depth) return;
@@ -433,6 +1020,57 @@ void RsxRenderer::recordClear(const RsxClear& clear) {
   vkCmdEndRendering(cmd);
 }
 
+// A clear that touches only some color channels: a full-target triangle clipped to the clear rectangle,
+// writing the clear colour through the channel mask (RPCS3 `VK/VKGSRender.cpp` `VKGSRender::clear_surface`
+// falls back to `attachment_clear_pass` for a partial mask).
+void RsxRenderer::recordMaskedColorClear(const RsxClear& clear, RenderTarget& color, std::uint32_t color_bits) {
+  VkColorComponentFlags mask = 0;
+  if ((color_bits & kRsxClearRed) != 0) mask |= VK_COLOR_COMPONENT_R_BIT;
+  if ((color_bits & kRsxClearGreen) != 0) mask |= VK_COLOR_COMPONENT_G_BIT;
+  if ((color_bits & kRsxClearBlue) != 0) mask |= VK_COLOR_COMPONENT_B_BIT;
+  if ((color_bits & kRsxClearAlpha) != 0) mask |= VK_COLOR_COMPONENT_A_BIT;
+  const VkPipeline pipeline = pipelines_->maskedClearPipeline(color.format, mask);
+  if (pipeline == VK_NULL_HANDLE) {
+    fail(pipelines_->error());
+    return;
+  }
+
+  const std::uint32_t x = std::min(clear.scissor[0], color.width);
+  const std::uint32_t y = std::min(clear.scissor[1], color.height);
+  const std::uint32_t w = std::min(clear.scissor[2], color.width - x);
+  const std::uint32_t h = std::min(clear.scissor[3], color.height - y);
+  if (w == 0 || h == 0) return;
+
+  const VkCommandBuffer cmd = slots_[current_slot_]->cmd;
+  transition(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  VkRenderingAttachmentInfo attachment{};
+  attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  attachment.imageView = color.view;
+  attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo rendering{};
+  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  rendering.renderArea = {{0, 0}, {color.width, color.height}};
+  rendering.layerCount = 1;
+  rendering.colorAttachmentCount = 1;
+  rendering.pColorAttachments = &attachment;
+
+  const std::uint32_t argb = clear.color_argb;
+  const float value[4] = {static_cast<float>((argb >> 16) & 0xFF) / 255.0f, static_cast<float>((argb >> 8) & 0xFF) / 255.0f,
+                          static_cast<float>(argb & 0xFF) / 255.0f, static_cast<float>(argb >> 24) / 255.0f};
+  const VkViewport viewport = {0.0f, 0.0f, static_cast<float>(color.width), static_cast<float>(color.height), 0.0f, 1.0f};
+  const VkRect2D scissor = {{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)}, {w, h}};
+
+  vkCmdBeginRendering(cmd, &rendering);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  vkCmdPushConstants(cmd, pipelines_->clearLayout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(value), value);
+  vkCmdDraw(cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(cmd);
+}
+
 bool RsxRenderer::ensureReadback(FrameSlot& slot, VkDeviceSize size) {
   if (slot.readback != VK_NULL_HANDLE && slot.readback_size >= size) return true;
   if (slot.readback != VK_NULL_HANDLE) {
@@ -506,8 +1144,7 @@ void RsxRenderer::execute(std::span<RsxCommand> commands) {
     if (const auto* clear = std::get_if<RsxClear>(&command)) {
       recordClear(*clear);
     } else if (const auto* draw = std::get_if<RsxDraw>(&command)) {
-      stats_.draws_skipped++;
-      resolveDrawTargets(draw->surfaces);
+      recordDraw(*draw);
     } else {
       recordFlip(std::get<RsxFlip>(command));
     }

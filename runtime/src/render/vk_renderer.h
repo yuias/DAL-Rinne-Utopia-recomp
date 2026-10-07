@@ -1,7 +1,7 @@
 #pragma once
 
-// RSX command executor on Vulkan: render target cache, clears and flips. Draws are resolved to their
-// render targets and counted as skipped until the draw path exists.
+// RSX command executor on Vulkan: render target cache, clears, draws and flips. Textures are not
+// uploaded yet: every sampled unit reads a 1x1 magenta placeholder.
 
 #include <array>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "render/vk_context.h"
+#include "render/vk_pipelines.h"
 #include "rsx/rsx_frame.h"
 
 namespace dal {
@@ -26,7 +27,8 @@ struct RenderOptions {
 
 struct RendererStats {
   std::uint64_t clears = 0;         // clears recorded (a clear whose mask is not modelled still counts)
-  std::uint64_t draws_skipped = 0;  // draws seen; none is rendered yet
+  std::uint64_t draws = 0;          // draws handled: recorded into a command buffer, or dropped with an empty scissor
+  std::uint64_t draws_skipped = 0;  // draws seen but not rendered (unimplemented state, program or primitive)
   std::uint64_t flips = 0;
 };
 
@@ -56,6 +58,7 @@ class RsxRenderer {
  private:
   struct RenderTarget;
   struct FrameSlot;
+  struct UploadRef;
   using TargetKey = std::pair<std::uint32_t, std::uint32_t>;  // location, offset
   using TargetMap = std::map<TargetKey, std::shared_ptr<RenderTarget>>;
 
@@ -72,9 +75,16 @@ class RsxRenderer {
   std::shared_ptr<RenderTarget> createTarget(bool depth, const RsxSurface& surface, VkFormat format);
   void touch(const std::shared_ptr<RenderTarget>& target);
   void transition(RenderTarget& target, VkImageLayout layout);
-  void resolveDrawTargets(const RsxSurfaceState& surfaces);
+
+  // Host-visible memory of the current frame slot for vertex, index and uniform data, valid until the
+  // slot's fence has signaled. False (and fail()) when the allocation fails.
+  bool allocUpload(std::size_t size, UploadRef& out);
+  bool ensurePlaceholder();
+  bool vertexFormatSupported(VkFormat format);
 
   void recordClear(const RsxClear& clear);
+  void recordMaskedColorClear(const RsxClear& clear, RenderTarget& color, std::uint32_t color_bits);
+  void recordDraw(const RsxDraw& draw);
   void recordFlip(const RsxFlip& flip);
   bool ensureReadback(FrameSlot& slot, VkDeviceSize size);
 
@@ -86,6 +96,16 @@ class RsxRenderer {
   // Color and depth targets live in separate maps: a surface of each kind may share an offset.
   TargetMap color_targets_;
   TargetMap depth_targets_;
+
+  std::unique_ptr<DrawPipelines> pipelines_;
+  std::map<VkFormat, bool> vertex_format_support_;
+
+  // Bound to every sampled texture unit until textures are uploaded.
+  VkImage placeholder_image_ = VK_NULL_HANDLE;
+  VmaAllocation placeholder_allocation_ = nullptr;
+  VkImageView placeholder_view_ = VK_NULL_HANDLE;
+  VkSampler placeholder_sampler_ = VK_NULL_HANDLE;
+  bool placeholder_ready_ = false;
 
   std::array<std::unique_ptr<FrameSlot>, kFramesInFlight> slots_;
   std::size_t current_slot_ = 0;

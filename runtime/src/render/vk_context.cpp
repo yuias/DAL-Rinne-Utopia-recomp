@@ -109,6 +109,8 @@ std::string checkDevice(VkPhysicalDevice device, const VkContextOptions& options
   // Extended dynamic state is core functionality in 1.3 and has no separate feature bit there.
   if (features13.dynamicRendering == VK_FALSE) return "dynamicRendering is not supported";
   if (features13.synchronization2 == VK_FALSE) return "synchronization2 is not supported";
+  // glslang compiles `discard` for Vulkan 1.3 as a demote to a helper invocation.
+  if (features13.shaderDemoteToHelperInvocation == VK_FALSE) return "shaderDemoteToHelperInvocation is not supported";
   return {};
 }
 
@@ -256,6 +258,7 @@ std::unique_ptr<VkContext> createVkContext(const VkContextOptions& options, std:
   features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
   features13.dynamicRendering = VK_TRUE;
   features13.synchronization2 = VK_TRUE;
+  features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info{};

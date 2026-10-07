@@ -1,7 +1,10 @@
 // Self-checking tests for the Vulkan renderer library. They skip when no Vulkan device exists.
 
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -10,11 +13,14 @@
 #include <system_error>
 #include <vector>
 
+#include "render/fp_translator.h"
 #include "render/frame_dump.h"
 #include "render/shader_compiler.h"
+#include "render/vertex_convert.h"
 #include "render/vk_context.h"
 #include "render/vk_renderer.h"
 #include "rsx/rsx_capture.h"
+#include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame_builder.h"
 #include "rsx/rsx_registers.h"
 #include "rsx/rsx_unimplemented.h"
@@ -403,8 +409,8 @@ std::vector<std::uint8_t> makeScissoredClearCapture(std::uint32_t first, std::ui
   return scene.finish();
 }
 
-// A clear inside a sub-rectangle changes only that rectangle; a partial color mask changes nothing
-// and is counted. Depth and stencil values are not checked: the renderer has no depth readback.
+// A clear inside a sub-rectangle changes only that rectangle; a partial color mask changes only the
+// masked channels. Depth and stencil values are not checked: the renderer has no depth readback.
 void testRendererScissorAndMask(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
   dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
@@ -430,13 +436,417 @@ void testRendererScissorAndMask(dal::VkContext& ctx) {
   }
   CHECK(unimplementedCount("state partial color clear mask") == 0);
 
-  // Red and green only (0x30): not modelled, so color A stays.
+  // Red and green only (0x30): they take color B's values, blue and alpha keep color A's.
   commands = replaySynthetic(makeScissoredClearCapture(kA, kB, 0x30, 0, 0, 64, 64));
   renderer.execute(commands);
   CHECK(renderer.readDisplay(bgra, width, height));
-  const std::uint8_t expected_a[4] = {0x30, 0x20, 0x10, 0xFF};
-  CHECK(displayIsUniform(bgra, width, height, expected_a));
-  CHECK(unimplementedCount("state partial color clear mask") == 1);
+  const std::uint8_t expected_rg[4] = {0x30, 0x50, 0x40, 0xFF};  // B, G, R, A
+  CHECK(displayIsUniform(bgra, width, height, expected_rg));
+
+  // Alpha only (0x80), inside a rectangle: the clear color's alpha lands, the rest is untouched.
+  constexpr std::uint32_t kHalfAlpha = 0x80405060;
+  commands = replaySynthetic(makeScissoredClearCapture(kA, kHalfAlpha, 0x80, 8, 16, 16, 8));
+  renderer.execute(commands);
+  CHECK(renderer.readDisplay(bgra, width, height) && width == 64 && height == 64);
+  if (bgra.size() == 64 * 64 * 4) {
+    CHECK(pixelArgb(bgra, width, 8, 16) == 0x80102030);
+    CHECK(pixelArgb(bgra, width, 23, 23) == 0x80102030);
+    CHECK(pixelArgb(bgra, width, 7, 16) == kA);
+    CHECK(pixelArgb(bgra, width, 24, 16) == kA);
+    CHECK(pixelArgb(bgra, width, 8, 24) == kA);
+  }
+  CHECK(unimplementedCount("state partial color clear mask") == 0);
+  CHECK(renderer.valid());
+  dal::rsxUnimplementedReset();
+}
+
+// ---- vertex_convert (no Vulkan device needed) ----
+
+void testVertexConvert() {
+  using dal::vertexAttribFormat;
+
+  // Formats and sizes. Three-component 16-bit and 8-bit attributes are padded to four components.
+  const auto f3 = vertexAttribFormat(dal::kVertexTypeFloat, 3);
+  CHECK(f3 && f3->format == VK_FORMAT_R32G32B32_SFLOAT && f3->guest_size == 12 && f3->host_size == 12);
+  const auto ub4 = vertexAttribFormat(dal::kVertexTypeUnorm8, 4);
+  CHECK(ub4 && ub4->format == VK_FORMAT_R8G8B8A8_UNORM && ub4->guest_size == 4 && ub4->host_size == 4);
+  const auto ub3 = vertexAttribFormat(dal::kVertexTypeUnorm8, 3);
+  CHECK(ub3 && ub3->guest_size == 3 && ub3->host_size == 4);
+  const auto sf3 = vertexAttribFormat(dal::kVertexTypeHalf, 3);
+  CHECK(sf3 && sf3->format == VK_FORMAT_R16G16B16A16_SFLOAT && sf3->guest_size == 6 && sf3->host_size == 8);
+  const auto s2 = vertexAttribFormat(dal::kVertexTypeSnorm16, 2);
+  CHECK(s2 && s2->format == VK_FORMAT_R16G16_SNORM && s2->host_size == 4);
+  const auto ub256 = vertexAttribFormat(dal::kVertexTypeUint8, 4);
+  CHECK(ub256 && ub256->format == VK_FORMAT_R8G8B8A8_USCALED);
+  CHECK(!vertexAttribFormat(dal::kVertexTypeUint8, 3));
+  CHECK(!vertexAttribFormat(dal::kVertexTypeCmp, 1));
+  CHECK(!vertexAttribFormat(0, 4));
+  CHECK(!vertexAttribFormat(dal::kVertexTypeFloat, 0) && !vertexAttribFormat(dal::kVertexTypeFloat, 5));
+
+  // f3, stride 16: two big-endian vertices become little-endian floats, tightly packed.
+  const std::uint8_t f3_source[32] = {0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x40, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA,
+                                      0x00, 0x00, 0x00, 0x00, 0x3E, 0x80, 0x00, 0x00, 0x41, 0x20, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA};
+  std::uint8_t out[24] = {};
+  CHECK(dal::convertVertexElements(*f3, f3_source, 16, 2, out) == 2);
+  float floats[6];
+  std::memcpy(floats, out, sizeof(floats));
+  CHECK(floats[0] == 1.0f && floats[1] == 2.0f && floats[2] == -3.0f);
+  CHECK(floats[3] == 0.0f && floats[4] == 0.25f && floats[5] == 10.0f);
+
+  // The source ends before the third vertex: two elements are written, the rest of dst is untouched.
+  std::uint8_t out3[36];
+  std::memset(out3, 0x55, sizeof(out3));
+  CHECK(dal::convertVertexElements(*f3, f3_source, 16, 3, out3) == 2);
+  CHECK(out3[24] == 0x55);
+  CHECK(dal::vertexElementsAvailable(*f3, 16, sizeof(f3_source)) == 2);
+  CHECK(dal::vertexElementsAvailable(*f3, 16, 11) == 0);
+  CHECK(dal::vertexElementsAvailable(*f3, 0, 12) == 1);
+
+  // Stride 0: one shared element.
+  std::uint8_t shared[12] = {};
+  CHECK(dal::convertVertexElements(*f3, f3_source, 0, 5, shared) == 1);
+  std::memcpy(floats, shared, 12);
+  CHECK(floats[0] == 1.0f && floats[1] == 2.0f && floats[2] == -3.0f);
+
+  // ub4: bytes stay in stored order.
+  const std::uint8_t colors[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  std::uint8_t ub_out[8] = {};
+  CHECK(dal::convertVertexElements(*ub4, colors, 4, 2, ub_out) == 2);
+  CHECK(std::memcmp(ub_out, colors, 8) == 0);
+
+  // ub3: padded with an opaque fourth byte.
+  const std::uint8_t rgb[3] = {1, 2, 3};
+  std::uint8_t ub3_out[4] = {};
+  CHECK(dal::convertVertexElements(*ub3, rgb, 3, 1, ub3_out) == 1);
+  CHECK(ub3_out[0] == 1 && ub3_out[1] == 2 && ub3_out[2] == 3 && ub3_out[3] == 0xFF);
+
+  // sf3: 16-bit components are swapped and the fourth is half-float 1.0 (0x3C00).
+  const std::uint8_t halves[6] = {0x3C, 0x00, 0x40, 0x00, 0x44, 0x00};
+  std::uint8_t half_out[8] = {};
+  CHECK(dal::convertVertexElements(*sf3, halves, 6, 1, half_out) == 1);
+  const std::uint8_t expected_halves[8] = {0x00, 0x3C, 0x00, 0x40, 0x00, 0x44, 0x00, 0x3C};
+  CHECK(std::memcmp(half_out, expected_halves, 8) == 0);
+
+  // Indices.
+  const std::uint8_t u16_source[6] = {0x01, 0x02, 0x00, 0x0A, 0xFF, 0xFE};
+  std::uint8_t u16_out[6] = {};
+  dal::convertIndices(true, u16_source, 3, u16_out);
+  const std::uint8_t expected_u16[6] = {0x02, 0x01, 0x0A, 0x00, 0xFE, 0xFF};
+  CHECK(std::memcmp(u16_out, expected_u16, 6) == 0);
+  const std::uint8_t u32_source[8] = {0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x07};
+  std::uint8_t u32_out[8] = {};
+  dal::convertIndices(false, u32_source, 2, u32_out);
+  const std::uint8_t expected_u32[8] = {0x02, 0x01, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00};
+  CHECK(std::memcmp(u32_out, expected_u32, 8) == 0);
+
+  std::uint32_t low = 0, high = 0;
+  CHECK(dal::indexRange(true, u16_source, 3, low, high) && low == 0x0A && high == 0xFFFE);
+  CHECK(dal::indexRange(false, u32_source, 2, low, high) && low == 7 && high == 0x102);
+  CHECK(!dal::indexRange(true, u16_source, 4, low, high) && !dal::indexRange(true, u16_source, 0, low, high));
+
+  // Range check with a restart index: 0x0102 and 0xFFFE are outside [10, 20].
+  CHECK(!dal::indicesInRange(true, u16_source, 3, 10, 20, false, 0));
+  CHECK(!dal::indicesInRange(true, u16_source, 3, 10, 20, true, 0xFFFF));
+  const std::uint8_t restart_u32[12] = {0, 0, 0, 5, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 7};
+  CHECK(dal::indicesInRange(false, restart_u32, 3, 5, 7, true, 0xFFFFFFFF));
+  CHECK(!dal::indicesInRange(false, restart_u32, 3, 5, 7, false, 0xFFFFFFFF));
+  CHECK(!dal::indicesInRange(false, restart_u32, 4, 5, 7, true, 0xFFFFFFFF));  // source too short
+
+  // Scaled-integer types can be widened to floats: s32k is signed, ub256 is not normalized.
+  const auto s32k3 = vertexAttribFormat(dal::kVertexTypeSint16, 3);
+  CHECK(s32k3 && s32k3->format == VK_FORMAT_R16G16B16A16_SSCALED);
+  const dal::VertexAttribFormat wide = dal::widenedFormat(*s32k3);
+  CHECK(wide.widen && wide.format == VK_FORMAT_R32G32B32A32_SFLOAT && wide.host_size == 16);
+  const std::uint8_t shorts[6] = {0x00, 0x07, 0xFF, 0xFE, 0x01, 0x00};  // 7, -2, 256
+  float wide_out[4] = {};
+  CHECK(dal::convertVertexElements(wide, shorts, 6, 1, std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(wide_out), 16)) == 1);
+  CHECK(wide_out[0] == 7.0f && wide_out[1] == -2.0f && wide_out[2] == 256.0f && wide_out[3] == 1.0f);
+  const dal::VertexAttribFormat wide_bytes = dal::widenedFormat(*ub256);
+  const std::uint8_t bytes4[4] = {0, 1, 200, 255};
+  float bytes_out[4] = {};
+  CHECK(dal::convertVertexElements(wide_bytes, bytes4, 4, 1, std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(bytes_out), 16)) == 1);
+  CHECK(bytes_out[0] == 0.0f && bytes_out[1] == 1.0f && bytes_out[2] == 200.0f && bytes_out[3] == 255.0f);
+  CHECK(!dal::widenedFormat(*f3).widen);
+
+  // Restart support: strips and fans, and only the all-ones value of the index type.
+  using dal::RsxPrimitive;
+  CHECK(dal::rsxPrimitiveRestartSupported(RsxPrimitive::TriangleStrip, dal::kRsxIndexTypeU32, 0xFFFFFFFF));
+  CHECK(dal::rsxPrimitiveRestartSupported(RsxPrimitive::TriangleFan, dal::kRsxIndexTypeU16, 0xFFFF));
+  CHECK(!dal::rsxPrimitiveRestartSupported(RsxPrimitive::TriangleStrip, dal::kRsxIndexTypeU16, 0xFFFFFFFF));
+  CHECK(!dal::rsxPrimitiveRestartSupported(RsxPrimitive::Triangles, dal::kRsxIndexTypeU32, 0xFFFFFFFF));
+  CHECK(!dal::rsxPrimitiveRestartSupported(RsxPrimitive::TriangleStrip, dal::kRsxIndexTypeU32, 5));
+}
+
+// ---- Drawing ----
+
+// One vertex program instruction: MOV o[slot] = v[input].swizzle. Field layout as in the vertex program
+// translator test's assembler; the end flag marks the last instruction.
+std::array<std::uint32_t, 4> vpMove(std::uint32_t slot, std::uint32_t input, const char* swizzle, bool end) {
+  const auto lane = [&](int i) { return static_cast<std::uint32_t>(std::string("xyzw").find(swizzle[i])); };
+  const std::uint32_t src0 = 2u | (lane(3) << 8) | (lane(2) << 10) | (lane(1) << 12) | (lane(0) << 14);  // input source
+  const std::uint32_t src12 = 3u | (3u << 8) | (2u << 10) | (1u << 12);                                    // unused constant source
+  const std::uint32_t w0 = (3u << 2) | (2u << 4) | (1u << 6) | (7u << 10) | (63u << 15) | (1u << 30);
+  const std::uint32_t w1 = (src0 >> 9) | (input << 8) | (1u << 22);
+  const std::uint32_t w2 = (src12 >> 11) | (src12 << 6) | ((src0 & 0x1ff) << 23);
+  // The write mask bits run w, z, y, x from low to high: all four lanes.
+  const std::uint32_t w3 = (end ? 1u : 0u) | (slot << 2) | (63u << 7) | ((src12 & 0x7ff) << 21) | (0xFu << 13);
+  return {w0, w1, w2, w3};
+}
+
+// The fragment program MOV R0 = COL0, as stored (16-bit halves swapped).
+std::vector<std::uint32_t> fpMoveColor() {
+  constexpr std::uint32_t kSwizzle = 0xE4u << 9;  // xyzw
+  const std::uint32_t src_input = 1u | kSwizzle, src_temp = kSwizzle;
+  const std::uint32_t w0 = 1u /* end */ | (0u << 1) | (0xFu << 9) | (1u << 13) /* COL0 */ | (1u << 24) /* MOV */;
+  const std::uint32_t w1 = src_input | (7u << 18) | (0xE4u << 21);
+  return {dal::fpFixupWord(w0), dal::fpFixupWord(w1), dal::fpFixupWord(src_temp), dal::fpFixupWord(src_temp)};
+}
+
+// Position in slot 0, color bytes (A, R, G, B in memory) in slot 3: the program moves the position to
+// the output and the color, rotated to R, G, B, A, to the front diffuse output.
+dal::rsx_synthetic::Programs quadPrograms() {
+  dal::rsx_synthetic::Programs programs;
+  programs.vertex.clear();
+  for (const auto& instruction : {vpMove(0, 0, "xyzw", false), vpMove(1, 3, "yzwx", true)}) {
+    programs.vertex.insert(programs.vertex.end(), instruction.begin(), instruction.end());
+  }
+  programs.fragment = fpMoveColor();
+  return programs;
+}
+
+void setQuadRenderState(dal::rsx_synthetic::SceneBuilder& scene) {
+  constexpr float kScale[4] = {32.0f, 32.0f, 0.5f, 0.0f};
+  constexpr float kOffset[4] = {32.0f, 32.0f, 0.5f, 0.0f};
+  for (std::uint32_t i = 0; i < 4; i++) {
+    scene.write(dal::kMethodNv4097SetViewportScale + i * 4, std::bit_cast<std::uint32_t>(kScale[i]));
+    scene.write(dal::kMethodNv4097SetViewportOffset + i * 4, std::bit_cast<std::uint32_t>(kOffset[i]));
+  }
+  scene.write(dal::kMethodNv4097SetVertexAttribOutputMask, 0x1);  // front diffuse only
+  scene.write(dal::kMethodNv4097SetShaderControl, 0x40);          // color from R0
+}
+
+enum class QuadDraw {
+  Strip,              // array draw, 4 vertices
+  IndexedU16,         // indices 10..13 over vertex arrays that start at element 10
+  Fan,                // array draw, corners in fan order
+  IndexedU32Restart,  // strip with the all-ones restart index between two triangles, minimum index 0
+  ListRestart,        // the same indices as a triangle list: a restart the renderer cannot express
+};
+
+struct QuadOptions {
+  QuadDraw draw = QuadDraw::Strip;
+  std::uint32_t clear = 0xFF000000;
+  bool cull = false;
+  std::uint32_t cull_face = 0x405;   // back
+  std::uint32_t front_face = 0x901;  // counter-clockwise
+  bool blend = false;
+  std::uint32_t uniform_color = 0;   // nonzero: every vertex carries this word (A, R, G, B in memory)
+  // Color comes from slot 5, which has no array: -1 leaves the default register unwritten, 0 writes four
+  // zeros, 1 writes (1, 0, 0, 1).
+  int default_color = -2;            // -2: color comes from the array in slot 3
+};
+
+constexpr float kQuadCorners[4][3] = {{-0.5f, -0.5f, 0}, {0.5f, -0.5f, 0}, {-0.5f, 0.5f, 0}, {0.5f, 0.5f, 0}};  // strip order
+constexpr std::uint32_t kQuadColors[4] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF};  // red, green, blue, white
+
+// Clear, then the quad drawn the way `options` says, flip.
+std::vector<std::uint8_t> makeRenderedQuadCapture(const QuadOptions& options) {
+  using namespace dal::rsx_synthetic;
+  SceneBuilder scene;
+  scene.setSurface();
+  scene.clear(options.clear);
+  setQuadRenderState(scene);
+  scene.setFloatAttrib(0, 3, kPositionsOffset);
+  Programs programs = quadPrograms();
+  if (options.default_color == -2) {
+    scene.setColorAttrib(3, kColorsOffset);
+  } else {
+    programs.vertex.clear();
+    for (const auto& instruction : {vpMove(0, 0, "xyzw", false), vpMove(1, 5, "xyzw", true)}) {
+      programs.vertex.insert(programs.vertex.end(), instruction.begin(), instruction.end());
+    }
+    if (options.default_color >= 0) {
+      const float value[4] = {options.default_color == 1 ? 1.0f : 0.0f, 0.0f, 0.0f, options.default_color == 1 ? 1.0f : 0.0f};
+      for (std::uint32_t i = 0; i < 4; i++) {
+        scene.write(dal::kMethodNv4097SetVertexData4fM + 5 * 16 + i * 4, std::bit_cast<std::uint32_t>(value[i]));
+      }
+    }
+  }
+  scene.setPrograms(programs);
+  scene.write(dal::kMethodNv4097SetCullFaceEnable, options.cull ? 1 : 0);
+  scene.write(dal::kMethodNv4097SetCullFace, options.cull_face);
+  scene.write(dal::kMethodNv4097SetFrontFace, options.front_face);
+  if (options.blend) {
+    scene.write(dal::kMethodNv4097SetBlendEnable, 1);
+    scene.write(dal::kMethodNv4097SetBlendFuncSfactor, 0x302 | (0x302u << 16));  // SRC_ALPHA
+    scene.write(dal::kMethodNv4097SetBlendFuncDfactor, 0x303 | (0x303u << 16));  // ONE_MINUS_SRC_ALPHA
+    scene.write(dal::kMethodNv4097SetBlendEquation, 0x8006 | (0x8006u << 16));   // ADD
+  }
+
+  const auto putVertex = [&](std::uint32_t element, const float (&corner)[3], std::uint32_t color) {
+    for (std::uint32_t c = 0; c < 3; c++) scene.memory().putFloat(1, kPositionsOffset + element * 12 + c * 4, corner[c]);
+    scene.memory().putWord(1, kColorsOffset + element * 4, options.uniform_color != 0 ? options.uniform_color : color);
+  };
+  const auto beginDraw = [&](dal::RsxPrimitive primitive) {
+    scene.write(dal::kMethodNv4097SetBeginEnd, static_cast<std::uint32_t>(primitive));
+  };
+  constexpr std::uint32_t kIndexOffset = 0x1300;
+
+  switch (options.draw) {
+    case QuadDraw::Strip:
+      for (std::uint32_t v = 0; v < 4; v++) putVertex(v, kQuadCorners[v], kQuadColors[v]);
+      scene.drawStrip(4);
+      break;
+    case QuadDraw::Fan: {
+      // top left, top right, bottom right, bottom left
+      constexpr std::uint32_t kOrder[4] = {0, 1, 3, 2};
+      for (std::uint32_t v = 0; v < 4; v++) putVertex(v, kQuadCorners[kOrder[v]], kQuadColors[kOrder[v]]);
+      beginDraw(dal::RsxPrimitive::TriangleFan);
+      scene.write(dal::kMethodNv4097DrawArrays, 3u << 24);
+      scene.write(dal::kMethodNv4097SetBeginEnd, 0);
+      break;
+    }
+    case QuadDraw::IndexedU16: {
+      constexpr std::uint32_t kFirst = 10;
+      for (std::uint32_t v = 0; v < 4; v++) putVertex(kFirst + v, kQuadCorners[v], kQuadColors[v]);
+      scene.memory().putWord(1, kIndexOffset, (kFirst << 16) | (kFirst + 1));
+      scene.memory().putWord(1, kIndexOffset + 4, ((kFirst + 2) << 16) | (kFirst + 3));
+      scene.write(dal::kMethodNv4097SetIndexArrayAddress, kIndexOffset);
+      scene.write(dal::kMethodNv4097SetIndexArrayDma, 1u | (dal::kRsxIndexTypeU16 << 4));  // main memory, u16
+      beginDraw(dal::RsxPrimitive::TriangleStrip);
+      scene.write(dal::kMethodNv4097DrawIndexArray, 3u << 24);
+      scene.write(dal::kMethodNv4097SetBeginEnd, 0);
+      break;
+    }
+    case QuadDraw::IndexedU32Restart:
+    case QuadDraw::ListRestart: {
+      for (std::uint32_t v = 0; v < 4; v++) putVertex(v, kQuadCorners[v], kQuadColors[v]);
+      constexpr std::uint32_t kIndices[7] = {0, 1, 2, 0xFFFFFFFF, 1, 3, 2};
+      for (std::uint32_t i = 0; i < 7; i++) scene.memory().putWord(1, kIndexOffset + i * 4, kIndices[i]);
+      scene.write(dal::kMethodNv4097SetIndexArrayAddress, kIndexOffset);
+      scene.write(dal::kMethodNv4097SetIndexArrayDma, 1u | (dal::kRsxIndexTypeU32 << 4));  // main memory, u32
+      scene.write(dal::kMethodNv4097SetRestartIndexEnable, 1);
+      scene.write(dal::kMethodNv4097SetRestartIndex, 0xFFFFFFFF);
+      beginDraw(options.draw == QuadDraw::ListRestart ? dal::RsxPrimitive::Triangles : dal::RsxPrimitive::TriangleStrip);
+      scene.write(dal::kMethodNv4097DrawIndexArray, 6u << 24);
+      scene.write(dal::kMethodNv4097SetBeginEnd, 0);
+      break;
+    }
+  }
+  return scene.finish();
+}
+
+bool channelsNear(std::uint32_t argb, int r, int g, int b, int tolerance = 12) {
+  const auto within = [tolerance](std::uint32_t value, int expected) { return std::abs(static_cast<int>(value) - expected) <= tolerance; };
+  return within((argb >> 16) & 0xFF, r) && within((argb >> 8) & 0xFF, g) && within(argb & 0xFF, b) &&
+         (argb >> 24) == 0xFF;
+}
+
+// The quad covers pixels 16..48; each corner carries one color, interpolated linearly. Probes sit three
+// pixels inside the corners, where the nearest vertex weighs about 0.84 and its neighbours 0.08.
+void checkQuadPixels(const std::vector<std::uint8_t>& bgra, std::uint32_t width, std::uint32_t height, int tolerance = 12) {
+  CHECK(width == 64 && height == 64 && bgra.size() == 64 * 64 * 4);
+  if (bgra.size() != 64 * 64 * 4) return;
+  CHECK(pixelArgb(bgra, width, 2, 2) == 0xFF000000);
+  CHECK(pixelArgb(bgra, width, 61, 61) == 0xFF000000);
+  CHECK(pixelArgb(bgra, width, 14, 32) == 0xFF000000);
+  CHECK(channelsNear(pixelArgb(bgra, width, 18, 18), 215, 20, 20, tolerance));  // top left: red vertex
+  CHECK(channelsNear(pixelArgb(bgra, width, 45, 18), 0, 235, 20, tolerance));   // top right: green vertex
+  CHECK(channelsNear(pixelArgb(bgra, width, 18, 45), 0, 20, 235, tolerance));   // bottom left: blue vertex
+  CHECK(channelsNear(pixelArgb(bgra, width, 45, 45), 215, 235, 235, tolerance));  // bottom right: white vertex
+}
+
+// A quad with big-endian float positions and ub4 colors and real vertex and fragment programs: strip, fan,
+// indexed with a nonzero minimum index, indexed with a restart index, culling, blending and default
+// attribute values.
+void testRendererQuad(dal::VkContext& ctx) {
+  dal::rsxUnimplementedReset();
+  dal::RsxRenderer renderer(ctx, dal::RenderOptions{});
+  CHECK(renderer.valid());
+  std::vector<std::uint8_t> bgra;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+
+  // Renders one scene and returns the display; renderer-side notes are left in the census.
+  const auto render = [&](const QuadOptions& options) {
+    std::vector<dal::RsxCommand> commands = replaySynthetic(makeRenderedQuadCapture(options));
+    dal::rsxUnimplementedReset();
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height));
+    CHECK(width == 64 && height == 64 && bgra.size() == 64 * 64 * 4);
+    if (bgra.size() != 64 * 64 * 4) bgra.assign(64 * 64 * 4, 0);
+  };
+  const auto expectNoNotes = [] {
+    for (const auto& [name, count] : dal::rsxUnimplementedSnapshot()) {
+      std::fprintf(stderr, "unimplemented: %s: %llu\n", name.c_str(), static_cast<unsigned long long>(count));
+    }
+    CHECK(dal::rsxUnimplementedSnapshot().empty());
+  };
+
+  for (const QuadDraw draw : {QuadDraw::Strip, QuadDraw::IndexedU16, QuadDraw::Fan, QuadDraw::IndexedU32Restart}) {
+    QuadOptions options;
+    options.draw = draw;
+    render(options);
+    // A fan splits the quad along the other diagonal, so the corner probes mix in a little more of the
+    // neighbouring colors.
+    checkQuadPixels(bgra, width, height, draw == QuadDraw::Fan ? 45 : 12);
+    CHECK(renderer.stats().draws_skipped == 0);
+    expectNoNotes();
+  }
+  CHECK(renderer.stats().draws == 4);
+
+  // A restart index in a triangle list cannot be expressed: the draw is skipped, nothing is drawn.
+  QuadOptions list_restart;
+  list_restart.draw = QuadDraw::ListRestart;
+  render(list_restart);
+  CHECK(renderer.stats().draws_skipped == 1 && pixelArgb(bgra, width, 32, 32) == 0xFF000000);
+
+  // Culling. The quad's triangles run clockwise on screen, so they are front faces when the front face
+  // is clockwise (0x900) and back faces when it is counter-clockwise (0x901).
+  const struct {
+    std::uint32_t front_face, cull_face;
+    bool drawn;
+  } kCullCases[] = {{0x900, 0x405, true}, {0x901, 0x405, false}, {0x900, 0x404, false}, {0x901, 0x404, true}};
+  for (const auto& test : kCullCases) {
+    QuadOptions options;
+    options.cull = true;
+    options.front_face = test.front_face;
+    options.cull_face = test.cull_face;
+    render(options);
+    CHECK((pixelArgb(bgra, width, 32, 32) != 0xFF000000) == test.drawn);
+  }
+  QuadOptions no_cull;
+  no_cull.front_face = 0x900;
+  no_cull.cull_face = 0x404;  // ignored while culling is off
+  render(no_cull);
+  CHECK(pixelArgb(bgra, width, 32, 32) != 0xFF000000);
+
+  // Blending: white at alpha 0.5 over blue gives (0.5, 0.5, 1).
+  QuadOptions blend;
+  blend.blend = true;
+  blend.clear = 0xFF0000FF;
+  blend.uniform_color = 0x80FFFFFF;
+  render(blend);
+  const std::uint32_t blended = pixelArgb(bgra, width, 32, 32);
+  CHECK(std::abs(static_cast<int>((blended >> 16) & 0xFF) - 128) <= 3 && std::abs(static_cast<int>((blended >> 8) & 0xFF) - 128) <= 3 &&
+        (blended & 0xFF) == 0xFF);
+
+  // Default attribute values: an unwritten register reads (0, 0, 0, 1); a register written with four zeros
+  // stays (0, 0, 0, 0); a written value is used as it is.
+  QuadOptions defaults;
+  defaults.clear = 0xFF404040;
+  defaults.default_color = -1;
+  render(defaults);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0xFF000000);
+  defaults.default_color = 0;
+  render(defaults);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0x00000000);
+  defaults.default_color = 1;
+  render(defaults);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0xFFFF0000);
+  CHECK(pixelArgb(bgra, width, 2, 2) == 0xFF404040);
+
   CHECK(renderer.valid());
   dal::rsxUnimplementedReset();
 }
@@ -472,6 +882,7 @@ int main() {
   testShaderCompiler();
   testFrameDump();
   testPartialStencilNote();
+  testVertexConvert();
 
   dal::VkContextOptions options;
   options.validation = true;
@@ -493,6 +904,7 @@ int main() {
   testClearAndReadback(*ctx);
   testRendererClear(*ctx);
   testRendererScissorAndMask(*ctx);
+  testRendererQuad(*ctx);
   CHECK(ctx->validationErrorCount() == 0);
 
   ctx.reset();

@@ -19,8 +19,8 @@ struct VkContextOptions {
 };
 
 // Instance, physical device, logical device with one graphics queue, and the VMA allocator.
-// Requires Vulkan 1.3 (dynamic rendering, synchronization2, extended dynamic state) and
-// VK_KHR_push_descriptor.
+// Requires Vulkan 1.3 (dynamic rendering, synchronization2, shader demote to helper invocation,
+// extended dynamic state) and VK_KHR_push_descriptor.
 class VkContext {
  public:
   ~VkContext();
