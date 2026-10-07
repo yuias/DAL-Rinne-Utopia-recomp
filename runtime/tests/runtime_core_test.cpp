@@ -4694,6 +4694,29 @@ void testRsxDecode() {
   const auto defaults = dal::decodeDefaultAttribs(*regs);
   CHECK(defaults[8] == 1.0f && defaults[9] == 2.5f && defaults[10] == -3.0f && defaults[11] == 4.0f);
   CHECK(defaults[0] == 0.0f && defaults[12] == 0.0f);
+  CHECK((regs->vertex_default_written & (1u << 2)) != 0 && (regs->vertex_default_written & (1u << 5)) == 0);
+
+  // The other float forms land in the same block, the components they do not carry read (0, 0, 0, 1),
+  // and an explicit zero write still counts as written.
+  regs->apply(0x1880 + 5 * 8, std::bit_cast<std::uint32_t>(7.0f));
+  regs->apply(0x1880 + 5 * 8 + 4, std::bit_cast<std::uint32_t>(8.0f));
+  regs->apply(0x1E40 + 7 * 4, std::bit_cast<std::uint32_t>(9.0f));
+  for (std::uint32_t i = 0; i < 4; i++) regs->apply(0x1C00 + 9 * 16 + i * 4, 0);
+  const auto more = dal::decodeDefaultAttribs(*regs);
+  CHECK(more[20] == 7.0f && more[21] == 8.0f && more[22] == 0.0f && more[23] == 1.0f);
+  CHECK(more[28] == 9.0f && more[29] == 0.0f && more[30] == 0.0f && more[31] == 1.0f);
+  CHECK(more[36] == 0.0f && more[39] == 0.0f);
+  CHECK((regs->vertex_default_written & ((1u << 5) | (1u << 7) | (1u << 9))) == ((1u << 5) | (1u << 7) | (1u << 9)));
+  CHECK((regs->vertex_default_written & (1u << 6)) == 0);
+  // The written mask survives a context reset (it lives in RPCS3's init-only register_vertex_info) and
+  // reset() clears it.
+  auto scratch = std::make_unique<dal::RsxRegisters>();
+  scratch->reset();
+  scratch->apply(0x1C00, 0);
+  scratch->contextReset();
+  CHECK(scratch->vertex_default_written == 1);
+  scratch->reset();
+  CHECK(scratch->vertex_default_written == 0);
 
   // Texture unit 0: A8R8G8B8 linear, normalized, one mip, 1024x512 in main memory, wrap and linear filters.
   dal::rsxUnimplementedReset();
@@ -4784,8 +4807,9 @@ void testRsxDecode() {
   CHECK(clear.surfaces.clip_w == 1280);
 
   // Written methods with render semantics that the builder ignores.
-  CHECK(std::string_view(dal::rsxIgnoredMethodName(0x1500)) == "NV4097_SET_VERTEX_DATA3F_M");
-  CHECK(dal::rsxIgnoredMethodName(0x15FC) != nullptr && dal::rsxIgnoredMethodName(0x1600) == nullptr);
+  CHECK(std::string_view(dal::rsxIgnoredMethodName(0x1940)) == "NV4097_SET_VERTEX_DATA4UB_M");
+  CHECK(dal::rsxIgnoredMethodName(0x197C) != nullptr && dal::rsxIgnoredMethodName(0x1900) != nullptr);
+  CHECK(dal::rsxIgnoredMethodName(0x1500) == nullptr);  // the float forms are decoded into the defaults
   CHECK(dal::rsxIgnoredMethodName(0x1C00) == nullptr && dal::rsxIgnoredMethodName(0x1814) == nullptr);
   CHECK(dal::rsxIgnoredMethodName(0x1818) != nullptr && dal::rsxIgnoredMethodName(0xC40C) != nullptr);
 
@@ -5258,10 +5282,16 @@ void testRsxCapture() {
   regs->vp_load = 3;
   regs->vp_start = 4;
   regs->constant_load = 6;
+  regs->apply(0x1C00 + 2 * 16, 0x3F800000);  // default attribute slot 2 written
+  regs->vertex_default_written |= 1u << 9;   // slot 9 written with zeros: only the v2 mask can say so
   const dal::RsxSurface known{1, 0x2000, 0x800, 64, 32, dal::RsxColorFormat::A8R8G8B8};
   dal::RsxCaptureWriter second(11, *regs, std::span<const dal::RsxSurface>(&known, 1));
   dal::RsxCaptureReader second_reader;
-  CHECK(second_reader.parse(second.finish({}, 0).flatten(), error));
+  const std::vector<std::uint8_t> second_file = second.finish({}, 0).flatten();
+  CHECK(second_reader.parse(second_file, error));
+  CHECK(second_file[8] == 2);
+  CHECK(second_reader.startRegisters().vertex_default_written == regs->vertex_default_written &&
+        (regs->vertex_default_written & (1u << 9)) != 0);
   CHECK(second_reader.flipIndex() == 11 && second_reader.events().empty());
   CHECK(second_reader.startRegisters().regs == regs->regs && second_reader.startRegisters().vp_ucode == regs->vp_ucode);
   CHECK(second_reader.startRegisters().vp_constants == regs->vp_constants);
@@ -5269,12 +5299,40 @@ void testRsxCapture() {
         second_reader.startRegisters().constant_load == 6);
   CHECK(second_reader.surfaces().size() == 1 && sameSurface(second_reader.surfaces()[0], known));
 
-  // Malformed files are refused.
+  // A version 1 file has no written mask in its REGS chunk: the same bytes without the mask word and with
+  // the version and chunk size of v1 load, and the mask is inferred from the default attribute registers
+  // (slot 2 is nonzero; slot 9, written with zeros, cannot be told apart).
+  constexpr std::size_t kRegsChunkOffset = 20;  // header, then the REGS chunk: tag, size, data
+  constexpr std::size_t kRegsBytesV1 =
+      (0x4000 + dal::kRsxVpInstructionCount * 4 + dal::kRsxVpConstantCount * 4 + 3) * 4;
+  std::vector<std::uint8_t> v1_file = second_file;
+  v1_file[8] = 1;
+  v1_file.erase(v1_file.begin() + kRegsChunkOffset + 8 + kRegsBytesV1,
+                v1_file.begin() + kRegsChunkOffset + 8 + kRegsBytesV1 + 4);
+  v1_file[kRegsChunkOffset + 4] = static_cast<std::uint8_t>(kRegsBytesV1);
+  v1_file[kRegsChunkOffset + 5] = static_cast<std::uint8_t>(kRegsBytesV1 >> 8);
+  v1_file[kRegsChunkOffset + 6] = static_cast<std::uint8_t>(kRegsBytesV1 >> 16);
+  v1_file[kRegsChunkOffset + 7] = static_cast<std::uint8_t>(kRegsBytesV1 >> 24);
+  dal::RsxCaptureReader v1_reader;
+  CHECK(v1_reader.parse(v1_file, error));
+  CHECK(v1_reader.startRegisters().vertex_default_written == (1u << 2));
+  CHECK(v1_reader.startRegisters().regs == regs->regs && v1_reader.flipIndex() == 11);
+
+  // Malformed files are refused, including a version that does not match the REGS chunk size.
   std::vector<std::uint8_t> bad = file;
   bad[0] = 'X';
   CHECK(!reader.parse(bad, error));
   bad = file;
-  bad[8] = 2;  // version
+  bad[8] = 3;  // unknown version
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad[8] = 0;
+  CHECK(!reader.parse(bad, error));
+  bad = file;
+  bad[8] = 1;  // v2 chunk size under v1
+  CHECK(!reader.parse(bad, error));
+  bad = v1_file;
+  bad[8] = 2;  // v1 chunk size under v2
   CHECK(!reader.parse(bad, error));
   bad = file;
   bad.resize(bad.size() - 3);

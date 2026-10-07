@@ -3,7 +3,7 @@
 // Capture of one RSX frame as inputs (register writes, the guest bytes the frame builder read, and the
 // state the frame started from), so that a decoder or builder fix can be tested on an old capture.
 // The file is little-endian with the `.dalcap` extension:
-//   header  "DALRSXC1", u32 version (1), u64 flip index of the flip command that ends the frame
+//   header  "DALRSXC1", u32 version (2), u64 flip index of the flip command that ends the frame
 //   chunks  {u32 tag, u32 size, bytes}: REGS, DISP, SURF, then in stream order WRIT / MEMR / FLIP, END
 // A capture holds the writes after the previous flip command up to and including the next one. The
 // start registers are those the previous flip left behind: after its context reset and after the flip
@@ -27,8 +27,9 @@
 namespace dal {
 
 // The REGS chunk size follows kRsxVpInstructionCount and kRsxVpConstantCount: changing either needs a
-// version bump, or old captures would be rejected as malformed.
-inline constexpr std::uint32_t kRsxCaptureVersion = 1;
+// version bump, or old captures would be rejected as malformed. The writer writes this version; the
+// reader also accepts version 1, whose REGS chunk lacks the vertex default written mask.
+inline constexpr std::uint32_t kRsxCaptureVersion = 2;
 
 // The file image in three parts, so the bulk of it (the recorded stream) is moved rather than copied
 // while the guest lock is held.

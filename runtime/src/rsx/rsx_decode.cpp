@@ -21,6 +21,7 @@ constexpr std::uint32_t kCullBack = 0x405;
 constexpr std::uint32_t kCullFrontAndBack = 0x408;
 constexpr std::uint32_t kFrontFaceCw = 0x900;
 constexpr std::uint32_t kFrontFaceCcw = 0x901;
+constexpr std::uint32_t kShadeModelSmooth = 0x1D01;  // CELL_GCM_SMOOTH; CELL_GCM_FLAT is 0x1D00
 constexpr std::uint32_t kBlendEquationSignedFirst = 0xF005;  // REVERSE_SUBTRACT_SIGNED .. REVERSE_ADD_SIGNED
 constexpr std::uint32_t kBlendEquationSignedLast = 0xF007;
 
@@ -53,22 +54,20 @@ struct MethodRange {
   const char* name;
 };
 
-// Methods the frame builder does not turn into commands: immediate vertex data other than the 4-float
-// form (read by decodeDefaultAttribs), element and inline arrays, and the data-moving trigger of each
-// blit engine. Counts are registers: 16 attributes times the words per attribute (RPCS3 `bind_range`
-// of the `NV4097_SET_VERTEX_DATA*_M` methods). NV308A_COLOR has a count of 1 on purpose: only its first
-// register is listed, so a blit is counted once although the color array spans 0x700 registers.
+// Methods the frame builder does not turn into commands: the integer immediate vertex data forms (the
+// float forms are decoded into the default attribute registers by RsxRegisters::apply), element and
+// inline arrays, and the data-moving trigger of each blit engine. Counts are registers: 16 attributes
+// times the words per attribute (RPCS3 `bind_range` of the `NV4097_SET_VERTEX_DATA*_M` methods).
+// NV308A_COLOR has a count of 1 on purpose: only its first register is listed, so a blit is counted
+// once although the color array spans 0x700 registers.
 constexpr MethodRange kIgnoredMethods[] = {
     {kMethodNv4097SetVertexDataScaled4sM, 32, "NV4097_SET_VERTEX_DATA_SCALED4S_M"},
-    {kMethodNv4097SetVertexData3fM, 64, "NV4097_SET_VERTEX_DATA3F_M"},
     {kMethodNv4097ArrayElement16, 1, "NV4097_ARRAY_ELEMENT16"},
     {kMethodNv4097ArrayElement32, 1, "NV4097_ARRAY_ELEMENT32"},
     {kMethodNv4097InlineArray, 1, "NV4097_INLINE_ARRAY"},
-    {kMethodNv4097SetVertexData2fM, 32, "NV4097_SET_VERTEX_DATA2F_M"},
     {kMethodNv4097SetVertexData2sM, 16, "NV4097_SET_VERTEX_DATA2S_M"},
     {kMethodNv4097SetVertexData4ubM, 16, "NV4097_SET_VERTEX_DATA4UB_M"},
     {kMethodNv4097SetVertexData4sM, 32, "NV4097_SET_VERTEX_DATA4S_M"},
-    {kMethodNv4097SetVertexData1fM, 16, "NV4097_SET_VERTEX_DATA1F_M"},
     {kMethodNv0039BufferNotify, 1, "NV0039_BUFFER_NOTIFY"},
     {kMethodNv308aColor, 1, "NV308A_COLOR"},
     {kMethodNv3089ImageIn, 1, "NV3089_IMAGE_IN"},
@@ -252,7 +251,8 @@ RsxSurfaceState decodeSurfaceState(const RsxRegisters& regs) {
 }
 
 // RPCS3 `rsx_decode.h` registers_decoder for SET_BLEND_*, SET_COLOR_MASK, SET_ALPHA_*, SET_DEPTH_*,
-// SET_CULL_FACE*, SET_FRONT_FACE, SET_SHADE_MODE, SET_VIEWPORT_*, SET_SCISSOR_*, SET_SHADER_WINDOW.
+// SET_CULL_FACE*, SET_FRONT_FACE, SET_SHADE_MODE, SET_VIEWPORT_*, SET_SCISSOR_*, SET_SHADER_WINDOW,
+// SET_CLIP_MIN / SET_CLIP_MAX (float bit patterns) and SET_POINT_SIZE.
 RsxRasterState decodeRasterState(const RsxRegisters& regs) {
   RsxRasterState r;
   r.blend = regs.reg(kMethodNv4097SetBlendEnable) != 0;
@@ -278,6 +278,10 @@ RsxRasterState decodeRasterState(const RsxRegisters& regs) {
   r.front_face = regs.reg(kMethodNv4097SetFrontFace);
   r.color_mask = regs.reg(kMethodNv4097SetColorMask);
   r.shade_model = regs.reg(kMethodNv4097SetShadeMode);
+  r.clip_min = asFloat(regs.reg(kMethodNv4097SetClipMin));
+  r.clip_max = asFloat(regs.reg(kMethodNv4097SetClipMax));
+  r.point_size = asFloat(regs.reg(kMethodNv4097SetPointSize));
+  r.two_sided_lighting = regs.reg(kMethodNv4097SetTwoSideLightEn) != 0;
 
   for (std::uint32_t i = 0; i < 4; i++) {
     r.viewport_scale[i] = asFloat(regs.reg(kMethodNv4097SetViewportScale + i * 4));
@@ -319,6 +323,12 @@ RsxRasterState decodeRasterState(const RsxRegisters& regs) {
   if (regs.reg(kMethodNv4097SetLogicOpEnable) != 0) noteState("logic op");
   if (regs.reg(kMethodNv4097SetPolyOffsetFillEnable) != 0) noteState("polygon offset");
   if (regs.reg(kMethodNv4097SetDepthBoundsTestEnable) != 0) noteState("depth bounds test");
+  // SET_ZMIN_MAX_CONTROL (`rsx_decode.h`): clip enable in bits 0..3, clamp in bits 4..7. The device has no
+  // depth clamp, so a primitive is always clipped to the depth range.
+  const std::uint32_t zmin_max_control = regs.reg(kMethodNv4097SetZminMaxControl);
+  if ((zmin_max_control & 0xF) == 0) noteState("depth clip disabled");
+  if ((zmin_max_control & 0xF0) != 0) noteState("depth clamp");
+  if (r.shade_model != kShadeModelSmooth) noteState("flat shading");
   return r;
 }
 
@@ -421,6 +431,13 @@ RsxIndexArray decodeIndexArray(const RsxRegisters& regs) {
     a.type = static_cast<std::uint8_t>(kRsxIndexTypeU32);
   }
   return a;
+}
+
+bool rsxPrimitiveRestartSupported(RsxPrimitive primitive, std::uint8_t index_type, std::uint32_t restart_index) {
+  const bool restartable = primitive == RsxPrimitive::LineStrip || primitive == RsxPrimitive::TriangleStrip ||
+                           primitive == RsxPrimitive::TriangleFan || primitive == RsxPrimitive::QuadStrip;
+  const std::uint32_t all_ones = index_type == kRsxIndexTypeU16 ? 0xFFFFu : 0xFFFFFFFFu;
+  return restartable && restart_index == all_ones;
 }
 
 bool decodePrimitive(std::uint32_t value, RsxPrimitive& out) {

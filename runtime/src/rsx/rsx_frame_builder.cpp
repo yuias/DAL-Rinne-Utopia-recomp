@@ -270,6 +270,7 @@ bool RsxFrameBuilder::fillVertices(const RsxRegisters& regs, RsxDraw& draw, std:
     attrib.has_data = true;
   }
   draw.default_attribs = decodeDefaultAttribs(regs);
+  draw.default_written = regs.vertex_default_written;
   return true;
 }
 
@@ -409,18 +410,31 @@ void RsxFrameBuilder::endDraw(const RsxRegisters& regs) {
 
     const bool restart = regs.reg(kMethodNv4097SetRestartIndexEnable) != 0;
     const std::uint32_t restart_index = regs.reg(kMethodNv4097SetRestartIndex);
-    if (restart) noteState("primitive restart");
     std::uint32_t min_index = 0xFFFFFFFF, max_index = 0;
     for (std::uint32_t i = 0; i < range_.count; i++) {
       const std::uint8_t* p = draw.index_data.data() + static_cast<std::size_t>(i) * type_size;
       const std::uint32_t index = type_size == 2 ? readBe16(p) : readBe32(p);
-      if (restart && index == restart_index) continue;
+      if (restart && index == restart_index) {
+        draw.restart_used = true;
+        continue;
+      }
       min_index = std::min(min_index, index);
       max_index = std::max(max_index, index);
+    }
+    draw.restart_index = restart_index;
+    draw.max_index = max_index;
+    // What the renderer can do with a restart index is its own business; only an unsupported one is counted.
+    if (draw.restart_used && !rsxPrimitiveRestartSupported(primitive_, draw.index_type, restart_index)) {
+      noteState("primitive restart");
     }
     // RPCS3 `VKVertexBuffers.cpp`: an empty index set, or a single index outside point lists, draws
     // nothing.
     if (min_index > max_index || (min_index == max_index && primitive_ != RsxPrimitive::Points)) return;
+    // Indices 0 and 0xFFFFFFFF together span 2^32 vertices, which no count can hold.
+    if (static_cast<std::uint64_t>(max_index) - min_index + 1 > 0xFFFFFFFFull) {
+      noteState("index range too large");
+      return;
+    }
     draw.min_index = min_index;
     // The vertex start of an indexed draw is rebased by SET_VERTEX_DATA_BASE_INDEX
     // (`rsx::get_index_from_base`); array draws are not.
@@ -428,6 +442,7 @@ void RsxFrameBuilder::endDraw(const RsxRegisters& regs) {
     vertex_count = max_index - min_index + 1;
   } else {
     draw.min_index = range_.first;
+    draw.max_index = range_.first + range_.count - 1;
   }
 
   draw.surfaces = decodeSurfaceState(regs);

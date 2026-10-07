@@ -390,6 +390,7 @@ void RsxRegisters::reset() {
   vp_ucode.fill(0);
   vp_constants.fill(0);
   vp_load = vp_start = constant_load = 0;
+  vertex_default_written = 0;
   for (const RegisterDefault& entry : kRegisterDefaults) {
     for (std::uint32_t i = 0; i < entry.count; i++) regs[(entry.method + i * entry.stride) >> 2] = entry.value;
   }
@@ -401,9 +402,42 @@ void RsxRegisters::contextReset() {
   }
 }
 
+namespace {
+
+struct ImmediateVertexForm {
+  std::uint32_t first;       // first method of the block
+  std::uint32_t registers;   // registers in the block
+  std::uint32_t per_slot;    // registers per attribute slot
+  std::uint32_t components;  // components the form carries (3F pads its fourth register)
+};
+
+// RPCS3 `NV47/HW/nv4097.h` set_vertex_data_impl: attribute = index / registers per attribute,
+// component = index % registers per attribute.
+constexpr ImmediateVertexForm kImmediateVertexForms[] = {
+    {kMethodNv4097SetVertexData3fM, 64, 4, 3},
+    {kMethodNv4097SetVertexData2fM, 32, 2, 2},
+    {kMethodNv4097SetVertexData4fM, 64, 4, 4},
+    {kMethodNv4097SetVertexData1fM, 16, 1, 1},
+};
+
+}  // namespace
+
 void RsxRegisters::apply(std::uint32_t method, std::uint32_t value) {
   method &= 0xFFFC;
   regs[method >> 2] = value;
+
+  for (const ImmediateVertexForm& form : kImmediateVertexForms) {
+    if (method < form.first || method >= form.first + form.registers * 4) continue;
+    const std::uint32_t index = (method - form.first) >> 2;
+    const std::uint32_t slot = index / form.per_slot, component = index % form.per_slot;
+    if (component >= form.components) return;
+    constexpr std::uint32_t kOne = 0x3F800000;
+    const std::uint32_t base = (kMethodNv4097SetVertexData4fM >> 2) + slot * 4;
+    regs[base + component] = value;
+    for (std::uint32_t c = form.components; c < 4; c++) regs[base + c] = c == 3 ? kOne : 0;
+    vertex_default_written |= 1u << slot;
+    return;
+  }
 
   if (method == kMethodNv4097SetTransformProgramLoad) {
     vp_load = value;

@@ -7,6 +7,7 @@
 #include <system_error>
 #include <utility>
 
+#include "rsx/fifo_parser.h"
 #include "rsx/rsx_unimplemented.h"
 
 namespace dal {
@@ -34,8 +35,11 @@ constexpr std::size_t kSurfaceRecordSize = 6 * 4;
 constexpr std::size_t kDisplayRecordSize = 4 * 4;
 constexpr std::size_t kMemoryHeaderSize = 3 * 4;
 
-constexpr std::size_t kRegsWords = 0x4000 + kRsxVpInstructionCount * 4 + kRsxVpConstantCount * 4 + 3;
-constexpr std::size_t kRegsBytes = kRegsWords * 4;
+// Version 2 appends the vertex default written mask after the load pointers. A version 1 chunk has no
+// mask; the reader infers it from the default attribute registers.
+constexpr std::size_t kRegsWordsBase = 0x4000 + kRsxVpInstructionCount * 4 + kRsxVpConstantCount * 4 + 3;
+constexpr std::size_t kRegsBytesBase = kRegsWordsBase * 4;
+constexpr std::size_t kRegsBytes = kRegsBytesBase + 4;
 constexpr std::size_t kDispBytes = 4 + kRsxDisplayBufferCount * kDisplayRecordSize;
 
 void put32(std::vector<std::uint8_t>& out, std::uint32_t value) {
@@ -77,6 +81,7 @@ RsxCaptureWriter::RsxCaptureWriter(std::uint64_t flip_index, const RsxRegisters&
   put32(head_, regs.vp_load);
   put32(head_, regs.vp_start);
   put32(head_, regs.constant_load);
+  put32(head_, regs.vertex_default_written);
 
   beginChunk(surfaces_, kTagSurf, 4 + surfaces.size() * kSurfaceRecordSize);
   put32(surfaces_, static_cast<std::uint32_t>(surfaces.size()));
@@ -171,7 +176,7 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
     return false;
   }
   const std::uint32_t version = get32(base + 8);
-  if (version != kRsxCaptureVersion) {
+  if (version != 1 && version != kRsxCaptureVersion) {
     error = std::format("unsupported capture version {}", version);
     return false;
   }
@@ -194,7 +199,8 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
     const std::uint8_t* chunk = base + pos;
 
     if (tag == kTagRegs) {
-      if (have_regs || chunk_size != kRegsBytes) {
+      // Version 1 has no written mask; version 2 must have it.
+      if (have_regs || chunk_size != (version == 1 ? kRegsBytesBase : kRegsBytes)) {
         error = "bad REGS chunk";
         return false;
       }
@@ -211,6 +217,17 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
       regs_->vp_load = take();
       regs_->vp_start = take();
       regs_->constant_load = take();
+      if (version != 1) {
+        regs_->vertex_default_written = take();
+      } else {
+        for (std::uint32_t slot = 0; slot < 16; slot++) {
+          for (std::uint32_t c = 0; c < 4; c++) {
+            if (regs_->regs[(kMethodNv4097SetVertexData4fM >> 2) + slot * 4 + c] != 0) {
+              regs_->vertex_default_written |= 1u << slot;
+            }
+          }
+        }
+      }
       have_regs = true;
     } else if (tag == kTagDisp) {
       if (have_disp || chunk_size != kDispBytes) {

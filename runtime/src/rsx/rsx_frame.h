@@ -55,6 +55,9 @@ struct RsxRasterState {
                 blend_eq_rgb = 0, blend_eq_a = 0, blend_color = 0, alpha_func = 0, alpha_ref = 0, depth_func = 0,
                 cull_face = 0, front_face = 0, color_mask = 0, shade_model = 0;
   float viewport_scale[4] = {}, viewport_offset[4] = {};
+  float clip_min = 0.0f, clip_max = 1.0f;  // SET_CLIP_MIN / SET_CLIP_MAX: the depth range of the viewport
+  float point_size = 1.0f;                 // SET_POINT_SIZE
+  bool two_sided_lighting = false;         // SET_TWO_SIDE_LIGHT_EN
   std::uint32_t scissor_x = 0, scissor_y = 0, scissor_w = 0, scissor_h = 0, window_origin = 0, pixel_center = 0;
 };
 
@@ -75,10 +78,19 @@ struct RsxDraw {
   bool indexed = false;
   std::uint8_t index_type = 0;
   std::uint32_t first = 0, count = 0, min_index = 0;
+  // Largest vertex index of the draw (first + count - 1 for array draws). For indexed draws the smallest
+  // and largest value exclude the restart index; each vertex array holds max_index - min_index + 1
+  // elements. restart_used: the index data contains restart_index, with SET_RESTART_INDEX_ENABLE on.
+  std::uint32_t max_index = 0;
+  bool restart_used = false;
+  std::uint32_t restart_index = 0;
   std::vector<RsxVertexAttrib> attribs;
   std::vector<std::uint8_t> vertex_data;  // guest bytes, BE
   std::vector<std::uint8_t> index_data;   // guest bytes, BE
-  std::array<float, 16 * 4> default_attribs{};  // SET_VERTEX_DATA4F_M for unbound slots
+  // SET_VERTEX_DATA*_M values for unbound slots; default_written bit n says slot n was written. A slot
+  // that was not reads as (0, 0, 0, 1) whatever default_attribs holds.
+  std::array<float, 16 * 4> default_attribs{};
+  std::uint32_t default_written = 0;
   std::vector<RsxTextureDesc> textures;
   std::vector<std::uint8_t> texture_data;
   std::uint64_t vp_hash = 0;

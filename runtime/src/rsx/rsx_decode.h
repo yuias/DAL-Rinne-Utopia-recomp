@@ -98,6 +98,10 @@ struct RsxDrawRange {
 };
 constexpr RsxDrawRange decodeDrawRange(std::uint32_t value) { return {value & 0xFFFFFF, (value >> 24) + 1}; }
 
+// True when a restart index can be honoured: the primitive is a strip or fan and the index is the
+// all-ones value of the index type (the only one Vulkan restarts at).
+bool rsxPrimitiveRestartSupported(RsxPrimitive primitive, std::uint8_t index_type, std::uint32_t restart_index);
+
 // SET_BEGIN_END argument. False for 0 (END) and for values outside 1..10 (the latter is counted).
 bool decodePrimitive(std::uint32_t value, RsxPrimitive& out);
 
