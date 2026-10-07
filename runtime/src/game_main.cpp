@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <optional>
 #include <span>
@@ -25,6 +26,8 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "input/keyboard_pad.h"
+#include "input/pad_script.h"
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
 #include "media/ffmpeg_codecs.h"
@@ -46,6 +49,11 @@ struct Options {
   std::string rsx_census;
   std::string log_file;
   std::string dialog_answer;
+  std::string pad;  // --pad as given; empty until the defaults are settled after all arguments
+  std::string pad_script;
+  std::vector<dal::PadScriptEvent> pad_script_events;
+  // Set when the keyboard is the pad. The window thread and the script thread write to it.
+  std::shared_ptr<dal::KeyboardPadState> keyboard;
   unsigned seconds = 0;
   bool strict = false;
   bool quiet_hle = false;
@@ -152,6 +160,18 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
     dal::PresenterOptions presenter_options;
     presenter_options.frame_slots = dal::RsxRenderer::kFramesInFlight;
     presenter_options.on_close = [] { dal::stopProcess(dal::ExitCode::ProcessExit, "dal: stop: window closed"); };
+    if (opt.keyboard) {
+      // These run on the window thread; the state is lock-free, so the guest never waits on it.
+      presenter_options.on_key = [keyboard = opt.keyboard](const dal::KeyMessage& key) {
+        keyboard->keyEvent(key.scan_code, key.down, key.repeat, dal::KeyboardPadState::Clock::now());
+        if (key.repeat) return;
+        if (const std::optional<dal::PadButton> button = dal::padButtonForScanCode(key.scan_code)) {
+          dal::logDebug("dal: pad: key {:#x} {} -> {}", key.scan_code, key.down ? "down" : "up",
+                        dal::padButtonName(*button));
+        }
+      };
+      presenter_options.on_focus_lost = [keyboard = opt.keyboard] { keyboard->releaseAll(dal::InputSource::Keyboard); };
+    }
     presenter = dal::Presenter::create(*context, std::move(presenter_options), error);
     if (!presenter) {
       error = "window: " + error;
@@ -194,7 +214,8 @@ void printUsage() {
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--log-level trace|debug|info|warn|error]\n"
       "                [--quiet-hle] [--load-only]\n"
-      "                [--dialog-answer yes|no|ok] [--pad none|neutral]\n"
+      "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard]\n"
+      "                [--pad-script FILE]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
       "                [--vk-validation] [--window]\n",
@@ -262,10 +283,19 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     } else if (arg == "--pad") {
       std::string name;
       if (!value(name)) return false;
-      if (!dal::setPadBackend(name)) {
-        std::fprintf(stderr, "error: --pad needs none or neutral\n");
+      if (name != "none" && name != "neutral" && name != "keyboard") {
+        std::fprintf(stderr, "error: --pad needs none, neutral or keyboard\n");
         return false;
       }
+      opt.pad = name;
+    } else if (arg == "--pad-script") {
+      if (!value(opt.pad_script)) return false;
+      auto events = dal::loadPadScript(std::filesystem::path(opt.pad_script));
+      if (!events) {
+        std::fprintf(stderr, "error: --pad-script %s: %s\n", opt.pad_script.c_str(), events.error().c_str());
+        return false;
+      }
+      opt.pad_script_events = std::move(*events);
     } else if (arg == "--render") {
       std::string name;
       if (!value(name)) return false;
@@ -323,6 +353,17 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     std::fputs(
         "error: --dump-frames, --dump-frames-every, --shader-cache, --vk-validation and --window need --render vulkan\n",
         stderr);
+    return false;
+  }
+  // A window or a script is what makes a keyboard pad useful, so either one selects it by default.
+  const bool pad_input = opt.window || !opt.pad_script.empty();
+  if (opt.pad.empty()) opt.pad = pad_input ? "keyboard" : "neutral";
+  if (opt.pad == "keyboard" && !pad_input) {
+    std::fputs("error: --pad keyboard needs --window or --pad-script\n", stderr);
+    return false;
+  }
+  if (!opt.pad_script.empty() && opt.pad != "keyboard") {
+    std::fputs("error: --pad-script needs --pad keyboard\n", stderr);
     return false;
   }
   return true;
@@ -480,6 +521,22 @@ int main(int argc, char** argv) {
 
   installMovieCodecs();
 
+  // The window thread and the script thread share `opt.keyboard`; the executor factory below copies
+  // the options, so it is created first.
+  if (opt.pad == "keyboard") {
+    opt.keyboard = std::make_shared<dal::KeyboardPadState>();
+    dal::setPadProvider(dal::makeKeyboardPadProvider(opt.keyboard));
+    std::string where;
+    if (opt.window) where += " (window)";
+    if (!opt.pad_script.empty()) {
+      where += std::format(" (script {}, {} events)", std::filesystem::path(opt.pad_script).filename().string(),
+                           opt.pad_script_events.size());
+    }
+    dal::logInfo("dal: pad: keyboard{}", where);
+  } else {
+    dal::setPadBackend(opt.pad);
+  }
+
   // The device is created on the RSX thread when it starts, so it belongs to that thread.
   if (opt.render_vulkan) {
     dal::setRsxExecutorFactory(
@@ -487,6 +544,8 @@ int main(int argc, char** argv) {
   }
 
   // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
+  // The script clock starts here so that it matches --seconds within a few milliseconds.
+  if (opt.keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, opt.keyboard);
   dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
   dal::runSupervisor(opt.seconds);
 }

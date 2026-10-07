@@ -173,7 +173,12 @@ void padSetPortSetting(DalPpuContext* ctx, std::uint8_t*) {
   }
   // Not NO_DEVICE for ports without state.
   if (port < kMaxPorts) {
-    g_pad.ports[port].setting = setting & (kSettingPressOn | kSettingSensorOn);
+    const std::uint32_t masked = setting & (kSettingPressOn | kSettingSensorOn);
+    g_pad.ports[port].setting = masked;
+    // Press mode decides whether pressure words reach the game, which matters to input providers.
+    logOnce(std::format("pad-setting-{}-{:#x}", port, masked),
+            "dal: pad: port {} setting {:#x} (press {}, sensor {})", port, masked,
+            (masked & kSettingPressOn) != 0 ? "on" : "off", (masked & kSettingSensorOn) != 0 ? "on" : "off");
   }
   ctx->gpr[3] = kCellOk;
 }
