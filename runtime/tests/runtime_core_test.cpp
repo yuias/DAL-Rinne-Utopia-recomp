@@ -189,6 +189,21 @@ void testIsCommittedAndRangeNames() {
   dal::GuestMemory unreserved;
   CHECK(!unreserved.isCommitted(0x10000, 4));
 
+  // The page bitmap holds 64 pages per word: ranges across word boundaries, partial decommit, top page.
+  CHECK(memory->commit(0x100000, 0x200000));  // 512 pages, whole words and partial ones
+  CHECK(memory->isCommitted(0x100000, 0x200000));
+  CHECK(!memory->isCommitted(0x100000, 0x200001));
+  CHECK(!memory->isCommitted(0xFFFFF, 2));
+  memory->decommit(0x13F000, 0x2000);  // pages 0x13F and 0x140 straddle a word boundary
+  CHECK(memory->isCommitted(0x100000, 0x3F000));
+  CHECK(!memory->isCommitted(0x13F000, 4));
+  CHECK(!memory->isCommitted(0x140FFC, 4));
+  CHECK(!memory->isCommitted(0x13EFFC, 8));
+  CHECK(memory->isCommitted(0x141000, 0x1BF000));
+  CHECK(memory->commit(0xFFFFF000u, 0x1000));
+  CHECK(memory->isCommitted(0xFFFFFFFCu, 4));
+  CHECK(!memory->isCommitted(0xFFFFFFFCu, 5));
+
   CHECK(std::string_view(dal::guestRangeName(0x10000)) == "main");
   CHECK(std::string_view(dal::guestRangeName(0x0FFFFFFF)) == "main");
   CHECK(std::string_view(dal::guestRangeName(0x10000000)) == "rsx-context");

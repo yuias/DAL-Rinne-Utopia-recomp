@@ -71,6 +71,7 @@ bool GuestMemory::reserve() {
     return false;
   }
   base_ = static_cast<std::uint8_t*>(p);
+  committed_pages_ = std::make_unique<std::atomic<std::uint64_t>[]>(kGuestSpace / kPageSize / 64);  // zeroed
   g_reserve_end.store(reinterpret_cast<std::uintptr_t>(base_) + total);
   g_reserve_begin.store(reinterpret_cast<std::uintptr_t>(base_));
   return true;
@@ -88,8 +89,11 @@ bool GuestMemory::commit(std::uint32_t addr, std::uint32_t size) {
   if (end > kGuestSpace) {
     return false;
   }
-  return VirtualAlloc(base_ + begin, static_cast<std::size_t>(end - begin), MEM_COMMIT,
-                      PAGE_READWRITE) != nullptr;
+  if (VirtualAlloc(base_ + begin, static_cast<std::size_t>(end - begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+    return false;
+  }
+  markPages(begin / kPageSize, end / kPageSize, true);
+  return true;
 }
 
 void GuestMemory::decommit(std::uint32_t addr, std::uint32_t size) {
@@ -99,7 +103,24 @@ void GuestMemory::decommit(std::uint32_t addr, std::uint32_t size) {
   const std::uint64_t begin = addr & ~(kPageSize - 1);
   const std::uint64_t end =
       std::min(alignUp(static_cast<std::uint64_t>(addr) + size, kPageSize), kGuestSpace);
+  // Cleared first, so a concurrent isCommitted never reports a page that is already being released.
+  markPages(begin / kPageSize, end / kPageSize, false);
   VirtualFree(base_ + begin, static_cast<std::size_t>(end - begin), MEM_DECOMMIT);
+}
+
+void GuestMemory::markPages(std::uint64_t first_page, std::uint64_t end_page, bool committed) {
+  for (std::uint64_t page = first_page; page < end_page;) {
+    const std::uint64_t word = page / 64;
+    const std::uint64_t first_bit = page % 64;
+    const std::uint64_t bits = std::min<std::uint64_t>(64 - first_bit, end_page - page);
+    const std::uint64_t mask = (bits == 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits) - 1)) << first_bit;
+    if (committed) {
+      committed_pages_[word].fetch_or(mask, std::memory_order_release);
+    } else {
+      committed_pages_[word].fetch_and(~mask, std::memory_order_release);
+    }
+    page += bits;
+  }
 }
 
 bool GuestMemory::isCommitted(std::uint32_t addr, std::uint32_t size) const {
@@ -110,14 +131,15 @@ bool GuestMemory::isCommitted(std::uint32_t addr, std::uint32_t size) const {
   if (end > kGuestSpace) {
     return false;
   }
-  for (std::uint64_t cursor = addr; cursor < end;) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(base_ + cursor, &info, sizeof info) == 0 || info.State != MEM_COMMIT ||
-        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+  const std::uint64_t end_page = alignUp(end, kPageSize) / kPageSize;
+  for (std::uint64_t page = addr / kPageSize; page < end_page;) {
+    const std::uint64_t first_bit = page % 64;
+    const std::uint64_t bits = std::min<std::uint64_t>(64 - first_bit, end_page - page);
+    const std::uint64_t mask = (bits == 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits) - 1)) << first_bit;
+    if ((committed_pages_[page / 64].load(std::memory_order_acquire) & mask) != mask) {
       return false;
     }
-    // RegionSize counts from the page containing the queried address.
-    cursor = static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize - base_;
+    page += bits;
   }
   return true;
 }

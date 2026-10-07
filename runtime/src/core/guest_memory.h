@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 
 namespace dal {
 
@@ -47,15 +49,22 @@ class GuestMemory {
   bool commit(std::uint32_t addr, std::uint32_t size);
   void decommit(std::uint32_t addr, std::uint32_t size);
 
-  // True when every page of [addr, addr + size) is committed (VirtualQuery). False before reserve()
-  // and when the range runs past the 32-bit space.
+  // True when every page of [addr, addr + size) is committed. False before reserve() and when the
+  // range runs past the 32-bit space. Answered from a page bitmap kept by commit()/decommit();
+  // VirtualQuery costs hundreds of microseconds inside a large committed block.
   bool isCommitted(std::uint32_t addr, std::uint32_t size) const;
 
   // True when `host` points into the reservation, including the guard tail.
   bool containsHost(const void* host) const;
 
  private:
+  // Sets or clears the bitmap bits of the pages [first_page, end_page).
+  void markPages(std::uint64_t first_page, std::uint64_t end_page, bool committed);
+
   std::uint8_t* base_ = nullptr;
+  // One bit per 4 KiB page; a set bit means the page was committed by commit() and not decommitted
+  // since. Guest pages are never re-protected, so this matches what VirtualQuery would report.
+  std::unique_ptr<std::atomic<std::uint64_t>[]> committed_pages_;
 };
 
 // First-fit allocator over a sorted map of used ranges. Callers hold the guest lock, so there is no
