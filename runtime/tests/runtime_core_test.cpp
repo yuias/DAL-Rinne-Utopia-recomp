@@ -46,6 +46,8 @@
 #include "rsx/fifo_parser.h"
 #include "rsx/gcm_interrupts.h"
 #include "rsx/rsx_census.h"
+#include "rsx/rsx_frame.h"
+#include "rsx/rsx_registers.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_thread.h"
 #include "zlib.h"
@@ -4500,6 +4502,87 @@ void testRsxArgCensus() {
   stdfs::remove_all(root, ec);
 }
 
+void testRsxRegisters() {
+  auto regs = std::make_unique<dal::RsxRegisters>();
+  regs->reset();
+
+  // Plain writes land in the register file; the offset is masked to the register window.
+  regs->apply(0x0A6C, 0x207);
+  CHECK(regs->reg(0x0A6C) == 0x207 && regs->regs[0x0A6C >> 2] == 0x207);
+  regs->apply(0x10000 + 0x0A6C, 0x201);
+  CHECK(regs->reg(0x0A6C) == 0x201);
+
+  // Eight program words at load slot 3 fill instructions 3 and 4 and move the load pointer by two.
+  regs->apply(dal::kMethodNv4097SetTransformProgramLoad, 3);
+  CHECK(regs->vp_load == 3);
+  for (std::uint32_t i = 0; i < 8; i++) regs->apply(dal::kMethodNv4097SetTransformProgram + i * 4, 0x100 + i);
+  for (std::uint32_t i = 0; i < 8; i++) CHECK(regs->vp_ucode[12 + i] == 0x100 + i);
+  CHECK(regs->vp_ucode[11] == 0 && regs->vp_ucode[20] == 0);
+  CHECK(regs->vp_load == 5 && regs->reg(dal::kMethodNv4097SetTransformProgramLoad) == 5);
+  // A block that starts mid-instruction (word 2 onwards) completes it, then starts the next one.
+  regs->apply(dal::kMethodNv4097SetTransformProgramLoad, 0);
+  regs->apply(dal::kMethodNv4097SetTransformProgram + 2 * 4, 0x20);
+  regs->apply(dal::kMethodNv4097SetTransformProgram + 3 * 4, 0x30);
+  CHECK(regs->vp_ucode[2] == 0x20 && regs->vp_ucode[3] == 0x30 && regs->vp_load == 1);
+  // Writes past the last instruction are dropped.
+  regs->apply(dal::kMethodNv4097SetTransformProgramLoad, dal::kRsxVpInstructionCount);
+  regs->apply(dal::kMethodNv4097SetTransformProgram, 0xDEAD);
+  CHECK(regs->vp_load == dal::kRsxVpInstructionCount);
+  regs->apply(dal::kMethodNv4097SetTransformProgramLoad, dal::kRsxVpInstructionCount - 1);
+  for (std::uint32_t i = 0; i < 8; i++) regs->apply(dal::kMethodNv4097SetTransformProgram + i * 4, 0x500 + i);
+  CHECK(regs->vp_ucode[(dal::kRsxVpInstructionCount - 1) * 4 + 3] == 0x503 && regs->vp_ucode[0] == 0);
+  CHECK(regs->vp_load == dal::kRsxVpInstructionCount);
+  // Further writes at the end of the store neither land nor move the pointer.
+  for (std::uint32_t i = 0; i < 4; i++) regs->apply(dal::kMethodNv4097SetTransformProgram + i * 4, 0x600 + i);
+  CHECK(regs->vp_load == dal::kRsxVpInstructionCount && regs->vp_ucode[0] == 0);
+  CHECK(regs->reg(dal::kMethodNv4097SetTransformProgramLoad) == dal::kRsxVpInstructionCount);
+  regs->apply(dal::kMethodNv4097SetTransformProgramStart, 7);
+  CHECK(regs->vp_start == 7);
+
+  // Constants are addressed from the load slot and the load slot itself stays put.
+  regs->apply(dal::kMethodNv4097SetTransformConstantLoad, 3);
+  CHECK(regs->constant_load == 3);
+  for (std::uint32_t i = 0; i < 8; i++) regs->apply(dal::kMethodNv4097SetTransformConstant + i * 4, 0x200 + i);
+  for (std::uint32_t i = 0; i < 8; i++) CHECK(regs->vp_constants[12 + i] == 0x200 + i);
+  CHECK(regs->vp_constants[11] == 0 && regs->vp_constants[20] == 0);
+  CHECK(regs->constant_load == 3 && regs->reg(dal::kMethodNv4097SetTransformConstantLoad) == 3);
+  // The last slot is 467; slot 468 and beyond are dropped.
+  regs->apply(dal::kMethodNv4097SetTransformConstantLoad, dal::kRsxVpConstantCount - 1);
+  for (std::uint32_t i = 0; i < 8; i++) regs->apply(dal::kMethodNv4097SetTransformConstant + i * 4, 0x300 + i);
+  CHECK(regs->vp_constants[(dal::kRsxVpConstantCount - 1) * 4 + 3] == 0x303 && regs->vp_constants[0] == 0);
+
+  // Reset restores the defaults and clears both stores.
+  regs->reset();
+  CHECK(regs->vp_load == 0 && regs->vp_start == 0 && regs->constant_load == 0);
+  CHECK(regs->vp_ucode[12] == 0 && regs->vp_constants[12] == 0 && regs->reg(0x0A6C) == 0x201);
+  CHECK(regs->reg(0x0208) == 0x121 && regs->reg(0x020C) == 0x40);              // surface format, pitch A
+  CHECK(regs->reg(0x0A30) == 0x45000000 && regs->reg(0x0A38) == 0x3F000000);  // viewport scale x, z
+  CHECK(regs->reg(0x0A20) == 0x45000000 && regs->reg(0x0A3C) == 0);           // viewport offset x, scale w
+  CHECK(regs->reg(0x0A00) == 0x10000000 && regs->reg(0x08C0) == 0x10000000);  // viewport, scissor
+  CHECK(regs->reg(0x0314) == 0x10001 && regs->reg(0x0318) == 0);              // blend sfactor, dfactor
+  CHECK(regs->reg(0x0320) == 0x80068006);                                     // blend equation
+  CHECK(regs->reg(0x0324) == 0x1010101);                                      // color mask
+  CHECK(regs->reg(0x0308) == 0x207 && regs->reg(0x030C) == 0);                // alpha func, ref
+  CHECK(regs->reg(0x0A6C) == 0x201 && regs->reg(0x0A70) == 1);                // depth func, mask
+  CHECK(regs->reg(0x1830) == 0x405 && regs->reg(0x1834) == 0x901);            // cull face, front face
+  CHECK(regs->reg(0x0368) == 0x1D01);                                         // shade mode
+  CHECK(regs->reg(0x08E4) == 1 && regs->reg(0x1D8C) == 0xFFFFFF00);           // shader program, zs clear
+  CHECK(regs->reg(0x1A04) == 0x18429 && regs->reg(0x1A04 + 15 * 0x20) == 0x18429);
+  CHECK(regs->reg(0x1A14) == 0x2052000 && regs->reg(0x1A08 + 3 * 0x20) == 0x30101);
+  CHECK(regs->reg(0x1740) == 2 && regs->reg(0x177C) == 2 && regs->reg(0x1680) == 0);
+  CHECK(regs->reg(0x0904 + 3 * 0x20) == 0x1BC21 && regs->reg(0x0904 + 4 * 0x20) == 0);
+  CHECK(regs->reg(0x1DB0) == 0xFFFFFFFF && regs->reg(0x1D7C) == 0xFFFF0000);
+
+  // The command types compose into the variant and start out zeroed.
+  dal::RsxCommand command = dal::RsxDraw{};
+  CHECK(std::holds_alternative<dal::RsxDraw>(command));
+  command = dal::RsxFlip{};
+  CHECK(std::get<dal::RsxFlip>(command).flip_index == 0);
+  command = dal::RsxClear{};
+  CHECK(std::get<dal::RsxClear>(command).surfaces.color.pitch == 0);
+  CHECK(static_cast<int>(dal::RsxPrimitive::Points) == 1 && static_cast<int>(dal::RsxPrimitive::Polygon) == 10);
+}
+
 void testRsxConsumer() {
   using dal::FifoStatus;
   using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
@@ -5901,6 +5984,7 @@ int main(int argc, char** argv) {
   testCellPngDec();
   testFifoParser();
   testRsxArgCensus();
+  testRsxRegisters();
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();

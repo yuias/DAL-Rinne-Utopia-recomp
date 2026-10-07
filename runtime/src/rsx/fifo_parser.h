@@ -60,6 +60,7 @@ inline constexpr std::uint32_t kMethodNv4097SetTextureOffset = 0x1A00;  // 16 un
 inline constexpr std::uint32_t kMethodNv4097SetTransformProgramLoad = 0x1E9C;
 inline constexpr std::uint32_t kMethodNv4097SetTransformProgramStart = 0x1EA0;
 inline constexpr std::uint32_t kMethodNv4097SetTransformConstantLoad = 0x1EFC;
+inline constexpr std::uint32_t kMethodNv4097SetTransformConstant = 0x1F00;  // 32 registers
 inline constexpr std::uint32_t kMethodGcmFlipHead = 0xE920;  // two registers, head 0 and 1
 inline constexpr std::uint32_t kMethodGcmSetUserCommand = 0xEB00;  // two registers
 inline constexpr std::uint32_t kMethodGcmFlipCommand = 0xFEAC;

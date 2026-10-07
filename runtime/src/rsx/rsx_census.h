@@ -21,9 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rsx/rsx_registers.h"
+
 namespace dal {
 
-inline constexpr std::uint32_t kRsxVpInstructionCount = 544;  // RPCS3 max_vertex_program_instructions
 inline constexpr std::uint32_t kRsxFpMaxInstructions = 2048;  // scan limit for a program without an end flag
 
 // ---- pure decoders (unit tested) ----
