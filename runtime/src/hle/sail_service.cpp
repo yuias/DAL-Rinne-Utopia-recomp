@@ -26,8 +26,13 @@ constexpr char kThreadName[] = "_libsail-control";
 struct ServiceState {
   std::condition_variable_any wake;
   std::deque<SailCall> queue;
-  bool stop = false;
+  // Bumped by stopSailService. A thread runs only while it holds the current value, so a thread
+  // that outlives a timed-out stop exits when it next wakes instead of consuming next to its
+  // replacement.
+  std::uint64_t generation = 1;
   std::uint32_t thread_id = 0;
+  // Set when the thread could not be created; later calls are dropped instead of retrying.
+  bool start_failed = false;
 };
 
 ServiceState& serviceState() {
@@ -36,13 +41,16 @@ ServiceState& serviceState() {
   return *state;
 }
 
-// Entry function of the thread. Returning ends the thread (only stopSailService asks for it).
+// Entry function of the thread; r3 holds the generation it serves. Returning ends the thread (only
+// stopSailService asks for it, by bumping the generation).
 void serviceThreadBody(DalPpuContext* ctx, std::uint8_t* base) {
   ServiceState& s = serviceState();
+  const std::uint64_t generation = ctx->gpr[3];
   for (;;) {
     blockingWait(
-        s.wake, [&] { return s.stop || !s.queue.empty(); }, "sail control wait", std::nullopt);
-    if (s.stop) {
+        s.wake, [&] { return s.generation != generation || !s.queue.empty(); },
+        "sail control wait", std::nullopt);
+    if (s.generation != generation) {
       ctx->gpr[3] = 0;
       return;
     }
@@ -75,13 +83,16 @@ bool startServiceThread(ServiceState& s) {
   params.entry_opd = registerHostFunction("sailServiceThread", serviceThreadBody);
   params.priority = kThreadPriority;
   params.stack_size = kThreadStackSize;
+  params.arg0 = s.generation;
   params.tls_r13 = r13;
   params.service = true;
   params.name = kThreadName;
   const std::uint32_t id = createGuestThread(params);
-  if (id == 0) return false;
+  if (id == 0) {
+    freeTls(r13);
+    return false;
+  }
 
-  s.stop = false;
   s.thread_id = id;
   return true;
 }
@@ -90,7 +101,8 @@ bool startServiceThread(ServiceState& s) {
 
 void queueSailCall(SailCall call) {
   ServiceState& s = serviceState();
-  if (s.thread_id == 0 && !startServiceThread(s)) {
+  if (s.thread_id == 0 && !s.start_failed && !startServiceThread(s)) s.start_failed = true;
+  if (s.start_failed) {
     // The game would wait for events that never come; say so instead of failing silently.
     logOnce(LogLevel::Error, "sail-service-thread",
             "dal: sail: cannot create the {} thread; a queued call is dropped", kThreadName);
@@ -104,17 +116,20 @@ void stopSailService() {
   ServiceState& s = serviceState();
   if (s.thread_id != 0) {
     GuestThread* thread = findThread(s.thread_id);
-    s.stop = true;
+    s.generation++;
     s.wake.notify_all();
     if (thread != nullptr) {
-      blockingWait(
+      const bool exited = blockingWait(
           thread->joiners(), [&] { return thread->state() == ThreadState::Exited; }, "sail service stop",
           std::chrono::seconds(5));
+      // The thread still exits on its own once it wakes; its generation is no longer current, so
+      // a thread started afterwards is the only consumer.
+      if (!exited) logWarn("dal: sail: the {} thread did not stop within 5 s", kThreadName);
     }
   }
   s.queue.clear();
-  s.stop = false;
   s.thread_id = 0;
+  s.start_failed = false;
 }
 
 void setMediaCodecFactory(std::unique_ptr<MediaCodecFactory> factory) {
