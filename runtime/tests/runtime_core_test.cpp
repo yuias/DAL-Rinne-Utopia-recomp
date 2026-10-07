@@ -35,6 +35,8 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "input/keyboard_pad.h"
+#include "input/pad_buttons.h"
 #include "png.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_ppu_thread.h"
@@ -3102,6 +3104,317 @@ void testCellPad() {
   dal::setLogSink({});
   dal::resetCensus();
   dal::resetLogOnce();
+}
+
+bool samePadState(const dal::PadPortState& a, const dal::PadPortState& b) {
+  return a.connected == b.connected && a.device_capability == b.device_capability &&
+         a.device_type == b.device_type && a.button == b.button;
+}
+
+void testPadButtons() {
+  using dal::PadButton;
+  CHECK(samePadState(dal::padStateFromButtons(0), dal::neutralPadState()));
+
+  const dal::PadPortState cross = dal::padStateFromButtons(dal::padButtonBit(PadButton::Cross));
+  CHECK(cross.button[dal::kPadButtonDigital1] == 0 && cross.button[dal::kPadButtonDigital2] == 0x40);
+  CHECK(cross.button[14] == 0xFF && cross.connected);
+
+  const dal::PadPortState up_start = dal::padStateFromButtons(dal::padButtonBit(PadButton::Up) |
+                                                              dal::padButtonBit(PadButton::Start));
+  CHECK(up_start.button[dal::kPadButtonDigital1] == 0x18 && up_start.button[dal::kPadButtonDigital2] == 0);
+  CHECK(up_start.button[10] == 0xFF);
+  // Start has no pressure word: Up's is the only one set.
+  std::size_t pressure_set = 0;
+  for (std::size_t i = dal::kPadButtonPressureFirst; i < dal::kPadButtonSensorFirst; i++) {
+    pressure_set += up_start.button[i] != 0;
+  }
+  CHECK(pressure_set == 1);
+
+  // Every button on its own: one digital bit, its pressure word (if any), nothing else changed.
+  constexpr std::size_t kPressureWords[16] = {0, 0, 0, 0, 10, 8, 11, 9, 18, 19, 16, 17, 12, 13, 14, 15};
+  const dal::PadPortState neutral = dal::neutralPadState();
+  bool layout_ok = true;
+  for (std::size_t i = 0; i < 16; i++) {
+    const auto button = static_cast<PadButton>(i);
+    CHECK(dal::padPressureWord(button) == kPressureWords[i]);
+    dal::PadPortState expected = neutral;
+    expected.button[i < 8 ? dal::kPadButtonDigital1 : dal::kPadButtonDigital2] =
+        static_cast<std::uint16_t>(1u << (i % 8));
+    if (kPressureWords[i] != 0) expected.button[kPressureWords[i]] = 0xFF;
+    layout_ok = layout_ok && samePadState(dal::padStateFromButtons(dal::padButtonBit(button)), expected);
+  }
+  CHECK(layout_ok);
+  CHECK(dal::padPressureWord(PadButton::Count) == 0);
+
+  // Names round-trip for all 16 buttons; anything else is rejected.
+  bool names_ok = true;
+  for (std::size_t i = 0; i < 16; i++) {
+    const auto button = static_cast<PadButton>(i);
+    const std::string_view name = dal::padButtonName(button);
+    names_ok = names_ok && !name.empty() && dal::padButtonFromName(name) == button;
+  }
+  CHECK(names_ok);
+  CHECK(dal::padButtonName(PadButton::Cross) == "cross" && dal::padButtonName(PadButton::L3) == "l3");
+  CHECK(dal::padButtonName(PadButton::Count).empty());
+  CHECK(!dal::padButtonFromName("crosss") && !dal::padButtonFromName("") && !dal::padButtonFromName("Cross"));
+  CHECK(!dal::padButtonFromName("ps") && !dal::padButtonFromName("count"));
+}
+
+void testKeyboardPadScanCodes() {
+  using dal::PadButton;
+  struct Key {
+    std::uint32_t scan_code;
+    PadButton button;
+  };
+  constexpr Key kKeys[] = {
+      {0xE048, PadButton::Up},     {0xE050, PadButton::Down},   {0xE04B, PadButton::Left},
+      {0xE04D, PadButton::Right},  {0x2C, PadButton::Cross},    {0x2D, PadButton::Circle},
+      {0x1F, PadButton::Square},   {0x20, PadButton::Triangle}, {0x11, PadButton::L1},
+      {0x12, PadButton::L2},       {0x13, PadButton::R1},       {0x16, PadButton::R2},
+      {0x02, PadButton::L3},       {0x04, PadButton::R3},       {0x2F, PadButton::Start},
+      {0x2E, PadButton::Select},
+  };
+  dal::PadButtons covered = 0;
+  for (const Key& key : kKeys) {
+    CHECK(dal::padButtonForScanCode(key.scan_code) == key.button);
+    covered |= dal::padButtonBit(key.button);
+  }
+  CHECK(covered == 0xFFFF);
+
+  // No other scan code maps, so each button has exactly one key.
+  std::size_t mapped = 0;
+  for (std::uint32_t code = 0; code < 0x10000; code++) mapped += dal::padButtonForScanCode(code).has_value();
+  CHECK(mapped == 16);
+  CHECK(!dal::padButtonForScanCode(0x48));  // numpad 8: same code as Up without the extended bit
+  CHECK(!dal::padButtonForScanCode(0x50) && !dal::padButtonForScanCode(0x4B) &&
+        !dal::padButtonForScanCode(0x4D));
+  CHECK(!dal::padButtonForScanCode(0));
+}
+
+void testKeyboardPadState() {
+  using State = dal::KeyboardPadState;
+  using std::chrono::milliseconds;
+  using dal::PadButton;
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+  constexpr dal::PadButtons kStart = dal::padButtonBit(PadButton::Start);
+  constexpr dal::PadButtons kUp = dal::padButtonBit(PadButton::Up);
+  constexpr dal::PadButtons kDown = dal::padButtonBit(PadButton::Down);
+  constexpr dal::PadButtons kLeft = dal::padButtonBit(PadButton::Left);
+  constexpr dal::PadButtons kRight = dal::padButtonBit(PadButton::Right);
+  constexpr std::uint32_t kZ = 0x2C;
+  const State::Clock::time_point t0 = State::Clock::time_point{} + std::chrono::seconds(100);
+
+  State state;
+  CHECK(state.held() == 0 && state.reported(t0) == 0);
+  CHECK(!state.keyEvent(0x48, true, false, t0) && state.held() == 0);  // unmapped
+  CHECK(state.keyEvent(kZ, true, false, t0) && state.held() == kCross);
+
+  // A tap shorter than the polling interval is still reported for the minimum visible time. The
+  // key-up message of Win32 always carries the repeat flag; it must still release.
+  CHECK(state.keyEvent(kZ, false, true, t0 + milliseconds(10)));
+  CHECK(state.held() == 0);
+  CHECK(state.reported(t0 + milliseconds(10)) == kCross);
+  CHECK(state.reported(t0 + milliseconds(50)) == kCross);
+  CHECK(state.reported(t0 + milliseconds(59)) == kCross);
+  CHECK(state.reported(t0 + milliseconds(70)) == 0);
+
+  // A repeat of a key that is not held (focus regained) is ignored; a repeat of a held key does
+  // not refresh the press time.
+  CHECK(state.keyEvent(kZ, true, true, t0 + milliseconds(100)) && state.held() == 0);
+  CHECK(state.reported(t0 + milliseconds(110)) == 0);
+  const State::Clock::time_point t1 = t0 + std::chrono::seconds(1);
+  CHECK(state.keyEvent(kZ, true, false, t1));
+  CHECK(state.keyEvent(kZ, true, true, t1 + milliseconds(40)) && state.held() == kCross);
+  CHECK(state.keyEvent(kZ, true, false, t1 + milliseconds(45)));  // already down: also ignored
+  CHECK(state.keyEvent(kZ, false, true, t1 + milliseconds(50)));
+  CHECK(state.reported(t1 + milliseconds(59)) == kCross);
+  CHECK(state.reported(t1 + milliseconds(61)) == 0);
+
+  // A long press ends with the key.
+  const State::Clock::time_point t2 = t1 + std::chrono::seconds(1);
+  CHECK(state.keyEvent(kZ, true, false, t2));
+  CHECK(state.reported(t2 + std::chrono::seconds(5)) == kCross);
+  CHECK(state.keyEvent(kZ, false, true, t2 + std::chrono::seconds(5)));
+  CHECK(state.reported(t2 + std::chrono::seconds(5) + milliseconds(70)) == 0);
+
+  // Opposite d-pad directions held together cancel; the other axis is unaffected.
+  const State::Clock::time_point t3 = t2 + std::chrono::seconds(10);
+  State dpad;
+  dpad.setButtons(dal::InputSource::Keyboard, kUp, true, t3);
+  CHECK(dpad.reported(t3 + std::chrono::seconds(1)) == kUp);
+  dpad.setButtons(dal::InputSource::Script, kDown, true, t3);
+  CHECK(dpad.held() == (kUp | kDown));
+  CHECK(dpad.reported(t3 + std::chrono::seconds(1)) == 0);
+  dpad.setButtons(dal::InputSource::Keyboard, kLeft | kRight | kCross, true, t3);
+  CHECK(dpad.reported(t3 + std::chrono::seconds(1)) == kCross);
+  dpad.setButtons(dal::InputSource::Script, kDown, false, t3 + std::chrono::seconds(1));
+  CHECK(dpad.reported(t3 + std::chrono::seconds(2)) == (kUp | kCross));
+
+  // releaseAll drops one source at once and leaves the other alone.
+  const State::Clock::time_point t4 = t3 + std::chrono::seconds(10);
+  State sources;
+  sources.setButtons(dal::InputSource::Keyboard, kCross, true, t4);
+  sources.setButtons(dal::InputSource::Script, kStart, true, t4);
+  CHECK(sources.held() == (kCross | kStart));
+  sources.releaseAll(dal::InputSource::Keyboard);
+  CHECK(sources.held() == kStart);
+  CHECK(sources.reported(t4 + milliseconds(5)) == kStart);  // Cross is not kept for 60 ms
+  sources.releaseAll(dal::InputSource::Keyboard);           // nothing left to release
+  CHECK(sources.held() == kStart);
+  // A script tap keeps its minimum visible time; a button held by two sources stays until both let go.
+  sources.setButtons(dal::InputSource::Script, kStart, false, t4 + milliseconds(10));
+  CHECK(sources.held() == 0 && sources.reported(t4 + milliseconds(50)) == kStart);
+  CHECK(sources.reported(t4 + milliseconds(70)) == 0);
+  sources.setButtons(dal::InputSource::Keyboard, kCross, true, t4 + std::chrono::seconds(1));
+  sources.setButtons(dal::InputSource::Script, kCross, true, t4 + std::chrono::seconds(1));
+  sources.setButtons(dal::InputSource::Script, kCross, false, t4 + std::chrono::seconds(2));
+  CHECK(sources.held() == kCross);
+
+  // The tail of a released key never swallows a newly pressed opposite key.
+  const State::Clock::time_point t5 = t4 + std::chrono::seconds(10);
+  State menu;
+  CHECK(menu.keyEvent(0xE048, true, false, t5));                      // Up down
+  CHECK(menu.keyEvent(0xE048, false, true, t5 + milliseconds(10)));   // Up up
+  CHECK(menu.keyEvent(0xE050, true, false, t5 + milliseconds(20)));   // Down down
+  CHECK(menu.reported(t5 + milliseconds(20)) == kDown);
+  CHECK(menu.reported(t5 + milliseconds(40)) == kDown);
+  CHECK(menu.keyEvent(0xE050, false, true, t5 + milliseconds(30)));
+  // Both only tails: the more recent press remains.
+  CHECK(menu.reported(t5 + milliseconds(35)) == kDown);
+  CHECK(menu.reported(t5 + milliseconds(75)) == kDown);
+  CHECK(menu.reported(t5 + milliseconds(85)) == 0);
+
+  // releaseAll of one source keeps the tail of a tap made by the other.
+  const State::Clock::time_point t6 = t5 + std::chrono::seconds(10);
+  State tails;
+  tails.setButtons(dal::InputSource::Script, kStart, true, t6);
+  tails.setButtons(dal::InputSource::Script, kStart, false, t6 + milliseconds(10));
+  tails.setButtons(dal::InputSource::Keyboard, kStart, true, t6 + milliseconds(20));
+  tails.releaseAll(dal::InputSource::Keyboard);
+  CHECK(tails.held() == 0 && tails.reported(t6 + milliseconds(30)) == kStart);
+  CHECK(tails.reported(t6 + milliseconds(70)) == 0);
+}
+
+void testKeyboardPadProvider() {
+  using State = dal::KeyboardPadState;
+  using dal::PadButton;
+  constexpr std::uint32_t kZ = 0x2C;
+
+  // The provider reads the state through the injected clock.
+  auto state = std::make_shared<State>();
+  State::Clock::time_point now = State::Clock::time_point{} + std::chrono::seconds(50);
+  std::unique_ptr<dal::PadProvider> provider = dal::makeKeyboardPadProvider(state, [&] { return now; });
+  CHECK(samePadState(provider->poll(0), dal::neutralPadState()));
+  CHECK(provider->poll(0).connected && !provider->poll(1).connected && !provider->poll(6).connected);
+  CHECK(state->keyEvent(kZ, true, false, now));
+  CHECK(samePadState(provider->poll(0), dal::padStateFromButtons(dal::padButtonBit(PadButton::Cross))));
+  CHECK(!provider->poll(1).connected);
+  now += std::chrono::seconds(2);
+  CHECK(state->keyEvent(kZ, false, false, now));
+  now += std::chrono::seconds(1);
+  CHECK(samePadState(provider->poll(0), dal::neutralPadState()));
+
+  // The default clock is the real one: a key held now shows up.
+  auto live_state = std::make_shared<State>();
+  std::unique_ptr<dal::PadProvider> live = dal::makeKeyboardPadProvider(live_state);
+  live_state->keyEvent(kZ, true, false, State::Clock::now());
+  CHECK(live->poll(0).button[dal::kPadButtonDigital2] == 0x40);
+
+  // Through the cellPad handlers, as a game polls it.
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetCellPad();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t data = scratch;
+
+  enum Import : std::uint32_t { Init, End, SetPortSetting, GetData, GetInfo2, SetActDirect, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x1cf98800, "sys_io", "cellPadInit"},
+      {0x00800010, 0x4d9b75d5, "sys_io", "cellPadEnd"},
+      {0x00800020, 0x578e3c98, "sys_io", "cellPadSetPortSetting"},
+      {0x00800030, 0x8b72cda1, "sys_io", "cellPadGetData"},
+      {0x00800040, 0xa703a51d, "sys_io", "cellPadGetInfo2"},
+      {0x00800050, 0xf65544ee, "sys_io", "cellPadSetActDirect"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  const auto len = [&] { return static_cast<std::int32_t>(dalRead32(base, data)); };
+  const auto word = [&](std::uint32_t i) { return dalRead16(base, data + 4 + 2 * i); };
+
+  auto pad_state = std::make_shared<State>();
+  State::Clock::time_point pad_now = State::Clock::time_point{} + std::chrono::seconds(10);
+  dal::setPadProvider(dal::makeKeyboardPadProvider(pad_state, [&] { return pad_now; }));
+  CHECK(call(Init, 4) == 0);
+  CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(2) == 0 && word(3) == 0);
+  CHECK(word(4) == 0x80 && word(7) == 0x80);
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  CHECK(call(GetData, 1, data) == 0x80121107);  // port 1: no device
+
+  CHECK(pad_state->keyEvent(kZ, true, false, pad_now));
+  CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(3) == 0x40 && word(2) == 0);
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  CHECK(pad_state->keyEvent(0xE048, true, false, pad_now));
+  CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(2) == 0x10 && word(3) == 0x40);
+
+  // With press mode on the pressed buttons report 0xFF in their pressure words.
+  CHECK(call(SetPortSetting, 0, 2) == 0);
+  CHECK(call(GetData, 0, data) == 0);  // a changed setting alone changes nothing the game compared
+  CHECK(pad_state->keyEvent(kZ, false, false, pad_now));
+  pad_now += std::chrono::seconds(1);
+  CHECK(call(GetData, 0, data) == 0 && len() == 20 && word(3) == 0 && word(2) == 0x10);
+  CHECK(word(10) == 0xFF && word(14) == 0);
+
+  dal::resetCellPad();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
+void testKeyboardPadThreads() {
+  using State = dal::KeyboardPadState;
+  constexpr std::uint32_t kZ = 0x2C;
+  constexpr int kToggles = 10000;
+
+  auto state = std::make_shared<State>();
+  std::unique_ptr<dal::PadProvider> provider = dal::makeKeyboardPadProvider(state);
+  std::atomic<bool> done{false};
+  std::atomic<bool> started{false};
+  // Two downs then an up: repeated downs of a held key are ignored, and the last toggle is a down.
+  bool last_down = false;
+  std::thread writer([&] {
+    // Starts only after the first poll, so writes and polls really overlap.
+    while (!started.load()) std::this_thread::yield();
+    for (int i = 0; i < kToggles; i++) {
+      last_down = i % 3 != 2;
+      state->keyEvent(kZ, last_down, false, State::Clock::now());
+    }
+    done.store(true);
+  });
+  std::uint64_t polls = 0;
+  while (!done.load()) {
+    const dal::PadPortState polled = provider->poll(0);
+    CHECK(polled.connected);
+    polls++;
+    started.store(true);
+  }
+  writer.join();
+  const dal::PadButtons expected = last_down ? dal::padButtonBit(dal::PadButton::Cross) : 0;
+  CHECK(last_down);
+  CHECK(state->held() == expected);
+  CHECK(provider->poll(0).button[dal::kPadButtonDigital2] == 0x40);
+  CHECK(polls > 0);
 }
 
 void testCellMsgDialog() {
@@ -6977,6 +7290,11 @@ int main(int argc, char** argv) {
   testCellSysutil();
   testVideoAndAudioOut();
   testCellPad();
+  testPadButtons();
+  testKeyboardPadScanCodes();
+  testKeyboardPadState();
+  testKeyboardPadProvider();
+  testKeyboardPadThreads();
   testCellMsgDialog();
   testCellSaveData();
   testCellPngDec();
