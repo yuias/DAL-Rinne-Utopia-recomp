@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -44,6 +45,45 @@ void testEmptyDirectory() {
   const auto absent = dal::loadFfmpeg(dir / "does_not_exist");
   CHECK(!absent.has_value());
   std::filesystem::remove_all(dir, ec);
+}
+
+// A load that fails after some libraries are mapped must unmap them again. Copies of the real
+// libraries sit in a temporary directory next to an avcodec that is not a valid DLL; if the loader
+// kept the copies mapped, Windows would refuse to delete them. Runs before testLoad for the same
+// reason as testEmptyDirectory.
+void testPartialLoadIsUnmapped(const std::filesystem::path& real_dir) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path(ec) / "dal_ffmpeg_partial_dir_test";
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+
+  const std::string avcodec = "avcodec-" + std::to_string(LIBAVCODEC_VERSION_MAJOR) + ".dll";
+  int copied = 0;
+  for (const char* stem : {"avutil-", "swresample-", "swscale-"}) {
+    for (const fs::directory_entry& entry : fs::directory_iterator(real_dir, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.starts_with(stem) && name.ends_with(".dll")) {
+        fs::copy_file(entry.path(), dir / name, fs::copy_options::overwrite_existing, ec);
+        if (!ec) copied++;
+      }
+    }
+  }
+  CHECK(copied == 3);
+  {
+    std::ofstream bogus(dir / avcodec, std::ios::binary);
+    bogus << "not a dll";
+  }
+
+  const auto result = dal::loadFfmpeg(dir);
+  CHECK(!result.has_value());
+  if (!result) {
+    std::printf("partial directory: unavailable: %s\n", result.error().c_str());
+    CHECK(result.error().find("cannot load " + avcodec) != std::string::npos);
+  }
+  fs::remove_all(dir, ec);
+  CHECK(!ec);
+  CHECK(!fs::exists(dir));
 }
 
 void testLoad() {
@@ -111,8 +151,12 @@ void testLoad() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   testEmptyDirectory();
+  if (argc > 0) {
+    std::error_code ec;
+    testPartialLoadIsUnmapped(std::filesystem::absolute(argv[0], ec).parent_path());
+  }
   testLoad();
   std::printf("media ffmpeg tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;

@@ -1,6 +1,7 @@
 #include "media/ffmpeg_api.h"
 
 #include <array>
+#include <atomic>
 #include <format>
 #include <mutex>
 #include <string_view>
@@ -32,29 +33,70 @@ struct Modules {
   HMODULE swscale = nullptr;
 };
 
+// Library order of the load; also indexes the file names and handles.
+enum Library : std::size_t { kAvutil, kSwresample, kSwscale, kAvcodec, kLibraryCount };
+
+// Frees the libraries of a failed load, last loaded first. Windows resolves an already loaded
+// module by its base name, so a leaked handle would make a later load from another directory
+// return the old DLLs.
+struct LoadedLibraries {
+  std::array<HMODULE, kLibraryCount> handles{};
+  bool keep = false;
+
+  LoadedLibraries() = default;
+  LoadedLibraries(const LoadedLibraries&) = delete;
+  LoadedLibraries& operator=(const LoadedLibraries&) = delete;
+  ~LoadedLibraries() {
+    if (keep) return;
+    for (std::size_t i = handles.size(); i-- > 0;) {
+      if (handles[i] != nullptr) FreeLibrary(handles[i]);
+    }
+  }
+};
+
+// Per-thread, so it does not change what other threads of the game see.
+class ScopedErrorMode {
+ public:
+  ScopedErrorMode() {
+    if (!SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &old_mode_)) {
+      active_ = false;
+    }
+  }
+  ScopedErrorMode(const ScopedErrorMode&) = delete;
+  ScopedErrorMode& operator=(const ScopedErrorMode&) = delete;
+  ~ScopedErrorMode() {
+    if (active_) SetThreadErrorMode(old_mode_, nullptr);
+  }
+
+ private:
+  DWORD old_mode_ = 0;
+  bool active_ = true;
+};
+
 using FormatLineFn = decltype(&::av_log_format_line2);
 
-// Set before the log callback is installed and never changed while it can run.
-FormatLineFn g_format_line = nullptr;
+// Written under the loader mutex but read by the log callback on any FFmpeg thread.
+std::atomic<FormatLineFn> g_format_line{nullptr};
 
 void ffmpegLogCallback(void* ptr, int level, const char* fmt, va_list vl) {
   // Warnings and errors from FFmpeg are frequent and mostly harmless for a decoder that skips bad
   // units, so even those stay at debug.
   const LogLevel mapped = level <= AV_LOG_WARNING ? LogLevel::Debug : LogLevel::Trace;
-  if (!logEnabled(mapped) || g_format_line == nullptr) return;
+  const FormatLineFn format_line = g_format_line.load(std::memory_order_acquire);
+  if (!logEnabled(mapped) || format_line == nullptr) return;
 
   // Local on purpose: FFmpeg logs from decoder threads and a shared prefix state would race.
   int print_prefix = 1;
   std::array<char, 1024> line;
-  g_format_line(ptr, level, fmt, vl, line.data(), static_cast<int>(line.size()), &print_prefix);
+  format_line(ptr, level, fmt, vl, line.data(), static_cast<int>(line.size()), &print_prefix);
   std::string_view text(line.data());
   while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
   if (text.empty()) return;
   logWrite(mapped, std::format("ffmpeg: {}", text));
 }
 
-std::string lastErrorText() {
-  return std::system_category().message(static_cast<int>(GetLastError()));
+std::string errorText(DWORD error) {
+  return std::system_category().message(static_cast<int>(error));
 }
 
 std::string joinNames(const std::vector<std::string>& names) {
@@ -87,12 +129,11 @@ std::expected<FfmpegApi, std::string> loadFrom(const std::filesystem::path& dir)
   }
 
   // Load order puts the dependencies first. swresample is only a static import of avcodec.
-  const std::array<std::string, 4> files = {
-      std::format("avutil-{}.dll", LIBAVUTIL_VERSION_MAJOR),
-      std::format("swresample-{}.dll", LIBSWRESAMPLE_VERSION_MAJOR),
-      std::format("swscale-{}.dll", LIBSWSCALE_VERSION_MAJOR),
-      std::format("avcodec-{}.dll", LIBAVCODEC_VERSION_MAJOR),
-  };
+  std::array<std::string, kLibraryCount> files;
+  files[kAvutil] = std::format("avutil-{}.dll", LIBAVUTIL_VERSION_MAJOR);
+  files[kSwresample] = std::format("swresample-{}.dll", LIBSWRESAMPLE_VERSION_MAJOR);
+  files[kSwscale] = std::format("swscale-{}.dll", LIBSWSCALE_VERSION_MAJOR);
+  files[kAvcodec] = std::format("avcodec-{}.dll", LIBAVCODEC_VERSION_MAJOR);
 
   std::vector<std::string> missing_files;
   for (const std::string& file : files) {
@@ -103,16 +144,23 @@ std::expected<FfmpegApi, std::string> loadFrom(const std::filesystem::path& dir)
         std::format("missing {} in {}", joinNames(missing_files), absolute_dir.generic_string()));
   }
 
-  std::array<HMODULE, 4> handles{};
+  LoadedLibraries loaded;
+  // A corrupt or truncated DLL would otherwise raise a modal "Bad Image" dialog and block the
+  // process; with the error mode set it is reported through GetLastError instead.
+  const ScopedErrorMode error_mode;
   for (std::size_t i = 0; i < files.size(); ++i) {
     // The directory must be part of an absolute path for DLL_LOAD_DIR to take effect.
-    handles[i] = LoadLibraryExW((absolute_dir / files[i]).c_str(), nullptr, kLoadFlags);
-    if (handles[i] == nullptr) {
+    loaded.handles[i] = LoadLibraryExW((absolute_dir / files[i]).c_str(), nullptr, kLoadFlags);
+    if (loaded.handles[i] == nullptr) {
+      // Read before anything else can overwrite it (std::format argument order is unspecified).
+      const DWORD error = GetLastError();
       return std::unexpected(std::format("cannot load {} from {}: {}", files[i],
-                                         absolute_dir.generic_string(), lastErrorText()));
+                                         absolute_dir.generic_string(), errorText(error)));
     }
   }
-  const Modules modules{.avutil = handles[0], .avcodec = handles[3], .swscale = handles[2]};
+  const Modules modules{.avutil = loaded.handles[kAvutil],
+                        .avcodec = loaded.handles[kAvcodec],
+                        .swscale = loaded.handles[kSwscale]};
 
   FfmpegApi api;
   std::vector<std::string> missing_symbols;
@@ -144,10 +192,13 @@ std::expected<FfmpegApi, std::string> loadFrom(const std::filesystem::path& dir)
     }
   }
 
-  g_format_line = api.av_log_format_line2;
+  g_format_line.store(api.av_log_format_line2, std::memory_order_release);
   api.av_log_set_callback(ffmpegLogCallback);
-  // The callback filters by our own level; FFmpeg's threshold only bounds what it formats.
+  // With a custom callback av_vlog calls it for every level whatever av_log_set_level says, so
+  // logEnabled() in the callback is the actual filter. The level only affects FFmpeg's own
+  // av_log_get_level() checks; it is raised so those do not skip messages before they get here.
   api.av_log_set_level(AV_LOG_VERBOSE);
+  loaded.keep = true;
 
   logDebug("ffmpeg: avutil {}.{}.{}, avcodec {}.{}.{}, swscale {}.{}.{} from {}",
            checks[0].loaded >> 16, (checks[0].loaded >> 8) & 0xff, checks[0].loaded & 0xff,
