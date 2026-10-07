@@ -3,6 +3,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+// WIN32_LEAN_AND_MEAN leaves the IME header out.
+#include <imm.h>
 
 #include "render/vk_window.h"
 
@@ -51,6 +53,29 @@ PixelRect letterboxRect(std::uint32_t area_width, std::uint32_t area_height, std
   return rect;
 }
 
+std::optional<KeyMessage> keyMessageFromWin32(std::uint32_t message, std::uint64_t wparam, std::uint64_t lparam) {
+  bool down = false;
+  switch (message) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+      down = true;
+      break;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+      break;
+    default:
+      return std::nullopt;
+  }
+  std::uint32_t scan_code = static_cast<std::uint32_t>((lparam >> 16) & 0xFF);
+  if (scan_code == 0) {
+    // Not every extended key comes back with 0xE0 (the arrows map to the numpad codes), so the
+    // message's own extended bit decides below.
+    scan_code = MapVirtualKeyW(static_cast<UINT>(wparam), MAPVK_VK_TO_VSC_EX) & 0xFF;
+  }
+  if (scan_code != 0 && (lparam & (1u << 24)) != 0) scan_code |= 0xE000u;
+  return KeyMessage{scan_code, down, down && (lparam & (1u << 30)) != 0};
+}
+
 class Presenter::Window {
  public:
   static std::unique_ptr<Window> create(const PresenterOptions& options, std::string& error) {
@@ -81,7 +106,12 @@ class Presenter::Window {
  private:
   static constexpr UINT kDestroyMessage = WM_APP;
 
-  explicit Window(const PresenterOptions& options) : on_close_(options.on_close), client_width_(options.client_width), client_height_(options.client_height) {}
+  explicit Window(const PresenterOptions& options)
+      : on_close_(options.on_close),
+        on_key_(options.on_key),
+        on_focus_lost_(options.on_focus_lost),
+        client_width_(options.client_width),
+        client_height_(options.client_height) {}
 
   void run() {
     const HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -112,6 +142,9 @@ class Presenter::Window {
       UnregisterClassW(kWindowClass, instance);
       return;
     }
+    // No IME for the game window: an open Japanese IME would otherwise show a composition window over
+    // the game and turn keys into composition input. Keys still arrive as plain key messages.
+    ImmAssociateContext(hwnd_, nullptr);
     if (const UINT window_dpi = GetDpiForWindow(hwnd_); window_dpi != 0 && window_dpi != system_dpi) {
       const SIZE adjusted = frameSize(window_dpi);
       SetWindowPos(hwnd_, nullptr, 0, 0, adjusted.cx, adjusted.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -145,6 +178,19 @@ class Presenter::Window {
         self->width_.store(wparam == SIZE_MINIMIZED ? 0 : LOWORD(lparam));
         self->height_.store(wparam == SIZE_MINIMIZED ? 0 : HIWORD(lparam));
         return 0;
+      case WM_KEYDOWN:
+      case WM_KEYUP:
+      case WM_SYSKEYDOWN:
+      case WM_SYSKEYUP:
+        if (self->on_key_) {
+          if (const auto key = keyMessageFromWin32(message, wparam, static_cast<std::uint64_t>(lparam))) self->on_key_(*key);
+        }
+        // Alt combinations (Alt+F4, Alt+Space) must still reach DefWindowProc.
+        if (message == WM_SYSKEYDOWN || message == WM_SYSKEYUP) break;
+        return 0;
+      case WM_KILLFOCUS:
+        if (self->on_focus_lost_) self->on_focus_lost_();
+        break;
       case WM_CLOSE:
         if (self->on_close_ && !self->closing_.load()) {
           self->on_close_();  // ends the process
@@ -171,6 +217,8 @@ class Presenter::Window {
   }
 
   std::function<void()> on_close_;
+  std::function<void(const KeyMessage&)> on_key_;
+  std::function<void()> on_focus_lost_;
   std::uint32_t client_width_;
   std::uint32_t client_height_;
   HWND hwnd_ = nullptr;

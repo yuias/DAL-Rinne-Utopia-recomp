@@ -81,6 +81,8 @@ function(dal_render_add)
     VMA_VULKAN_VERSION=1003000)
   target_link_libraries(dal_render PUBLIC volk dal_runtime_core)
   target_link_libraries(dal_render PRIVATE shaderc_combined)
+  # ImmAssociateContext turns the IME off for the game window.
+  target_link_libraries(dal_render PRIVATE imm32)
   # PRIVATE: libpng types stay inside frame_dump.cpp.
   target_link_libraries(dal_render PRIVATE png_static)
 

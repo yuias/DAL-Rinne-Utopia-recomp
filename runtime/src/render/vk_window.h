@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,9 +29,26 @@ struct PixelRect {
 PixelRect letterboxRect(std::uint32_t area_width, std::uint32_t area_height, std::uint32_t aspect_width,
                         std::uint32_t aspect_height);
 
+struct KeyMessage {
+  std::uint32_t scan_code = 0;  // PC/AT set 1 make code, 0xE000 | code for extended keys
+  bool down = false;
+  bool repeat = false;  // the key was already down (auto-repeat)
+};
+
+// WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP -> KeyMessage; nullopt for any other message. The scan
+// code is the physical key position, so it does not depend on the keyboard layout or on an IME. A zero
+// scan code (some injected input) falls back to the virtual key in `wparam`.
+std::optional<KeyMessage> keyMessageFromWin32(std::uint32_t message, std::uint64_t wparam, std::uint64_t lparam);
+
 struct PresenterOptions {
   // Called on the UI thread when the user closes the window. The window is not destroyed by it.
   std::function<void()> on_close;
+  // Both callbacks run on the UI thread inside the window procedure: they must be cheap and must not
+  // block, or the window stops responding.
+  // Called for every key message, including repeats and Alt combinations.
+  std::function<void(const KeyMessage&)> on_key;
+  // Called when the window loses keyboard focus (key-up messages are not delivered to it afterwards).
+  std::function<void()> on_focus_lost;
   std::uint32_t client_width = 1280;
   std::uint32_t client_height = 720;
   // Frame slots of the renderer: one acquire semaphore each.

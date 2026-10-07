@@ -22,6 +22,7 @@
 #include "render/vertex_convert.h"
 #include "render/vk_context.h"
 #include "render/vk_renderer.h"
+#include "render/vk_window.h"
 #include "rsx/rsx_capture.h"
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame_builder.h"
@@ -1317,12 +1318,57 @@ void testLetterbox() {
   CHECK(sameRect(dal::letterboxRect(0xFFFFFFFFu, 0xFFFFFFFFu, 16, 9), 0, 939524096, 0xFFFFFFFFu, 2415919103u));
 }
 
+// lParam of a key message: repeat count, scan code (bits 16..23), extended (24), previous state (30).
+std::uint64_t keyLparam(std::uint32_t scan, bool extended, bool was_down) {
+  return 1u | (static_cast<std::uint64_t>(scan) << 16) | (extended ? 1u << 24 : 0u) | (was_down ? 1u << 30 : 0u);
+}
+
+void testKeyMessages() {
+  constexpr std::uint32_t kKeyDown = 0x100, kKeyUp = 0x101, kChar = 0x102, kSysKeyDown = 0x104, kSysKeyUp = 0x105;
+  constexpr std::uint32_t kSize = 0x5, kKillFocus = 0x8;
+  constexpr std::uint64_t kVkZ = 0x5A, kVkUp = 0x26, kVkV = 0x56;
+
+  auto key = dal::keyMessageFromWin32(kKeyDown, kVkZ, keyLparam(0x2C, false, false));
+  CHECK(key && key->scan_code == 0x2C && key->down && !key->repeat);
+
+  key = dal::keyMessageFromWin32(kKeyDown, kVkZ, keyLparam(0x2C, false, true));
+  CHECK(key && key->scan_code == 0x2C && key->down && key->repeat);
+
+  key = dal::keyMessageFromWin32(kKeyDown, kVkUp, keyLparam(0x48, true, false));
+  CHECK(key && key->scan_code == 0xE048 && key->down);
+  // The same scan code without the extended bit is numpad 8.
+  key = dal::keyMessageFromWin32(kKeyDown, kVkUp, keyLparam(0x48, false, false));
+  CHECK(key && key->scan_code == 0x48);
+
+  // A key-up always carries the previous-state bit; it is not a repeat.
+  key = dal::keyMessageFromWin32(kKeyUp, kVkZ, keyLparam(0x2C, false, true) | (1ull << 31));
+  CHECK(key && key->scan_code == 0x2C && !key->down && !key->repeat);
+
+  // Alt held: bit 29 is set and the message is the SYS variant.
+  key = dal::keyMessageFromWin32(kSysKeyDown, kVkV, keyLparam(0x2F, false, false) | (1ull << 29));
+  CHECK(key && key->scan_code == 0x2F && key->down && !key->repeat);
+  key = dal::keyMessageFromWin32(kSysKeyUp, kVkV, keyLparam(0x2F, false, true) | (1ull << 29) | (1ull << 31));
+  CHECK(key && key->scan_code == 0x2F && !key->down);
+
+  // A zero scan code falls back to the virtual key; the extended bit still tells the arrow from numpad 8.
+  // (Arrow keys only: letter keys map through the active layout.)
+  key = dal::keyMessageFromWin32(kKeyDown, kVkUp, keyLparam(0, true, false));
+  CHECK(key && key->scan_code == 0xE048 && key->down);
+  key = dal::keyMessageFromWin32(kKeyDown, kVkUp, keyLparam(0, false, false));
+  CHECK(key && key->scan_code == 0x48);
+
+  CHECK(!dal::keyMessageFromWin32(kChar, kVkZ, keyLparam(0x2C, false, false)));
+  CHECK(!dal::keyMessageFromWin32(kSize, 0, 0x02D00500));
+  CHECK(!dal::keyMessageFromWin32(kKillFocus, 0, 0));
+}
+
 }  // namespace
 
 int main() {
   const bool layer = dal::vkValidationLayerAvailable();
   std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
   testLetterbox();
+  testKeyMessages();
   testShaderCompiler();
   testTextureMapping();
   testFrameDump();
