@@ -63,6 +63,7 @@ function(dal_ppu_add_generated_tree)
 
   # Pins how far the game gets; updated by whoever moves the milestone.
   include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")
+  include("${CMAKE_SOURCE_DIR}/cmake/game_input.cmake")
   if(DAL_EBOOT_ELF STREQUAL "" OR DAL_GAME_DIR STREQUAL "")
     message(STATUS "DAL: game_boot test not registered (DAL_EBOOT_ELF or DAL_GAME_DIR is empty)")
   else()
@@ -82,6 +83,22 @@ function(dal_ppu_add_generated_tree)
       add_custom_target(sdata_cache ALL DEPENDS "${sdata_stamp}")
       list(APPEND boot_args --sdata-cache "${sdata_cache}")
       set(boot_milestone "${DAL_GAME_BOOT_MILESTONE}")
+
+      # Own hdd directory: pressing buttons can write save data, which must not leak into game_boot's
+      # directory or into the next run. The setup test wipes it before every run.
+      add_test(NAME game_input_hdd_clean
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/game_hdd_input")
+      set_tests_properties(game_input_hdd_clean PROPERTIES FIXTURES_SETUP game_input_hdd)
+      add_test(NAME game_input
+        COMMAND dal_game --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
+          --sdata-cache "${sdata_cache}" --hdd-dir "${CMAKE_BINARY_DIR}/game_hdd_input"
+          --pad-script "${CMAKE_SOURCE_DIR}/tools/pad_scripts/leave_title.txt"
+          --seconds ${DAL_GAME_INPUT_SECONDS})
+      math(EXPR game_input_timeout "${DAL_GAME_INPUT_SECONDS} + 60")
+      set_tests_properties(game_input PROPERTIES
+        FIXTURES_REQUIRED game_input_hdd
+        TIMEOUT ${game_input_timeout}
+        PASS_REGULAR_EXPRESSION "${DAL_GAME_INPUT_MILESTONE}")
     else()
       set(boot_milestone "${DAL_GAME_BOOT_MILESTONE_NO_SDATA}")
     endif()
