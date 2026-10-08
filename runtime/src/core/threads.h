@@ -18,7 +18,9 @@ namespace dal {
 // The one lock all guest code runs under. A thread takes it when it starts and gives it up only
 // inside dalYield, blockingWait and exitCurrentThread, so guest threads never run in parallel.
 // Waiters are served in arrival order. Deferred: lv2 priority scheduling; runnable threads get the
-// lock in FIFO order and set/get_priority only store and return the value.
+// lock in FIFO order and set/get_priority only store and return the value. The one exception is the
+// creation rule of sys_ppu_thread_create (startGuestThreadFirst): a new thread with a numerically
+// lower priority than its creator takes the lock before the creator continues.
 class GuestLock {
  public:
   void lock();
@@ -121,6 +123,18 @@ GuestThread* prepareGuestThread(const GuestThreadParams& params);
 
 // Starts the host thread of a prepared guest thread.
 void startGuestThread(GuestThread* thread);
+
+// Longest wait of startGuestThreadFirst for the new host thread to queue for the guest lock.
+inline constexpr std::chrono::microseconds kStartFirstBound{5000};
+
+// Starts `thread` and lets it take the guest lock before the caller continues: snapshots
+// guestLock().waiterCount(), starts the host thread, waits (polling, at most `bound`) until the
+// waiter count has grown, then yieldGuestLock(). The new host thread queues asynchronously and
+// yieldGuestLock() does nothing while nobody waits, so a bare yield would be a timing bet. Returns
+// false when the count did not grow in time; the thread is started anyway and the caller keeps the
+// lock. Called by a guest thread holding the guest lock.
+bool startGuestThreadFirst(GuestThread* thread,
+                           std::chrono::microseconds bound = kStartFirstBound);
 
 // prepareGuestThread + startGuestThread. Returns the new thread id, 0 on failure.
 std::uint32_t createGuestThread(const GuestThreadParams& params);

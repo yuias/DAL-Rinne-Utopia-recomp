@@ -6959,6 +6959,150 @@ void testPpuThreads() {
   dal::resetCensus();
 }
 
+// Inputs and results of the priority creation test; written under the guest lock.
+struct PrioScenario {
+  std::uint32_t word_addr = 0, id_out = 0, opd_child = 0;
+  std::int64_t set_priority_to = -1;  // the creator lowers itself first when >= 0
+  std::int32_t child_prio = 0;
+  std::uint64_t flags = 0;
+  std::uint32_t seen_after_create = 0, create_result = ~0u;
+  bool done = false;
+};
+PrioScenario g_prio;
+std::condition_variable_any g_prio_cv;
+
+DAL_PPU_FUNC(prioChildEntry) {
+  (void)ctx;
+  dalWrite32(base, g_prio.word_addr, 1);
+}
+
+DAL_PPU_FUNC(prioCreatorEntry) {
+  if (g_prio.set_priority_to >= 0) {
+    ctx->gpr[11] = 47;  // sys_ppu_thread_set_priority(self, prio)
+    ctx->gpr[3] = static_cast<dal::GuestThread*>(ctx->runtime)->id();
+    ctx->gpr[4] = static_cast<std::uint64_t>(g_prio.set_priority_to);
+    dalSyscall(ctx, base, 0x10000);
+  }
+  ctx->gpr[3] = g_prio.id_out;
+  ctx->gpr[4] = g_prio.opd_child;
+  ctx->gpr[5] = 0;
+  ctx->gpr[6] = static_cast<std::uint64_t>(g_prio.child_prio);
+  ctx->gpr[7] = 0x4000;
+  ctx->gpr[8] = g_prio.flags;
+  ctx->gpr[9] = 0;
+  dalHleCall(ctx, base, 0);  // sys_ppu_thread_create, no blocking call after it
+  g_prio.create_result = static_cast<std::uint32_t>(ctx->gpr[3]);
+  g_prio.seen_after_create = dalRead32(base, g_prio.word_addr);
+  g_prio.done = true;
+  g_prio_cv.notify_all();
+  ctx->gpr[3] = 0;
+}
+
+void testPpuThreadCreatePriority() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::resetPpuThreadState();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t opd_child = scratch + 0x10, opd_creator = scratch + 0x20;
+  const std::uint32_t tls_image = scratch + 0x100;
+
+  const DalFuncMapping mappings[] = {{0x10300, prioChildEntry}, {0x10310, prioCreatorEntry}};
+  dalRegisterFuncs(mappings, 2);
+  dalWrite32(base, opd_child, 0x10300);
+  dalWrite32(base, opd_child + 4, 0x1111);
+  dalWrite32(base, opd_creator, 0x10310);
+  dalWrite32(base, opd_creator + 4, 0x2222);
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x24a1ea07, "sysPrxForUser", "sys_ppu_thread_create"},
+  };
+  dal::installImports(imports, 1);
+
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+  dalWrite32(base, tls_image, 0xCAFEF00D);
+  auto boot_ctx = std::make_unique<DalPpuContext>();
+  CHECK(dal::initializeTls(boot_ctx.get(), base, 0x01000000, tls_image, 4, 0x20) != 0);
+
+  struct Outcome {
+    std::uint32_t seen_after_create;
+    std::uint32_t seen_at_end;
+    dal::ThreadState child_state;
+    bool ok;
+  };
+  // Runs a guest creator thread at `creator_prio`; it creates a thread with `child_prio` and
+  // reports the guest word right after the create returned.
+  auto run = [&](std::int32_t creator_prio, std::int64_t set_priority_to, std::int32_t child_prio,
+                 std::uint64_t flags) {
+    g_prio = PrioScenario{};
+    g_prio.word_addr = scratch + 0x200;
+    g_prio.id_out = scratch + 0x208;
+    g_prio.opd_child = opd_child;
+    g_prio.set_priority_to = set_priority_to;
+    g_prio.child_prio = child_prio;
+    g_prio.flags = flags;
+    dalWrite32(base, g_prio.word_addr, 0);
+
+    dal::GuestThreadParams params;
+    params.entry_opd = opd_creator;
+    params.priority = creator_prio;
+    params.stack_size = 0x10000;
+    params.tls_r13 = dal::allocateTls();
+    params.name = "creator";
+    const std::uint32_t creator_id = dal::createGuestThread(params);
+    Outcome out{0, 0, dal::ThreadState::Created, false};
+    if (creator_id == 0) return out;
+    out.ok = dal::blockingWait(g_prio_cv, [] { return g_prio.done; }, "test wait",
+                               std::chrono::seconds(5));
+    out.seen_after_create = g_prio.seen_after_create;
+    const dal::GuestThread* child = dal::findThread(creator_id + 1);
+    for (int i = 0; child != nullptr && flags == 0 && i < 2500 &&
+                    child->state() != dal::ThreadState::Exited;
+         i++) {
+      std::condition_variable_any pause;
+      dal::blockingWait(pause, [] { return false; }, "test pause", std::chrono::milliseconds(2));
+    }
+    if (child != nullptr) out.child_state = child->state();
+    out.seen_at_end = dalRead32(base, g_prio.word_addr);
+    return out;
+  };
+
+  // A lower number than the creator's: the new thread has run when the create returns.
+  Outcome first = run(1005, -1, 90, 0);
+  CHECK(first.ok && g_prio.create_result == 0);
+  CHECK(first.seen_after_create == 1 && first.seen_at_end == 1);
+  CHECK(first.child_state == dal::ThreadState::Exited);
+
+  // Equal and higher numbers: the creator keeps the lock; the thread runs after it returned.
+  Outcome equal = run(1005, -1, 1005, 0);
+  CHECK(equal.ok && equal.seen_after_create == 0 && equal.seen_at_end == 1);
+  Outcome lower = run(1005, -1, 1100, 0);
+  CHECK(lower.ok && lower.seen_after_create == 0 && lower.seen_at_end == 1);
+
+  // The stored priority counts: a creator that moved itself from 1100 to 1005 yields to a thread
+  // at 1002.
+  Outcome lowered = run(1100, 1005, 1002, 0);
+  CHECK(lowered.ok && lowered.seen_after_create == 1);
+  // And the other way: a creator that raised itself to 1000 does not yield to a thread at 1002.
+  Outcome raised = run(1005, 1000, 1002, 0);
+  CHECK(raised.ok && raised.seen_after_create == 0 && raised.seen_at_end == 1);
+
+  // An interrupt thread is created but not started, whatever its priority.
+  Outcome interrupt = run(1005, -1, 90, dal::kCreateInterrupt);
+  CHECK(interrupt.ok && interrupt.seen_after_create == 0 && interrupt.seen_at_end == 0);
+  CHECK(interrupt.child_state == dal::ThreadState::Created);
+
+  p.main.free(scratch);
+  dalRegisterFuncs(nullptr, 0);
+  dal::resetSyncObjects();
+  dal::resetPpuThreadState();
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
 struct HandlerCall {
   char tag;
   std::uint64_t r3;
@@ -7487,6 +7631,7 @@ int main(int argc, char** argv) {
   testRsxConsumer();
   testLwmutex();
   testPpuThreads();
+  testPpuThreadCreatePriority();
   testGcmInterruptThread();
   testJudgeThreads();
   testTimebase();

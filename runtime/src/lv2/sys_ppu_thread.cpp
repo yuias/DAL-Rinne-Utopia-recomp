@@ -11,6 +11,7 @@
 
 #include "core/boot.h"
 #include "core/guest_memory.h"
+#include "core/log.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "lv2/cell_error.h"
@@ -90,7 +91,22 @@ std::uint32_t ppuThreadCreate(std::uint8_t* base, std::uint32_t thread_id, std::
   }
 
   dalWrite64(base, thread_id, thread->id());
-  if ((flags & kCreateInterrupt) == 0) startGuestThread(thread);
+  if ((flags & kCreateInterrupt) != 0) return kCellOk;
+
+  // lv2 would run a higher-priority thread at once. The game relies on it: its mixer thread (90)
+  // must store its notify queue key before the creator (1005) reads it.
+  GuestThread* creator = currentThread();
+  if (creator == nullptr || priority >= creator->priority()) {
+    startGuestThread(thread);
+    return kCellOk;
+  }
+  logDebug("dal: thread: {:#010x} {} prio {} starts before creator {:#010x} prio {}", thread->id(),
+           thread->name(), priority, creator->id(), creator->priority());
+  if (!startGuestThreadFirst(thread)) {
+    logInfo("dal: thread: {:#010x} {} not queued within {} ms; creator continues", thread->id(),
+            thread->name(), kStartFirstBound.count() / 1000);
+  }
+  creator->context().preempt_budget = kDalPreemptBudget;
   return kCellOk;
 }
 
@@ -144,6 +160,7 @@ void sysPpuThreadJoin(DalPpuContext* ctx, std::uint8_t* base) {
 }
 
 // 47 sys_ppu_thread_set_priority(u32 thread_id, s32 prio): stored only (no priority scheduling).
+// ppuThreadCreate compares the stored value of the creator with the priority of a new thread.
 void sysPpuThreadSetPriority(DalPpuContext* ctx, std::uint8_t* base) {
   (void)base;
   const auto prio = static_cast<std::int32_t>(ctx->gpr[4]);

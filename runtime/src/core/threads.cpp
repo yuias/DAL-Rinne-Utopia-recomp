@@ -234,6 +234,22 @@ void startGuestThread(GuestThread* thread) {
   CloseHandle(reinterpret_cast<HANDLE>(handle));
 }
 
+bool startGuestThreadFirst(GuestThread* thread, std::chrono::microseconds bound) {
+  GuestLock& lock = guestLock();
+  const std::size_t waiting_before = lock.waiterCount();
+  startGuestThread(thread);
+
+  // The counter grows when the new thread takes its ticket, which needs only the lock's internal
+  // mutex, so polling while holding the guest lock cannot deadlock.
+  const auto deadline = std::chrono::steady_clock::now() + bound;
+  while (lock.waiterCount() <= waiting_before) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::yield();
+  }
+  yieldGuestLock();
+  return true;
+}
+
 std::uint32_t createGuestThread(const GuestThreadParams& params) {
   GuestThread* thread = prepareGuestThread(params);
   if (thread == nullptr) return 0;
