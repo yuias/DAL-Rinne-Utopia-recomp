@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string_view>
 
 #include "dal/ppu_context.h"
@@ -69,5 +70,8 @@ void setFatalContext(const DalPpuContext* ctx);
 // Keeps failures from raising modal dialogs (CRT abort/assert/report boxes, critical-error and
 // fault boxes) so that a headless run always ends with an exit code. Call first thing in main().
 void installProcessSettings();
+
+// Directory of the running executable; empty if Windows cannot report it.
+std::filesystem::path executableDirectory();
 
 }  // namespace dal

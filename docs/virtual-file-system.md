@@ -11,6 +11,12 @@ Guest paths map to host directories (`runtime/src/lv2/vfs.cpp`, following RPCS3'
 The table is the layout the command-line options produce. A VFS configuration file can change it
 (other host directories, more devices, single-file overrides).
 
+When neither an option nor the configuration file sets them, `dal_game` uses defaults relative to
+its own build directory (`build/<preset>`, the parent of the `bin` directory that holds the
+executable): `/dev_hdd0` and `/dev_hdd1` go to `build/<preset>/hdd`, and the sdata cache is
+`build/<preset>/sdata_cache` if that directory exists, which is where the build writes it. The log
+reports each default it applies (`dal: vfs: ... (default)`).
+
 `..` components may not leave a device, and a guest cannot create entries directly under
 `/dev_hdd0` or `/dev_hdd0/game`. The directories that the console's system software keeps on hdd0
 (`game`, `home/00000001/savedata`, `home/00000001/trophy` and a few more) are created when

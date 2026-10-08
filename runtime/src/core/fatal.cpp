@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <string>
 
@@ -170,6 +171,19 @@ void installProcessSettings() {
     _CrtSetReportFile(type, _CRTDBG_FILE_STDERR);
   }
 #endif
+}
+
+std::filesystem::path executableDirectory() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0) return {};
+    if (length < buffer.size()) {
+      buffer.resize(length);
+      return std::filesystem::path(buffer).parent_path();
+    }
+    buffer.resize(buffer.size() * 2);
+  }
 }
 
 }  // namespace dal

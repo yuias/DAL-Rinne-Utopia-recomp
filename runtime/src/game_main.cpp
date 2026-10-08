@@ -486,6 +486,32 @@ void configureAudio(const Options& opt) {
   dal::setAudioCensusProvider(&audioCensusLines);
 }
 
+// dal_game lives in build/<preset>/bin, and the build writes the .sdat cache next to that
+// directory, so a plain run finds it without --sdata-cache. The hdd directory defaults to the same
+// place so that game data and saves persist between runs without --hdd-dir. Both apply only when
+// neither the command line nor the VFS configuration chose one.
+void applyBuildDirDefaults(dal::VfsLayout& layout) {
+  const std::filesystem::path exe_dir = dal::executableDirectory();
+  if (exe_dir.empty()) return;
+  const std::filesystem::path build_dir = exe_dir.parent_path();
+  std::error_code ec;
+  if (!layout.sdata_cache) {
+    const std::filesystem::path cache = build_dir / "sdata_cache";
+    if (std::filesystem::is_directory(cache, ec)) {
+      dal::logInfo("dal: vfs: sdata cache {} (default)", cache.generic_string());
+      layout.sdata_cache = cache;
+    }
+  }
+  if (std::ranges::find(layout.mounts, "dev_hdd0", &dal::VfsMount::name) == layout.mounts.end()) {
+    const std::filesystem::path hdd = build_dir / "hdd";
+    dal::logInfo("dal: vfs: hdd directory {} (default)", hdd.generic_string());
+    for (dal::VfsMount& mount : dal::hddDirMounts(hdd)) {
+      std::erase_if(layout.mounts, [&](const dal::VfsMount& m) { return m.name == mount.name; });
+      layout.mounts.push_back(std::move(mount));
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -538,6 +564,7 @@ int main(int argc, char** argv) {
     dal::logError("vfs: {}", layout.error());
     return static_cast<int>(dal::ExitCode::LoadError);
   }
+  applyBuildDirDefaults(*layout);
   dal::configureVfs(std::move(*layout));
 
   std::filesystem::path elf_path(opt.elf);

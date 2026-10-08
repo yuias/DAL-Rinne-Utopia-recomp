@@ -16,6 +16,7 @@ extern "C" {
 #include <libswresample/version_major.h>
 }
 
+#include "core/fatal.h"
 #include "core/log.h"
 
 namespace dal {
@@ -106,19 +107,6 @@ std::string joinNames(const std::vector<std::string>& names) {
     joined += name;
   }
   return joined;
-}
-
-std::filesystem::path executableDirectory() {
-  std::wstring buffer(MAX_PATH, L'\0');
-  for (;;) {
-    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-    if (length == 0) return {};
-    if (length < buffer.size()) {
-      buffer.resize(length);
-      return std::filesystem::path(buffer).parent_path();
-    }
-    buffer.resize(buffer.size() * 2);
-  }
 }
 
 std::expected<FfmpegApi, std::string> loadFrom(const std::filesystem::path& dir) {
