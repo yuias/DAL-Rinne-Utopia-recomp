@@ -28,6 +28,7 @@
 #include "core/log.h"
 #include "core/param_sfo.h"
 #include "core/threads.h"
+#include "core/timer_resolution.h"
 #include "dal/ppu_context.h"
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
@@ -580,6 +581,17 @@ int main(int argc, char** argv) {
   }
 
   installMovieCodecs();
+
+  // Held until the process ends (runSupervisor does not return); the decode loops of the game poll
+  // with 1 ms sleeps, which the default tick would stretch to 15 ms.
+  const dal::TimerResolution timer_resolution;
+  if (timer_resolution.active()) {
+    const auto period_us = dal::currentTimerPeriodUs();
+    dal::logDebug("dal: timer: requested {} ms, system period {}", timer_resolution.periodMs(),
+                  period_us ? std::format("{:.3f} ms", *period_us / 1000.0) : std::string("unknown"));
+  } else {
+    dal::logWarn("dal: timer: the 1 ms resolution request was refused; timed waits use the default tick");
+  }
 
   // The window thread and the script thread share `opt.keyboard`; the executor factory below copies
   // the options, so it is created first.

@@ -33,6 +33,7 @@
 #include "core/log.h"
 #include "core/param_sfo.h"
 #include "core/threads.h"
+#include "core/timer_resolution.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
 #include "input/keyboard_pad.h"
@@ -7420,6 +7421,29 @@ void testTimebase() {
   CHECK(dal::systemTimeUs() >= us0 + 15000);
 }
 
+void testTimerResolution() {
+  const dal::TimerResolution resolution;
+  CHECK(resolution.active());
+  CHECK(resolution.periodMs() >= 1);
+  // Reported in whole microseconds; an unreadable period only skips the check.
+  const auto period_us = dal::currentTimerPeriodUs();
+  if (period_us) {
+    CHECK(*period_us <= 1000 * resolution.periodMs());
+  }
+
+  // The median over a few waits tolerates a single descheduled sample.
+  std::vector<double> ms;
+  for (int i = 0; i < 21; ++i) {
+    const auto start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+  }
+  std::sort(ms.begin(), ms.end());
+  const bool fast = ms[ms.size() / 2] < 5.0;
+  CHECK(fast);
+  if (!fast) std::fprintf(stderr, "1 ms sleep median %.2f ms\n", ms[ms.size() / 2]);
+}
+
 void testReservationAndDcbz() {
   std::unique_ptr<dal::GuestMemory> memory(newMemory());
   std::uint8_t* base = memory->base();
@@ -7759,6 +7783,7 @@ int main(int argc, char** argv) {
   testGcmInterruptThread();
   testJudgeThreads();
   testTimebase();
+  testTimerResolution();
   testGuestLockFifo();
   testReservationAndDcbz();
   testGuestStackWalk();

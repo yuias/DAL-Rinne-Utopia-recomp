@@ -91,6 +91,7 @@ function(dal_runtime_add_core)
     runtime/src/core/log.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
+    runtime/src/core/timer_resolution.cpp
     runtime/src/hle/cell_atrac.cpp
     runtime/src/hle/cell_atrac_stream.cpp
     runtime/src/hle/cell_audio.cpp
@@ -143,6 +144,8 @@ function(dal_runtime_add_core)
     ${CMAKE_SOURCE_DIR}/runtime/src
     ${CMAKE_SOURCE_DIR}/runtime/include)
   target_link_libraries(dal_runtime_core PUBLIC bcrypt)
+  # timeBeginPeriod (core/timer_resolution.cpp).
+  target_link_libraries(dal_runtime_core PRIVATE winmm)
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
