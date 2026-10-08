@@ -18,14 +18,53 @@
 
 namespace dal {
 
+void BlockClock::setCorrectionPpm(double ppm) {
+  ppm = std::clamp(ppm, -kClockMaxPpm, kClockMaxPpm);
+  period_ = ppm == 0.0 ? Clock::duration(kAudioBlockPeriod)
+                       : Clock::duration(std::llround(static_cast<double>(kAudioBlockPeriod.count()) / (1.0 + ppm * 1e-6)));
+}
+
 BlockClockPlan BlockClock::due(Clock::time_point now) {
   if (now < next_due_) return {};
-  const std::uint64_t periods = 1 + static_cast<std::uint64_t>((now - next_due_) / kAudioBlockPeriod);
+  const std::uint64_t periods = 1 + static_cast<std::uint64_t>((now - next_due_) / period_);
   const std::uint64_t produce = std::min<std::uint64_t>(periods, 1 + std::uint64_t{kMaxCatchUpBlocks});
-  next_due_ += kAudioBlockPeriod * static_cast<std::int64_t>(periods);
+  next_due_ += period_ * static_cast<std::int64_t>(periods);
 
   constexpr std::uint64_t kMax = std::numeric_limits<std::uint32_t>::max();
   return {static_cast<std::uint32_t>(produce), static_cast<std::uint32_t>(std::min(periods - produce, kMax))};
+}
+
+bool BlockRateController::observe(Clock::time_point now, std::optional<std::uint64_t> fill_frames) {
+  if (!fill_frames) {
+    window_open_ = false;
+    return false;
+  }
+  if (!window_open_) {
+    window_open_ = true;
+    window_start_ = now;
+    window_sum_ = 0.0;
+    window_count_ = 0;
+  }
+  window_sum_ += static_cast<double>(*fill_frames);
+  ++window_count_;
+  if (now - window_start_ < kClockUpdateInterval) return false;
+
+  // The mean over the interval averages out the device's block-sized steps in the fill, so the
+  // controller sees the trend and not the sawtooth.
+  const double seconds = std::chrono::duration<double>(now - window_start_).count();
+  last_mean_fill_ = window_sum_ / static_cast<double>(window_count_);
+  const double error = last_mean_fill_ - static_cast<double>(kFillTargetFrames);
+
+  // A fill above the target means the engine is too fast: the correction is the negated sum.
+  const double unclamped = kClockKpPpmPerFrame * error + integral_ppm_;
+  // Anti-windup: no more integration while the output is at its bound and the error pushes further.
+  if (!(std::fabs(unclamped) >= kClockMaxPpm && unclamped * error > 0.0)) {
+    integral_ppm_ = std::clamp(integral_ppm_ + kClockKiPpmPerFrameSecond * error * seconds, -kClockMaxPpm, kClockMaxPpm);
+  }
+  ppm_ = -std::clamp(kClockKpPpmPerFrame * error + integral_ppm_, -kClockMaxPpm, kClockMaxPpm);
+
+  window_open_ = false;
+  return true;
 }
 
 namespace {
@@ -37,6 +76,9 @@ bool isNonSilent(std::span<const float> block) {
 }
 
 constexpr AudioBlock kSilentBlock{};
+
+// One debug line per this many correction updates (seconds).
+constexpr unsigned kClockLogEvery = 10;
 
 class Engine : public std::enable_shared_from_this<Engine> {
  public:
@@ -75,6 +117,7 @@ class Engine : public std::enable_shared_from_this<Engine> {
     stats.non_silent_blocks = non_silent_blocks_.load(std::memory_order_relaxed);
     stats.skipped_blocks = skipped_blocks_.load(std::memory_order_relaxed);
     stats.max_producer_time = std::chrono::microseconds(max_producer_us_.load(std::memory_order_relaxed));
+    stats.clock_ppm = clock_ppm_.load(std::memory_order_relaxed);
     return stats;
   }
 
@@ -162,12 +205,28 @@ class Engine : public std::enable_shared_from_this<Engine> {
     Sleeper sleeper;
     // Started after the output is open, so a slow device open does not show up as skipped periods.
     BlockClock clock(Clock::now());
+    // A resumed engine keeps the correction it had learned (same device, same drift); the interval
+    // under way when it stopped is not continued.
+    rate_.observe(Clock::now(), std::nullopt);
+    clock.setCorrectionPpm(rate_.ppm());
+    unsigned updates = 0;
     AudioBlock block;
     for (;;) {
       sleeper.sleep(std::chrono::duration_cast<std::chrono::microseconds>(clock.nextDue() - Clock::now()));
       if (retireIfStopRequested()) return;
 
-      const BlockClockPlan plan = clock.due(Clock::now());
+      const Clock::time_point now = Clock::now();
+      const BlockClockPlan plan = clock.due(now);
+      if (plan.produce + plan.skipped != 0 && rate_.observe(now, output_->fillFrames())) {
+        clock.setCorrectionPpm(rate_.ppm());
+        clock_ppm_.store(rate_.ppm(), std::memory_order_relaxed);
+        if (++updates % kClockLogEvery == 0) {
+          const AudioOutputStats output_stats = output_->stats();
+          logDebug("dal: audio: clock {:+.1f} ppm, mean fill {:.0f} frames (target {}), dropped {}, underrun {} frames",
+                   rate_.ppm(), rate_.lastMeanFill(), kFillTargetFrames, output_stats.blocks_dropped,
+                   output_stats.underrun_frames);
+        }
+      }
       // Silence for the periods that were missed comes first; the produced block is the newest.
       for (std::uint32_t i = 0; i < plan.skipped; ++i) {
         emit(kSilentBlock);
@@ -207,11 +266,13 @@ class Engine : public std::enable_shared_from_this<Engine> {
   bool dump_finish_requested_ = false;  // guarded by mutex_
   std::atomic<bool> dump_finished_{false};
   bool dump_warned_ = false;  // engine thread only
+  BlockRateController rate_;  // engine thread only
 
   std::atomic<std::uint64_t> blocks_{0};
   std::atomic<std::uint64_t> non_silent_blocks_{0};
   std::atomic<std::uint64_t> skipped_blocks_{0};
   std::atomic<std::int64_t> max_producer_us_{0};
+  std::atomic<double> clock_ppm_{0.0};
 };
 
 std::mutex g_mutex;

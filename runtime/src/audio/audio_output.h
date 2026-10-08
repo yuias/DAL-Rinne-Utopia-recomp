@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -44,6 +45,10 @@ class AudioOutput {
   virtual void submit(std::span<const float> block) = 0;  // kAudioBlockSamples values
   virtual std::string description() const = 0;           // for the start line (device, mix format, buffer)
   virtual AudioOutputStats stats() const = 0;             // any thread
+  // Frames submitted and not yet played: the output's queue plus what the device holds. The engine
+  // steers its clock by it (see BlockRateController). Any thread. nullopt when the output has no
+  // device clock to follow, or while it is not playing (priming, device outage).
+  virtual std::optional<std::uint64_t> fillFrames() const { return std::nullopt; }
 };
 
 // Discards every block (counts them). The engine's clock still runs.

@@ -458,10 +458,10 @@ std::vector<std::string> audioCensusLines() {
     const dal::CellAudioStats ports = dal::cellAudioPorts().stats();
     lines.push_back(std::format(
         "audio {}: {} blocks ({} non-silent), skipped {}, dropped {}, underrun {} frames, notify {} sent {} failed, "
-        "max producer {:.2f} ms",
+        "max producer {:.2f} ms, clock {:+.0f} ppm",
         engine.output, engine.blocks, engine.non_silent_blocks, engine.skipped_blocks,
         engine.output_stats.blocks_dropped, engine.output_stats.underrun_frames, ports.notifies_sent,
-        ports.notifies_failed, static_cast<double>(engine.max_producer_time.count()) / 1000.0));
+        ports.notifies_failed, static_cast<double>(engine.max_producer_time.count()) / 1000.0, engine.clock_ppm));
     std::string channels;
     for (std::size_t c = 0; c < ports.nonzero_samples.size(); ++c) {
       channels += std::format("{}{}:{}", c == 0 ? "" : " ", c, ports.nonzero_samples[c]);

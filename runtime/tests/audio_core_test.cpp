@@ -673,12 +673,158 @@ void testBlockClock() {
   CHECK(paused.nextDue() > now && paused.nextDue() - now <= period);
 }
 
+void testBlockClockCorrection() {
+  using Clock = dal::BlockClock::Clock;
+  using Ns = std::chrono::nanoseconds;
+  const Clock::time_point start{};
+  const auto nominal = dal::kAudioBlockPeriod;
+
+  dal::BlockClock clock(start);
+  CHECK(clock.period() == nominal);
+  clock.setCorrectionPpm(0.0);
+  CHECK(clock.period() == nominal);
+
+  // Faster means a shorter period; 300 ppm of 5.333 ms is 1.6 us.
+  clock.setCorrectionPpm(300.0);
+  CHECK(nominal - clock.period() >= Ns(1590) && nominal - clock.period() <= Ns(1610));
+  clock.setCorrectionPpm(-300.0);
+  CHECK(clock.period() - nominal >= Ns(1590) && clock.period() - nominal <= Ns(1610));
+
+  // Out-of-range requests are held at the bound: +-2.7 us.
+  clock.setCorrectionPpm(1e6);
+  CHECK(nominal - clock.period() > Ns(2600) && nominal - clock.period() <= Ns(2700));
+  clock.setCorrectionPpm(-1e6);
+  CHECK(clock.period() - nominal > Ns(2600) && clock.period() - nominal <= Ns(2700));
+
+  // The schedule is absolute: a change moves only the steps after it.
+  dal::BlockClock stepped(start);
+  stepped.due(start + nominal);
+  const Clock::time_point due_before = stepped.nextDue();
+  stepped.setCorrectionPpm(-500.0);
+  CHECK(stepped.nextDue() == due_before);
+  const dal::BlockClockPlan plan = stepped.due(due_before);
+  CHECK(plan.produce == 1 && plan.skipped == 0 && stepped.nextDue() == due_before + stepped.period());
+}
+
+// The engine thread's loop against a modelled device, on made-up time: the BlockClock ticks (a little
+// late, now and then three periods late), every tick adds the periods that elapsed to the frames
+// submitted, and the device has consumed `(1 + device_ppm) * 48000` frames per second. The reported
+// fill goes to the controller once per tick, as the engine does.
+struct DriftRun {
+  double max_error = 0.0;  // largest |true fill - target| over the run
+  double min_fill = 1e18;
+  double max_fill = 0.0;
+  double max_abs_ppm = 0.0;
+  double final_ppm = 0.0;
+  double final_error = 0.0;
+  std::uint64_t updates = 0;
+};
+
+DriftRun simulateDrift(double device_ppm, std::chrono::seconds length, double initial_error, bool device_steps) {
+  using Clock = dal::BlockClock::Clock;
+  using Ns = std::chrono::nanoseconds;
+  constexpr double kDevicePeriodFrames = 480.0;  // the device takes its data in 10 ms steps
+  const Clock::time_point start{};
+  const double target = static_cast<double>(dal::kFillTargetFrames);
+  const double initial_fill = target + initial_error;
+
+  dal::BlockClock clock(start);
+  dal::BlockRateController rate;
+  DriftRun run;
+  std::uint64_t submitted = 0;
+  std::uint64_t wakes = 0;
+  std::uint32_t lcg = 12345;
+  const Clock::time_point end = start + length;
+  while (clock.nextDue() < end) {
+    lcg = lcg * 1664525u + 1013904223u;
+    ++wakes;
+    Clock::time_point now = clock.nextDue() + Ns((lcg >> 16 & 0x7fff) * 45);  // up to 1.5 ms late
+    if (wakes % 997 == 0) now += 2 * clock.period();
+    const dal::BlockClockPlan plan = clock.due(now);
+    submitted += std::uint64_t{plan.produce + plan.skipped} * dal::kAudioBlockFrames;
+
+    const double consumed =
+        std::chrono::duration<double>(now - start).count() * dal::kAudioSampleRate * (1.0 + device_ppm * 1e-6);
+    const double fill = initial_fill + static_cast<double>(submitted) - consumed;
+    // A real device reports its padding at the top of the step; the output subtracts half a period.
+    const double reported = device_steps ? initial_fill + static_cast<double>(submitted) -
+                                               std::floor(consumed / kDevicePeriodFrames) * kDevicePeriodFrames -
+                                               kDevicePeriodFrames / 2
+                                         : fill;
+    run.max_error = std::max(run.max_error, std::fabs(fill - target));
+    run.min_fill = std::min(run.min_fill, fill);
+    run.max_fill = std::max(run.max_fill, fill);
+    if (rate.observe(now, static_cast<std::uint64_t>(std::max(0.0, std::round(reported))))) {
+      clock.setCorrectionPpm(rate.ppm());
+      run.max_abs_ppm = std::max(run.max_abs_ppm, std::fabs(rate.ppm()));
+      ++run.updates;
+    }
+    run.final_error = fill - target;
+  }
+  run.final_ppm = rate.ppm();
+  return run;
+}
+
+void testRateControllerFollowsDeviceDrift() {
+  using namespace std::chrono_literals;
+  using Clock = dal::BlockClock::Clock;
+  constexpr double kBlock = dal::kAudioBlockFrames;
+  for (const double device_ppm : {300.0, -300.0, 50.0, 0.0}) {
+    const DriftRun run = simulateDrift(device_ppm, 30min, 0.0, false);
+    // Within one block of the target for the whole 30 minutes, nothing near empty or near the ring's
+    // high-water mark, and the correction is the drift (device faster: the engine speeds up).
+    CHECK(run.max_error <= kBlock);
+    CHECK(run.min_fill > 0.0 && run.max_fill < 12 * kBlock);
+    CHECK(run.max_abs_ppm <= dal::kClockMaxPpm);
+    CHECK(run.updates >= 1700);
+    CHECK(std::fabs(run.final_ppm - device_ppm) < 15.0);
+    CHECK(std::fabs(run.final_error) <= kBlock);
+  }
+
+  // The same with a device that reports its consumption in 10 ms steps, as the output corrects it
+  // (half a period off the top of the step): the mean of the reading follows the true fill.
+  for (const double device_ppm : {300.0, -300.0}) {
+    const DriftRun run = simulateDrift(device_ppm, 30min, 0.0, true);
+    CHECK(run.max_error <= kBlock);
+    CHECK(std::fabs(run.final_error) <= kBlock);
+    CHECK(run.min_fill > 0.0 && run.max_fill < 12 * kBlock);
+    CHECK(run.max_abs_ppm <= dal::kClockMaxPpm);
+    CHECK(std::fabs(run.final_ppm - device_ppm) < 30.0);
+  }
+
+  // A fill that starts off the target is walked back at the bounded rate, without running dry.
+  for (const double initial_error : {-512.0, 512.0}) {
+    const DriftRun run = simulateDrift(0.0, 10min, initial_error, false);
+    CHECK(run.min_fill > 0.0);
+    CHECK(run.max_abs_ppm <= dal::kClockMaxPpm);
+    CHECK(std::fabs(run.final_error) < 32.0);
+    CHECK(std::fabs(run.final_ppm) < 15.0);
+  }
+
+  // Readings of "no fill" leave the correction alone and restart the interval.
+  dal::BlockRateController rate;
+  const Clock::time_point t0{};
+  CHECK(!rate.observe(t0, dal::kFillTargetFrames + 1000));
+  CHECK(rate.observe(t0 + 1s, dal::kFillTargetFrames + 1000));
+  const double before = rate.ppm();
+  CHECK(before < 0.0);
+  CHECK(!rate.observe(t0 + 1500ms, std::nullopt));
+  CHECK(!rate.observe(t0 + 3s, dal::kFillTargetFrames + 1000));  // a new interval starts here
+  CHECK(rate.ppm() == before);
+
+  // No fill level, no correction.
+  dal::BlockRateController idle;
+  for (int i = 0; i < 1000; ++i) CHECK(!idle.observe(t0 + i * 10ms, std::nullopt));
+  CHECK(idle.ppm() == 0.0);
+}
+
 // Everything a RecordingOutput receives, readable by the test after the engine has stopped.
 struct Recording {
   std::mutex mutex;
   std::vector<float> samples;  // every submitted block back to back
   int opens = 0;
   std::chrono::milliseconds open_delay{0};  // how long open() takes, to model a slow device
+  std::atomic<std::int64_t> fill{-1};       // what fillFrames() reports; negative: none
 
   std::vector<float> take() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -705,6 +851,11 @@ class RecordingOutput final : public dal::AudioOutput {
     submitted_.fetch_add(1);
   }
   std::string description() const override { return "recording"; }
+  std::optional<std::uint64_t> fillFrames() const override {
+    const std::int64_t fill = recording_->fill.load();
+    if (fill < 0) return std::nullopt;
+    return static_cast<std::uint64_t>(fill);
+  }
   dal::AudioOutputStats stats() const override {
     dal::AudioOutputStats stats;
     stats.blocks_submitted = submitted_.load();
@@ -1012,6 +1163,31 @@ void testEngineResumesAfterStop() {
     CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
     const auto wav = dal::readWav(dump_path);
     CHECK(wav.has_value() && wav->samples == samples);
+  }
+}
+
+void testEngineFollowsReportedFill() {
+  using namespace std::chrono_literals;
+  // An output that reports far more than the target in flight: the engine slows down, bounded.
+  {
+    const auto recording = std::make_shared<Recording>();
+    recording->fill = 3000;
+    dal::configureAudioEngine(engineConfig(recording, true, {}));
+    dal::startAudioEngine(makeProducer(std::make_shared<ProducerState>()));
+    CHECK(waitFor([&] { return dal::audioEngineStats().clock_ppm != 0.0; }, 5s));
+    const double ppm = dal::audioEngineStats().clock_ppm;
+    CHECK(ppm < 0.0 && ppm >= -dal::kClockMaxPpm);
+    CHECK(dal::stopAudioEngineForTest());
+  }
+  // An output without a fill level keeps the plain clock.
+  {
+    const auto recording = std::make_shared<Recording>();
+    dal::configureAudioEngine(engineConfig(recording, true, {}));
+    const auto state = std::make_shared<ProducerState>();
+    dal::startAudioEngine(makeProducer(state));
+    CHECK(waitFor([&] { return state->calls.load() >= 250; }));
+    CHECK(dal::audioEngineStats().clock_ppm == 0.0);
+    CHECK(dal::stopAudioEngineForTest());
   }
 }
 
@@ -2576,12 +2752,15 @@ int main(int argc, char** argv) {
   testWavStatsSilence();
   testWavStatsFile();
   testBlockClock();
+  testBlockClockCorrection();
+  testRateControllerFollowsDeviceDrift();
   testEngineBlocksAndDump();
   testEngineSkipsLatePeriods();
   testEngineStopDoesNotWait();
   testEngineOutputOpenFails();
   testEngineFinishDumpDuringOpen();
   testEngineResumesAfterStop();
+  testEngineFollowsReportedFill();
   testCellAudioStateErrors();
   testCellAudioPortOpenAndConfig();
   testCellAudioTagsAndTimestamps();

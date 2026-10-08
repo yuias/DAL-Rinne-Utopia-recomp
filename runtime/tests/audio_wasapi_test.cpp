@@ -339,6 +339,51 @@ void testHighWaterDropsAreCounted() {
   CHECK(stats.blocks_dropped <= kBlocks - dal::kHighWaterBlocks);
 }
 
+void testFillFramesCountsQueueAndDevice() {
+  const auto recording = std::make_shared<Recording>();
+  FakeConfig config;
+  config.buffer_frames = 512;
+  config.consume = false;
+  auto output = dal::makeWasapiOutputForTest([recording, config](std::string&) -> std::unique_ptr<dal::RenderStream> {
+    return std::make_unique<FakeStream>(config, recording);
+  });
+  CHECK(!output->fillFrames().has_value());
+  std::string error;
+  CHECK(output->open(error));
+  // Priming is not playing: no fill level yet.
+  submitPaced(*output, 0, 2, 2000us, fillRamp);
+  CHECK(!output->fillFrames().has_value());
+
+  submitPaced(*output, 2, 8, 2000us, fillRamp);
+  CHECK(waitFor([&] { return output->stats().frames_played == 512; }, 1000ms));
+  // The device holds 512 frames and the ring the other 2048 of the ten blocks.
+  CHECK(waitFor([&] { return output->fillFrames().has_value(); }, 1000ms));
+  CHECK(output->fillFrames().value_or(0) == 10 * dal::kAudioBlockFrames);
+}
+
+void testFillFramesEndsWithTheDevice() {
+  const auto recording = std::make_shared<Recording>();
+  FakeConfig config;
+  config.fail_after_writes = 2;
+  dal::WasapiOutputOptions options;
+  options.reopen_interval = 5000ms;  // the outage lasts for the whole test
+  const auto opened = std::make_shared<std::atomic<int>>(0);
+  auto output = dal::makeWasapiOutputForTest(
+      [recording, config, opened](std::string& error) -> std::unique_ptr<dal::RenderStream> {
+        if (opened->fetch_add(1) > 0) {
+          error = "still gone";
+          return nullptr;
+        }
+        return std::make_unique<FakeStream>(config, recording);
+      },
+      options);
+  std::string error;
+  CHECK(output->open(error));
+  submitPaced(*output, 0, 30, std::chrono::duration_cast<std::chrono::microseconds>(dal::kAudioBlockPeriod), fillRamp);
+  CHECK(waitFor([&] { return output->stats().device_errors == 1; }, 1000ms));
+  CHECK(!output->fillFrames().has_value());
+}
+
 void testDeviceLossAndReopen() {
   LogCapture log;
   const auto recording = std::make_shared<Recording>();
@@ -465,6 +510,8 @@ int main() {
   testStreamStaysContiguous();
   testStallCountsUnderrun();
   testHighWaterDropsAreCounted();
+  testFillFramesCountsQueueAndDevice();
+  testFillFramesEndsWithTheDevice();
   testDeviceLossAndReopen();
 
   bool skipped = true;

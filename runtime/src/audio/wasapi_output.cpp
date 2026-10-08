@@ -302,6 +302,12 @@ struct Shared {
   std::atomic<std::uint64_t> frames_played{0};
   std::atomic<std::uint64_t> device_errors{0};
 
+  // Frames the device holds as of the device thread's last pass, and whether a stream is playing.
+  // The engine thread reads them (the IAudioClient stays on the device thread).
+  std::atomic<std::uint32_t> device_padding{0};
+  std::atomic<std::uint32_t> device_period_frames{0};  // written before `streaming` is set
+  std::atomic<bool> streaming{false};
+
   std::mutex mutex;  // guards the members below
   std::condition_variable changed;
   bool open_done = false;
@@ -376,6 +382,12 @@ class DevicePump {
   // when its buffer runs dry; that is the only case counted as an underrun. The device buffer is
   // kept near the primed amount: the ring holds only what the engine produced since the last pass.
   RenderStatus serve(RenderStream& stream) {
+    // The fill level means nothing before the stream starts and after it is lost.
+    struct StreamingFlag {
+      Shared& shared;
+      ~StreamingFlag() { shared.streaming.store(false, std::memory_order_release); }
+    } streaming_flag{shared_};
+
     const std::uint32_t buffer_frames = stream.bufferFrames();
     const std::uint32_t period_frames = stream.periodFrames();
     scratch_.resize(std::max<std::size_t>(std::size_t{buffer_frames} * kAudioOutputChannels, kDiscardChunkSamples));
@@ -407,6 +419,9 @@ class DevicePump {
     status = stream.start();
     if (status < 0) return status;
     Clock::time_point last_pass = Clock::now();
+    shared_.device_padding.store(padding_after, std::memory_order_relaxed);
+    shared_.device_period_frames.store(period_frames, std::memory_order_relaxed);
+    shared_.streaming.store(true, std::memory_order_release);
 
     while (!stopping()) {
       stream.waitForBuffer(kWaitSlice);
@@ -430,6 +445,7 @@ class DevicePump {
       }
       status = fill(stream, buffer_frames, pending, padding_after);
       if (status < 0) return status;
+      shared_.device_padding.store(padding_after, std::memory_order_relaxed);
       last_pass = now;
     }
     return S_OK;
@@ -558,6 +574,19 @@ class WasapiOutput final : public AudioOutput {
   std::string description() const override {
     std::lock_guard<std::mutex> lock(shared_->mutex);
     return shared_->description;
+  }
+
+  // The padding is published right after the device thread's write, when it is at its highest; the
+  // device then drains it in steps of one period until the next pass, so on average it is half a
+  // period lower. Subtracting that gives the mean fill. The ring and the padding are read
+  // separately, so a read that lands while the device thread moves frames from one to the other
+  // is off by that amount; it is rare and averages out.
+  std::optional<std::uint64_t> fillFrames() const override {
+    const Shared& shared = *shared_;
+    if (!shared.streaming.load(std::memory_order_acquire)) return std::nullopt;
+    const std::uint64_t held = shared.ring.queuedFrames() + shared.device_padding.load(std::memory_order_relaxed);
+    const std::uint64_t half_period = shared.device_period_frames.load(std::memory_order_relaxed) / 2;
+    return held > half_period ? held - half_period : 0;
   }
 
   AudioOutputStats stats() const override {
