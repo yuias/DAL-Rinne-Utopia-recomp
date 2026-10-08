@@ -200,8 +200,12 @@ std::span<const HleEntry> cellAudioHandlers();
 // audio engine. Intended for tests.
 void resetCellAudio();
 
-// Handlers of the cellAtrac module: cellAtracSetDataAndGetMemSize only (a placeholder).
+// Handlers of the cellAtrac module: all 15 imports. Decode outputs silence of the right length until
+// a decoder is attached.
 std::span<const HleEntry> cellAtracHandlers();
+
+// Forgets every cellAtrac handle without touching guest memory. Intended for tests.
+void resetCellAtrac();
 
 // Handlers of the cellGcmSys module.
 std::span<const HleEntry> cellGcmSysHandlers();

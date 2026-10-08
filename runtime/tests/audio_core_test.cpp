@@ -17,11 +17,13 @@
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -36,6 +38,7 @@
 #include "core/log.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
+#include "hle/cell_atrac_stream.h"
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
 #include "lv2/sys_sync.h"
@@ -1701,6 +1704,748 @@ void testAtracFactorySlot() {
   CHECK(dal::atracDecoderFactory() == nullptr);
 }
 
+// ---- cellAtrac stream model and handlers ----
+
+constexpr std::uint32_t kAtracUnknownFormat = 0x80610312;
+constexpr std::uint32_t kAtracReadsizeOverBuffer = 0x80610311;
+constexpr std::uint32_t kAtracNoDecoder = 0x80610321;
+constexpr std::uint32_t kAtracUnsetData = 0x80610322;
+constexpr std::uint32_t kAtracDecoderWasCreated = 0x80610323;
+constexpr std::uint32_t kAtracAllDataIsOnMemory = 0x80610341;
+constexpr std::uint32_t kAtracAddDataIsTooBig = 0x80610342;
+constexpr std::int32_t kRemainOnMemory = -1;
+constexpr std::int32_t kRemainStreamEnd = -2;
+constexpr std::uint32_t kAt3Block = 512;
+
+// A synthetic ATRAC3plus file: `frames` frames of 512 bytes whose first four bytes hold the frame
+// index (big-endian) and whose other bytes follow a pattern of the index, so a wrong or torn frame
+// is recognisable. `fact` holds (total, 2048, delay).
+Bytes makeAt3File(std::uint32_t channels, std::uint32_t frames, std::uint32_t total, std::uint32_t delay,
+                  std::optional<std::pair<std::uint32_t, std::uint32_t>> loop = std::nullopt) {
+  std::vector<Bytes> chunks = {chunk("fmt ", fmtBody(channels)), chunk("fact", factBody(total, 2048, delay))};
+  if (loop) chunks.push_back(chunk("smpl", smplBody(1, loop->first, loop->second)));
+  Bytes file = riffEntry(chunks, frames * kAt3Block);
+  for (std::uint32_t f = 0; f < frames; ++f) {
+    for (std::uint32_t i = 0; i < kAt3Block; ++i) {
+      file.push_back(i < 4 ? static_cast<std::uint8_t>(f >> (24 - 8 * i)) : static_cast<std::uint8_t>(f * 7 + i));
+    }
+  }
+  return file;
+}
+
+std::uint32_t at3DataOffset(const Bytes& file) {
+  const auto info = dal::parseAt3Header(file);
+  CHECK(info.has_value());
+  return info ? info->data_offset : 0;
+}
+
+struct FakeDecoderStats {
+  std::vector<std::int64_t> events;  // frame index per decoded frame, -1 per reset()
+  std::uint64_t bad_frames = 0;
+  std::uint32_t resets() const { return static_cast<std::uint32_t>(std::count(events.begin(), events.end(), -1)); }
+};
+
+// Output sample j of frame f is f * 2048 + j on the left channel and its negative on the right, so
+// the output shows which decoder-output position every sample came from.
+class FakeFrameDecoder : public dal::AtracFrameDecoder {
+ public:
+  FakeFrameDecoder(std::uint32_t channels, FakeDecoderStats* stats) : channels_(channels), stats_(stats) {}
+  bool decode(std::span<const std::uint8_t> frame, std::span<float> out, std::string&) override {
+    std::uint32_t index = 0;
+    for (int i = 0; i < 4 && frame.size() >= 4; ++i) index = (index << 8) | frame[i];
+    bool good = frame.size() == kAt3Block && out.size() >= std::size_t{2048} * channels_;
+    for (std::uint32_t i = 4; good && i < frame.size(); ++i) good = frame[i] == static_cast<std::uint8_t>(index * 7 + i);
+    if (!good) ++stats_->bad_frames;
+    stats_->events.push_back(index);
+    for (std::uint32_t j = 0; j < 2048; ++j) {
+      const float value = static_cast<float>(index * 2048 + j);
+      out[j * channels_] = value;
+      if (channels_ == 2) out[j * channels_ + 1] = -value;
+    }
+    return true;
+  }
+  void reset() override { stats_->events.push_back(-1); }
+
+ private:
+  std::uint32_t channels_;
+  FakeDecoderStats* stats_;
+};
+
+// A model under test with its guest buffer as a host vector (the model never sees guest memory).
+struct ModelRig {
+  static constexpr std::uint32_t kBufferAddr = 0x30000000;
+  Bytes file;
+  Bytes ring;
+  FakeDecoderStats stats;
+  std::optional<dal::AtracStream> stream;
+  std::uint32_t data_offset = 0;
+  std::uint32_t threshold = 0;
+
+  // read_bytes == buffer_bytes == file size is memory mode.
+  bool open(Bytes file_bytes, std::uint32_t read_bytes, std::uint32_t buffer_bytes, bool with_decoder = true) {
+    file = std::move(file_bytes);
+    data_offset = at3DataOffset(file);
+    ring.assign(buffer_bytes, 0);
+    std::copy_n(file.begin(), std::min<std::size_t>(read_bytes, file.size()), ring.begin());
+    std::string error;
+    auto opened = dal::AtracStream::open(std::span<const std::uint8_t>(ring).first(read_bytes), kBufferAddr,
+                                         buffer_bytes, error);
+    CHECK(opened.has_value());
+    if (!opened) return false;
+    stream.emplace(std::move(*opened));
+    std::unique_ptr<dal::AtracFrameDecoder> decoder;
+    if (with_decoder) decoder = std::make_unique<FakeFrameDecoder>(stream->info().channels, &stats);
+    CHECK(stream->createDecoder(std::move(decoder)) == 0);
+    const std::int32_t initial = stream->remain();
+    threshold = static_cast<std::uint32_t>(initial * 3 / 4);  // as the game computes it
+    if (initial < 0) threshold = 0;
+    return true;
+  }
+};
+
+struct Collected {
+  std::vector<float> left;
+  std::vector<std::uint32_t> call_samples;
+  std::vector<std::int32_t> loops_after_call;
+  std::vector<std::uint32_t> read_positions;  // every GetStreamDataInfo that led to a read
+  std::vector<std::uint32_t> chunks;          // bytes of every committed read
+  bool finished = false;
+  std::int32_t last_remain = 0;
+  bool all_ok = true;
+};
+
+// Decode calls with the game's refill rule: a request when 0 <= remain < threshold, at most 0x4000
+// bytes, one in flight. The read completes (writes the ring, then AddStreamData) after the next
+// Decode call, as the file thread would.
+Collected collect(ModelRig& rig, std::uint32_t max_calls, std::function<bool(const Collected&)> stop = {}) {
+  Collected got;
+  dal::AtracStream& stream = *rig.stream;
+  const std::uint32_t channels = stream.info().channels;
+  struct Pending {
+    std::uint32_t read_pos, ring_offset, bytes;
+  };
+  std::optional<Pending> pending;
+  for (std::uint32_t call = 0; call < max_calls && !got.finished; ++call) {
+    std::vector<float> out(2048 * channels + 16, -12345.0f);
+    const auto result = stream.decode(rig.ring, std::span<float>(out).first(2048 * channels));
+    if (!result) {
+      got.all_ok = false;
+      break;
+    }
+    got.all_ok = got.all_ok && result->samples <= 2048;
+    for (std::uint32_t i = 0; i < result->samples; ++i) got.left.push_back(out[i * channels]);
+    // Nothing beyond the reported frames may be touched.
+    for (std::size_t i = std::size_t{result->samples} * channels; i < out.size(); ++i) {
+      got.all_ok = got.all_ok && out[i] == -12345.0f;
+    }
+    got.call_samples.push_back(result->samples);
+    got.loops_after_call.push_back(stream.loopNum());
+    got.finished = result->finish;
+    got.last_remain = result->remain;
+
+    if (pending) {
+      for (std::uint32_t i = 0; i < pending->bytes; ++i) {
+        rig.ring[(pending->ring_offset + i) % rig.ring.size()] = rig.file[pending->read_pos + i];
+      }
+      got.all_ok = got.all_ok && stream.addStreamData(pending->bytes) == 0;
+      got.chunks.push_back(pending->bytes);
+      pending.reset();
+    } else if (!stream.memoryMode() && result->remain >= 0 && result->remain < static_cast<std::int32_t>(rig.threshold)) {
+      const auto info = stream.streamDataInfo();
+      got.all_ok = got.all_ok && info.has_value();
+      if (info) {
+        const std::uint32_t bytes = std::min<std::uint32_t>(info->writable, 0x4000);
+        got.all_ok = got.all_ok && info->write_addr >= ModelRig::kBufferAddr &&
+                     info->write_addr + info->writable <= ModelRig::kBufferAddr + rig.ring.size();
+        if (bytes > 0) {
+          got.read_positions.push_back(info->read_pos);
+          pending = Pending{info->read_pos, info->write_addr - ModelRig::kBufferAddr,
+                            std::min<std::uint32_t>(bytes, static_cast<std::uint32_t>(rig.file.size()) - info->read_pos)};
+        }
+      }
+    }
+    if (stop && stop(got)) break;
+  }
+  return got;
+}
+
+// Positions [first, last] as the floats the fake decoder produces.
+void appendPositions(std::vector<float>& expected, std::uint32_t first, std::uint32_t last) {
+  for (std::uint32_t p = first; p <= last; ++p) expected.push_back(static_cast<float>(p));
+}
+
+void testAtracModelMemoryStereo() {
+  // 4 frames, delay 2232, 5000 valid samples: frame 0 is cut entirely, frame 1 starts at the delay and
+  // frame 3 ends at the total.
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, 4, 5000, 2232);
+  CHECK(rig.open(file, static_cast<std::uint32_t>(file.size()), static_cast<std::uint32_t>(file.size())));
+  CHECK(rig.stream->memoryMode());
+  CHECK(rig.stream->frames() == 4);
+  CHECK(rig.stream->remain() == kRemainOnMemory);
+  CHECK(rig.stream->loopStatus() == 0);
+  CHECK(rig.stream->soundInfo().end_sample == 4999);
+  CHECK(rig.stream->soundInfo().loop_start == 0 && rig.stream->soundInfo().loop_end == 0);
+  CHECK(rig.stream->createDecoder(nullptr) == kAtracDecoderWasCreated);
+  const auto info = rig.stream->streamDataInfo();
+  CHECK(!info.has_value() && info.error() == kAtracAllDataIsOnMemory);
+  CHECK(rig.stream->addStreamData(1) == kAtracAllDataIsOnMemory);
+
+  const Collected got = collect(rig, 20);
+  CHECK(got.all_ok && got.finished);
+  CHECK((got.call_samples == std::vector<std::uint32_t>{1864, 2048, 1088}));
+  std::vector<float> expected;
+  appendPositions(expected, 2232, 2232 + 4999);
+  CHECK(got.left == expected);
+  CHECK(got.last_remain == kRemainOnMemory);
+  CHECK(rig.stats.bad_frames == 0 && rig.stats.resets() == 0);
+  CHECK((rig.stats.events == std::vector<std::int64_t>{0, 1, 2, 3}));
+
+  // After the end every call repeats "finished" without an error.
+  std::vector<float> out(4096);
+  const auto again = rig.stream->decode(rig.ring, out);
+  CHECK(again.has_value() && again->samples == 0 && again->finish);
+}
+
+void testAtracModelMemoryMono() {
+  ModelRig rig;
+  const Bytes file = makeAt3File(1, 3, 3000, 100);
+  CHECK(rig.open(file, static_cast<std::uint32_t>(file.size()), static_cast<std::uint32_t>(file.size())));
+  const Collected got = collect(rig, 20);
+  CHECK(got.all_ok && got.finished);
+  CHECK((got.call_samples == std::vector<std::uint32_t>{1948, 1052}));
+  std::vector<float> expected;
+  appendPositions(expected, 100, 3099);
+  CHECK(got.left == expected);
+}
+
+void testAtracModelSilentWithoutDecoder() {
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, 4, 5000, 2232);
+  CHECK(rig.open(file, static_cast<std::uint32_t>(file.size()), static_cast<std::uint32_t>(file.size()), false));
+  const Collected got = collect(rig, 20);
+  CHECK(got.all_ok && got.finished);
+  CHECK((got.call_samples == std::vector<std::uint32_t>{1864, 2048, 1088}));
+  CHECK(std::all_of(got.left.begin(), got.left.end(), [](float v) { return v == 0.0f; }));
+}
+
+void testAtracModelStreaming() {
+  // The game's sizes: 0x10000 bytes read first, a 0x20000 byte ring, refills of at most 0x4000 bytes.
+  constexpr std::uint32_t kFrames = 300;
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, kFrames, kFrames * 2048 - 2232 - 1, 2232);
+  CHECK(rig.open(file, 0x10000, 0x20000));
+  CHECK(!rig.stream->memoryMode());
+  const std::int32_t initial = rig.stream->remain();
+  CHECK(initial == static_cast<std::int32_t>((0x10000 - rig.data_offset) / kAt3Block));
+  CHECK(rig.threshold == static_cast<std::uint32_t>(initial * 3 / 4));
+
+  const Collected got = collect(rig, 2000);
+  CHECK(got.all_ok && got.finished);
+  CHECK(got.left.size() == kFrames * 2048 - 2232 - 1);
+  std::vector<float> expected;
+  appendPositions(expected, 2232, kFrames * 2048 - 2);
+  CHECK(got.left == expected);
+  CHECK(got.last_remain == kRemainStreamEnd);
+  CHECK(rig.stats.bad_frames == 0);
+  CHECK(rig.stats.events.size() == kFrames);
+
+  // The refills: file order, never above 0x4000 bytes, the last one short, the whole file read.
+  CHECK(!got.read_positions.empty());
+  CHECK(std::is_sorted(got.read_positions.begin(), got.read_positions.end()));
+  CHECK(got.read_positions.front() == 0x10000);
+  std::uint64_t total = 0x10000;
+  for (std::uint32_t chunk_bytes : got.chunks) {
+    CHECK(chunk_bytes > 0 && chunk_bytes <= 0x4000);
+    total += chunk_bytes;
+  }
+  CHECK(total == file.size());
+  CHECK(got.chunks.back() < 0x4000);
+  CHECK(file.size() > 0x20000);  // the ring wrapped
+
+  // At least one frame straddled the end of the ring and still decoded intact.
+  std::uint32_t straddling = 0;
+  for (std::uint32_t f = 0; f < kFrames; ++f) {
+    const std::uint32_t at = (rig.data_offset + f * kAt3Block) % 0x20000;
+    if (at + kAt3Block > 0x20000) ++straddling;
+  }
+  CHECK(straddling >= 1);
+}
+
+void testAtracModelStarvation() {
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, 10, 10 * 2048, 0);
+  // Two and a half frames are buffered.
+  const std::uint32_t read_bytes = at3DataOffset(file) + 2 * kAt3Block + kAt3Block / 2;
+  CHECK(rig.open(file, read_bytes, 0x20000));
+  CHECK(rig.stream->remain() == 2);
+
+  std::vector<float> out(4096);
+  for (int i = 0; i < 2; ++i) {
+    const auto result = rig.stream->decode(rig.ring, out);
+    CHECK(result.has_value() && result->samples == 2048 && !result->finish);
+  }
+  for (int i = 0; i < 3; ++i) {
+    const auto starved = rig.stream->decode(rig.ring, out);
+    CHECK(starved.has_value());
+    if (starved) CHECK(starved->samples == 0 && !starved->finish && starved->remain == 0);
+  }
+
+  // The rest of frame 2 arrives: decoding resumes where it stopped.
+  const auto info = rig.stream->streamDataInfo();
+  CHECK(info.has_value() && info->read_pos == read_bytes);
+  if (!info) return;
+  CHECK(info->writable > 0 && info->write_addr == ModelRig::kBufferAddr + read_bytes);
+  for (std::uint32_t i = 0; i < kAt3Block / 2; ++i) rig.ring[read_bytes + i] = file[read_bytes + i];
+  CHECK(rig.stream->addStreamData(kAt3Block / 2) == 0);
+  const auto resumed = rig.stream->decode(rig.ring, out);
+  CHECK(resumed.has_value() && resumed->samples == 2048);
+  CHECK(rig.stream->addStreamData(0x20000) == kAtracAddDataIsTooBig);
+  CHECK(rig.stats.events.size() == 3 && rig.stats.bad_frames == 0);
+}
+
+void testAtracModelLoops() {
+  // 6 frames, delay 100, 12000 valid samples, loop [5000, 8999] (start is not the delay).
+  const Bytes file = makeAt3File(2, 6, 12000, 100, std::pair{5000u, 8999u});
+  const auto size = static_cast<std::uint32_t>(file.size());
+  {
+    ModelRig rig;
+    CHECK(rig.open(file, size, size));
+    CHECK(rig.stream->loopStatus() == 1);
+    CHECK(rig.stream->soundInfo().loop_start == 4900 && rig.stream->soundInfo().loop_end == 8899);
+    CHECK(rig.stream->soundInfo().end_sample == 11999);
+    rig.stream->setLoopNum(3);
+    const Collected got = collect(rig, 100);
+    CHECK(got.all_ok && got.finished);
+    std::vector<float> expected;
+    appendPositions(expected, 100, 8999);
+    appendPositions(expected, 5000, 8999);
+    appendPositions(expected, 5000, 12099);
+    CHECK(got.left == expected);
+    // The count reads 3, 2, 1 over the three passes; a seek goes back one frame before the loop start.
+    std::vector<std::int32_t> distinct;
+    for (std::int32_t count : got.loops_after_call) {
+      if (distinct.empty() || distinct.back() != count) distinct.push_back(count);
+    }
+    CHECK((distinct == std::vector<std::int32_t>{3, 2, 1}));
+    CHECK((rig.stats.events ==
+           std::vector<std::int64_t>{0, 1, 2, 3, 4, -1, 1, 2, 3, 4, -1, 1, 2, 3, 4, 5}));
+    CHECK(rig.stats.bad_frames == 0);
+  }
+  for (std::int32_t count : {0, 1}) {
+    ModelRig rig;
+    CHECK(rig.open(file, size, size));
+    rig.stream->setLoopNum(count);
+    const Collected got = collect(rig, 100);
+    std::vector<float> expected;
+    appendPositions(expected, 100, 12099);
+    CHECK(got.all_ok && got.finished && got.left == expected);
+    CHECK(rig.stats.resets() == 0);
+  }
+  {
+    ModelRig rig;
+    CHECK(rig.open(file, size, size));
+    rig.stream->setLoopNum(-1);
+    const Collected got = collect(rig, 200, [&](const Collected&) { return rig.stats.resets() >= 4; });
+    CHECK(got.all_ok && !got.finished);
+    CHECK(rig.stats.resets() >= 4);
+    CHECK(std::all_of(got.loops_after_call.begin(), got.loops_after_call.end(), [](std::int32_t n) { return n == -1; }));
+  }
+  {
+    // No smpl chunk: no loop status, and a loop count has no effect.
+    ModelRig rig;
+    const Bytes plain = makeAt3File(2, 6, 12000, 100);
+    CHECK(rig.open(plain, static_cast<std::uint32_t>(plain.size()), static_cast<std::uint32_t>(plain.size())));
+    CHECK(rig.stream->loopStatus() == 0);
+    rig.stream->setLoopNum(5);
+    const Collected got = collect(rig, 100);
+    CHECK(got.finished && got.left.size() == 12000 && rig.stats.resets() == 0);
+  }
+}
+
+void testAtracModelStreamingLoop() {
+  constexpr std::uint32_t kFrames = 300;
+  constexpr std::uint32_t kEnd = kFrames * 2048 - 1;  // exclusive end of the valid audio
+  constexpr std::uint32_t kStart = 100 * 2048 + 500;
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, kFrames, kEnd - 2232, 2232, std::pair{kStart, kEnd - 1});
+  CHECK(rig.open(file, 0x10000, 0x20000));
+  rig.stream->setLoopNum(2);
+  std::vector<std::uint32_t> seek_read_pos;
+  std::uint32_t seen_resets = 0;
+  // After the seek the game's next request must start at the frame before the loop start.
+  const Collected got = collect(rig, 3000, [&](const Collected&) {
+    if (rig.stats.resets() > seen_resets) {
+      seen_resets = rig.stats.resets();
+      const auto info = rig.stream->streamDataInfo();
+      CHECK(info.has_value());
+      if (info) {
+        seek_read_pos.push_back(info->read_pos);
+        CHECK(info->write_addr == ModelRig::kBufferAddr + info->read_pos % 0x20000);
+        CHECK(info->writable > 0);
+      }
+    }
+    return false;
+  });
+  CHECK(got.all_ok && got.finished);
+  CHECK(seek_read_pos.size() == 1);
+  if (!seek_read_pos.empty()) CHECK(seek_read_pos[0] == rig.data_offset + 99 * kAt3Block);
+  std::vector<float> expected;
+  appendPositions(expected, 2232, kEnd - 1);
+  appendPositions(expected, kStart, kEnd - 1);
+  CHECK(got.left == expected);
+  CHECK(rig.stats.bad_frames == 0);
+}
+
+void testAtracModelStaleRead() {
+  // A read requested before a loop seek completes after it: its bytes belong to the old position and
+  // must not be committed. The file is long enough that data past the loop end is still unread.
+  constexpr std::uint32_t kFrames = 600;
+  constexpr std::uint32_t kLoopEnd = 200 * 2048 + 100;
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, kFrames, kFrames * 2048 - 2232 - 1, 2232, std::pair{2048u * 10, kLoopEnd});
+  CHECK(rig.open(file, 0x10000, 0x20000));
+  rig.stream->setLoopNum(2);
+  std::vector<float> out(4096);
+
+  // Play up to frame 199 with every refill completing at once.
+  while (rig.stats.events.size() < 200) {
+    const auto result = rig.stream->decode(rig.ring, out);
+    CHECK(result.has_value());
+    if (!result) return;
+    const auto info = rig.stream->streamDataInfo();
+    if (info && info->writable > 0 && result->remain >= 0 && result->remain < static_cast<std::int32_t>(rig.threshold)) {
+      const std::uint32_t bytes = std::min<std::uint32_t>(info->writable, 0x4000);
+      for (std::uint32_t i = 0; i < bytes; ++i) {
+        rig.ring[(info->write_addr - ModelRig::kBufferAddr + i) % rig.ring.size()] = file[info->read_pos + i];
+      }
+      CHECK(rig.stream->addStreamData(bytes) == 0);
+    }
+  }
+
+  // A read is requested and stays in flight while the decoder reaches the loop end and seeks.
+  const auto request = rig.stream->streamDataInfo();
+  CHECK(request.has_value() && request->writable > 0);
+  if (!request) return;
+  const std::uint32_t stale_bytes = std::min<std::uint32_t>(request->writable, 0x4000);
+  for (int guard = 0; guard < 10 && rig.stats.resets() == 0; ++guard) {
+    CHECK(rig.stream->decode(rig.ring, out).has_value());
+  }
+  CHECK(rig.stats.resets() == 1);
+
+  // The late completion of the old request succeeds but neither moves the read position nor adds
+  // frames; the game asks for the position again only afterwards.
+  CHECK(rig.stream->addStreamData(stale_bytes) == 0);
+  CHECK(rig.stream->remain() == 0);
+  const auto fresh = rig.stream->streamDataInfo();
+  CHECK(fresh.has_value() && fresh->read_pos == rig.data_offset + 9 * kAt3Block);
+}
+
+void testAtracModelOpenErrors() {
+  std::string error;
+  const Bytes file = makeAt3File(2, 4, 5000, 2232);
+  const auto size = static_cast<std::uint32_t>(file.size());
+  const auto over = dal::AtracStream::open(file, 0x30000000, size - 1, error);
+  CHECK(!over.has_value() && over.error() == kAtracReadsizeOverBuffer);
+
+  Bytes junk = file;
+  junk[0] = 'X';
+  const auto bad = dal::AtracStream::open(junk, 0x30000000, size, error);
+  CHECK(!bad.has_value() && bad.error() == kAtracUnknownFormat);
+  CHECK(!error.empty());
+
+  // The header ends before the data chunk header: the parser cannot find the data.
+  const auto truncated = dal::AtracStream::open(std::span<const std::uint8_t>(file).first(40), 0x30000000, 0x20000, error);
+  CHECK(!truncated.has_value() && truncated.error() == kAtracUnknownFormat);
+
+  // No frame in the data chunk.
+  const Bytes empty = makeAt3File(2, 0, 0, 0);
+  const auto none = dal::AtracStream::open(empty, 0x30000000, static_cast<std::uint32_t>(empty.size()), error);
+  CHECK(!none.has_value() && none.error() == 0x80610315);
+
+  // Decode before CreateDecoder.
+  auto opened = dal::AtracStream::open(file, 0x30000000, size, error);
+  CHECK(opened.has_value());
+  if (!opened) return;
+  std::vector<float> out(4096);
+  const auto early = opened->decode(file, out);
+  CHECK(!early.has_value() && early.error() == kAtracNoDecoder);
+
+  // No `fact` chunk: the whole decoder output counts.
+  Bytes no_fact = riffEntry({chunk("fmt ", fmtBody(2))}, 2 * kAt3Block);
+  no_fact.resize(no_fact.size() + 2 * kAt3Block);
+  auto plain = dal::AtracStream::open(no_fact, 0x30000000, static_cast<std::uint32_t>(no_fact.size()), error);
+  CHECK(plain.has_value());
+  if (plain) CHECK(plain->soundInfo().end_sample == 2 * 2048 - 1);
+}
+
+// The handlers on synthetic guest memory.
+class AtracGuest {
+ public:
+  static constexpr std::uint32_t kHandle = 0x0;
+  static constexpr std::uint32_t kCells = 0x400;
+  static constexpr std::uint32_t kBuffer = 0x10000;
+  static constexpr std::uint32_t kOut = 0x40000;
+
+  AtracGuest() : caller_(0x01000000, dal::GuestThreadParams{}, 0, 0) {
+    dal::setLogSink([](std::string_view) {});
+    dal::resetCellAtrac();
+    CHECK(dal::process().memory.reserve());
+    base_ = dal::process().memory.base();
+    scratch_ = dal::process().main.allocate(0x80000, 0x10000);
+    CHECK(scratch_ != 0);
+  }
+  ~AtracGuest() {
+    dal::resetCellAtrac();
+    dal::setLogSink({});
+  }
+
+  std::uint8_t* base() const { return base_; }
+  std::uint32_t at(std::uint32_t offset) const { return scratch_ + offset; }
+  std::uint32_t handle() const { return at(kHandle); }
+  std::uint32_t cell(std::uint32_t n) const { return at(kCells + 4 * n); }
+  std::uint32_t read(std::uint32_t n) const { return dalRead32(base_, cell(n)); }
+
+  void put(std::uint32_t addr, const Bytes& bytes) { std::memcpy(base_ + addr, bytes.data(), bytes.size()); }
+
+  std::uint32_t call(std::string_view name, std::uint64_t r3 = 0, std::uint64_t r4 = 0, std::uint64_t r5 = 0,
+                     std::uint64_t r6 = 0, std::uint64_t r7 = 0) {
+    for (const dal::HleEntry& entry : dal::cellAtracHandlers()) {
+      if (name != entry.name) continue;
+      DalPpuContext* ctx = &caller_.context();
+      ctx->gpr[3] = r3;
+      ctx->gpr[4] = r4;
+      ctx->gpr[5] = r5;
+      ctx->gpr[6] = r6;
+      ctx->gpr[7] = r7;
+      entry.handler(ctx, base_);
+      return static_cast<std::uint32_t>(ctx->gpr[3]);
+    }
+    CHECK(false);
+    return 0;
+  }
+
+  std::uint32_t setData(const Bytes& file, std::uint32_t read_bytes, std::uint32_t buffer_bytes) {
+    put(at(kBuffer), file);
+    return call("cellAtracSetDataAndGetMemSize", handle(), at(kBuffer), read_bytes, buffer_bytes, cell(0));
+  }
+  std::uint32_t createDecoder() { return call("cellAtracCreateDecoder", handle(), at(0x800), 0x64, 0x64); }
+
+ private:
+  dal::GuestThread caller_;
+  std::uint8_t* base_ = nullptr;
+  std::uint32_t scratch_ = 0;
+};
+
+constexpr std::uint8_t kSentinel = 0x5a;
+
+// Decode until `finish`, checking each call against the silent-output contract.
+struct HandlerDecode {
+  std::uint32_t total = 0;
+  std::uint32_t calls = 0;
+  bool finished = false;
+  std::int32_t last_remain = 0;
+  bool ok = true;
+};
+
+HandlerDecode decodeAll(AtracGuest& guest, std::uint32_t channels,
+                        const std::function<void(std::uint32_t)>& after_call = {}) {
+  HandlerDecode got;
+  const std::uint32_t out = guest.at(AtracGuest::kOut);
+  for (std::uint32_t call = 0; call < 4000 && !got.finished; ++call) {
+    std::memset(guest.base() + out, kSentinel, 2048 * channels * 4 + 64);
+    const std::uint32_t result = guest.call("cellAtracDecode", guest.handle(), out, guest.cell(1), guest.cell(2), guest.cell(3));
+    got.ok = got.ok && result == 0;
+    const std::uint32_t samples = guest.read(1);
+    got.ok = got.ok && samples <= 2048;
+    // Silence for the reported frames, nothing written past them.
+    for (std::uint32_t i = 0; i < samples * channels * 4; ++i) got.ok = got.ok && guest.base()[out + i] == 0;
+    for (std::uint32_t i = samples * channels * 4; i < 2048 * channels * 4 + 64; ++i) {
+      got.ok = got.ok && guest.base()[out + i] == kSentinel;
+    }
+    got.total += samples;
+    ++got.calls;
+    got.finished = guest.read(2) == 1;
+    got.last_remain = static_cast<std::int32_t>(guest.read(3));
+    if (after_call) after_call(call);
+  }
+  return got;
+}
+
+void testAtracHandlersMemory() {
+  CHECK(dal::cellAtracHandlers().size() == 15);
+  AtracGuest guest;
+  std::uint8_t* base = guest.base();
+  std::memset(base + guest.handle(), 0xaa, 0x200);
+
+  // Nothing works before SetDataAndGetMemSize.
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(0)) == kAtracUnsetData);
+  CHECK(guest.call("cellAtracDecode", guest.handle(), guest.at(AtracGuest::kOut), guest.cell(1), guest.cell(2),
+                   guest.cell(3)) == kAtracUnsetData);
+  CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == kAtracUnsetData);
+  CHECK(guest.call("cellAtracIsSecondBufferNeeded", guest.handle()) == kAtracUnsetData);
+
+  const Bytes file = makeAt3File(2, 4, 5000, 2232, std::pair{3000u, 7231u});
+  const auto size = static_cast<std::uint32_t>(file.size());
+  dalWrite32(base, guest.cell(0), 0xdeadbeef);
+  CHECK(guest.setData(file, size, size) == 0);
+  CHECK(guest.read(0) == 0x1000);
+
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == 0 && guest.read(1) == 2);
+  CHECK(guest.call("cellAtracGetMaxSample", guest.handle(), guest.cell(1)) == 0 && guest.read(1) == 2048);
+  CHECK(guest.call("cellAtracGetLoopInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0);
+  CHECK(guest.read(1) == 0 && guest.read(2) == 1);
+  CHECK(guest.call("cellAtracGetRemainFrame", guest.handle(), guest.cell(1)) == 0 &&
+        static_cast<std::int32_t>(guest.read(1)) == kRemainOnMemory);
+  CHECK(guest.call("cellAtracGetSoundInfo", guest.handle(), guest.cell(1), guest.cell(2), guest.cell(3)) == 0);
+  CHECK(guest.read(1) == 4999 && guest.read(2) == 768 && guest.read(3) == 4999);
+  CHECK(guest.call("cellAtracIsSecondBufferNeeded", guest.handle()) == 0);
+  dalWrite32(base, guest.cell(1), 7);
+  dalWrite32(base, guest.cell(2), 7);
+  CHECK(guest.call("cellAtracGetSecondBufferInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0);
+  CHECK(guest.read(1) == 0 && guest.read(2) == 0);
+  CHECK(guest.call("cellAtracSetSecondBuffer", guest.handle(), guest.at(0x900), 0x100) == 0);
+
+  // Decode needs the decoder; the stream calls do not exist in memory mode.
+  CHECK(guest.call("cellAtracDecode", guest.handle(), guest.at(AtracGuest::kOut), guest.cell(1), guest.cell(2),
+                   guest.cell(3)) == kAtracNoDecoder);
+  CHECK(guest.call("cellAtracGetStreamDataInfo", guest.handle(), guest.cell(1), guest.cell(2), guest.cell(3)) ==
+        kAtracAllDataIsOnMemory);
+  CHECK(guest.call("cellAtracAddStreamData", guest.handle(), 0x100) == kAtracAllDataIsOnMemory);
+  CHECK(guest.createDecoder() == 0);
+  CHECK(guest.createDecoder() == kAtracDecoderWasCreated);
+
+  // The loop count: 3, then endless (-1 as a 32-bit register value).
+  CHECK(guest.call("cellAtracSetLoopNum", guest.handle(), 3) == 0);
+  CHECK(guest.call("cellAtracGetLoopInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0);
+  CHECK(guest.read(1) == 3 && guest.read(2) == 1);
+  CHECK(guest.call("cellAtracSetLoopNum", guest.handle(), 0xffffffffu) == 0);
+  CHECK(guest.call("cellAtracGetLoopInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0);
+  CHECK(guest.read(1) == 0xffffffffu && guest.read(2) == 1);
+  CHECK(guest.call("cellAtracSetLoopNum", guest.handle(), 0) == 0);
+
+  // Decode to the end: 5000 frames of silence in 1864 + 2048 + 1088.
+  const HandlerDecode got = decodeAll(guest, 2);
+  CHECK(got.ok && got.finished && got.total == 5000 && got.calls == 3);
+  CHECK(got.last_remain == kRemainOnMemory);
+  CHECK(guest.call("cellAtracDecode", guest.handle(), guest.at(AtracGuest::kOut), guest.cell(1), guest.cell(2),
+                   guest.cell(3)) == 0);
+  CHECK(guest.read(1) == 0 && guest.read(2) == 1);
+
+  CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == 0);
+  CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == kAtracUnsetData);
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == kAtracUnsetData);
+
+  // Nothing was ever written into the handle.
+  bool untouched = true;
+  for (std::uint32_t i = 0; i < 0x200; ++i) untouched = untouched && base[guest.handle() + i] == 0xaa;
+  CHECK(untouched);
+}
+
+void testAtracHandlersMono() {
+  AtracGuest guest;
+  const Bytes file = makeAt3File(1, 3, 3000, 100);
+  const auto size = static_cast<std::uint32_t>(file.size());
+  CHECK(guest.setData(file, size, size) == 0);
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == 0 && guest.read(1) == 1);
+  CHECK(guest.createDecoder() == 0);
+  const HandlerDecode got = decodeAll(guest, 1);
+  CHECK(got.ok && got.finished && got.total == 3000 && got.calls == 2);
+}
+
+void testAtracHandlersStreaming() {
+  constexpr std::uint32_t kFrames = 300;
+  AtracGuest guest;
+  std::uint8_t* base = guest.base();
+  const Bytes file = makeAt3File(2, kFrames, kFrames * 2048 - 2232, 2232);
+  guest.put(guest.at(AtracGuest::kBuffer), Bytes(file.begin(), file.begin() + 0x10000));
+  CHECK(guest.call("cellAtracSetDataAndGetMemSize", guest.handle(), guest.at(AtracGuest::kBuffer), 0x10000,
+                   0x20000, guest.cell(0)) == 0);
+  CHECK(guest.createDecoder() == 0);
+  CHECK(guest.call("cellAtracGetRemainFrame", guest.handle(), guest.cell(4)) == 0);
+  const auto initial = static_cast<std::int32_t>(guest.read(4));
+  const std::int32_t threshold = initial * 3 / 4;
+  CHECK(initial > 100 && initial < 128);
+
+  struct Pending {
+    std::uint32_t write_ptr, bytes, read_pos;
+  };
+  std::optional<Pending> pending;
+  std::vector<std::uint32_t> read_positions;
+  std::uint32_t total_read = 0x10000;
+  bool cells_ok = true;
+  const std::uint32_t ring = guest.at(AtracGuest::kBuffer);
+  const HandlerDecode got = decodeAll(guest, 2, [&](std::uint32_t) {
+    const auto remain = static_cast<std::int32_t>(guest.read(3));
+    if (pending) {
+      std::memcpy(base + pending->write_ptr, file.data() + pending->read_pos, pending->bytes);
+      cells_ok = cells_ok && guest.call("cellAtracAddStreamData", guest.handle(), pending->bytes) == 0;
+      total_read += pending->bytes;
+      pending.reset();
+    } else if (remain >= 0 && remain < threshold) {
+      cells_ok = cells_ok && guest.call("cellAtracGetStreamDataInfo", guest.handle(), guest.cell(5),
+                                        guest.cell(6), guest.cell(7)) == 0;
+      const std::uint32_t write_ptr = guest.read(5), writable = guest.read(6), read_pos = guest.read(7);
+      cells_ok = cells_ok && write_ptr >= ring && write_ptr + writable <= ring + 0x20000;
+      const std::uint32_t bytes = std::min({writable, 0x4000u, static_cast<std::uint32_t>(file.size()) - read_pos});
+      if (bytes > 0) {
+        read_positions.push_back(read_pos);
+        pending = Pending{write_ptr, bytes, read_pos};
+      }
+    }
+  });
+  CHECK(got.ok && got.finished && cells_ok);
+  CHECK(got.total == kFrames * 2048 - 2232);
+  CHECK(got.last_remain == kRemainStreamEnd);
+  CHECK(total_read == file.size());
+  CHECK(!read_positions.empty() && std::is_sorted(read_positions.begin(), read_positions.end()));
+
+  // The whole file is buffered: nothing more can be committed.
+  CHECK(guest.call("cellAtracGetStreamDataInfo", guest.handle(), guest.cell(5), guest.cell(6), guest.cell(7)) == 0);
+  CHECK(guest.read(6) == 0 && guest.read(7) == file.size());
+  CHECK(guest.call("cellAtracAddStreamData", guest.handle(), 1) == kAtracAddDataIsTooBig);
+}
+
+void testAtracHandlersReuseAndErrors() {
+  AtracGuest guest;
+  const Bytes stereo = makeAt3File(2, 4, 5000, 2232, std::pair{3000u, 7231u});
+  const Bytes mono = makeAt3File(1, 3, 3000, 100);
+  CHECK(guest.setData(stereo, static_cast<std::uint32_t>(stereo.size()), static_cast<std::uint32_t>(stereo.size())) == 0);
+  CHECK(guest.createDecoder() == 0);
+  CHECK(guest.call("cellAtracGetLoopInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0 && guest.read(2) == 1);
+
+  // The same address with another file, with and without DeleteDecoder in between: a fresh state.
+  for (bool deleted : {true, false}) {
+    if (deleted) CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == 0);
+    CHECK(guest.setData(mono, static_cast<std::uint32_t>(mono.size()), static_cast<std::uint32_t>(mono.size())) == 0);
+    CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == 0 && guest.read(1) == 1);
+    CHECK(guest.call("cellAtracGetLoopInfo", guest.handle(), guest.cell(1), guest.cell(2)) == 0);
+    CHECK(guest.read(1) == 0 && guest.read(2) == 0);
+    CHECK(guest.call("cellAtracGetSoundInfo", guest.handle(), guest.cell(1), guest.cell(2), guest.cell(3)) == 0);
+    CHECK(guest.read(1) == 2999);
+    CHECK(guest.createDecoder() == 0);  // the decoder of the old state is gone too
+    const HandlerDecode got = decodeAll(guest, 1);
+    CHECK(got.ok && got.finished && got.total == 3000);
+    if (!deleted) CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == 0);
+  }
+
+  // A bad header leaves the handle without data; the outputs are not written.
+  Bytes junk = stereo;
+  junk[1] = 'X';
+  dalWrite32(guest.base(), guest.cell(0), 0x1234);
+  CHECK(guest.setData(junk, static_cast<std::uint32_t>(junk.size()), static_cast<std::uint32_t>(junk.size())) == kAtracUnknownFormat);
+  CHECK(guest.read(0) == 0x1234);
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == kAtracUnsetData);
+  CHECK(guest.setData(stereo, static_cast<std::uint32_t>(stereo.size()), static_cast<std::uint32_t>(stereo.size()) - 1) ==
+        kAtracReadsizeOverBuffer);
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), guest.cell(1)) == kAtracUnsetData);
+
+  // An unmapped output pointer is a fault code, not a crash.
+  CHECK(guest.setData(stereo, static_cast<std::uint32_t>(stereo.size()), static_cast<std::uint32_t>(stereo.size())) == 0);
+  CHECK(guest.call("cellAtracGetChannel", guest.handle(), 0) == 0x8001000d);
+  CHECK(guest.call("cellAtracSetDataAndGetMemSize", 0, guest.at(AtracGuest::kBuffer), 100, 100, guest.cell(0)) == 0x8001000d);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1751,6 +2496,19 @@ int main(int argc, char** argv) {
   testAt3ParseTruncated();
   testScanRiffEntries();
   testAtracFactorySlot();
+  testAtracModelMemoryStereo();
+  testAtracModelMemoryMono();
+  testAtracModelSilentWithoutDecoder();
+  testAtracModelStreaming();
+  testAtracModelStarvation();
+  testAtracModelLoops();
+  testAtracModelStreamingLoop();
+  testAtracModelStaleRead();
+  testAtracModelOpenErrors();
+  testAtracHandlersMemory();
+  testAtracHandlersMono();
+  testAtracHandlersStreaming();
+  testAtracHandlersReuseAndErrors();
 
   if (!keep) fs::remove_all(g_dir, ec);
   std::printf("audio core tests: %d passed, %d failed\n", g_passed, g_failed);

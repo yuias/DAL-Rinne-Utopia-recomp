@@ -92,6 +92,7 @@ function(dal_runtime_add_core)
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
     runtime/src/hle/cell_atrac.cpp
+    runtime/src/hle/cell_atrac_stream.cpp
     runtime/src/hle/cell_audio.cpp
     runtime/src/hle/cell_audio_ports.cpp
     runtime/src/hle/cell_fs.cpp
