@@ -64,6 +64,7 @@ function(dal_ppu_add_generated_tree)
   # Pins how far the game gets; updated by whoever moves the milestone.
   include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")
   include("${CMAKE_SOURCE_DIR}/cmake/game_input.cmake")
+  include("${CMAKE_SOURCE_DIR}/cmake/game_audio.cmake")
   if(DAL_EBOOT_ELF STREQUAL "" OR DAL_GAME_DIR STREQUAL "")
     message(STATUS "DAL: game_boot test not registered (DAL_EBOOT_ELF or DAL_GAME_DIR is empty)")
   else()
@@ -99,6 +100,22 @@ function(dal_ppu_add_generated_tree)
         FIXTURES_REQUIRED game_input_hdd
         TIMEOUT ${game_input_timeout}
         PASS_REGULAR_EXPRESSION "${DAL_GAME_INPUT_MILESTONE}")
+
+      # Same reason for the separate hdd directory as above. The dump file is in the build directory,
+      # which exists; the writer does not create parents.
+      add_test(NAME game_audio_hdd_clean
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/game_hdd_audio")
+      set_tests_properties(game_audio_hdd_clean PROPERTIES FIXTURES_SETUP game_audio_hdd)
+      add_test(NAME game_audio
+        COMMAND dal_game --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
+          --sdata-cache "${sdata_cache}" --hdd-dir "${CMAKE_BINARY_DIR}/game_hdd_audio"
+          --pad-script "${CMAKE_SOURCE_DIR}/tools/pad_scripts/leave_title.txt"
+          --audio none --audio-dump "${CMAKE_BINARY_DIR}/game_audio.wav"
+          --seconds ${DAL_GAME_AUDIO_SECONDS})
+      set_tests_properties(game_audio PROPERTIES
+        FIXTURES_REQUIRED game_audio_hdd
+        TIMEOUT 100
+        PASS_REGULAR_EXPRESSION "${DAL_GAME_AUDIO_ATRAC_PATTERN}")
     else()
       set(boot_milestone "${DAL_GAME_BOOT_MILESTONE_NO_SDATA}")
     endif()

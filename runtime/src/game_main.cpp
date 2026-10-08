@@ -36,6 +36,7 @@
 #include "input/pad_script.h"
 #include "lv2/vfs.h"
 #include "lv2/vfs_config.h"
+#include "media/atrac_decoder.h"
 #include "media/ffmpeg_codecs.h"
 #include "media/movie_decoder.h"
 #include "render/vk_context.h"
@@ -410,6 +411,18 @@ void installMovieCodecs() {
   dal::setMediaCodecFactory(std::move(factory));
 }
 
+// cellAtrac sounds decode through the same DLLs. Without them every sound plays as silence of its
+// own length and the stream protocol is unchanged.
+void installAtracDecoder() {
+  std::string error;
+  std::unique_ptr<dal::AtracDecoderFactory> factory = dal::createFfmpegAtracDecoderFactory(error);
+  if (!factory) {
+    dal::logWarn("dal: atrac: no decoder: {}", error);
+    return;
+  }
+  dal::setAtracDecoderFactory(std::move(factory));
+}
+
 // Video and audio out report what the game's PARAM.SFO allows. A missing or broken file keeps the
 // defaults of gameParamSfo().
 void loadGameParamSfo() {
@@ -439,21 +452,28 @@ void loadGameParamSfo() {
 std::vector<std::string> audioCensusLines() {
   const dal::AudioEngineStats engine = dal::audioEngineStats();
   dal::finishAudioDump();
-  if (engine.output.empty()) return {};  // cellAudioInit never ran
 
-  const dal::CellAudioStats ports = dal::cellAudioPorts().stats();
   std::vector<std::string> lines;
-  lines.push_back(std::format(
-      "audio {}: {} blocks ({} non-silent), skipped {}, dropped {}, underrun {} frames, notify {} sent {} failed, "
-      "max producer {:.2f} ms",
-      engine.output, engine.blocks, engine.non_silent_blocks, engine.skipped_blocks,
-      engine.output_stats.blocks_dropped, engine.output_stats.underrun_frames, ports.notifies_sent,
-      ports.notifies_failed, static_cast<double>(engine.max_producer_time.count()) / 1000.0));
-  std::string channels;
-  for (std::size_t c = 0; c < ports.nonzero_samples.size(); ++c) {
-    channels += std::format("{}{}:{}", c == 0 ? "" : " ", c, ports.nonzero_samples[c]);
+  if (!engine.output.empty()) {  // otherwise cellAudioInit never ran
+    const dal::CellAudioStats ports = dal::cellAudioPorts().stats();
+    lines.push_back(std::format(
+        "audio {}: {} blocks ({} non-silent), skipped {}, dropped {}, underrun {} frames, notify {} sent {} failed, "
+        "max producer {:.2f} ms",
+        engine.output, engine.blocks, engine.non_silent_blocks, engine.skipped_blocks,
+        engine.output_stats.blocks_dropped, engine.output_stats.underrun_frames, ports.notifies_sent,
+        ports.notifies_failed, static_cast<double>(engine.max_producer_time.count()) / 1000.0));
+    std::string channels;
+    for (std::size_t c = 0; c < ports.nonzero_samples.size(); ++c) {
+      channels += std::format("{}{}:{}", c == 0 ? "" : " ", c, ports.nonzero_samples[c]);
+    }
+    lines.push_back(std::format("audio input: {} periods, non-zero samples per channel {}", ports.periods, channels));
   }
-  lines.push_back(std::format("audio input: {} periods, non-zero samples per channel {}", ports.periods, channels));
+
+  const dal::CellAtracStats atrac = dal::cellAtracStats();
+  if (atrac.decoders != 0) {
+    lines.push_back(std::format("atrac {} decoders, {} frames decoded ({} non-silent), {} errors, {} without decoder",
+                                atrac.decoders, atrac.frames, atrac.non_silent, atrac.errors, atrac.without_decoder));
+  }
   return lines;
 }
 
@@ -581,6 +601,7 @@ int main(int argc, char** argv) {
   }
 
   installMovieCodecs();
+  installAtracDecoder();
 
   // Held until the process ends (runSupervisor does not return); the decode loops of the game poll
   // with 1 ms sleeps, which the default tick would stretch to 15 ms.

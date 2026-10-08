@@ -11,6 +11,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "media/at3_file.h"
@@ -43,10 +44,22 @@ struct AtracStreamInfo {
   std::uint32_t read_pos = 0;    // file offset of the byte at write_addr
 };
 
+// ATRAC3plus frames handled by one decode() call (or summed over a stream's life).
+struct AtracFrameCounts {
+  std::uint64_t decoded = 0;          // frames the decoder produced
+  std::uint64_t non_silent = 0;       // of those, frames with a sample above kAtracSilenceLevel
+  std::uint64_t errors = 0;           // frames the decoder rejected (played as silence)
+  std::uint64_t without_decoder = 0;  // frames passed through with no decoder attached
+};
+
+// -80 dBFS, the audio engine's threshold for a block that counts as non-silent.
+inline constexpr float kAtracSilenceLevel = 1.0e-4f;
+
 struct AtracDecodeResult {
   std::uint32_t samples = 0;  // frames written to the output, at most kAtracMaxSample
   bool finish = false;
   std::int32_t remain = 0;
+  AtracFrameCounts counts;  // frames handled by this call
 };
 
 struct AtracSoundInfo {
@@ -79,7 +92,9 @@ class AtracStream {
   std::int32_t remain() const;
   void setLoopNum(std::int32_t count) { loop_num_ = count; }
   std::int32_t loopNum() const { return loop_num_; }
-  std::uint32_t loopStatus() const { return info_.loop ? 1 : 0; }
+  // 1 only for a loop the model plays; a loop whose region holds no valid audio is ignored and
+  // reported as absent, like loopBackPending() treats it.
+  std::uint32_t loopStatus() const { return loopUsable() ? 1 : 0; }
   AtracSoundInfo soundInfo() const;
 
   // Streaming only (kAtracErrorAllDataIsOnMemory in memory mode).
@@ -94,8 +109,8 @@ class AtracStream {
   std::expected<AtracDecodeResult, std::uint32_t> decode(std::span<const std::uint8_t> ring,
                                                          std::span<float> out);
 
-  std::uint64_t decodeErrors() const { return decode_errors_; }
-  std::uint64_t framesDecoded() const { return frames_decoded_; }
+  // The reason of the first rejected frame, once; empty afterwards (the HLE layer logs it per handle).
+  std::string takeFirstError() { return std::exchange(first_error_, std::string()); }
 
  private:
   AtracStream() = default;
@@ -103,6 +118,7 @@ class AtracStream {
   std::uint64_t frameOffset(std::uint32_t index) const {
     return std::uint64_t{info_.data_offset} + std::uint64_t{index} * info_.block_align;
   }
+  bool loopUsable() const;  // the file has a loop whose region holds valid audio
   bool loopBackPending() const;
   std::uint64_t passEnd() const;  // exclusive output position where the current pass ends
   std::uint32_t writableNow() const;
@@ -130,7 +146,8 @@ class AtracStream {
   std::unique_ptr<AtracFrameDecoder> decoder_;
   std::vector<std::uint8_t> frame_bytes_;
   std::vector<float> frame_samples_;
-  std::uint64_t decode_errors_ = 0, frames_decoded_ = 0;
+  std::string first_error_;
+  bool error_seen_ = false;
 };
 
 }  // namespace dal

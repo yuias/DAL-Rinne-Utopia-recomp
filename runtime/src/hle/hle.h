@@ -200,11 +200,23 @@ std::span<const HleEntry> cellAudioHandlers();
 // audio engine. Intended for tests.
 void resetCellAudio();
 
-// Handlers of the cellAtrac module: all 15 imports. Decode outputs silence of the right length until
-// a decoder is attached.
+// Handlers of the cellAtrac module: all 15 imports. Decode runs the decoder of the installed
+// AtracDecoderFactory; without a decoder, or for a frame it rejects, it outputs silence of the right
+// length.
 std::span<const HleEntry> cellAtracHandlers();
 
-// Forgets every cellAtrac handle without touching guest memory. Intended for tests.
+// Totals over every handle since start-up (or the last resetCellAtrac). Safe to read from any thread.
+struct CellAtracStats {
+  std::uint64_t decoders = 0;          // CreateDecoder calls that succeeded
+  std::uint64_t frames = 0;            // ATRAC3plus frames decoded
+  std::uint64_t non_silent = 0;        // of those, frames with audible content
+  std::uint64_t errors = 0;            // frames the decoder rejected
+  std::uint64_t without_decoder = 0;   // frames passed through with no decoder
+  std::uint64_t starved = 0;           // Decode calls that returned no samples for lack of buffered data
+};
+CellAtracStats cellAtracStats();
+
+// Forgets every cellAtrac handle and the totals without touching guest memory. Intended for tests.
 void resetCellAtrac();
 
 // Handlers of the cellGcmSys module.

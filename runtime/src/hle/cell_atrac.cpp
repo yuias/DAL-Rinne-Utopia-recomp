@@ -4,8 +4,9 @@
 // and AddStreamData from the file thread. All state is host side, keyed by the handle's guest
 // address; nothing is written into the handle, which the game never reads.
 //
-// The stream rules are in cell_atrac_stream.cpp. Decode currently outputs silence of the right
-// length: the cursor, loop and buffer bookkeeping run in full, but no decoder is attached.
+// The stream rules are in cell_atrac_stream.cpp. Decode runs the frame decoder of the installed
+// factory under the guest lock (one ATRAC3plus frame takes tens of microseconds); without a decoder,
+// or for a frame the decoder rejects, it outputs silence of the right length.
 //
 // Argument lists and error codes follow RPCS3 `rpcs3/Emu/Cell/Modules/cellAtrac.h` (`CellAtracError`)
 // and `cellAtrac.cpp` (the registered functions). Every value written through an output pointer is
@@ -13,12 +14,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "core/guest_memory.h"
@@ -44,6 +48,27 @@ AtracStream* findSound(std::uint32_t handle) {
   const auto it = sounds().find(handle);
   return it != sounds().end() ? &it->second : nullptr;
 }
+
+// Handle addresses whose unusable data was already reported: the game may retry the same call.
+std::unordered_set<std::uint32_t>& unusableReported() {
+  static std::unordered_set<std::uint32_t> set;
+  return set;
+}
+
+// Written under the guest lock, read by the census at stop from another thread.
+struct Totals {
+  std::atomic<std::uint64_t> decoders{0}, frames{0}, non_silent{0}, errors{0}, without_decoder{0}, starved{0};
+};
+
+Totals& totals() {
+  static Totals t;
+  return t;
+}
+
+void add(std::atomic<std::uint64_t>& counter, std::uint64_t n) { counter.fetch_add(n, std::memory_order_relaxed); }
+
+// One warning per run: every handle would fail the same way (missing codec, bad parameters).
+std::atomic<bool> g_decoder_warned{false};
 
 bool guestRange(std::uint32_t addr, std::uint32_t size) {
   return addr != 0 && process().memory.isCommitted(addr, size);
@@ -75,17 +100,21 @@ void atracSetDataAndGetMemSize(DalPpuContext* ctx, std::uint8_t* base) {
   auto stream = AtracStream::open(std::span<const std::uint8_t>(base + buffer, read_bytes), buffer,
                                   buffer_bytes, error);
   if (!stream) {
-    logWarn("dal: atrac: handle {:#x}: unusable data: {}", handle, error);
+    if (unusableReported().insert(handle).second) {
+      logWarn("dal: atrac: handle {:#x}: unusable data: {}", handle, error);
+    }
     setResultCode(ctx, stream.error());
     return;
   }
+  unusableReported().erase(handle);
   sounds().insert_or_assign(handle, std::move(*stream));
   dalWrite32(base, work_out, kAtracWorkMemoryBytes);
   setResultCode(ctx, kCellOk);
 }
 
 // cellAtracCreateDecoder(CellAtracHandle* handle, u8* work_memory, u32 ppu_priority, u32 spu_priority)
-// The work memory and priorities have no meaning here: the decoder state is host side.
+// The work memory and priorities have no meaning here: the decoder state is host side. A handle
+// without a decoder still plays (as silence), so a failure to make one is not an error to the game.
 void atracCreateDecoder(DalPpuContext* ctx, std::uint8_t* base) {
   (void)base;
   const std::uint32_t handle = argU32(ctx, 0);
@@ -94,8 +123,18 @@ void atracCreateDecoder(DalPpuContext* ctx, std::uint8_t* base) {
     setResultCode(ctx, kAtracErrorUnsetData);
     return;
   }
-  const std::uint32_t result = sound->createDecoder(nullptr);
+  std::unique_ptr<AtracFrameDecoder> decoder;
+  // With no factory installed the process start-up has already said why.
+  if (AtracDecoderFactory* factory = atracDecoderFactory(); factory != nullptr && !sound->decoderCreated()) {
+    std::string error;
+    decoder = factory->create(sound->info(), error);
+    if (!decoder && !g_decoder_warned.exchange(true)) {
+      logWarn("dal: atrac: no decoder: {}", error);
+    }
+  }
+  const std::uint32_t result = sound->createDecoder(std::move(decoder));
   if (result == kCellOk) {
+    add(totals().decoders, 1);
     const At3Info& info = sound->info();
     const std::string loop = info.loop ? std::format("{}-{}", info.loop->start_sample, info.loop->end_sample)
                                        : std::string("none");
@@ -139,6 +178,15 @@ void atracDecode(DalPpuContext* ctx, std::uint8_t* base) {
   if (!result) {
     setResultCode(ctx, result.error());
     return;
+  }
+  Totals& t = totals();
+  add(t.frames, result->counts.decoded);
+  add(t.non_silent, result->counts.non_silent);
+  add(t.errors, result->counts.errors);
+  add(t.without_decoder, result->counts.without_decoder);
+  if (result->samples == 0 && !result->finish) add(t.starved, 1);
+  if (const std::string reason = sound->takeFirstError(); !reason.empty()) {
+    logWarn("dal: atrac: handle {:#x}: decode error, playing silence for such frames: {}", argU32(ctx, 0), reason);
   }
   const std::size_t count = std::size_t{result->samples} * channels;
   for (std::size_t i = 0; i < count; ++i) {
@@ -333,6 +381,27 @@ constexpr HleEntry kHandlers[] = {
 
 std::span<const HleEntry> cellAtracHandlers() { return kHandlers; }
 
-void resetCellAtrac() { sounds().clear(); }
+CellAtracStats cellAtracStats() {
+  const Totals& t = totals();
+  CellAtracStats stats;
+  stats.decoders = t.decoders.load(std::memory_order_relaxed);
+  stats.frames = t.frames.load(std::memory_order_relaxed);
+  stats.non_silent = t.non_silent.load(std::memory_order_relaxed);
+  stats.errors = t.errors.load(std::memory_order_relaxed);
+  stats.without_decoder = t.without_decoder.load(std::memory_order_relaxed);
+  stats.starved = t.starved.load(std::memory_order_relaxed);
+  return stats;
+}
+
+void resetCellAtrac() {
+  sounds().clear();
+  unusableReported().clear();
+  Totals& t = totals();
+  for (std::atomic<std::uint64_t>* counter :
+       {&t.decoders, &t.frames, &t.non_silent, &t.errors, &t.without_decoder, &t.starved}) {
+    counter->store(0, std::memory_order_relaxed);
+  }
+  g_decoder_warned.store(false);
+}
 
 }  // namespace dal

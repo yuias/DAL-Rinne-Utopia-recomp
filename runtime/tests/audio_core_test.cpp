@@ -2446,6 +2446,105 @@ void testAtracHandlersReuseAndErrors() {
   CHECK(guest.call("cellAtracSetDataAndGetMemSize", 0, guest.at(AtracGuest::kBuffer), 100, 100, guest.cell(0)) == 0x8001000d);
 }
 
+// A decoder that fills every sample with one value and rejects the frame whose index is `bad_frame`.
+class ConstantDecoder : public dal::AtracFrameDecoder {
+ public:
+  ConstantDecoder(float value, std::uint32_t bad_frame) : value_(value), bad_frame_(bad_frame) {}
+  bool decode(std::span<const std::uint8_t> frame, std::span<float> out, std::string& error) override {
+    const std::uint32_t index = frame.size() >= 4 ? (std::uint32_t{frame[2]} << 8) | frame[3] : 0;
+    if (index == bad_frame_) {
+      error = "bad frame";
+      return false;
+    }
+    std::fill(out.begin(), out.end(), value_);
+    return true;
+  }
+  void reset() override {}
+
+ private:
+  float value_;
+  std::uint32_t bad_frame_;
+};
+
+class ConstantFactory : public dal::AtracDecoderFactory {
+ public:
+  ConstantFactory(float value, std::uint32_t bad_frame) : value_(value), bad_frame_(bad_frame) {}
+  std::unique_ptr<dal::AtracFrameDecoder> create(const dal::At3Info&, std::string&) override {
+    return std::make_unique<ConstantDecoder>(value_, bad_frame_);
+  }
+
+ private:
+  float value_;
+  std::uint32_t bad_frame_;
+};
+
+// Decode to the end and check that every reported sample is the big-endian bytes of `value`, or zero
+// for the frame the decoder rejects (which is 2048 samples long and not cut by the delay).
+void testAtracHandlersDecodeThroughFactory() {
+  // 0.5f is 0x3f000000, so a byte-order mistake shows as a different first byte.
+  constexpr std::uint8_t kHalf[4] = {0x3f, 0x00, 0x00, 0x00};
+  AtracGuest guest;
+  dal::setAtracDecoderFactory(std::make_unique<ConstantFactory>(0.5f, 2));
+  const Bytes file = makeAt3File(2, 4, 5000, 2232);
+  const auto size = static_cast<std::uint32_t>(file.size());
+  CHECK(guest.setData(file, size, size) == 0);
+  CHECK(guest.createDecoder() == 0);
+
+  const std::uint32_t out = guest.at(AtracGuest::kOut);
+  const std::uint32_t expected_samples[] = {1864, 2048, 1088};
+  bool bytes_ok = true;
+  for (int call = 0; call < 3; ++call) {
+    std::memset(guest.base() + out, kSentinel, 2048 * 2 * 4 + 64);
+    CHECK(guest.call("cellAtracDecode", guest.handle(), out, guest.cell(1), guest.cell(2), guest.cell(3)) == 0);
+    const std::uint32_t samples = guest.read(1);
+    CHECK(samples == expected_samples[call]);
+    for (std::uint32_t i = 0; i < samples * 2; ++i) {
+      const std::uint8_t* word = guest.base() + out + 4 * i;
+      // The second call is the rejected frame: silence.
+      const bool match = call == 1 ? (word[0] == 0 && word[1] == 0 && word[2] == 0 && word[3] == 0)
+                                   : std::memcmp(word, kHalf, 4) == 0;
+      bytes_ok = bytes_ok && match;
+    }
+    for (std::uint32_t i = samples * 2 * 4; i < 2048 * 2 * 4 + 64; ++i) {
+      bytes_ok = bytes_ok && guest.base()[out + i] == kSentinel;
+    }
+    CHECK(guest.read(2) == (call == 2 ? 1u : 0u));
+  }
+  CHECK(bytes_ok);
+
+  // Frames 0, 1 and 3 decode (the cut first frame included), frame 2 is rejected.
+  dal::CellAtracStats stats = dal::cellAtracStats();
+  CHECK(stats.decoders == 1 && stats.frames == 3 && stats.non_silent == 3 && stats.errors == 1);
+  CHECK(stats.without_decoder == 0 && stats.starved == 0);
+
+  // A factory that cannot make a decoder leaves the handle usable: silence, counted as such.
+  dal::setAtracDecoderFactory(std::make_unique<FakeAtracFactory>());
+  CHECK(guest.call("cellAtracDeleteDecoder", guest.handle()) == 0);
+  CHECK(guest.setData(file, size, size) == 0);
+  CHECK(guest.createDecoder() == 0);
+  const HandlerDecode silent = decodeAll(guest, 2);
+  CHECK(silent.ok && silent.finished && silent.total == 5000);
+  stats = dal::cellAtracStats();
+  CHECK(stats.decoders == 2 && stats.frames == 3 && stats.without_decoder == 4);
+  dal::setAtracDecoderFactory(nullptr);
+}
+
+// A loop that ends before the valid audio starts is ignored, so it must not be advertised either.
+void testAtracLoopOutsideValidAudio() {
+  ModelRig rig;
+  const Bytes file = makeAt3File(2, 4, 5000, 2232, std::pair{0u, 100u});
+  CHECK(rig.open(file, static_cast<std::uint32_t>(file.size()), static_cast<std::uint32_t>(file.size())));
+  CHECK(rig.stream->loopStatus() == 0);
+  rig.stream->setLoopNum(3);
+  const Collected got = collect(rig, 20);
+  CHECK(got.all_ok && got.finished && got.left.size() == 5000 && rig.stats.resets() == 0);
+
+  ModelRig inside;
+  const Bytes usable = makeAt3File(2, 4, 5000, 2232, std::pair{3000u, 7231u});
+  CHECK(inside.open(usable, static_cast<std::uint32_t>(usable.size()), static_cast<std::uint32_t>(usable.size())));
+  CHECK(inside.stream->loopStatus() == 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2509,6 +2608,8 @@ int main(int argc, char** argv) {
   testAtracHandlersMono();
   testAtracHandlersStreaming();
   testAtracHandlersReuseAndErrors();
+  testAtracHandlersDecodeThroughFactory();
+  testAtracLoopOutsideValidAudio();
 
   if (!keep) fs::remove_all(g_dir, ec);
   std::printf("audio core tests: %d passed, %d failed\n", g_passed, g_failed);

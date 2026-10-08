@@ -1,6 +1,7 @@
 #include "hle/cell_atrac_stream.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <format>
 #include <limits>
@@ -36,6 +37,7 @@ std::expected<AtracStream, std::uint32_t> AtracStream::open(std::span<const std:
   AtracStream stream;
   stream.info_ = *parsed;
   const At3Info& info = stream.info_;
+  // parseAt3Header accepts up to 8 channels; the game's files and this model have 1 or 2.
   if (info.channels != 1 && info.channels != 2) {
     error = std::format("{} channels", info.channels);
     return std::unexpected(kAtracErrorIllegalData);
@@ -82,12 +84,16 @@ std::uint32_t AtracStream::createDecoder(std::unique_ptr<AtracFrameDecoder> deco
   return 0;
 }
 
-bool AtracStream::loopBackPending() const {
-  if (!info_.loop || (loop_num_ != -1 && loop_num_ <= 1)) return false;
+bool AtracStream::loopUsable() const {
+  if (!info_.loop) return false;
   // A loop whose region holds no valid audio would make a pass produce nothing forever.
   const std::uint64_t first = std::max<std::uint64_t>(info_.loop->start_sample, info_.delay_samples);
   const std::uint64_t last = std::min<std::uint64_t>(std::uint64_t{info_.loop->end_sample} + 1, out_end_);
   return first < last;
+}
+
+bool AtracStream::loopBackPending() const {
+  return (loop_num_ == -1 || loop_num_ > 1) && loopUsable();
 }
 
 std::uint64_t AtracStream::passEnd() const {
@@ -205,11 +211,21 @@ std::expected<AtracDecodeResult, std::uint32_t> AtracStream::decode(std::span<co
       std::string error;
       if (decoder_->decode(frame_bytes_, frame_samples_, error)) {
         have_samples = true;
+        ++result.counts.decoded;
+        if (std::any_of(frame_samples_.begin(), frame_samples_.end(),
+                        [](float v) { return std::fabs(v) > kAtracSilenceLevel; })) {
+          ++result.counts.non_silent;
+        }
       } else {
-        ++decode_errors_;
+        ++result.counts.errors;
+        if (!error_seen_) {
+          error_seen_ = true;
+          first_error_ = std::format("frame {}: {}", cursor_, error);
+        }
       }
+    } else {
+      ++result.counts.without_decoder;
     }
-    ++frames_decoded_;
 
     const std::uint64_t frame_end = pos + kFrameSamples;
     const std::uint64_t first = std::max(pos, emit_from_);
