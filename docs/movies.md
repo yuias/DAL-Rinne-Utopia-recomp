@@ -80,7 +80,7 @@ sends every 5.333 ms. The game's sound thread, which that notify wakes, calls
 `cellSailSoundAdapterGetFrame` for the number of samples it wants (stereo float, 48 kHz), mixes
 them with its `cellAtrac` sounds, and the mixer writes the result into the port block that the next
 period plays. The runtime plays the result through the audio output
-(WASAPI with `--window`, none otherwise; `--audio-dump FILE` writes it to a WAV file). Audio that
+(WASAPI with the window, none with `--no-window`; `--audio-dump FILE` writes it to a WAV file). Audio that
 the game does not pull is still dropped once the playback clock has passed it, as before. See
 [Audio](audio.md) for the engine, the options and `cellAtrac`, which plays the game's music and
 sound effects.

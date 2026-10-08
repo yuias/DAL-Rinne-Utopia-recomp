@@ -10,7 +10,7 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
          [--audio none|wasapi] [--audio-dump FILE]
          [--load-only] [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
-         [--shader-cache DIR] [--vk-validation] [--window]
+         [--shader-cache DIR] [--vk-validation] [--no-window]
 ```
 
 `dal_game` loads the decrypted `EBOOT.elf` into a 4 GiB guest address space, sets up the main PPU
@@ -32,10 +32,10 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 
 | Option | Meaning |
 | --- | --- |
-| `--window` | Show the frames in a window (implies `--render vulkan`). Closing the window stops the run with exit code 0. |
-| `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad. Default: `keyboard` with `--window` or `--pad-script`, otherwise `neutral`. `keyboard` without `--window` or `--pad-script` is a usage error. See [Input](runtime.md#input). |
+| `--no-window` | Run without a window, for unattended runs and tests. By default `dal_game` shows the frames in a window (which implies `--render vulkan`), and closing it stops the run with exit code 0. An explicit `--render none` also turns the window off. |
+| `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad. Default: `keyboard` with the window or `--pad-script`, otherwise `neutral`. `keyboard` without the window or `--pad-script` is a usage error. See [Input](runtime.md#input). |
 | `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It cannot be combined with `--pad none` or `--pad neutral`. See [Pad script](runtime.md#pad-script). |
-| `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with `--window`, otherwise `none`, so unattended runs and tests need no sound device. See [Audio](audio.md#options). |
+| `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. See [Audio](audio.md#options). |
 | `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. Its header is updated every second, so a run stopped by `--seconds` or by closing the window leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see [`dal_audiotool`](audio.md#dal_audiotool)). |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
 
@@ -43,17 +43,17 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 
 | Option | Meaning |
 | --- | --- |
-| `--render none\|vulkan` | Whether the RSX commands are drawn (default `none`, unless `--dump-frames` or `--window` is given, which imply `vulkan`). See [Rendering](rendering.md#rendering). |
-| `--dump-frames DIR` | Write the displayed frame of every flip as `DIR/frame_<flip>.png` (flips counted from 1, six digits; RGB, 8 bits), with no window. `DIR` is created. |
+| `--render none\|vulkan` | Whether the RSX commands are drawn (default `vulkan` with the window or `--dump-frames`, otherwise `none`). See [Rendering](rendering.md#rendering). |
+| `--dump-frames DIR` | Write the displayed frame of every flip as `DIR/frame_<flip>.png` (flips counted from 1, six digits; RGB, 8 bits), with or without the window. `DIR` is created. |
 | `--dump-frames-every K` | Dump every `K`-th flip instead of every one (default 1). |
 | `--shader-cache DIR` | Directory of the SPIR-V cache (default `generated/shader_cache`). |
 | `--vk-validation` | Enable the Khronos validation layer. It comes with the Vulkan SDK; if it is not installed, `dal_game` logs a warning and goes on without it. |
 | `--rsx-capture N[,M...]` | Record the given frames (1-based flip numbers) as `.dalcap` files. See [Capture and replay](rendering.md#capture-and-replay). |
 
-The renderer options are a usage error (exit code 2) when the renderer is off. `--dump-frames` and
-`--window` switch it on; `--dump-frames-every`, `--shader-cache` and `--vk-validation` need one of
-them or `--render vulkan`; an explicit `--render none` conflicts with all of them. `--rsx-capture`
-does not need the renderer.
+The renderer options are a usage error (exit code 2) when the renderer is off. The window and
+`--dump-frames` switch it on; `--dump-frames-every`, `--shader-cache` and `--vk-validation` need one
+of them or `--render vulkan`; an explicit `--render none` conflicts with all of them.
+`--rsx-capture` does not need the renderer.
 
 Frame dumps are encoded on a worker thread, so dumping does not slow the game down. When the worker
 falls more than four frames behind, a frame is skipped and counted (`dal: render: dump skipped
@@ -103,24 +103,24 @@ disabled, so a run always ends with an exit code, also when it is started from a
 A run that stops by itself after the title screen, with a log file:
 
 ```sh
-dal_game --game-dir <game-dir> --seconds 165 --log run.log
+dal_game --game-dir <game-dir> --no-window --seconds 165 --log run.log
 ```
 
 Every 30th frame of the first 30 s as PNG files, without a window:
 
 ```sh
-dal_game --game-dir <game-dir> --seconds 30 --dump-frames out/frames --dump-frames-every 30
+dal_game --game-dir <game-dir> --no-window --seconds 30 --dump-frames out/frames --dump-frames-every 30
 ```
 
 Leaving the title screen without a person at the keyboard, with a fresh hdd directory (the script
 is the one the `game_input` test uses):
 
 ```sh
-dal_game --game-dir <game-dir> --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt
+dal_game --game-dir <game-dir> --no-window --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt
 ```
 
 Recording the game's sound to a file without playing it:
 
 ```sh
-dal_game --game-dir <game-dir> --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt --audio-dump out/run.wav
+dal_game --game-dir <game-dir> --no-window --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt --audio-dump out/run.wav
 ```

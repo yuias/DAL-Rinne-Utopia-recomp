@@ -33,7 +33,7 @@ run ends at the watchdog, exit code 5).
 With the keyboard or a pad script it leaves the title screen: Circle skips the notice screen and the
 movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`.
 The game's sound runs through its own mixer: the movie audio, the music and the sound effects reach
-the speakers with `--window` and appear in the `--audio-dump` file in every run. Voice, which the
+the speakers when the window is shown and appear in the `--audio-dump` file in every run. Voice, which the
 game streams through `cellAtrac`, is covered by unit tests only: no scene a standard run reaches has
 voice. With `--render vulkan` the only entry in the `rsx unimplemented` census is the constant ZPASS
 report value.

@@ -198,8 +198,8 @@ interface, so each module follows a documented policy that never blocks on a per
   from a queue that the modules above feed. `CELL_SYSUTIL_REQUEST_EXITGAME` is not acted on.
 - **cellGame**: the content directories are created on the host through the VFS, under the
   `--hdd-dir` directory.
-- **Audio**: the output is `none` unless `--window` or `--audio wasapi` asks for the device, so
-  unattended runs need no sound device; the game's mixer and the `cellAudio` clock run either way
+- **Audio**: the output is `none` with `--no-window` unless `--audio wasapi` asks for the device,
+  so unattended runs need no sound device; the game's mixer and the `cellAudio` clock run either way
   (see [Audio](audio.md#options)). A device or decoder problem degrades to silence with one warning.
 - **Input**: see `--pad` and [Input](#input). The pad on port 0 comes from a provider
   (`runtime/src/hle/hle.h`): none, neutral, or the keyboard with an optional pad script. A gamepad
@@ -316,7 +316,7 @@ The `game_input` test (`cmake/PpuCodegen.cmake`, pins in `cmake/game_input.cmake
 under the same conditions as `game_boot` with the `.sdat` cache: `DAL_EBOOT_ELF` and `DAL_GAME_DIR`
 must be set, and the build must have the `.sdat` keys. The setup test `game_input_hdd_clean` deletes
 `build/<preset>/game_hdd_input`, and `game_input` (fixture `game_input_hdd`) then runs
-`dal_game --pad-script tools/pad_scripts/leave_title.txt --hdd-dir build/<preset>/game_hdd_input
+`dal_game --no-window --pad-script tools/pad_scripts/leave_title.txt --hdd-dir build/<preset>/game_hdd_input
 --seconds 40` with a time limit of 100 s. It passes when the log contains the main-thread line
 
 ```

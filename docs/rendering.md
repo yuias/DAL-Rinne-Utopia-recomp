@@ -28,8 +28,8 @@ rendered and skipped.
 
 ## Rendering
 
-The renderer is optional and off by default. `--render vulkan` (implied by `--dump-frames` and
-`--window`) creates it on the RSX thread when that thread starts; the RSX thread then hands each
+The renderer is on when `dal_game` shows its window (the default) and off with `--no-window`.
+`--render vulkan` (implied by the window and by `--dump-frames`) creates it on the RSX thread when that thread starts; the RSX thread then hands each
 frame's commands to it outside the guest lock, so rendering does not hold up guest threads. The
 code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the renderer).
 
@@ -61,7 +61,7 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   recompiled and rewritten, and the translator version in the name keeps SPIR-V from an older
   translation from being reused. A program with an opcode that is not translated skips its draw
   and is counted.
-- **Flips and vsync.** A flip is done when the command executes (see [Fake RSX](#fake-rsx)). With `--window`
+- **Flips and vsync.** A flip is done when the command executes (see [Fake RSX](#fake-rsx)). With the window
   the displayed buffer is also blitted, letterboxed to 16:9, to a swapchain with the FIFO present
   mode, so the display's refresh is what paces the RSX thread; presenting runs outside the guest
   lock. Without a window nothing waits for a vertical blank in the renderer, and the game's own

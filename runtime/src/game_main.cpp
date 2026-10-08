@@ -71,7 +71,8 @@ struct Options {
   std::optional<bool> render_flag;  // --render as given; the final mode is settled after all arguments
   bool dump_every_given = false;
   bool vk_validation = false;
-  bool window = false;
+  bool no_window = false;
+  bool window = false;  // settled after all arguments
   std::string dump_frames;
   std::uint32_t dump_frames_every = 1;
   std::string shader_cache;
@@ -227,7 +228,7 @@ void printUsage() {
       "                [--pad-script FILE] [--audio none|wasapi] [--audio-dump FILE]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
-      "                [--vk-validation] [--window]\n",
+      "                [--vk-validation] [--no-window]\n",
       stderr);
 }
 
@@ -338,8 +339,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
       if (!value(opt.shader_cache)) return false;
     } else if (arg == "--vk-validation") {
       opt.vk_validation = true;
-    } else if (arg == "--window") {
-      opt.window = true;
+    } else if (arg == "--no-window") {
+      opt.no_window = true;
     } else if (arg == "--seconds") {
       std::string text;
       if (!value(text)) return false;
@@ -363,22 +364,24 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     std::fputs("error: --game-dir or --vfs-config is required\n", stderr);
     return false;
   }
-  // --dump-frames and --window imply vulkan; an explicit "--render none" (anywhere on the line) overrides
-  // that and then conflicts with it. The other options have no effect without a renderer.
+  // Playing is the default, so the window is on unless the run asks for none: --no-window for
+  // unattended runs, or an explicit "--render none", which leaves nothing to show.
+  opt.window = !opt.no_window && opt.render_flag.value_or(true);
+  // --dump-frames and the window imply vulkan; an explicit "--render none" (anywhere on the line)
+  // overrides that and then conflicts with it. The other options have no effect without a renderer.
   opt.render_vulkan = opt.render_flag.value_or(!opt.dump_frames.empty() || opt.window);
-  const bool render_option = !opt.dump_frames.empty() || opt.dump_every_given || !opt.shader_cache.empty() ||
-                             opt.vk_validation || opt.window;
+  const bool render_option =
+      !opt.dump_frames.empty() || opt.dump_every_given || !opt.shader_cache.empty() || opt.vk_validation;
   if (render_option && !opt.render_vulkan) {
-    std::fputs(
-        "error: --dump-frames, --dump-frames-every, --shader-cache, --vk-validation and --window need --render vulkan\n",
-        stderr);
+    std::fputs("error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need --render vulkan\n",
+               stderr);
     return false;
   }
   // A window or a script is what makes a keyboard pad useful, so either one selects it by default.
   const bool pad_input = opt.window || !opt.pad_script.empty();
   if (opt.pad.empty()) opt.pad = pad_input ? "keyboard" : "neutral";
   if (opt.pad == "keyboard" && !pad_input) {
-    std::fputs("error: --pad keyboard needs --window or --pad-script\n", stderr);
+    std::fputs("error: --pad keyboard needs the window or --pad-script\n", stderr);
     return false;
   }
   if (!opt.pad_script.empty() && opt.pad != "keyboard") {

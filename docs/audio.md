@@ -20,7 +20,7 @@ tool.
 
 | Option | Meaning |
 | --- | --- |
-| `--audio none\|wasapi` | The output. `wasapi` plays through the default render device; `none` has no device but the clock and the game's mixer run the same, without the device-clock correction. Default: `wasapi` with `--window`, otherwise `none`, so unattended runs and tests need no sound device. Any other value is a usage error. |
+| `--audio none\|wasapi` | The output. `wasapi` plays through the default render device; `none` has no device but the clock and the game's mixer run the same, without the device-clock correction. Default: `wasapi` with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. Any other value is a usage error. |
 | `--audio-dump FILE` | Write the mix to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. The file is created while the arguments are handled, so a path that cannot be written is a usage error (exit code 2). |
 
 ## Architecture
@@ -59,7 +59,7 @@ itself be waiting for the lock. Device threads never take the lock and never tou
 After each notify the game's mixer needs 90 to 250 us and several passes through the lock (each hold
 under 0.1 ms) to write its block, and it only gets the lock in arrival order. A long hold by another thread makes periods run back to back
 and a block is then consumed before the mixer rewrote it, which plays as silence in the middle of
-the music. The long holder was the RSX thread with the frame builder on (`--window`, `--render
+the music. The long holder was the RSX thread with the frame builder on (the window, `--render
 vulkan`): it now pumps the command buffer in slices of 128 words and ends a hold once it has lasted
 300 us (`kPumpSliceWords`, `kMaxGuestLockHold` in `runtime/src/rsx/rsx_thread.cpp`), then queues
 again behind the other waiters. One draw's data copy cannot be split, so a single hold can still be

@@ -70,7 +70,7 @@ Every build parameter, the CMake variables and the test builds are described in
 ## Running the game
 
 ```powershell
-build/release/bin/dal_game.exe --game-dir <game-dir> --window
+build/release/bin/dal_game.exe --game-dir <game-dir>
 ```
 
 Closing the window ends the run. Game data and saves are written to `build/release/hdd`;

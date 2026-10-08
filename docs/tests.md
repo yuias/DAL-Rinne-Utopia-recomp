@@ -43,7 +43,7 @@ stop before the milestone leaves the pattern unmatched.
 The pin file `cmake/game_boot.cmake` holds the arguments and two milestones:
 
 ```cmake
-set(DAL_GAME_BOOT_ARGS "--seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
+set(DAL_GAME_BOOT_ARGS "--no-window --seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
 set(DAL_GAME_BOOT_MILESTONE "\\[t 01000000\\] dal: first hle sceNpTrophy::sceNpTrophyGetTrophyUnlockState")
 set(DAL_GAME_BOOT_MILESTONE_NO_SDATA "\\[t 01000000\\] dal: first hle cellSysutil::cellMsgDialogOpen2")
 ```
@@ -52,7 +52,7 @@ A milestone is a `dal: first ...` line written by the main thread (thread id `01
 a line from another thread can appear or not depending on scheduling. The first one applies when
 the build has the `.sdat` keys (the test also passes `--sdata-cache`), the second when it has not and
 the game stops at its error dialog for the missing `.sdat` file. When a change lets the game get
-further, run `dal_game --game-dir <dir> --seconds 20 --hdd-dir <empty-dir>` three times, take the
+further, run `dal_game --game-dir <dir> --no-window --seconds 20 --hdd-dir <empty-dir>` three times, take the
 last main-thread `dal: first ...` line that appears in every run, and set the matching milestone.
 Update only that file; the test then guards against regressions.
 
