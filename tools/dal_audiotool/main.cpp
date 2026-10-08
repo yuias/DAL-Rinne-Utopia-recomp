@@ -3,6 +3,7 @@
 //   devices                     the active render devices and their mix formats
 //   tone [--output none|wasapi] [--seconds N] [--hz F] [--db L]   a sine through an output
 //   play FILE.wav [--output none|wasapi]                          a 48 kHz WAV through an output
+//   at3scan FILE                the ATRAC3plus RIFF entries of an archive
 // Exits 0 on success, 1 when the work fails, 2 on a usage error.
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <numbers>
@@ -25,6 +27,7 @@
 #include "audio/wasapi_output.h"
 #include "audio/wav_file.h"
 #include "core/sleeper.h"
+#include "media/at3_file.h"
 
 namespace {
 
@@ -39,10 +42,12 @@ void printUsage() {
       "       dal_audiotool devices\n"
       "       dal_audiotool tone [--output none|wasapi] [--seconds N] [--hz F] [--db L]\n"
       "       dal_audiotool play FILE.wav [--output none|wasapi]\n"
+      "       dal_audiotool at3scan FILE\n"
       "  wavstat   print RMS, peak and non-silent frame count per window of S seconds (default 1)\n"
       "  devices   list the active render devices with their mix format and device periods\n"
       "  tone      play a sine (default wasapi, 2 s, 440 Hz, -18 dBFS) and print the output statistics\n"
-      "  play      play a 48 kHz mono or stereo WAV file and print the output statistics\n",
+      "  play      play a 48 kHz mono or stereo WAV file and print the output statistics\n"
+      "  at3scan   list the ATRAC3plus RIFF entries of an archive (offset, size, format, samples, delay, loop)\n",
       stderr);
 }
 
@@ -280,11 +285,80 @@ int runPlay(std::span<const std::string_view> args) {
   });
 }
 
+int runAt3scan(std::span<const std::string_view> args) {
+  if (args.size() != 1 || args[0].starts_with("--")) {
+    std::fputs("error: at3scan needs exactly one file\n", stderr);
+    return 2;
+  }
+  std::ifstream stream(std::filesystem::path(args[0]), std::ios::binary | std::ios::ate);
+  if (!stream) {
+    std::fprintf(stderr, "error: cannot open %.*s\n", static_cast<int>(args[0].size()), args[0].data());
+    return 1;
+  }
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(stream.tellg()));
+  stream.seekg(0);
+  if (!stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+    std::fputs("error: read failed\n", stderr);
+    return 1;
+  }
+
+  const auto entries = dal::scanRiffEntries(bytes);
+  std::size_t parsed = 0, errors = 0, looped = 0, mono = 0, stereo = 0;
+  std::size_t unaligned = 0, overrun = 0, loop_start_valid = 0, loop_end_is_valid_end = 0;
+  for (std::size_t index = 0; index < entries.size(); ++index) {
+    const auto [offset, size] = entries[index];
+    // The entry's bytes, clamped to the archive so that a bad size cannot read past the end.
+    const std::uint64_t available = std::min<std::uint64_t>(std::uint64_t{size} + 8, bytes.size() - offset);
+    const auto info = dal::parseAt3Header(std::span<const std::uint8_t>(bytes).subspan(offset, available));
+    if (!info) {
+      ++errors;
+      printLine(std::format("{} offset {} size {}: error: {}", index, offset, size, info.error()));
+      continue;
+    }
+    ++parsed;
+    (info->channels == 1 ? mono : stereo) += 1;
+
+    std::string loop = "none";
+    if (info->loop) {
+      ++looped;
+      loop = std::format("{}-{}", info->loop->start_sample, info->loop->end_sample);
+      // The valid audio is [delay, delay + total); a loop start is somewhere inside it and the loop
+      // end is normally its last sample.
+      if (info->loop->start_sample >= info->delay_samples &&
+          std::uint64_t{info->loop->start_sample} < std::uint64_t{info->delay_samples} + info->total_samples) {
+        ++loop_start_valid;
+      }
+      if (std::uint64_t{info->loop->end_sample} + 1 == std::uint64_t{info->delay_samples} + info->total_samples) {
+        ++loop_end_is_valid_end;
+      }
+    }
+    std::string flags;
+    if (info->data_size % info->block_align != 0) {
+      ++unaligned;
+      flags += " data-not-multiple-of-block_align";
+    }
+    if (std::uint64_t{info->data_offset} + info->data_size > available) {
+      ++overrun;
+      flags += " data-past-entry-end";
+    }
+    printLine(std::format("{} offset {} size {} ch {} rate {} block_align {} samples {} delay {} loop {}{}", index,
+                          offset, size, info->channels, info->sample_rate, info->block_align, info->total_samples,
+                          info->delay_samples, loop, flags));
+  }
+  printLine(std::format("at3scan: {} entries, {} parsed, {} errors; {} mono, {} stereo; {} with a loop", entries.size(),
+                        parsed, errors, mono, stereo, looped));
+  printLine(std::format("at3scan: loop start inside [delay, delay + samples) in {} of {}; loop end == delay + samples - 1 in {} of {}; "
+                        "data size not a multiple of block_align in {}; data past the entry end in {}",
+                        loop_start_valid, looped, loop_end_is_valid_end, looped, unaligned, overrun));
+  return errors == 0 ? 0 : 1;
+}
+
 constexpr Subcommand kSubcommands[] = {
     {"wavstat", runWavstat},
     {"devices", runDevices},
     {"tone", runTone},
     {"play", runPlay},
+    {"at3scan", runAt3scan},
 };
 
 }  // namespace

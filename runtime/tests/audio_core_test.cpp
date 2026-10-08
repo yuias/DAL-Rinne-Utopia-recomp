@@ -39,6 +39,8 @@
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
 #include "lv2/sys_sync.h"
+#include "media/at3_file.h"
+#include "media/atrac_decoder.h"
 
 namespace {
 
@@ -1441,6 +1443,264 @@ void testCellAudioEngine() {
   dal::guestLock().lock();
 }
 
+// Synthetic ATRAC3plus RIFF entries.
+using Bytes = std::vector<std::uint8_t>;
+
+void put16(Bytes& out, std::uint32_t v) {
+  out.push_back(static_cast<std::uint8_t>(v));
+  out.push_back(static_cast<std::uint8_t>(v >> 8));
+}
+
+void put32(Bytes& out, std::uint32_t v) {
+  put16(out, v);
+  put16(out, v >> 16);
+}
+
+void putTag(Bytes& out, const char* tag) { out.insert(out.end(), tag, tag + 4); }
+
+constexpr std::uint8_t kAt3Guid[16] = {0xbf, 0xaa, 0x23, 0xe9, 0x58, 0xcb, 0x71, 0x44,
+                                       0xa1, 0x19, 0xff, 0xfa, 0x01, 0xe4, 0xce, 0x62};
+
+// Chunk with its pad byte when the size is odd.
+Bytes chunk(const char* tag, const Bytes& body) {
+  Bytes out;
+  putTag(out, tag);
+  put32(out, static_cast<std::uint32_t>(body.size()));
+  out.insert(out.end(), body.begin(), body.end());
+  if (body.size() & 1) out.push_back(0);
+  return out;
+}
+
+Bytes fmtBody(std::uint32_t channels, const std::uint8_t* guid = kAt3Guid, std::uint32_t block_align = 512) {
+  Bytes b;
+  put16(b, 0xfffe);
+  put16(b, channels);
+  put32(b, 48000);
+  put32(b, 12000);
+  put16(b, block_align);
+  put16(b, 0);
+  put16(b, 34);                     // cbSize
+  put16(b, 2048);                   // valid bits
+  put32(b, channels == 1 ? 1 : 3);  // channel mask
+  b.insert(b.end(), guid, guid + 16);
+  for (int i = 0; i < 12; ++i) b.push_back(i == 0 ? 1 : 0);
+  return b;
+}
+
+Bytes factBody(std::uint32_t a, std::uint32_t b, std::uint32_t c) {
+  Bytes out;
+  put32(out, a);
+  put32(out, b);
+  put32(out, c);
+  return out;
+}
+
+Bytes smplBody(std::uint32_t loops, std::uint32_t start, std::uint32_t end) {
+  Bytes b;
+  for (int i = 0; i < 7; ++i) put32(b, 0);
+  put32(b, loops);
+  put32(b, 0);  // sampler data size
+  for (std::uint32_t i = 0; i < loops; ++i) {
+    put32(b, i);          // id
+    put32(b, 0);          // type
+    put32(b, start + i);  // start
+    put32(b, end + i);    // end
+    put32(b, 0);          // fraction
+    put32(b, 0);          // play count
+  }
+  return b;
+}
+
+// RIFF header plus the given chunks and a data chunk header declaring `data_size` bytes. The payload
+// is not appended: the parser must not need it.
+Bytes riffEntry(const std::vector<Bytes>& chunks, std::uint32_t data_size) {
+  Bytes body;
+  putTag(body, "WAVE");
+  for (const Bytes& c : chunks) body.insert(body.end(), c.begin(), c.end());
+  putTag(body, "data");
+  put32(body, data_size);
+  Bytes out;
+  putTag(out, "RIFF");
+  put32(out, static_cast<std::uint32_t>(body.size()) + data_size);
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+
+void testAt3ParseStereoWithLoop() {
+  const Bytes file = riffEntry({chunk("fmt ", fmtBody(2)), chunk("fact", factBody(5097599, 3601, 3785)),
+                                chunk("smpl", smplBody(1, 3785, 5101383))},
+                               1275392);
+  const auto info = dal::parseAt3Header(file);
+  CHECK(info.has_value());
+  if (!info) return;
+  CHECK(info->channels == 2);
+  CHECK(info->sample_rate == 48000);
+  CHECK(info->block_align == 512);
+  CHECK(info->bytes_per_second == 12000);
+  CHECK(info->total_samples == 5097599);
+  CHECK(info->delay_samples == 3785);
+  CHECK(info->loop.has_value());
+  if (info->loop) {
+    CHECK(info->loop->start_sample == 3785);
+    CHECK(info->loop->end_sample == 5101383);
+  }
+  CHECK(info->data_size == 1275392);
+  CHECK(info->data_offset == file.size());
+  CHECK(info->frameCount() == 2491);
+  CHECK(dal::kAtrac3plusFrameSamples == 2048);
+}
+
+void testAt3ParseMonoWithoutLoop() {
+  // An unknown chunk of odd size: its pad byte must be skipped. Chunk order differs from the game's.
+  const Bytes file = riffEntry({chunk("fmt ", fmtBody(1)), chunk("LIST", Bytes{1, 2, 3}),
+                                chunk("fact", factBody(1000, 2048, 2232))},
+                               512 * 3);
+  const auto info = dal::parseAt3Header(file);
+  CHECK(info.has_value());
+  if (!info) return;
+  CHECK(info->channels == 1);
+  CHECK(info->total_samples == 1000);
+  CHECK(info->delay_samples == 2232);
+  CHECK(!info->loop.has_value());
+  CHECK(info->frameCount() == 3);
+  CHECK(info->data_offset == file.size());
+}
+
+void testAt3ParseOptionalChunks() {
+  // No fact: nothing known about length or delay. A one-dword fact has a length but no delay.
+  auto info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2))}, 1024));
+  CHECK(info.has_value());
+  if (info) {
+    CHECK(info->total_samples == 0);
+    CHECK(info->delay_samples == 0);
+  }
+  Bytes one_dword;
+  put32(one_dword, 777);
+  info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2)), chunk("fact", one_dword)}, 1024));
+  CHECK(info.has_value());
+  if (info) {
+    CHECK(info->total_samples == 777);
+    CHECK(info->delay_samples == 0);
+  }
+  // smpl with no loops, and with two loops (the first one is reported).
+  info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2)), chunk("smpl", smplBody(0, 0, 0))}, 512));
+  CHECK(info.has_value() && !info->loop.has_value());
+  info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2)), chunk("smpl", smplBody(2, 10, 20))}, 512));
+  CHECK(info.has_value() && info->loop.has_value());
+  if (info && info->loop) {
+    CHECK(info->loop->start_sample == 10);
+    CHECK(info->loop->end_sample == 20);
+  }
+  // A data size that is not a multiple of block_align is reported as it is; frameCount() rounds down.
+  info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2))}, 1300));
+  CHECK(info.has_value() && info->data_size == 1300 && info->frameCount() == 2);
+}
+
+void testAt3ParseRejects() {
+  // A plain WAVE_FORMAT_ATRAC3 (0x0270) header.
+  Bytes plain;
+  put16(plain, 0x0270);
+  put16(plain, 2);
+  put32(plain, 44100);
+  put32(plain, 16537);
+  put16(plain, 384);
+  put16(plain, 0);
+  put16(plain, 14);
+  for (int i = 0; i < 14; ++i) plain.push_back(0);
+  auto info = dal::parseAt3Header(riffEntry({chunk("fmt ", plain)}, 384));
+  CHECK(!info.has_value());
+  if (!info) CHECK(info.error().find("0x0270") != std::string::npos);
+
+  // Extensible with another sub-format GUID (the PCM one).
+  constexpr std::uint8_t kPcmGuid[16] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+                                         0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+  info = dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2, kPcmGuid))}, 512));
+  CHECK(!info.has_value());
+
+  CHECK(!dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2, kAt3Guid, 0))}, 512)).has_value());
+  CHECK(!dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(0))}, 512)).has_value());
+  CHECK(!dal::parseAt3Header(riffEntry({chunk("fmt ", Bytes(10, 0))}, 512)).has_value());
+  // data before fmt, and no fmt at all.
+  CHECK(!dal::parseAt3Header(riffEntry({chunk("fact", factBody(1, 2, 3))}, 512)).has_value());
+  // smpl that claims a loop it does not hold.
+  Bytes short_smpl = smplBody(1, 0, 0);
+  short_smpl.resize(40);
+  CHECK(!dal::parseAt3Header(riffEntry({chunk("fmt ", fmtBody(2)), chunk("smpl", short_smpl)}, 512)).has_value());
+  // Not RIFF/WAVE.
+  Bytes bad_magic = riffEntry({chunk("fmt ", fmtBody(2))}, 512);
+  bad_magic[8] = 'X';
+  CHECK(!dal::parseAt3Header(bad_magic).has_value());
+  CHECK(!dal::parseAt3Header(Bytes{}).has_value());
+}
+
+void testAt3ParseTruncated() {
+  const Bytes file = riffEntry({chunk("fmt ", fmtBody(2)), chunk("fact", factBody(5, 6, 7))}, 512);
+  CHECK(dal::parseAt3Header(file).has_value());
+  // Every prefix that stops before the end of the data chunk header is an error, and none may crash.
+  bool all_rejected = true;
+  for (std::size_t cut = 0; cut < file.size(); ++cut) {
+    if (dal::parseAt3Header(std::span<const std::uint8_t>(file).first(cut)).has_value()) all_rejected = false;
+  }
+  CHECK(all_rejected);
+}
+
+void testScanRiffEntries() {
+  const Bytes first = riffEntry({chunk("fmt ", fmtBody(2))}, 8);
+  Bytes second = riffEntry({chunk("fmt ", fmtBody(1)), chunk("fact", factBody(1, 2, 3))}, 8);
+
+  Bytes archive(5, 0xaa);
+  const std::size_t first_at = archive.size();
+  archive.insert(archive.end(), first.begin(), first.end());
+  // The payload of the first entry holds a RIFF/WAVE magic: it must not be reported.
+  Bytes payload;
+  putTag(payload, "RIFF");
+  put32(payload, 4);
+  putTag(payload, "WAVE");
+  archive.insert(archive.end(), payload.begin(), payload.begin() + 8);
+  const std::size_t second_at = archive.size();
+  archive.insert(archive.end(), second.begin(), second.end());
+  archive.insert(archive.end(), 7, 0x55);
+
+  auto entries = dal::scanRiffEntries(archive);
+  CHECK(entries.size() == 2);
+  if (entries.size() == 2) {
+    CHECK(entries[0].first == first_at);
+    CHECK(entries[0].second == first.size());  // header bytes after the size field plus the 8-byte payload
+    CHECK(entries[1].first == second_at);
+  }
+
+  CHECK(dal::scanRiffEntries(Bytes{}).empty());
+  CHECK(dal::scanRiffEntries(Bytes(100, 'R')).empty());
+  // A declared size that runs past the archive still reports the entry.
+  Bytes cut_entry(second.begin(), second.begin() + 20);
+  entries = dal::scanRiffEntries(cut_entry);
+  CHECK(entries.size() == 1);
+  // "RIFF" without "WAVE" is not an entry.
+  Bytes avi = first;
+  avi[8] = 'A';
+  CHECK(dal::scanRiffEntries(avi).empty());
+}
+
+class FakeAtracFactory : public dal::AtracDecoderFactory {
+ public:
+  std::unique_ptr<dal::AtracFrameDecoder> create(const dal::At3Info&, std::string& error) override {
+    error = "fake";
+    return nullptr;
+  }
+};
+
+void testAtracFactorySlot() {
+  CHECK(dal::atracDecoderFactory() == nullptr);
+  auto factory = std::make_unique<FakeAtracFactory>();
+  dal::AtracDecoderFactory* raw = factory.get();
+  dal::setAtracDecoderFactory(std::move(factory));
+  CHECK(dal::atracDecoderFactory() == raw);
+  std::string error;
+  CHECK(dal::atracDecoderFactory()->create(dal::At3Info{}, error) == nullptr && error == "fake");
+  dal::setAtracDecoderFactory(nullptr);
+  CHECK(dal::atracDecoderFactory() == nullptr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1484,6 +1744,13 @@ int main(int argc, char** argv) {
   testCellAudioMixing();
   testCellAudioNotify();
   testCellAudioEngine();
+  testAt3ParseStereoWithLoop();
+  testAt3ParseMonoWithoutLoop();
+  testAt3ParseOptionalChunks();
+  testAt3ParseRejects();
+  testAt3ParseTruncated();
+  testScanRiffEntries();
+  testAtracFactorySlot();
 
   if (!keep) fs::remove_all(g_dir, ec);
   std::printf("audio core tests: %d passed, %d failed\n", g_passed, g_failed);
