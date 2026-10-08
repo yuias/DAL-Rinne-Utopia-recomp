@@ -1,10 +1,12 @@
-// Self-checking tests for the audio core: the output interface, the null output, the block ring and
-// the WAV writer, reader and level statistics. No sound device is involved.
+// Self-checking tests for the audio core: the output interface, the null output, the block ring, the
+// WAV writer, reader and level statistics, and the engine with its block clock. No sound device is
+// involved.
 //
 // With a directory argument the WAV files the tests write are kept there (for dal_audiotool
 // wavstat); without one they go to a temporary directory that is removed at the end.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -16,15 +18,19 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numbers>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
 
+#include "audio/audio_engine.h"
 #include "audio/audio_output.h"
 #include "audio/wav_file.h"
+#include "core/log.h"
 
 namespace {
 
@@ -596,6 +602,406 @@ void testWavStatsFile() {
         stats[3].non_silent_frames == 24000);
 }
 
+void testBlockClock() {
+  using Clock = dal::BlockClock::Clock;
+  using namespace std::chrono_literals;
+  const Clock::time_point start{};
+  const auto period = dal::kAudioBlockPeriod;
+  CHECK(dal::kMaxCatchUpBlocks == 0);
+
+  dal::BlockClock clock(start);
+  CHECK(clock.nextDue() == start + period);
+
+  // Before the first period is due nothing happens and the schedule stays.
+  auto plan = clock.due(start + period - 1ns);
+  CHECK(plan.produce == 0 && plan.skipped == 0 && clock.nextDue() == start + period);
+
+  // On time, then a little late: one block each, no skips.
+  plan = clock.due(start + period);
+  CHECK(plan.produce == 1 && plan.skipped == 0 && clock.nextDue() == start + 2 * period);
+  plan = clock.due(start + 2 * period + 3ms);
+  CHECK(plan.produce == 1 && plan.skipped == 0 && clock.nextDue() == start + 3 * period);
+
+  // Woken with three periods due (3p, 4p, 5p): one block, two skipped, and the schedule moves to the
+  // first period after now.
+  Clock::time_point now = start + 5 * period + 1ms;
+  plan = clock.due(now);
+  CHECK(plan.produce == 1 && plan.skipped == 2);
+  CHECK(clock.nextDue() == start + 6 * period && clock.nextDue() > now);
+
+  // Ten due.
+  now = clock.nextDue() + 9 * period + 100us;
+  const Clock::time_point before = clock.nextDue();
+  plan = clock.due(now);
+  CHECK(plan.produce == 1 && plan.skipped == 9);
+  CHECK(clock.nextDue() == before + 10 * period && clock.nextDue() > now && clock.nextDue() - now <= period);
+
+  // Just short of the next period: nothing due.
+  plan = clock.due(clock.nextDue() - 1ns);
+  CHECK(plan.produce == 0 && plan.skipped == 0);
+
+  // Exactly on time for a long run: one block per period, nothing skipped.
+  dal::BlockClock steady(start);
+  std::uint64_t produced = 0;
+  std::uint64_t skipped = 0;
+  for (int i = 1; i <= 1000; ++i) {
+    plan = steady.due(start + i * period);
+    produced += plan.produce;
+    skipped += plan.skipped;
+  }
+  CHECK(produced == 1000 && skipped == 0 && steady.nextDue() == start + 1001 * period);
+
+  // A pause of an hour is one block and a large count of skipped periods.
+  dal::BlockClock paused(start);
+  now = start + 1h;
+  plan = paused.due(now);
+  const std::uint64_t due = 1 + (now - (start + period)) / period;
+  CHECK(plan.produce == 1 && plan.skipped == due - 1);
+  CHECK(paused.nextDue() > now && paused.nextDue() - now <= period);
+}
+
+// Everything a RecordingOutput receives, readable by the test after the engine has stopped.
+struct Recording {
+  std::mutex mutex;
+  std::vector<float> samples;  // every submitted block back to back
+  int opens = 0;
+  std::chrono::milliseconds open_delay{0};  // how long open() takes, to model a slow device
+
+  std::vector<float> take() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return samples;
+  }
+};
+
+class RecordingOutput final : public dal::AudioOutput {
+ public:
+  RecordingOutput(std::shared_ptr<Recording> recording, bool open_ok)
+      : recording_(std::move(recording)), open_ok_(open_ok) {}
+
+  std::string_view name() const override { return "fake"; }
+  bool open(std::string& error) override {
+    if (recording_->open_delay.count() > 0) std::this_thread::sleep_for(recording_->open_delay);
+    std::lock_guard<std::mutex> lock(recording_->mutex);
+    ++recording_->opens;
+    if (!open_ok_) error = "device gone";
+    return open_ok_;
+  }
+  void submit(std::span<const float> block) override {
+    std::lock_guard<std::mutex> lock(recording_->mutex);
+    recording_->samples.insert(recording_->samples.end(), block.begin(), block.end());
+    submitted_.fetch_add(1);
+  }
+  std::string description() const override { return "recording"; }
+  dal::AudioOutputStats stats() const override {
+    dal::AudioOutputStats stats;
+    stats.blocks_submitted = submitted_.load();
+    return stats;
+  }
+
+ private:
+  std::shared_ptr<Recording> recording_;
+  bool open_ok_;
+  std::atomic<std::uint64_t> submitted_{0};
+};
+
+dal::AudioEngineConfig engineConfig(const std::shared_ptr<Recording>& recording, bool open_ok,
+                                    fs::path dump) {
+  dal::AudioEngineConfig config;
+  config.make_output = [recording, open_ok] { return std::make_unique<RecordingOutput>(recording, open_ok); };
+  config.dump = std::move(dump);
+  return config;
+}
+
+// A producer that numbers its calls: call c fills block frames c * 256 + 1 ... as a ramp, so every
+// produced block is non-silent and says which call made it. Optionally every fourth call leaves the
+// block silent, and one call can stall to make the engine wake late.
+struct ProducerState {
+  std::atomic<std::uint64_t> calls{0};
+  bool silent_every_fourth = false;
+  std::uint64_t stall_call = ~std::uint64_t{0};
+  std::chrono::milliseconds stall{0};
+};
+
+dal::AudioBlockProducer makeProducer(const std::shared_ptr<ProducerState>& state) {
+  return [state](std::span<float> block) {
+    const std::uint64_t call = state->calls.fetch_add(1);
+    if (call == state->stall_call) std::this_thread::sleep_for(state->stall);
+    if (state->silent_every_fourth && call % 4 == 3) return;
+    fillRamp(block, call * dal::kAudioBlockFrames + 1);
+  };
+}
+
+template <typename Predicate>
+bool waitFor(Predicate done, std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+struct RecordedBlocks {
+  std::size_t total = 0;
+  std::size_t silent = 0;
+  std::vector<std::uint64_t> tags;  // producer call of each non-silent block, in order
+  bool ramps_intact = true;
+};
+
+RecordedBlocks analyse(std::span<const float> samples) {
+  RecordedBlocks result;
+  result.total = samples.size() / dal::kAudioBlockSamples;
+  for (std::size_t b = 0; b < result.total; ++b) {
+    const auto block = samples.subspan(b * dal::kAudioBlockSamples, dal::kAudioBlockSamples);
+    if (std::all_of(block.begin(), block.end(), [](float s) { return s == 0.0f; })) {
+      ++result.silent;
+      continue;
+    }
+    const auto tag = static_cast<std::uint64_t>((static_cast<double>(block[0]) - 1.0) / dal::kAudioBlockFrames);
+    result.tags.push_back(tag);
+    result.ramps_intact = result.ramps_intact && isRamp(block, tag * dal::kAudioBlockFrames + 1);
+  }
+  return result;
+}
+
+double periodsToMs(std::uint64_t periods) {
+  return static_cast<double>(periods) * static_cast<double>(dal::kAudioBlockPeriod.count()) / 1e6;
+}
+
+void testEngineBlocksAndDump() {
+  using Clock = std::chrono::steady_clock;
+  const fs::path dump_path = g_dir / "engine_dump.wav";
+  const auto recording = std::make_shared<Recording>();
+  const auto state = std::make_shared<ProducerState>();
+  state->silent_every_fourth = true;
+  const auto other = std::make_shared<ProducerState>();
+
+  dal::configureAudioEngine(engineConfig(recording, true, dump_path));
+  const Clock::time_point t0 = Clock::now();
+  dal::startAudioEngine(makeProducer(state));
+  dal::startAudioEngine(makeProducer(other));  // already running: ignored
+  CHECK(waitFor([&] { return state->calls.load() >= 40; }));
+  const Clock::time_point t_stop = Clock::now();
+
+  const dal::AudioEngineStats running = dal::audioEngineStats();
+  CHECK(running.output == "fake");
+
+  dal::AudioEngineStats stats;
+  CHECK(dal::stopAudioEngineForTest(&stats));
+  const Clock::time_point t1 = Clock::now();
+  CHECK(other->calls.load() == 0);
+
+  const std::uint64_t calls = state->calls.load();
+  CHECK(stats.output == "fake");
+  CHECK(stats.blocks == calls);
+  const std::vector<float> samples = recording->take();
+  const RecordedBlocks recorded = analyse(samples);
+  CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
+  CHECK(stats.output_stats.blocks_submitted == recorded.total);
+  CHECK(recording->opens == 1);
+
+  // Every fourth produced block is silent; the rest arrive in call order, unchanged.
+  std::vector<std::uint64_t> expected_tags;
+  for (std::uint64_t c = 0; c < calls; ++c) {
+    if (c % 4 != 3) expected_tags.push_back(c);
+  }
+  CHECK(recorded.tags == expected_tags);
+  CHECK(recorded.ramps_intact);
+  CHECK(stats.non_silent_blocks == expected_tags.size());
+  CHECK(recorded.silent == calls / 4 + stats.skipped_blocks);
+
+  // The dump holds exactly what the output received.
+  const auto wav = dal::readWav(dump_path);
+  CHECK(wav.has_value());
+  if (wav) {
+    CHECK(wav->sample_rate == dal::kAudioSampleRate && wav->channels == dal::kAudioOutputChannels);
+    CHECK(wav->samples == samples);
+  }
+
+  // The periods that elapsed are all accounted for as blocks or skips.
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double until_stop_ms = std::chrono::duration<double, std::milli>(t_stop - t0).count();
+  CHECK(periodsToMs(recorded.total) <= elapsed_ms);
+  CHECK(periodsToMs(recorded.total) >= until_stop_ms - 80.0);
+
+  // The engine is gone: the next test starts from a clean slate.
+  CHECK(dal::audioEngineStats().blocks == 0 && dal::audioEngineStats().output.empty());
+}
+
+void testEngineSkipsLatePeriods() {
+  const fs::path dump_path = g_dir / "engine_skip.wav";
+  const auto recording = std::make_shared<Recording>();
+  const auto state = std::make_shared<ProducerState>();
+  state->stall_call = 5;
+  state->stall = std::chrono::milliseconds(25);  // 4.7 periods
+
+  dal::configureAudioEngine(engineConfig(recording, true, dump_path));
+  dal::startAudioEngine(makeProducer(state));
+  CHECK(waitFor([&] { return state->calls.load() >= 20; }));
+  dal::AudioEngineStats stats;
+  CHECK(dal::stopAudioEngineForTest(&stats));
+
+  const std::uint64_t calls = state->calls.load();
+  const std::vector<float> samples = recording->take();
+  const RecordedBlocks recorded = analyse(samples);
+
+  // The producer ran once per produced block, never for a skipped period; every skipped period is a
+  // silent block in the output and the dump.
+  CHECK(stats.blocks == calls);
+  CHECK(stats.skipped_blocks >= 3);
+  CHECK(stats.max_producer_time >= std::chrono::milliseconds(20));
+  CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
+  CHECK(recorded.silent == stats.skipped_blocks);
+  CHECK(stats.non_silent_blocks == calls);
+  CHECK(recorded.ramps_intact);
+  bool contiguous = recorded.tags.size() == calls;
+  for (std::size_t i = 0; i < recorded.tags.size(); ++i) contiguous = contiguous && recorded.tags[i] == i;
+  CHECK(contiguous);
+
+  // The silence for the missed periods sits between the stalled block (call 5) and the next one.
+  std::size_t run = 0;
+  std::size_t index_of_five = 0;
+  for (std::size_t b = 0; b < recorded.total; ++b) {
+    if (samples[b * dal::kAudioBlockSamples] == 5.0f * dal::kAudioBlockFrames + 1.0f) index_of_five = b;
+  }
+  for (std::size_t b = index_of_five + 1; b < recorded.total; ++b) {
+    const float first = samples[b * dal::kAudioBlockSamples];
+    if (first != 0.0f) break;
+    ++run;
+  }
+  CHECK(run >= 3);
+
+  const auto wav = dal::readWav(dump_path);
+  CHECK(wav.has_value() && wav->samples == samples);
+  CHECK(wav.has_value() && wav->frames() == recorded.total * dal::kAudioBlockFrames);
+}
+
+void testEngineStopDoesNotWait() {
+  using Clock = std::chrono::steady_clock;
+  const auto recording = std::make_shared<Recording>();
+  // Shared with the producer, which can outlive this function if the engine fails to stop.
+  struct Gate {
+    std::mutex mutex;  // stands in for the guest lock
+    std::atomic<int> calls{0};
+  };
+  const auto gate_state = std::make_shared<Gate>();
+  gate_state->mutex.lock();
+  std::mutex& gate = gate_state->mutex;
+  std::atomic<int>& calls = gate_state->calls;
+
+  dal::configureAudioEngine(engineConfig(recording, true, {}));
+  dal::startAudioEngine([gate_state](std::span<float>) {
+    gate_state->calls.fetch_add(1);
+    std::lock_guard<std::mutex> hold(gate_state->mutex);
+  });
+  CHECK(waitFor([&] { return calls.load() >= 1; }));
+
+  // The producer is stuck on the gate; neither stopping nor reading the statistics waits for it.
+  const Clock::time_point before = Clock::now();
+  dal::requestAudioEngineStop();
+  const dal::AudioEngineStats blocked = dal::audioEngineStats();
+  const auto took = Clock::now() - before;
+  CHECK(took < std::chrono::milliseconds(100));
+  CHECK(blocked.blocks == 0);
+
+  gate.unlock();
+  dal::AudioEngineStats stats;
+  CHECK(dal::stopAudioEngineForTest(&stats));
+  // The thread ended at its next tick without calling the producer again.
+  CHECK(calls.load() == 1);
+  CHECK(stats.blocks == 1);
+}
+
+void testEngineOutputOpenFails() {
+  std::mutex lines_mutex;
+  std::vector<std::string> lines;
+  dal::setLogSink([&](std::string_view line) {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    lines.emplace_back(line);
+  });
+
+  const auto recording = std::make_shared<Recording>();
+  const auto state = std::make_shared<ProducerState>();
+  // The dump cannot be created either: the engine reports it once and carries on without it.
+  dal::configureAudioEngine(engineConfig(recording, false, g_dir / "no_such_dir" / "x.wav"));
+  dal::startAudioEngine(makeProducer(state));
+  CHECK(waitFor([&] { return state->calls.load() >= 5; }));
+  dal::AudioEngineStats stats;
+  CHECK(dal::stopAudioEngineForTest(&stats));
+  dal::setLogSink({});
+
+  CHECK(stats.output == "none (fake failed)");
+  CHECK(stats.blocks >= 5);
+  CHECK(stats.output_stats.blocks_submitted == stats.blocks + stats.skipped_blocks);
+  CHECK(recording->opens == 1 && recording->take().empty());
+
+  auto count = [&](std::string_view needle) {
+    std::lock_guard<std::mutex> lock(lines_mutex);
+    return std::count_if(lines.begin(), lines.end(),
+                         [&](const std::string& line) { return line.find(needle) != std::string::npos; });
+  };
+  CHECK(count("dal: audio: fake: device gone; continuing without sound") == 1);
+  CHECK(count("continuing without sound") == 1);
+  CHECK(count("dal: audio: output none") == 1);
+  CHECK(count("continuing without a dump") == 1);
+}
+
+void testEngineFinishDumpDuringOpen() {
+  const fs::path dump_path = g_dir / "engine_early_finish.wav";
+  std::error_code ec;
+  fs::remove(dump_path, ec);
+
+  const auto recording = std::make_shared<Recording>();
+  recording->open_delay = std::chrono::milliseconds(200);
+  const auto state = std::make_shared<ProducerState>();
+  dal::configureAudioEngine(engineConfig(recording, true, dump_path));
+  dal::startAudioEngine(makeProducer(state));
+
+  // The engine thread is still inside the slow open(): there is no dump to finish yet. The finish
+  // request must not be lost; the engine then creates no dump file.
+  dal::finishAudioDump();
+  CHECK(waitFor([&] { return state->calls.load() >= 3; }));
+  dal::AudioEngineStats stats;
+  CHECK(dal::stopAudioEngineForTest(&stats));
+  CHECK(stats.blocks >= 3);
+  CHECK(!recording->take().empty());
+  CHECK(!fs::exists(dump_path));
+}
+
+void testEngineResumesAfterStop() {
+  const fs::path dump_path = g_dir / "engine_resume.wav";
+  for (const bool wait_for_exit : {false, true}) {
+    const auto recording = std::make_shared<Recording>();
+    const auto state = std::make_shared<ProducerState>();
+    dal::configureAudioEngine(engineConfig(recording, true, dump_path));
+    dal::startAudioEngine(makeProducer(state));
+    CHECK(waitFor([&] { return state->calls.load() >= 5; }));
+
+    // A start right after a stop request cancels it; one after the thread has ended starts a new
+    // thread. Either way production goes on with the same output and dump.
+    dal::requestAudioEngineStop();
+    if (wait_for_exit) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const std::uint64_t settled = state->calls.load();
+      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      CHECK(state->calls.load() == settled);
+    }
+    const std::uint64_t before = state->calls.load();
+    dal::startAudioEngine(makeProducer(std::make_shared<ProducerState>()));
+    CHECK(waitFor([&] { return state->calls.load() >= before + 10; }));
+
+    dal::AudioEngineStats stats;
+    CHECK(dal::stopAudioEngineForTest(&stats));
+    const std::vector<float> samples = recording->take();
+    const RecordedBlocks recorded = analyse(samples);
+    CHECK(recording->opens == 1);
+    CHECK(stats.blocks == state->calls.load());
+    CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
+    const auto wav = dal::readWav(dump_path);
+    CHECK(wav.has_value() && wav->samples == samples);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -626,6 +1032,13 @@ int main(int argc, char** argv) {
   testWavStatsTone();
   testWavStatsSilence();
   testWavStatsFile();
+  testBlockClock();
+  testEngineBlocksAndDump();
+  testEngineSkipsLatePeriods();
+  testEngineStopDoesNotWait();
+  testEngineOutputOpenFails();
+  testEngineFinishDumpDuringOpen();
+  testEngineResumesAfterStop();
 
   if (!keep) fs::remove_all(g_dir, ec);
   std::printf("audio core tests: %d passed, %d failed\n", g_passed, g_failed);

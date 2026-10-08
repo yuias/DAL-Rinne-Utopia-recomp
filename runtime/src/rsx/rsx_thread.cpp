@@ -13,12 +13,9 @@
 #include <variant>
 #include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-
 #include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/sleeper.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "rsx/gcm_interrupts.h"
@@ -542,30 +539,6 @@ void writeCaptures(const std::vector<RsxConsumer::FinishedCapture>& captures) {
             capture.file.size(), capture.writes, capture.ranges);
   }
 }
-
-// A high-resolution timer sleeps in about a millisecond steps; Sleep() would round to the 15.6 ms
-// system tick and make the VBlank rate irregular.
-class Sleeper {
- public:
-  Sleeper() { timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS); }
-  ~Sleeper() {
-    if (timer_ != nullptr) CloseHandle(timer_);
-  }
-  void sleep(std::chrono::microseconds duration) {
-    if (duration.count() <= 0) return;
-    if (timer_ == nullptr) return std::this_thread::sleep_for(duration);
-    LARGE_INTEGER due;
-    due.QuadPart = -10 * duration.count();  // relative, in 100 ns units
-    if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
-      WaitForSingleObject(timer_, INFINITE);
-    } else {
-      std::this_thread::sleep_for(duration);
-    }
-  }
-
- private:
-  HANDLE timer_ = nullptr;
-};
 
 void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
   using Clock = std::chrono::steady_clock;
