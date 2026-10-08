@@ -14,6 +14,7 @@ include(cmake/PpuCodegen.cmake)
 include(cmake/Runtime.cmake)
 include(cmake/Render.cmake)
 include(cmake/Media.cmake)
+include(cmake/Audio.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -33,6 +34,7 @@ set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
 dal_ppu_add_generated_tree()
 dal_runtime_add_core()
 dal_media_add()
+dal_audio_add()
 dal_render_add()
 if(TARGET dal_game)
   # dal_media supplies the FFmpeg codec factory that game_main installs for the cellSail movies; the

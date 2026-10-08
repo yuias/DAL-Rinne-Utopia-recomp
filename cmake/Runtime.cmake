@@ -78,6 +78,8 @@ function(dal_runtime_add_core)
   dal_runtime_add_yyjson()
 
   add_library(dal_runtime_core STATIC
+    runtime/src/audio/audio_output.cpp
+    runtime/src/audio/wav_file.cpp
     runtime/src/core/boot.cpp
     runtime/src/core/census.cpp
     runtime/src/core/cpu_hooks.cpp
