@@ -169,8 +169,136 @@ interface, so each module follows a documented policy that never blocks on a per
   from a queue that the modules above feed. `CELL_SYSUTIL_REQUEST_EXITGAME` is not acted on.
 - **cellGame**: the content directories are created on the host through the VFS, under the
   `--hdd-dir` directory.
-- **Input**: see `--pad`. A host keyboard or gamepad backend plugs in through a provider
-  interface (`runtime/src/hle/hle.h`); none is implemented.
+- **Input**: see `--pad` and [Input](#input). The pad on port 0 comes from a provider
+  (`runtime/src/hle/hle.h`): none, neutral, or the keyboard with an optional pad script. A gamepad
+  backend would plug in the same way; none is implemented.
+
+## Input
+
+`cellPad` asks a `PadProvider` for the state of a port on every `cellPadGetData` call and reports
+the changes to the game. `--pad` picks the provider: `none` (no pad), `neutral` (a standard pad on
+port 0 that never changes) or `keyboard`. `--pad keyboard` is set up in `runtime/src/game_main.cpp`
+with `setPadProvider`, because it needs the window and the script thread; `setPadBackend` accepts
+only `none` and `neutral`. The defaults and the user-visible keys and script format are in the
+[README](../README.md#keyboard-and-pad-scripts).
+
+| Part | File | Role |
+| --- | --- | --- |
+| Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `padStateFromButtons` (digital words, pressure words at 0xFF for pressed buttons, sticks centred, everything else as the neutral pad) and the button names used by scripts |
+| State and provider | `runtime/src/input/keyboard_pad.*` | The scan-code table, `KeyboardPadState` and the keyboard provider (port 0 always connected, other ports empty) |
+| Script | `runtime/src/input/pad_script.*` | The script parser and the player thread |
+| Window | `runtime/src/render/vk_window.*` | Key and focus messages from the window thread; turns the IME off for the window |
+
+The renderer library does not depend on `input/`: the window reports raw scan codes through
+callbacks, and `game_main.cpp` connects them to the state.
+
+### Threading
+
+`poll` runs on guest threads under the guest lock, so it must never block or take a lock that the
+window thread or the script thread holds. `KeyboardPadState` is therefore lock-free: one atomic
+mask of held buttons and one atomic press time per button for each source (`Keyboard`, written by
+the window thread, and `Script`, written by the script thread). `poll` only reads them. All accesses
+are relaxed, because each bit and each time is independent, and a stale read delays a change by one
+poll. The script thread is detached and owns a `shared_ptr` to the state; nothing joins it, because
+the process ends with `std::_Exit`.
+
+### Key handling
+
+- Keys are identified by scan code (PC/AT set 1 make code from `lParam` bits 16 to 23, plus `0xE000`
+  for an extended key), not by virtual key, so the mapping is a positional cluster on any layout
+  and works while an IME is open. A zero scan code (some injected input) falls back to
+  `MapVirtualKeyW`. Only the dedicated arrow keys map; the numpad does not.
+- Key repeats are dropped, so they do not refresh a press time.
+- A press stays in the reported state for at least `KeyboardPadState::kMinPressVisible` (60 ms)
+  after it started, also when the key is already up. The game reads the pad about every 33 ms and
+  `cellPadGetData` reports only changes, so a shorter tap could fall between two reads.
+- Both opposite D-pad directions held cancel each other. A held direction beats the 60 ms tail of a
+  released opposite one; with two tails the later press wins.
+- `WM_KILLFOCUS` releases every `Keyboard` button at once (a key-up is not delivered to a window
+  without focus). Script buttons are a separate source and stay. `Alt` combinations still reach the
+  default window procedure, so `Alt+F4` closes the window.
+- The press mode that the game sets with `cellPadSetPortSetting` decides whether `cellPad` copies
+  the pressure words to the game; the game under test turns it on (`dal: pad: port 0 setting 0x2`).
+
+### Pad script
+
+A script is a text file of timed commands, one per line, read by `loadPadScript` while the options
+are parsed. `#` starts a comment, blank lines are ignored, tokens are separated by spaces or tabs:
+
+```
+<time> press   <buttons>
+<time> release <buttons>
+<time> tap     <buttons> [every <interval> until <time>]
+```
+
+- `<time>` and `<interval>` are decimal seconds from the start of the script, with millisecond
+  precision (more decimals are rounded). `<buttons>` are the names `select l3 r3 start up right down
+  left l2 r2 l1 r1 triangle circle cross square`, joined with `+`.
+- `tap` is a press at `<time>` and a release `kPadScriptTapHold` (150 ms) later, which is longer
+  than the minimum press time. `every <interval> until <time>` repeats it at `<time> + k *
+  <interval>` while that is not after the `until` time; `<interval>` must be longer than the hold.
+  A script has at most 100000 events and times of at most 1000000 s.
+- The events are sorted by time (stable); at the same time, releases come before presses.
+- An error names the line (`line 7: unknown button "crosss"`), is printed to stderr and ends the
+  start-up with exit code 2.
+- The clock starts right before the main guest thread is booted, so it matches `--seconds` within
+  a few milliseconds. The player thread sleeps until each event, applies it to the `Script` source
+  and logs it.
+
+Example (`tools/pad_scripts/leave_title.txt`, which the `game_input` test uses):
+
+```
+# Skip whatever screen is showing every 2 s, from 4 s to 30 s.
+4 tap circle every 2 until 30
+```
+
+A script that holds a direction while it taps a button:
+
+```
+10   press   down
+10.5 tap     cross+r1
+12   release down
+```
+
+### Log lines
+
+All pad lines start with `dal: pad:`; the script lines carry the `[host]` prefix.
+
+| Line | Level | Source |
+| --- | --- | --- |
+| `dal: pad: init max_connect N` | info | `cellPadInit` |
+| `dal: pad: port N connected` or `disconnected` | info | the first change of a port to that state |
+| `dal: pad: port N setting 0xS (press on\|off, sensor on\|off)` | info | `cellPadSetPortSetting`, once per port and value |
+| `dal: pad: keyboard` followed by ` (window)` and ` (script <file name>, <n> events)` as they apply | info | start-up with `--pad keyboard` |
+| `dal: pad: script <s>.<ms> s: press\|release <buttons>` | info | the player thread, one line per event |
+| `dal: pad: key 0x<scan code> down\|up -> <button>` | debug | a mapped key, window thread; unmapped keys and repeats are not logged |
+
+### Scripted runs and tests
+
+Pressing buttons can make the game write save or system data under `--hdd-dir`, so a scripted run
+uses its own directory and deletes it first (`rm -rf build/release/game_hdd_input`), never the
+directory of a normal run or of `game_boot`.
+
+The `game_input` test (`cmake/PpuCodegen.cmake`, pins in `cmake/game_input.cmake`) is registered
+under the same conditions as `game_boot` with the `.sdat` cache: `DAL_EBOOT_ELF`, `DAL_GAME_DIR` and
+`DAL_RPCS3_CRYPTO_DIR` must be set. The setup test `game_input_hdd_clean` deletes
+`build/<preset>/game_hdd_input`, and `game_input` (fixture `game_input_hdd`) then runs
+`dal_game --pad-script tools/pad_scripts/leave_title.txt --hdd-dir build/<preset>/game_hdd_input
+--seconds 40` with a time limit of 100 s. It passes when the log contains the main-thread line
+
+```
+[t 01000000] dal: fs: sdata-open "/dev_bdvd/PS3_GAME/USRDIR/Script/Event.sdat" ok
+```
+
+which the game writes about 20 s into a headless run after Circle has skipped the notice screen
+and the movies and confirmed NEW GAME. Without input the game is still in the intro movies at that
+time. The run stops at 40 s, before `world.pam` (83 s, not skippable with Circle) ends. The pad
+code itself is covered by `runtime_core` (`testPadButtons`, `testKeyboardPadScanCodes`,
+`testKeyboardPadState`, `testKeyboardPadProvider`, `testKeyboardPadThreads`, `testPadScriptParse`,
+`testPadScriptErrors`, `testPadScriptPlay`) and the key message conversion by `render_core`
+(`testKeyMessages`).
+
+Scripts live in `tools/pad_scripts/`.
 
 ## PNG decoding
 

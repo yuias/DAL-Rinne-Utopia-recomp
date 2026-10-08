@@ -82,7 +82,9 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
   (`sdat_tests`), the movie tests (`media_core`, `media_ffmpeg`, and with `-GameDir` also
   `movie_decode`; see [Movies](docs/movies.md)), the Python unit tests, and,
   with `-PpuDir`, the link check of the generated code (`ppu_link`). With `-PpuDir`,
-  `-EbootElf` and `-GameDir` together it also runs `game_boot`; see [Running the game](#running-the-game). When a
+  `-EbootElf` and `-GameDir` together it also runs `game_boot`; see [Running the game](#running-the-game).
+  When `DAL_RPCS3_CRYPTO_DIR` is set as well, it also runs `game_input`, which leaves the title
+  screen with a pad script; see [Keyboard and pad scripts](#keyboard-and-pad-scripts). When a
   local capture and reference image exist it also runs `rsx_replay`; see [Capture and replay](docs/rendering.md#capture-and-replay).
   The full list is in [Tests](docs/tests.md).
 - `-EbootElf <path>` passes the decrypted ELF to the tests so the checks against the real
@@ -117,8 +119,9 @@ CMake options for generated code (also usable with `cmake` directly):
   without generated code.
 - `DAL_RPCS3_CRYPTO_DIR` (default empty) is the `rpcs3/Crypto` directory of a local RPCS3 source
   checkout. When it is set together with `DAL_GAME_DIR`, the build runs `dal_sdat` to decrypt
-  the game's `.sdat` files into `build/<preset>/sdata_cache` and the `game_boot` test passes that
-  directory to `dal_game` (see [SDAT files](#sdat-files)). It is a CMake cache variable, so pass it with
+  the game's `.sdat` files into `build/<preset>/sdata_cache`, the `game_boot` test passes that
+  directory to `dal_game`, and the `game_input` test is registered (see [SDAT files](#sdat-files)).
+  It is a CMake cache variable, so pass it with
   `cmake -D` once (`cmake -S . -B build/<preset> -DDAL_RPCS3_CRYPTO_DIR=<dir>`); `tools/build.ps1`
   has no parameter for it and keeps the cached value.
 - `DAL_PPU_WERROR` (default `ON`) adds `-Werror` for generated code and the code that
@@ -140,8 +143,8 @@ code was emitted from.
 
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
-         [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral] [--load-only]
-         [--png-dump DIR]
+         [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard] [--pad-script FILE]
+         [--load-only] [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
          [--shader-cache DIR] [--vk-validation] [--window]
 ```
@@ -159,7 +162,8 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
 | `--log-level trace\|debug\|info\|warn\|error` | Lowest level that is logged (default `info`). `debug` adds diagnostics such as the 10 s window statistics; `trace` is the most verbose. Debug and trace lines carry a `debug: ` / `trace: ` tag. |
 | `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
-| `--pad none\|neutral` | Input source: `neutral` (the default) connects a standard pad on port 0 that never changes, `none` connects no pad. |
+| `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad (see [Keyboard and pad scripts](#keyboard-and-pad-scripts)). Default: `keyboard` with `--window` or `--pad-script`, otherwise `neutral`. `keyboard` without `--window` or `--pad-script` is a usage error. |
+| `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It cannot be combined with `--pad none` or `--pad neutral`. See [Keyboard and pad scripts](#keyboard-and-pad-scripts). |
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 | `--render none\|vulkan` | Whether the RSX commands are drawn (default `none`, unless `--dump-frames` or `--window` is given, which imply `vulkan`). See [Rendering](docs/rendering.md#rendering). |
@@ -257,6 +261,81 @@ demote-to-helper-invocation features (the translated shaders use `discard`, whic
 compiles to a demote). A window also needs the Win32 surface and swapchain extensions, which any
 Windows driver with Vulkan support provides.
 
+### Keyboard and pad scripts
+
+With `--window`, the keyboard is the pad on port 0 (`--pad keyboard` is the default then). The keys
+are fixed and are physical key positions (scan codes), so the layout stays in place on AZERTY and
+QWERTZ keyboards and the keys work while an IME is on (the game window turns the IME off):
+
+| Keys | Pad |
+| --- | --- |
+| Arrow keys (not the numpad) | D-pad |
+| `Z` / `X` / `S` / `D` | Cross / Circle / Square / Triangle |
+| `W` / `E` / `R` / `U` | L1 / L2 / R1 / R2 |
+| `1` / `3` (main row) | L3 / R3 |
+| `V` / `C` | Start / Select |
+
+- A pressed key is a fully pressed button (pressure 0xFF); the sticks stay centred, and there are no
+  keys for them. Until a key is pressed the pad is the same as with `--pad neutral`.
+- A press is reported to the game for at least 60 ms, so a quick tap is not lost between two of the
+  game's pad reads. Key repeat is ignored. Left and Right, or Up and Down, held together cancel
+  each other, as on a real D-pad.
+- When the window loses keyboard focus, every key held on the keyboard is released. If keys do
+  nothing, click the window: one that a background process opened may not have keyboard focus.
+- The game confirms with Circle, which is the `X` key. Start and Cross do nothing on the title
+  screen. Circle skips the notice screen and the intro movies (`if_logo.pam`, `ch_logo.pam`,
+  `op.pam`), and it picks NEW GAME on the title screen. It does not skip `world.pam`, the 83 s movie
+  that plays after NEW GAME.
+- NEW GAME can write game data, so use a fresh `--hdd-dir` when you try it.
+
+`--pad-script FILE` presses buttons without a person at the keyboard, with or without `--window`
+(the script and the keyboard add up). It is a text file with one command per line; `#` starts a
+comment, and blank lines are ignored:
+
+```
+<time> press   <buttons>
+<time> release <buttons>
+<time> tap     <buttons> [every <interval> until <time>]
+```
+
+- Times and intervals are decimal seconds from the start of the run (the `--seconds` clock, within a
+  few milliseconds), for example `40` or `40.5`. Buttons are `select l3 r3 start up right down left
+  l2 r2 l1 r1 triangle circle cross square`, joined with `+` for several at once (`circle+r1`).
+- `tap` presses at `<time>` and releases 150 ms later. With `every <interval> until <time>` it
+  repeats at `<time>`, `<time> + <interval>`, ... for as long as that is not after the `until`
+  time. The interval must be longer than 150 ms.
+- Events run in time order; at the same time, releases come before presses.
+- A bad line is a usage error (exit code 2) that names the line, for example
+  `line 7: unknown button "crosss"`.
+
+`tools/pad_scripts/leave_title.txt` is the script of the `game_input` test. It taps `circle` every 2 s
+from 4 s to 30 s, which skips whichever screen is showing, so the script does not depend on the exact
+start-up time:
+
+```sh
+dal_game --game-dir <game-dir> --sdata-cache <cache-dir> --hdd-dir <hdd-dir> --seconds 40 \
+         --pad-script tools/pad_scripts/leave_title.txt
+```
+
+Pad lines in the log (prefix `dal: pad:`):
+
+| Line | Level | When |
+| --- | --- | --- |
+| `dal: pad: init max_connect N` | info | the game calls `cellPadInit` |
+| `dal: pad: port N connected` / `disconnected` | info | the first time port `N` is reported in that state |
+| `dal: pad: port N setting 0x2 (press on, sensor off)` | info | the game sets a port setting, once per value |
+| `dal: pad: keyboard (window) (script NAME, N events)` | info | at start with `--pad keyboard`; each part appears only when it applies |
+| `dal: pad: script T s: press\|release BUTTONS` | info | each script event as it is applied (prefix `[host]`) |
+| `dal: pad: key 0x2c down -> cross` | debug | a mapped key changes state in the window (`--log-level debug`); unmapped keys and repeats are not logged |
+
+The CTest `game_input` runs `leave_title.txt` for 40 s and passes when the log contains the line
+where the main thread opens the event script (`Script/Event.sdat`), which a run without input
+does not reach in that time. The run is stopped before `world.pam` ends. It is registered under the
+same conditions as `game_boot` with the `.sdat` cache (`DAL_EBOOT_ELF`, `DAL_GAME_DIR` and
+`DAL_RPCS3_CRYPTO_DIR` set), uses its own hdd directory `build/<preset>/game_hdd_input`, which the
+setup test `game_input_hdd_clean` deletes before every run, and takes its seconds and milestone from
+`cmake/game_input.cmake`. See [Runtime internals](docs/runtime.md#input).
+
 ### Current state
 
 On the pinned executable, with the `.sdat` cache, the run loads, initializes thread-local storage
@@ -266,7 +345,10 @@ decode threads open), reads the pad, registers the trophy context, runs the save
 first boot finds no data, which the game accepts), and drives its frame loop with the vblank
 handler running at 60 Hz. After the warning screen it plays its three intro movies
 (`if_logo.pam`, `ch_logo.pam`, `op.pam`, about 7 s, 7 s and 95 s) at their 29.97 fps rate, then
-shows the title screen, where it stays (a 165 s run ends at the watchdog, exit code 5). The movie
+shows the title screen, where it stays without input (a 165 s run ends at the watchdog, exit code 5).
+With the keyboard or a pad script it leaves the title screen: Circle skips the notice screen and the
+movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`
+(see [Keyboard and pad scripts](#keyboard-and-pad-scripts)). The movie
 audio is decoded but not heard, because `cellAudio` is still default-handled. With
 `--render vulkan` the only entry in the `rsx unimplemented` census is the constant ZPASS report
 value. Without the `.sdat` cache the game stops earlier, at its error dialog for the missing file;
@@ -284,7 +366,9 @@ without the FFmpeg DLLs the movies run their full length as black frames.
   screen can start; nothing is decoded through it.
 - Movies: only the `cellSail` calls this game makes are implemented (PAMF files with H.264 video
   and ATRAC3plus audio). Repeat mode is stored but not acted on.
-- Input: only the `neutral` and `none` pad providers; no keyboard or gamepad backend.
+- Input: the `neutral`, `none` and `keyboard` pad providers; no gamepad backend. The keyboard has
+  a fixed mapping, no analog sticks, no vibration, and only port 0; there is no mouse or `cellKb`
+  input.
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are
   not scheduled.
 - The remaining imports (25 of 166, from `cellAudio` and `cellAtrac`) use the default handler;
