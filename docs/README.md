@@ -12,6 +12,6 @@ how the project works:
 | [virtual-file-system.md](virtual-file-system.md) | Guest path mapping and the VFS configuration file |
 | [rendering.md](rendering.md) | Fake RSX, the Vulkan renderer, and capture and replay |
 | [movies.md](movies.md) | cellSail HLE, PAMF demuxing, FFmpeg decoding and `dal_moviedump` |
-| [tests.md](tests.md) | CTest targets, the `game_boot` test and the Python unit tests |
+| [tests.md](tests.md) | CTest targets, the `game_boot` and `game_input` tests and the Python unit tests |
 | [layout.md](layout.md) | Repository layout |
 | [porting-guide.md](porting-guide.md) | Applying the method to another PS3 game |

@@ -5,7 +5,7 @@
 | Path | Contents |
 | --- | --- |
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
-| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `rsx`, `media`, `game_main.cpp`; see [Running the game](../README.md#running-the-game)) and runtime-side tests |
+| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `media`, `game_main.cpp`; see [Running the game](../README.md#running-the-game)) and runtime-side tests |
 | `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see [SDAT files](../README.md#sdat-files) |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
@@ -18,6 +18,8 @@
 | `tools/dal_rsxreplay/` | `dal_rsxreplay`, which replays an RSX capture without the game; see [Capture and replay](rendering.md#capture-and-replay) |
 | `cmake/Render.cmake`, `cmake/rsx_replay.cmake` | Renderer targets and tests, and the pin file of the `rsx_replay` test |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
+| `runtime/src/input/` | Pad buttons, the keyboard pad provider and the pad script player; see [Input](runtime.md#input) |
+| `tools/pad_scripts/`, `cmake/game_input.cmake` | Pad scripts (`leave_title.txt` is used by the `game_input` test) and the pin file of that test; see [Keyboard and pad scripts](../README.md#keyboard-and-pad-scripts) |
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
 | `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |

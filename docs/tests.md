@@ -19,6 +19,7 @@ files are registered only when those are configured, and configuration prints wh
 | `media_ffmpeg` | The FFmpeg loader, the H.264 and ATRAC3plus decoders and the colour and PCM conversion; with `DAL_GAME_DIR` set it also plays `ch_logo.pam` through the movie player with a fast clock | the fetched FFmpeg DLLs |
 | `movie_decode` | `dal_moviedump` on the first 60 frames of `ch_logo.pam`: frame count, YUV and RGB hashes of three frames and the hash of the whole decoded audio, pinned in `cmake/movie_decode.cmake` | `-GameDir` (see [Movies](movies.md#tests)) |
 | `game_boot` | The game reaches a milestone in a 20 s run (below) | `-PpuDir`, `-EbootElf`, `-GameDir` |
+| `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus `DAL_RPCS3_CRYPTO_DIR` |
 
 The game-file parts of `media_core` and `media_ffmpeg` read the `DAL_GAME_DIR` environment
 variable; `tools/build.ps1` does not set it, so export it before running CTest to include them.
@@ -50,6 +51,19 @@ the game stops at its error dialog for the missing `.sdat` file. When a change l
 further, run `dal_game --game-dir <dir> --seconds 20 --hdd-dir <empty-dir>` three times, take the
 last main-thread `dal: first ...` line that appears in every run, and set the matching milestone.
 Update only that file; the test then guards against regressions.
+
+## The `game_input` test
+
+CTest registers `game_input` under the same conditions as `game_boot` when `DAL_RPCS3_CRYPTO_DIR`
+is also set, because the game needs its decrypted `.sdat` files to get past the title screen. It
+runs `dal_game` with `--sdata-cache`, `--pad-script tools/pad_scripts/leave_title.txt` and its own
+hdd directory `build/<preset>/game_hdd_input`, which the setup test `game_input_hdd_clean` deletes
+before every run, so that save data written after NEW GAME never reaches `game_boot` or the next
+run. The pin file `cmake/game_input.cmake` holds the run length (`DAL_GAME_INPUT_SECONDS`, 40) and
+the milestone (`DAL_GAME_INPUT_MILESTONE`): the main thread opening `Script/Event.sdat`, which a
+run without input does not reach in that time. The time limit is the run length plus 60 s. The
+script and the pad log lines are described in
+[Keyboard and pad scripts](../README.md#keyboard-and-pad-scripts).
 
 ## Python unit tests
 
