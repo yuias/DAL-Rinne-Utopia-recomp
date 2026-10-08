@@ -16,10 +16,14 @@ files are registered only when those are configured, and configuration prints wh
 | `render_core`, `vp_translator`, `fp_translator` | Renderer and shader translators (see [Rendering](rendering.md)) | a Vulkan 1.3 device for the rendering parts |
 | `rsx_replay` | Replays a local capture and compares it with a reference image | a local capture (see [Capture and replay](rendering.md#capture-and-replay)) |
 | `media_core` | PAMF parser and demuxer, the movie player and the cellSail HLE on synthetic data, with fake codecs; with `DAL_GAME_DIR` set it also demuxes every `.pam` file of the game | - |
-| `media_ffmpeg` | The FFmpeg loader, the H.264 and ATRAC3plus decoders and the colour and PCM conversion; with `DAL_GAME_DIR` set it also plays `ch_logo.pam` through the movie player with a fast clock | the fetched FFmpeg DLLs |
+| `media_ffmpeg` | The FFmpeg loader, the H.264 and ATRAC3plus decoders (the movie decoder and the raw-frame decoder behind `cellAtrac`) and the colour and PCM conversion; with `DAL_GAME_DIR` set it also plays `ch_logo.pam` through the movie player with a fast clock | the fetched FFmpeg DLLs |
 | `movie_decode` | `dal_moviedump` on the first 60 frames of `ch_logo.pam`: frame count, YUV and RGB hashes of three frames and the hash of the whole decoded audio, pinned in `cmake/movie_decode.cmake` | `-GameDir` (see [Movies](movies.md#tests)) |
+| `audio_core` | Audio on synthetic data, with no device and no FFmpeg: the block ring, null output, WAV writer and reader, `wavStats`, `BlockClock` and its correction, the clock controller against a fake device, the engine with fake producers and outputs, the `cellAudio` state and handlers on synthetic guest memory, the AT3 parser, and the `cellAtrac` stream model and handlers with a fake decoder | - |
+| `audio_wasapi` | The WASAPI output: device loss and reopen, priming, high-water drops and the fill level on fake streams, then (when a render device exists) opening the default device, playing silence and a real device loss and reopen. Exit code 77 (skipped) when the machine has no render device. Runs serially, because it measures timing | a render device for the real-device part |
+| `atrac_decode` | `dal_audiotool at3` on the title BGM (entry 19 of the decrypted `Bgm.sdat`): frame count, sample count and the SHA-256 of the decoded PCM, pinned in `cmake/atrac_decode.cmake` | the sdata cache (registered when it exists or can be built), the FFmpeg DLLs |
 | `game_boot` | The game reaches a milestone in a 20 s run (below) | `-PpuDir`, `-EbootElf`, `-GameDir` |
 | `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus `DAL_RPCS3_CRYPTO_DIR` |
+| `game_audio_hdd_clean`, `game_audio` | The same run as `game_input` with `--audio none --audio-dump`: the `atrac` line of the audio census reports decoded frames with audible content (below) | as `game_input` |
 
 The game-file parts of `media_core` and `media_ffmpeg` read the `DAL_GAME_DIR` environment
 variable; `tools/build.ps1` does not set it, so export it before running CTest to include them.
@@ -64,6 +68,27 @@ the milestone (`DAL_GAME_INPUT_MILESTONE`): the main thread opening `Script/Even
 run without input does not reach in that time. The time limit is the run length plus 60 s. The
 script and the pad log lines are described in
 [Keyboard and pad scripts](../README.md#keyboard-and-pad-scripts).
+
+## The `game_audio` test
+
+CTest registers `game_audio` under the same conditions as `game_input`. It runs the same pad script
+for 40 s (`DAL_GAME_AUDIO_SECONDS` in `cmake/game_audio.cmake`) with `--audio none` and
+`--audio-dump build/<preset>/game_audio.wav`, and its own hdd directory `build/<preset>/game_hdd_audio`,
+which the setup test `game_audio_hdd_clean` deletes before every run. The time limit is 100 s. It
+passes when the stop census has an `atrac` line with at least one non-silent decoded frame
+(`DAL_GAME_AUDIO_ATRAC_PATTERN`): the title music and the confirm sound effect are both
+ATRAC3plus, so it fails if the FFmpeg DLLs are missing, if the `cellAudio` mixer is not driven, or if
+`cellAtrac` stops decoding. The WAV file is not inspected by the test; `dal_audiotool wavstat` reads
+it (see [Audio](audio.md#dal_audiotool)).
+
+`atrac_decode` takes the archive, the entry index and the expected counts from
+`cmake/atrac_decode.cmake`. The hash of the decoded PCM holds for the pinned FFmpeg build; another
+build or CPU feature set may round the float output differently and needs a new hash (the counts
+stay).
+
+Other audio code is covered by `runtime_core` (`testEventQueueIpcKeys`,
+`testPpuThreadCreatePriority`, `testTimerResolution`) and `media_ffmpeg` (`testAtracFrameDecoder`,
+`testAtracResetWithGameFile`, which is skipped unless `Se.sdat` is in the sdata cache of the build directory).
 
 ## Python unit tests
 

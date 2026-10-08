@@ -40,7 +40,9 @@ followed by `ptr r3,r5,...`, the argument registers that held a pointer to commi
 the `, rendered ... draws, skipped ...` part appears when the renderer runs, and the
 `rsx unimplemented` section under [Rendering](rendering.md#rendering).
 After a run that played movies, a `census: sail <n> movies` section repeats the per-movie
-summary lines (see [Movies](movies.md#log-lines-and-census)).
+summary lines (see [Movies](movies.md#log-lines-and-census)). After a run in which the game
+initialised `cellAudio`, a `census: audio` section gives the audio engine, mixer input and
+`cellAtrac` counters (see [Audio](audio.md#census)).
 Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
 each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
 the game runs; these lines are the progress markers that `game_boot` checks.
@@ -89,8 +91,31 @@ a blocking wait and when it exits. Blocking system calls (mutex, condition varia
 event queue, sleep, join) wait on host condition variables with the guest lock, and record what
 they wait for for the census and for stall detection.
 
-Priority scheduling is deferred. Runnable threads get the lock in arrival order, and
-`sys_ppu_thread_set_priority` and `sys_ppu_thread_get_priority` only store and return the value.
+Priority scheduling is deferred, with one exception. Runnable threads get the lock in arrival order,
+and `sys_ppu_thread_set_priority` and `sys_ppu_thread_get_priority` only store and return the value.
+The exception is the creation rule of `sys_ppu_thread_create`: a new thread whose priority number is
+lower than the stored priority of its creator (lower number means higher precedence on lv2) runs
+before the creator continues. `startGuestThreadFirst` starts the host thread, waits until it has
+queued for the guest lock (at most 5 ms), and yields the lock to it. The new thread then runs until
+it blocks, exits, yields or uses up its preemption budget; the creator's budget is reset afterwards.
+A thread with an equal or higher number, an interrupt thread, and the threads the runtime itself
+creates are started as before. The game depends on it: its audio mixer thread (priority 90) is created
+by the main thread (1005) and has to store its notify queue key before main registers it with
+`cellAudio`. The rule is logged at debug level, and a new thread that did not queue within 5 ms
+logs `dal: thread: ... not queued within 5 ms; creator continues` at info level. There is no other
+priority behaviour: no priority-ordered hand-off, no wake order by priority, no preemption, and no
+rescheduling when a priority changes.
+
+`dal_game` holds a 1 ms system timer resolution for the whole run (`timeBeginPeriod`,
+`runtime/src/core/timer_resolution.*`). Timed waits (`sys_timer_usleep`, lock and queue time-outs)
+are host condition variable waits, and Windows rounds them to its timer tick (15.6 ms by default),
+so a 1 ms guest sleep would take 15 ms. The game's decode loops poll with 1 ms sleeps. The request
+ends with the process; a refusal is logged as a warning and the default tick stays.
+
+The RSX thread and the audio engine are host threads that take the same guest lock. The RSX thread
+therefore pumps the command buffer in slices of 128 words and leaves the lock once a hold has lasted
+300 us, so that the game's mixer can run between the slices (see [Audio](audio.md#guest-lock)).
+
 Thread ids start at `0x01000000`. lv2 interrupt threads are not implemented; the one interrupt
 thread the game needs is the GCM interrupt thread described under [Fake RSX](rendering.md#fake-rsx).
 
@@ -116,16 +141,19 @@ name; struct layouts and error codes are restated from its headers.
 | Memory | `sys_memory_allocate` (348), `sys_memory_free` (349), `sys_memory_get_user_memory_size` (352) |
 | Mutex and condition variable | `sys_mutex_create`, `_destroy`, `_lock`, `_trylock`, `_unlock` (100-104); `sys_cond_create`, `_destroy`, `_wait`, `_signal`, `_signal_all` (105-109) |
 | Event flag | `sys_event_flag_create` (82), `_destroy` (83), `_wait` (85), `_set` (87), `_clear` (118), `_cancel` (132), `_get` (139) |
-| Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138) |
+| Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138). A queue created with a non-zero IPC key can be found by that key (the host looks it up and sends to it; the `cellAudio` notify uses this); a second live queue with the same key fails with `CELL_EEXIST`, key 0 makes a local queue, and destroying the queue forgets the key. IPC ports (`sys_event_port_connect_ipc`) are not supported. |
 | SPU | `sys_spu_initialize` (169), `sys_spu_thread_write_ls` (181), `_read_ls` (182), `_write_spu_mb` (190), `_connect_event` (191), `_disconnect_event` (192), `sys_spu_thread_group_connect_event_all_threads` (251), `_disconnect_event_all_threads` (252). Only the bookkeeping is kept; no SPU code runs. |
 | File system | `sys_fs_open` (801), `_read` (802), `_write` (803), `_close` (804), `_opendir` (805), `_readdir` (806), `_closedir` (807), `_stat` (808), `_fstat` (809), `_mkdir` (811), `_unlink` (814), `_lseek` (818); see [Virtual file system](virtual-file-system.md#virtual-file-system) |
-| Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48) |
+| Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48); the creation rule of `sys_ppu_thread_create` is under [Threads](#threads) |
 
 ## Implemented imports
 
-Imports are matched to handlers by module and FNID. 141 of the executable's 166 imports have a
-handler (the log says `dal: hle: 166 imports, 141 with handlers`); the rest use the default handler. Behaviour follows the RPCS3 function of the same name
-(`Emu/Cell/Modules/`); each handler file lists its deviations in its header comment.
+Imports are matched to handlers by module and FNID. All 166 of the executable's imports have a
+handler (the log says `dal: hle: 166 imports, 166 with handlers`); the default handler below still
+serves any import without one. Behaviour follows the RPCS3 function of the same name
+(`Emu/Cell/Modules/`); each handler file lists its deviations in its header comment. `cellAudio` and
+`cellAtrac` were implemented from a written description of RPCS3's behaviour, not from its code (see
+[Audio](audio.md#clean-room)).
 
 | Module | Imports |
 | --- | --- |
@@ -140,7 +168,8 @@ handler (the log says `dal: hle: 166 imports, 141 with handlers`); the rest use 
 | `cellPngDec` | `cellPngDecCreate`, `cellPngDecDestroy`, `cellPngDecExtOpen`, `cellPngDecExtReadHeader`, `cellPngDecExtSetParameter`, `cellPngDecExtDecodeData`, `cellPngDecClose`; see [PNG decoding](#png-decoding) |
 | `cellSail` | the 27 imports the game uses: the memory allocator, player initialise, boot, open, start and finalize, descriptors and their stream database, and the graphics and sound adapters (format, `GetFrame`, `UpdateAvSync`); see [Movies](movies.md) |
 | `cellPamf` | `cellPamfReaderGetNumberOfSpecificStreams` on the descriptor's stream database |
-| `cellAtrac` | `cellAtracSetDataAndGetMemSize` only, as a placeholder: it reports a work memory size so the title scene's decode thread can start, and decodes nothing |
+| `cellAudio` | all 11 imports the game uses: `Init`, `Quit`, `PortOpen`, `PortStart`, `PortStop`, `PortClose`, `GetPortConfig`, `GetPortBlockTag`, `GetPortTimestamp`, `SetNotifyEventQueue`, `RemoveNotifyEventQueue`; the ports and the 8-block ring live in guest memory and a host clock drives the game's mixer; see [Audio](audio.md) |
+| `cellAtrac` | all 15 imports the game uses: `SetDataAndGetMemSize`, `CreateDecoder`, `DeleteDecoder`, `Decode`, the stream calls (`GetStreamDataInfo`, `AddStreamData`, `GetRemainFrame`), the loop and info calls and the second-buffer calls; ATRAC3plus is decoded through FFmpeg; see [Audio](audio.md#cellatrac) |
 | `sceNp`, `sceNpTrophy` | `sceNpInit`, `sceNpTerm`, `sceNpDrmIsAvailable`; the 10 trophy imports (`sceNpTrophyInit` to `sceNpTrophyUnlockTrophy`) |
 
 Video and audio out report what the game's `PARAM.SFO` allows (the `RESOLUTION` and
@@ -169,6 +198,9 @@ interface, so each module follows a documented policy that never blocks on a per
   from a queue that the modules above feed. `CELL_SYSUTIL_REQUEST_EXITGAME` is not acted on.
 - **cellGame**: the content directories are created on the host through the VFS, under the
   `--hdd-dir` directory.
+- **Audio**: the output is `none` unless `--window` or `--audio wasapi` asks for the device, so
+  unattended runs need no sound device; the game's mixer and the `cellAudio` clock run either way
+  (see [Audio](audio.md#options)). A device or decoder problem degrades to silence with one warning.
 - **Input**: see `--pad` and [Input](#input). The pad on port 0 comes from a provider
   (`runtime/src/hle/hle.h`): none, neutral, or the keyboard with an optional pad script. A gamepad
   backend would plug in the same way; none is implemented.

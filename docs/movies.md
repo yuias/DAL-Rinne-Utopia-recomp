@@ -18,7 +18,6 @@ game thread -> cellSail HLE -> MoviePlayer (decode thread) -> PAMF demuxer -> FF
 | `cell_sail_adapters.cpp` | Graphics and sound adapters: initialise, finalize, preferred and current format, `GetFrame`, `UpdateAvSync` |
 | `sail_service.cpp` | `_libsail-control`, a guest service thread that delivers the notify events and calls the game's allocator callbacks in the order the game waits for |
 | `cell_pamf.cpp` | `cellPamfReaderGetNumberOfSpecificStreams`, answered from the descriptor's stream database |
-| `cell_atrac.cpp` | `cellAtracSetDataAndGetMemSize` only, a placeholder that reports a work memory size so the title scene's decode thread can start; nothing is decoded through `cellAtrac` |
 
 Only stream URIs of the form `x-cell-fs://...` that name a PAMF file are accepted; the path is
 resolved through the [virtual file system](virtual-file-system.md). The game owns the frame
@@ -68,9 +67,23 @@ Media problems are never fatal:
 
 ## Audio
 
-The ATRAC3plus audio is decoded and offered to the game's sound adapter, but the game only asks
-for it when `cellAudio` drives its mixer. `cellAudio` is not implemented yet, so the movie audio is
-dropped and nothing is heard.
+The ATRAC3plus audio is decoded and offered to the game's sound adapter, and the game pulls it
+when its mixer runs:
+
+```
+MoviePlayer audio blocks -> cellSailSoundAdapterGetFrame (game's sound thread)
+  -> game's mixer writes its cellAudio port -> audio engine downmixes to stereo -> output
+```
+
+The game's mixer thread waits for a `cellAudio` notify event, which the runtime's audio engine
+sends every 5.333 ms. The game's sound thread, which that notify wakes, calls
+`cellSailSoundAdapterGetFrame` for the number of samples it wants (stereo float, 48 kHz), mixes
+them with its `cellAtrac` sounds, and the mixer writes the result into the port block that the next
+period plays. The runtime plays the result through the audio output
+(WASAPI with `--window`, none otherwise; `--audio-dump FILE` writes it to a WAV file). Audio that
+the game does not pull is still dropped once the playback clock has passed it, as before. See
+[Audio](audio.md) for the engine, the options and `cellAtrac`, which plays the game's music and
+sound effects.
 
 ## Log lines and census
 

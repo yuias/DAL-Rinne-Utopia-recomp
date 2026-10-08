@@ -16,15 +16,15 @@ consumes the game's command buffer. With `--render vulkan` a renderer on Vulkan 
 the RSX commands describe, either into a window (`--window`) or into PNG files
 (`--dump-frames`); a capture and replay tool (`dal_rsxreplay`) renders single recorded frames
 without the game. The game boots, runs its frame loop at the 60 Hz vertical-blank rate, loads its
-assets, plays its three intro movies (video only; FFmpeg decodes them) and reaches the title
-screen. Audio output is not implemented. See [Current state](#current-state) and
-[Not implemented](#not-implemented).
+assets, plays its three intro movies (FFmpeg decodes them) and reaches the title screen. With
+`--window` it plays sound through the default Windows audio device: the movie audio, the music and
+the sound effects. See [Current state](#current-state) and [Not implemented](#not-implemented).
 
 ## Documentation
 
 This README covers building and running the game. Development material is under
 [`docs/`](docs/README.md): the analysis tools, function recovery, the C emitter, runtime
-internals, the virtual file system, rendering, movies, tests, the repository layout, and a guide
+internals, the virtual file system, rendering, movies, audio, tests, the repository layout, and a guide
 for applying the method to other PS3 games.
 
 ## Prerequisites
@@ -45,11 +45,11 @@ for applying the method to other PS3 games.
   that `--vk-validation` enables is part of the SDK as well.
 - To run the renderer: a Vulkan 1.3 device and driver with dynamic rendering, synchronization2 and
   shader demote-to-helper-invocation (see [Rendering](docs/rendering.md#rendering))
-- FFmpeg for the movies: run `pwsh -NoProfile -File tools/fetch-ffmpeg.ps1` once before the
+- FFmpeg for the movies and the game's sound (ATRAC3plus): run `pwsh -NoProfile -File tools/fetch-ffmpeg.ps1` once before the
   first build. It downloads a pinned LGPL build (DLLs only), checks its SHA-256 and extracts it
   under `generated/deps/ffmpeg`; `-From <zip>` uses a local copy of the pinned zip instead.
   Configuration fails with this hint while FFmpeg is missing, and `tools/build.ps1` does not
-  fetch it. See [Movies](docs/movies.md) and `THIRD_PARTY_NOTICES.md`.
+  fetch it. See [Movies](docs/movies.md), [Audio](docs/audio.md) and `THIRD_PARTY_NOTICES.md`.
 - Python 3.10 or newer (the analysis tools use only the standard library)
 - Optional, for `ghidra-export` only: Ghidra 12.x and a JDK 21 (see below). `recover` does
   not need Ghidra, because the Ghidra results it uses are committed.
@@ -80,11 +80,15 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
   (`ppu_semantics`), the runtime core unit tests (`runtime_core`), the renderer tests
   (`render_core`, `vp_translator`, `fp_translator`; see [Rendering](docs/rendering.md#rendering)), the SDAT tests
   (`sdat_tests`), the movie tests (`media_core`, `media_ffmpeg`, and with `-GameDir` also
-  `movie_decode`; see [Movies](docs/movies.md)), the Python unit tests, and,
+  `movie_decode`; see [Movies](docs/movies.md)), the audio tests (`audio_core`, and `audio_wasapi`,
+  which is skipped on a machine without an audio device, and, when the decrypted sdata cache
+  exists or can be built (`-PpuDir`, `-EbootElf`, `-GameDir` and `DAL_RPCS3_CRYPTO_DIR`),
+  `atrac_decode`; see [Audio](docs/audio.md)), the Python unit tests, and,
   with `-PpuDir`, the link check of the generated code (`ppu_link`). With `-PpuDir`,
   `-EbootElf` and `-GameDir` together it also runs `game_boot`; see [Running the game](#running-the-game).
   When `DAL_RPCS3_CRYPTO_DIR` is set as well, it also runs `game_input`, which leaves the title
-  screen with a pad script; see [Keyboard and pad scripts](#keyboard-and-pad-scripts). When a
+  screen with a pad script, and `game_audio`, which runs the same script with the audio dump and
+  checks that the game's sounds are decoded; see [Keyboard and pad scripts](#keyboard-and-pad-scripts). When a
   local capture and reference image exist it also runs `rsx_replay`; see [Capture and replay](docs/rendering.md#capture-and-replay).
   The full list is in [Tests](docs/tests.md).
 - `-EbootElf <path>` passes the decrypted ELF to the tests so the checks against the real
@@ -135,7 +139,7 @@ CMake options for generated code (also usable with `cmake` directly):
 PPU thread the way RPCS3 does and calls the entry function through the generated code. It is
 built only when `DAL_PPU_GENERATED_DIR` is set (`-PpuDir`), because it links the generated
 functions. The runtime core (`dal_runtime_core`, everything under `runtime/src/core`,
-`runtime/src/lv2`, `runtime/src/hle`, `runtime/src/rsx` and the demuxer and player in `runtime/src/media`) does not reference generated symbols and is always
+`runtime/src/lv2`, `runtime/src/hle`, `runtime/src/rsx`, `runtime/src/audio` without the WASAPI output, and the demuxer, player and ATRAC3plus file parser in `runtime/src/media`) does not reference generated symbols and is always
 built, together with its unit tests (`runtime_core`). The renderer (`dal_render`, `runtime/src/render`)
 is a separate library on top of it, so the core itself needs no GPU. Only `runtime/src/game_main.cpp`
 passes the generated tables to the core. The executable is checked against the SHA-256 that the generated
@@ -144,6 +148,7 @@ code was emitted from.
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
          [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard] [--pad-script FILE]
+         [--audio none|wasapi] [--audio-dump FILE]
          [--load-only] [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
          [--shader-cache DIR] [--vk-validation] [--window]
@@ -164,6 +169,8 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
 | `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad (see [Keyboard and pad scripts](#keyboard-and-pad-scripts)). Default: `keyboard` with `--window` or `--pad-script`, otherwise `neutral`. `keyboard` without `--window` or `--pad-script` is a usage error. |
 | `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It cannot be combined with `--pad none` or `--pad neutral`. See [Keyboard and pad scripts](#keyboard-and-pad-scripts). |
+| `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with `--window`, otherwise `none`, so unattended runs and tests need no sound device. See [Audio](#audio). |
+| `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. See [Audio](#audio). |
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 | `--render none\|vulkan` | Whether the RSX commands are drawn (default `none`, unless `--dump-frames` or `--window` is given, which imply `vulkan`). See [Rendering](docs/rendering.md#rendering). |
@@ -191,7 +198,7 @@ Every run ends with one stop line on stderr and a census (below), then exits:
 | Code | Meaning | Stop line |
 | --- | --- | --- |
 | 0 | The guest called `sys_process_exit` or `_sys_process_exit` (also `--load-only` after loading) | `dal: stop: process exit status N` |
-| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file not writable | `error: ...` (usage text) |
+| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable | `error: ...` (usage text) |
 | 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved | `dal: stop: fatal <kind>: ...` |
 | 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
 | 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
@@ -260,6 +267,31 @@ Requirements on the device: Vulkan 1.3, and the dynamic rendering, synchronizati
 demote-to-helper-invocation features (the translated shaders use `discard`, which glslang
 compiles to a demote). A window also needs the Win32 surface and swapchain extensions, which any
 Windows driver with Vulkan support provides.
+
+### Audio
+
+The game's music, sound effects and movie audio are mixed by the game itself; the runtime drives that
+mixer with a 5.333 ms clock and plays the result.
+
+- With `--window` the sound goes to the default Windows audio device (WASAPI, shared mode, no
+  setting to choose a device or a volume; change the default device in Windows). Without `--window`
+  nothing is played unless you pass `--audio wasapi`. `--audio none` also turns it off with
+  `--window`.
+- `--audio-dump FILE` records the mix, with either output, so a run without a person or a device can
+  still be checked. The file is a 48 kHz stereo 32-bit float WAV that most audio editors open; its
+  header is updated every second, so a run that is stopped by `--seconds` or by closing the window
+  leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see
+  [Audio](docs/audio.md#dal_audiotool)).
+- The music and sound effects need the FFmpeg DLLs, like the movies. Without them one warning,
+  `dal: atrac: no decoder: ...`, is logged and the game continues without them.
+- Sound problems never stop the game. `dal: audio: wasapi: ...; continuing without sound` means the
+  device could not be opened (no device, or a format the driver refused) and the run goes on silently.
+  `dal: audio: wasapi: device lost (...); retrying` means the device went away, for example after
+  unplugging it; the runtime tries the default device again every 2 seconds and logs `reopened` when
+  it is back.
+- The output is stereo: the game's 8-channel mix is reduced to its front left and right channels.
+  The end-of-run `census: audio` section shows how much audio was produced, skipped or dropped; see
+  [Audio](docs/audio.md#census).
 
 ### Keyboard and pad scripts
 
@@ -348,11 +380,14 @@ handler running at 60 Hz. After the warning screen it plays its three intro movi
 shows the title screen, where it stays without input (a 165 s run ends at the watchdog, exit code 5).
 With the keyboard or a pad script it leaves the title screen: Circle skips the notice screen and the
 movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`
-(see [Keyboard and pad scripts](#keyboard-and-pad-scripts)). The movie
-audio is decoded but not heard, because `cellAudio` is still default-handled. With
+(see [Keyboard and pad scripts](#keyboard-and-pad-scripts)). The game's sound runs through its own
+mixer: the movie audio, the music and the sound effects reach the speakers with `--window` and
+appear in the `--audio-dump` file in every run (see [Audio](#audio)). Voice, which the game streams
+through `cellAtrac`, is covered by unit tests only: no scene a standard run reaches has voice. With
 `--render vulkan` the only entry in the `rsx unimplemented` census is the constant ZPASS report
 value. Without the `.sdat` cache the game stops earlier, at its error dialog for the missing file;
-without the FFmpeg DLLs the movies run their full length as black frames.
+without the FFmpeg DLLs the movies run their full length as black frames and the game's music and
+sound effects are silent.
 
 ### Not implemented
 
@@ -361,9 +396,10 @@ without the FFmpeg DLLs the movies run their full length as black frames.
   [Rendering](docs/rendering.md#rendering)). Known gaps are the ZPASS report values (the constant 0 is written, no occlusion
   query runs) and user clip planes (the vertex translator does not write the clip distances).
   Without `--render` nothing is drawn, and the renderer needs a Vulkan 1.3 device.
-- Audio: `cellAudio` and the mixer are default-handled, so no sound is produced, including the
-  movie audio that is already decoded. `cellAtrac` only reports its work memory size so the title
-  screen can start; nothing is decoded through it.
+- Audio: WASAPI is the only device output, in shared mode on the default device. The output is
+  stereo (the game's 8-channel port is reduced to its front pair), and there is no volume setting
+  or device choice. ATRAC3 (non-plus) is not supported; the game has none. Only the `cellAudio` and
+  `cellAtrac` calls this game makes are implemented.
 - Movies: only the `cellSail` calls this game makes are implemented (PAMF files with H.264 video
   and ATRAC3plus audio). Repeat mode is stored but not acted on.
 - Input: the `neutral`, `none` and `keyboard` pad providers; no gamepad backend. The keyboard has
@@ -371,11 +407,13 @@ without the FFmpeg DLLs the movies run their full length as black frames.
   input.
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are
   not scheduled.
-- The remaining imports (25 of 166, from `cellAudio` and `cellAtrac`) use the default handler;
-  see the census of a run.
+- Every import of this game has a handler, but some are minimal (for example `cellSpurs`, which
+  only keeps bookkeeping); the census of a run lists what the game called and what the default
+  handler served.
 - SDAT decryption needs the keys from a local RPCS3 checkout at run time, so it only works on a
   machine that has one.
-- Priority scheduling, lv2 interrupt threads, savestates.
+- Priority scheduling beyond the creation rule (a new thread with a numerically lower priority than
+  its creator runs first), lv2 interrupt threads, savestates.
 
 ## Licence and legal notice
 
