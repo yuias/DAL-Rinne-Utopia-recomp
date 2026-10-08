@@ -136,10 +136,9 @@ function(dal_media_add)
   include("${CMAKE_SOURCE_DIR}/cmake/atrac_decode.cmake")
   set(atrac_archive "${CMAKE_BINARY_DIR}/sdata_cache/${DAL_ATRAC_DECODE_ARCHIVE}")
   # The cache is decrypted at build time (see PpuCodegen.cmake), so it may not exist yet at configure
-  # time: the same variables that make the build produce it also register the test. An existing cache
-  # from an earlier build is enough as well.
-  if(NOT EXISTS "${atrac_archive}" AND (DAL_PPU_GENERATED_DIR STREQUAL "" OR DAL_EBOOT_ELF STREQUAL ""
-      OR DAL_GAME_DIR STREQUAL "" OR DAL_RPCS3_CRYPTO_DIR STREQUAL ""))
+  # time: the sdata_cache target that produces it also registers the test. An existing cache from an
+  # earlier build is enough as well.
+  if(NOT EXISTS "${atrac_archive}" AND NOT TARGET sdata_cache)
     message(STATUS "DAL: atrac_decode test not registered (no sdata cache and nothing to build it)")
   else()
     add_test(NAME atrac_decode

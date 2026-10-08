@@ -22,9 +22,9 @@ endfunction()
 # dal_ppu_stub is defined. dal_ppu_generated links no hook library; each consumer picks the stub
 # or the real runtime.
 set(DAL_PPU_GENERATED_DIR "" CACHE PATH "Output directory of 'ps3tool emit' (empty: no generated code)")
-set(DAL_GAME_DIR "" CACHE PATH "Game directory for the game_boot test (empty: test not registered)")
+set(DAL_GAME_DIR "" CACHE PATH "Game directory whose .sdat files the build decrypts, also used by the game tests (empty: neither)")
 
-set(DAL_RPCS3_CRYPTO_DIR "" CACHE PATH "RPCS3 Crypto source directory (key_vault.h) for decrypting .sdat files at build time (empty: skipped)")
+include("${CMAKE_SOURCE_DIR}/cmake/sdat_keys.cmake")
 
 function(dal_ppu_add_generated_tree)
   if(DAL_PPU_GENERATED_DIR STREQUAL "")
@@ -65,23 +65,30 @@ function(dal_ppu_add_generated_tree)
   include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")
   include("${CMAKE_SOURCE_DIR}/cmake/game_input.cmake")
   include("${CMAKE_SOURCE_DIR}/cmake/game_audio.cmake")
+
+  # Decrypt the game's .sdat files during the build into the directory dal_game uses by default.
+  set(sdata_cache "${CMAKE_BINARY_DIR}/sdata_cache")
+  set(DAL_SDAT_KEYS "")
+  if(NOT DAL_GAME_DIR STREQUAL "")
+    dal_resolve_sdat_keys()
+  endif()
+  if(NOT DAL_SDAT_KEYS STREQUAL "")
+    set(sdata_stamp "${sdata_cache}/.stamp")
+    add_custom_command(OUTPUT "${sdata_stamp}"
+      COMMAND dal_sdat --keys "${DAL_SDAT_KEYS}" --game-dir "${DAL_GAME_DIR}" --out "${sdata_cache}"
+      COMMAND ${CMAKE_COMMAND} -E touch "${sdata_stamp}"
+      DEPENDS dal_sdat
+      COMMENT "Decrypting sdat files into ${sdata_cache}"
+      VERBATIM)
+    add_custom_target(sdata_cache ALL DEPENDS "${sdata_stamp}")
+  endif()
+
   if(DAL_EBOOT_ELF STREQUAL "" OR DAL_GAME_DIR STREQUAL "")
     message(STATUS "DAL: game_boot test not registered (DAL_EBOOT_ELF or DAL_GAME_DIR is empty)")
   else()
     separate_arguments(boot_args UNIX_COMMAND "${DAL_GAME_BOOT_ARGS}")
 
-    # Optional: decrypt the game's .sdat files during the build and hand them to the game. The keys
-    # come from a local RPCS3 checkout at build time and never enter the repository.
-    if(NOT DAL_RPCS3_CRYPTO_DIR STREQUAL "")
-      set(sdata_cache "${CMAKE_BINARY_DIR}/sdata_cache")
-      set(sdata_stamp "${sdata_cache}/.stamp")
-      add_custom_command(OUTPUT "${sdata_stamp}"
-        COMMAND dal_sdat --keys "${DAL_RPCS3_CRYPTO_DIR}" --game-dir "${DAL_GAME_DIR}" --out "${sdata_cache}"
-        COMMAND ${CMAKE_COMMAND} -E touch "${sdata_stamp}"
-        DEPENDS dal_sdat
-        COMMENT "Decrypting sdat files into ${sdata_cache}"
-        VERBATIM)
-      add_custom_target(sdata_cache ALL DEPENDS "${sdata_stamp}")
+    if(TARGET sdata_cache)
       list(APPEND boot_args --sdata-cache "${sdata_cache}")
       set(boot_milestone "${DAL_GAME_BOOT_MILESTONE}")
 

@@ -312,8 +312,8 @@ uses its own directory and deletes it first (`rm -rf build/release/game_hdd_inpu
 directory of a normal run or of `game_boot`.
 
 The `game_input` test (`cmake/PpuCodegen.cmake`, pins in `cmake/game_input.cmake`) is registered
-under the same conditions as `game_boot` with the `.sdat` cache: `DAL_EBOOT_ELF`, `DAL_GAME_DIR` and
-`DAL_RPCS3_CRYPTO_DIR` must be set. The setup test `game_input_hdd_clean` deletes
+under the same conditions as `game_boot` with the `.sdat` cache: `DAL_EBOOT_ELF` and `DAL_GAME_DIR`
+must be set, and the build must have the `.sdat` keys. The setup test `game_input_hdd_clean` deletes
 `build/<preset>/game_hdd_input`, and `game_input` (fixture `game_input_hdd`) then runs
 `dal_game --pad-script tools/pad_scripts/leave_title.txt --hdd-dir build/<preset>/game_hdd_input
 --seconds 40` with a time limit of 100 s. It passes when the log contains the main-thread line

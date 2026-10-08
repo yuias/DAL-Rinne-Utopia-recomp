@@ -22,7 +22,7 @@ files are registered only when those are configured, and configuration prints wh
 | `audio_wasapi` | The WASAPI output: device loss and reopen, priming, high-water drops and the fill level on fake streams, then (when a render device exists) opening the default device, playing silence and a real device loss and reopen. Exit code 77 (skipped) when the machine has no render device. Runs serially, because it measures timing | a render device for the real-device part |
 | `atrac_decode` | `dal_audiotool at3` on the title BGM (entry 19 of the decrypted `Bgm.sdat`): frame count, sample count and the SHA-256 of the decoded PCM, pinned in `cmake/atrac_decode.cmake` | the sdata cache (registered when it exists or can be built), the FFmpeg DLLs |
 | `game_boot` | The game reaches a milestone in a 20 s run (below) | `-GeneratedDir`, `-EbootElf`, `-GameDir` |
-| `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus `DAL_RPCS3_CRYPTO_DIR` |
+| `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus the `.sdat` keys ([SDAT files](sdat.md#keys)) |
 | `game_audio_hdd_clean`, `game_audio` | The same run as `game_input` with `--audio none --audio-dump`: the `atrac` line of the audio census reports decoded frames with audible content (below) | as `game_input` |
 
 The game-file parts of `media_core` and `media_ffmpeg` read the `DAL_GAME_DIR` environment
@@ -50,7 +50,7 @@ set(DAL_GAME_BOOT_MILESTONE_NO_SDATA "\\[t 01000000\\] dal: first hle cellSysuti
 
 A milestone is a `dal: first ...` line written by the main thread (thread id `01000000`), because
 a line from another thread can appear or not depending on scheduling. The first one applies when
-`DAL_RPCS3_CRYPTO_DIR` is set (the test also passes `--sdata-cache`), the second when it is not and
+the build has the `.sdat` keys (the test also passes `--sdata-cache`), the second when it has not and
 the game stops at its error dialog for the missing `.sdat` file. When a change lets the game get
 further, run `dal_game --game-dir <dir> --seconds 20 --hdd-dir <empty-dir>` three times, take the
 last main-thread `dal: first ...` line that appears in every run, and set the matching milestone.
@@ -58,8 +58,8 @@ Update only that file; the test then guards against regressions.
 
 ## The `game_input` test
 
-CTest registers `game_input` under the same conditions as `game_boot` when `DAL_RPCS3_CRYPTO_DIR`
-is also set, because the game needs its decrypted `.sdat` files to get past the title screen. It
+CTest registers `game_input` under the same conditions as `game_boot` when the build also has the
+`.sdat` keys, because the game needs its decrypted `.sdat` files to get past the title screen. It
 runs `dal_game` with `--sdata-cache`, `--pad-script tools/pad_scripts/leave_title.txt` and its own
 hdd directory `build/<preset>/game_hdd_input`, which the setup test `game_input_hdd_clean` deletes
 before every run, so that save data written after NEW GAME never reaches `game_boot` or the next
@@ -67,7 +67,7 @@ run. The pin file `cmake/game_input.cmake` holds the run length (`DAL_GAME_INPUT
 the milestone (`DAL_GAME_INPUT_MILESTONE`): the main thread opening `Script/Event.sdat`, which a
 run without input does not reach in that time. The time limit is the run length plus 60 s. The
 script and the pad log lines are described in
-[Keyboard and pad scripts](../README.md#keyboard-and-pad-scripts).
+[Pad script](runtime.md#pad-script) and [Log lines](runtime.md#log-lines).
 
 ## The `game_audio` test
 

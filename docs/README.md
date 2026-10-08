@@ -10,6 +10,7 @@ how the project works:
 | [emitter.md](emitter.md) | Turning the recovered functions into C, the contract header and the semantics harness |
 | [runtime.md](runtime.md) | Runtime internals: logging, census, memory map, dispatch, threads, system calls, HLE imports, headless policy, PNG decoding, default handlers |
 | [virtual-file-system.md](virtual-file-system.md) | Guest path mapping and the VFS configuration file |
+| [sdat.md](sdat.md) | Decrypting the game's `.sdat` files: where the keys come from, the build step and `dal_sdat` |
 | [rendering.md](rendering.md) | Fake RSX, the Vulkan renderer, and capture and replay |
 | [movies.md](movies.md) | cellSail HLE, PAMF demuxing, FFmpeg decoding and `dal_moviedump` |
 | [audio.md](audio.md) | `cellAudio` and `cellAtrac`, the audio engine and block clock, the WASAPI output, options, log lines and `dal_audiotool` |

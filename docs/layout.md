@@ -6,7 +6,7 @@
 | --- | --- |
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
 | `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `media`, `audio`, `game_main.cpp`; see [Running the game](../README.md#running-the-game)) and runtime-side tests |
-| `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see [SDAT files](../README.md#sdat-files) |
+| `tools/dal_sdat/`, `cmake/sdat_keys.cmake` | `dal_sdat`, the SDAT decryption tool, and its tests, and the pin of the downloaded key file; see [SDAT files](sdat.md) |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
 | `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used only to parse the VFS configuration |
