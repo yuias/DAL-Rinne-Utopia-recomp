@@ -1,13 +1,16 @@
 // lv2 event flags (syscalls 82, 83, 85, 87, 118, 132, 139), event queues (128-130, 133) and local
 // event ports (134-138). Behaviour follows RPCS3 `Emu/Cell/lv2/sys_event_flag.cpp` and
 // `sys_event.cpp`. Handlers run under the guest lock; a waiting call parks in blockingWait, which
-// gives the lock up. Deferred: waiters are served in arrival order, not by priority (see GuestLock),
-// and IPC keys and IPC ports are not supported.
+// gives the lock up. Event queues support IPC keys (a non-zero key is unique among live queues);
+// the host can look a queue up by key and send to it (eventQueueIdByKey, sendEventToQueue).
+// Deferred: waiters are served in arrival order, not by priority (see GuestLock), and IPC ports
+// (sys_event_port_connect_ipc) are not supported.
 
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -95,6 +98,7 @@ struct EventQueue {
   std::uint32_t protocol = 0;
   std::uint32_t type = 0;
   std::uint32_t size = 0;
+  std::uint64_t ipc_key = 0;  // 0: local queue, not findable by key
   bool exists = true;  // false once destroyed; ports that still point here are disconnected
   std::deque<Event> events;
   std::deque<QueueWaiter*> waiters;  // arrival order
@@ -116,6 +120,10 @@ constexpr std::uint32_t kEventPortIdBase = 0x0e000000;
 IdMap<EventFlag> g_flags(kEventFlagIdBase, kSyncIdStep);
 IdMap<EventQueue> g_queues(kEventQueueIdBase, kSyncIdStep);
 IdMap<EventPort> g_ports(kEventPortIdBase, kSyncIdStep);
+
+// Queue id by IPC key, for live queues created with a non-zero key. The key table is per object
+// type in lv2, and event queues are the only keyed objects here.
+std::map<std::uint64_t, std::uint32_t> g_queue_keys;
 
 // Hands `event` to the oldest receiver or stores it. RPCS3 `lv2_event_queue::send`.
 std::uint32_t queueSend(EventQueue& queue, const Event& event) {
@@ -142,9 +150,22 @@ std::uint32_t arg32(const DalPpuContext* ctx, int reg) {
 
 bool eventQueueExists(std::uint32_t id) { return g_queues.find(id) != nullptr; }
 
+std::uint32_t eventQueueIdByKey(std::uint64_t ipc_key) {
+  const auto it = g_queue_keys.find(ipc_key);
+  return it != g_queue_keys.end() ? it->second : 0;
+}
+
+std::uint32_t sendEventToQueue(std::uint32_t id, std::uint64_t source, std::uint64_t data1,
+                               std::uint64_t data2, std::uint64_t data3) {
+  const auto queue = g_queues.find(id);
+  if (queue == nullptr) return kCellEsrch;
+  return queueSend(*queue, Event{source, data1, data2, data3});
+}
+
 void resetEventObjects() {
   g_flags = IdMap<EventFlag>(kEventFlagIdBase, kSyncIdStep);
   g_queues = IdMap<EventQueue>(kEventQueueIdBase, kSyncIdStep);
+  g_queue_keys.clear();
   g_ports = IdMap<EventPort>(kEventPortIdBase, kSyncIdStep);
 }
 
@@ -313,7 +334,9 @@ void sysEventFlagGet(DalPpuContext* ctx, std::uint8_t* base) {
   setResultCode(ctx, kCellOk);
 }
 
-// 128 sys_event_queue_create(u32* id, sys_event_queue_attribute_t* attr, u64 ipc_key, s32 size)
+// 128 sys_event_queue_create(u32* id, sys_event_queue_attribute_t* attr, u64 ipc_key, s32 size):
+// a non-zero key is "create new": a live queue that already holds it makes the call fail with
+// EEXIST, without writing `*id`.
 void sysEventQueueCreate(DalPpuContext* ctx, std::uint8_t* base) {
   const std::uint32_t id_addr = arg32(ctx, 3);
   const std::uint32_t attr = arg32(ctx, 4);
@@ -333,11 +356,19 @@ void sysEventQueueCreate(DalPpuContext* ctx, std::uint8_t* base) {
     setResultCode(ctx, kCellEinval);
     return;
   }
+  const std::uint64_t ipc_key = ctx->gpr[5];
+  if (ipc_key != 0 && g_queue_keys.contains(ipc_key)) {
+    setResultCode(ctx, kCellEexist);
+    return;
+  }
   auto queue = std::make_shared<EventQueue>();
   queue->protocol = protocol;
   queue->type = type;
   queue->size = static_cast<std::uint32_t>(size);
-  dalWrite32(base, id_addr, g_queues.add(std::move(queue)));
+  queue->ipc_key = ipc_key;
+  const std::uint32_t id = g_queues.add(std::move(queue));
+  if (ipc_key != 0) g_queue_keys.emplace(ipc_key, id);
+  dalWrite32(base, id_addr, id);
   setResultCode(ctx, kCellOk);
 }
 
@@ -367,6 +398,7 @@ void sysEventQueueDestroy(DalPpuContext* ctx, std::uint8_t* base) {
   const bool had_waiters = !queue->waiters.empty();
   queue->waiters.clear();
   queue->exists = false;
+  if (queue->ipc_key != 0) g_queue_keys.erase(queue->ipc_key);
   g_queues.erase(id);
   if (had_waiters) queue->cv.notify_all();
   setResultCode(ctx, kCellOk);

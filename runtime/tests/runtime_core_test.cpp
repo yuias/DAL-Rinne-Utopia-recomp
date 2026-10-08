@@ -1692,6 +1692,129 @@ void testEventObjects() {
   dal::resetCensus();
 }
 
+void testEventQueueIpcKeys() {
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetSyncObjects();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t id_out = scratch, attr = scratch + 0x40, port_out = scratch + 0x80,
+                      sys_event = scratch + 0xc0;
+
+  auto a = makeCaller(0x01000000);
+  auto b = makeCaller(0x01000001);
+  std::lock_guard<dal::GuestLock> guard(dal::guestLock());
+
+  constexpr std::uint64_t kKey = 0x8000cafe02460300;  // the game mixer's first notify queue key
+  dalWrite32(base, attr, 1);      // protocol FIFO
+  dalWrite32(base, attr + 4, 1);  // PPU queue
+
+  // A keyed queue is found by its key.
+  CHECK(dal::eventQueueIdByKey(kKey) == 0);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey, 2) == 0);
+  const std::uint32_t first = dalRead32(base, id_out);
+  CHECK(first == 0x8d000000);
+  CHECK(dal::eventQueueIdByKey(kKey) == first);
+  CHECK(dal::eventQueueIdByKey(kKey + 1) == 0);
+  CHECK(dal::eventQueueIdByKey(0) == 0);
+
+  // A duplicate key fails with EEXIST and creates nothing: `*id` stays and the id counter does not
+  // move. The game's retry with key + 1 then succeeds.
+  dalWrite32(base, id_out, 0xdeadbeef);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey, 2) == err(dal::kCellEexist));
+  CHECK(dalRead32(base, id_out) == 0xdeadbeef);
+  CHECK(dal::eventQueueIdByKey(kKey) == first);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey + 1, 2) == 0);
+  const std::uint32_t second = dalRead32(base, id_out);
+  CHECK(second == first + 0x100);
+  CHECK(dal::eventQueueIdByKey(kKey + 1) == second);
+  CHECK(dal::eventQueueIdByKey(kKey) == first);
+
+  // Argument checks come before the key rules.
+  dalWrite32(base, attr + 4, 3);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey, 2) == err(dal::kCellEinval));
+  dalWrite32(base, attr + 4, 1);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey, 0) == err(dal::kCellEinval));
+
+  // Key 0 is local: any number of queues, none findable by key.
+  CHECK(syscallAs(*a, 128, id_out, attr, 0, 2) == 0);
+  const std::uint32_t local_a = dalRead32(base, id_out);
+  CHECK(syscallAs(*a, 128, id_out, attr, 0, 2) == 0);
+  const std::uint32_t local_b = dalRead32(base, id_out);
+  CHECK(local_a != local_b && local_a != 0 && local_b != 0);
+  CHECK(dal::eventQueueIdByKey(0) == 0);
+
+  // Destroying a queue forgets its key; the key can then be used again. A refused destroy (a
+  // receiver waits) keeps it.
+  {
+    std::atomic<bool> receiving{false};
+    std::uint64_t b_result = ~0ull;
+    std::thread worker([&] {
+      std::lock_guard<dal::GuestLock> worker_guard(dal::guestLock());
+      receiving = true;
+      b_result = syscallAs(*b, 130, second, sys_event, 0);
+    });
+    dal::guestLock().unlock();
+    while (!receiving) std::this_thread::yield();
+    dal::guestLock().lock();
+    CHECK(syscallAs(*a, 129, second, 0) == err(dal::kCellEbusy));
+    CHECK(dal::eventQueueIdByKey(kKey + 1) == second);
+
+    // sendEventToQueue wakes the blocked receiver; the event arrives in r4..r7.
+    CHECK(dal::sendEventToQueue(second, 0x1111, 1, 2, 3) == 0);
+    dal::guestLock().unlock();
+    worker.join();
+    dal::guestLock().lock();
+    CHECK(b_result == 0);
+    DalPpuContext* bctx = &b->context();
+    CHECK(bctx->gpr[4] == 0x1111 && bctx->gpr[5] == 1 && bctx->gpr[6] == 2 && bctx->gpr[7] == 3);
+  }
+  CHECK(syscallAs(*a, 129, second, 0) == 0);
+  CHECK(dal::eventQueueIdByKey(kKey + 1) == 0);
+  CHECK(dal::eventQueueIdByKey(kKey) == first);
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey + 1, 2) == 0);
+  const std::uint32_t reused = dalRead32(base, id_out);
+  CHECK(reused != second);  // ids are never handed out twice
+  CHECK(dal::eventQueueIdByKey(kKey + 1) == reused);
+
+  // With nobody waiting the event is stored; a size-2 queue refuses the third one.
+  CHECK(dal::sendEventToQueue(first, 0xa1, 10, 11, 12) == 0);
+  CHECK(dal::sendEventToQueue(first, 0xa2, 20, 21, 22) == 0);
+  CHECK(dal::sendEventToQueue(first, 0xa3, 30, 31, 32) == dal::kCellEbusy);
+  CHECK(dal::sendEventToQueue(0x8d000fff, 1, 2, 3, 4) == dal::kCellEsrch);
+  DalPpuContext* actx = &a->context();
+  CHECK(syscallAs(*a, 130, first, sys_event, 1000) == 0);
+  CHECK(actx->gpr[4] == 0xa1 && actx->gpr[5] == 10 && actx->gpr[6] == 11 && actx->gpr[7] == 12);
+  CHECK(syscallAs(*a, 130, first, sys_event, 1000) == 0);
+  CHECK(actx->gpr[4] == 0xa2 && actx->gpr[5] == 20 && actx->gpr[6] == 21 && actx->gpr[7] == 22);
+  CHECK(syscallAs(*a, 130, first, sys_event, 1000) == err(dal::kCellEtimedout));  // the third was lost
+
+  // A local port connected by queue id reaches a keyed queue (the game's shutdown path).
+  CHECK(syscallAs(*a, 134, port_out, 1, 0) == 0);
+  const std::uint32_t port = dalRead32(base, port_out);
+  CHECK(syscallAs(*a, 136, port, first) == 0);
+  CHECK(syscallAs(*a, 138, port, 0x51, 0x52, 0x53) == 0);
+  CHECK(syscallAs(*a, 130, first, sys_event, 1000) == 0);
+  CHECK(actx->gpr[4] == ((std::uint64_t{1} << 32) | port));
+  CHECK(actx->gpr[5] == 0x51 && actx->gpr[6] == 0x52 && actx->gpr[7] == 0x53);
+
+  // Destroying the keyed queue frees its key even though a port still points at it.
+  CHECK(syscallAs(*a, 129, first, 0) == 0);
+  CHECK(dal::eventQueueIdByKey(kKey) == 0);
+  CHECK(dal::sendEventToQueue(first, 1, 2, 3, 4) == dal::kCellEsrch);
+  CHECK(syscallAs(*a, 138, port, 1, 2, 3) == err(dal::kCellEnotconn));
+  CHECK(syscallAs(*a, 128, id_out, attr, kKey, 2) == 0);
+
+  p.main.free(scratch);
+  dal::resetSyncObjects();
+  CHECK(dal::eventQueueIdByKey(kKey) == 0);  // a reset forgets the keys too
+  dal::setLogSink({});
+  dal::resetCensus();
+}
+
 void testSpuAndSysmodule() {
   std::vector<std::string> lines;
   dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
@@ -7599,6 +7722,7 @@ int main(int argc, char** argv) {
   testSysPrxForUser();
   testMutexAndCond();
   testEventObjects();
+  testEventQueueIpcKeys();
   testSpuAndSysmodule();
   testSpurs();
   testCellGcmSys();

@@ -104,6 +104,16 @@ void createProcessSyncObjects(std::uint8_t* base);
 // True while the event queue `id` exists (sys_event.cpp).
 bool eventQueueExists(std::uint32_t id);
 
+// Id of the live event queue created with `ipc_key`, or 0 (also for key 0, which is local and never
+// registered). Under the guest lock.
+std::uint32_t eventQueueIdByKey(std::uint64_t ipc_key);
+
+// Sends an event to queue `id` like a connected port: hands it to the oldest receiver or stores it.
+// Returns kCellOk, kCellEbusy (queue full) or kCellEsrch (no such queue). Under the guest lock; may
+// be called from a host thread that holds it.
+std::uint32_t sendEventToQueue(std::uint32_t id, std::uint64_t source, std::uint64_t data1,
+                               std::uint64_t data2, std::uint64_t data3);
+
 // Forgets every event flag, event queue and event port (sys_event.cpp).
 void resetEventObjects();
 
