@@ -16,6 +16,10 @@
 #include <string_view>
 #include <vector>
 
+#include "audio/audio_engine.h"
+#include "audio/audio_output.h"
+#include "audio/wasapi_output.h"
+#include "audio/wav_file.h"
 #include "core/boot.h"
 #include "core/census.h"
 #include "core/elf_loader.h"
@@ -25,6 +29,7 @@
 #include "core/param_sfo.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
+#include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_script.h"
@@ -51,6 +56,8 @@ struct Options {
   std::string dialog_answer;
   std::string pad;  // --pad as given; empty until the defaults are settled after all arguments
   std::string pad_script;
+  std::string audio;  // --audio as given; empty until the defaults are settled after all arguments
+  std::string audio_dump;
   std::vector<dal::PadScriptEvent> pad_script_events;
   // Set when the keyboard is the pad. The window thread and the script thread write to it.
   std::shared_ptr<dal::KeyboardPadState> keyboard;
@@ -215,7 +222,7 @@ void printUsage() {
       "                [--log-level trace|debug|info|warn|error]\n"
       "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard]\n"
-      "                [--pad-script FILE]\n"
+      "                [--pad-script FILE] [--audio none|wasapi] [--audio-dump FILE]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
       "                [--vk-validation] [--window]\n",
@@ -296,6 +303,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         return false;
       }
       opt.pad_script_events = std::move(*events);
+    } else if (arg == "--audio") {
+      std::string name;
+      if (!value(name)) return false;
+      if (name != "none" && name != "wasapi") {
+        std::fprintf(stderr, "error: --audio needs none or wasapi\n");
+        return false;
+      }
+      opt.audio = name;
+    } else if (arg == "--audio-dump") {
+      if (!value(opt.audio_dump)) return false;
     } else if (arg == "--render") {
       std::string name;
       if (!value(name)) return false;
@@ -366,6 +383,17 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     std::fputs("error: --pad-script needs --pad keyboard\n", stderr);
     return false;
   }
+  // A window means somebody is listening; unattended runs must not need a sound device.
+  if (opt.audio.empty()) opt.audio = opt.window ? "wasapi" : "none";
+  if (!opt.audio_dump.empty()) {
+    // The engine creates the file again on its own thread; creating it here makes a bad path a
+    // usage error instead of a warning in the middle of a run.
+    const auto probe = dal::WavWriter::create(opt.audio_dump, dal::kAudioSampleRate, dal::kAudioOutputChannels);
+    if (!probe) {
+      std::fprintf(stderr, "error: --audio-dump %s: %s\n", opt.audio_dump.c_str(), probe.error().c_str());
+      return false;
+    }
+  }
   return true;
 }
 
@@ -403,6 +431,38 @@ void loadGameParamSfo() {
                resolution == sfo->ints.end() ? 0x1u : resolution->second,
                sound_format == sfo->ints.end() ? 0x1u : sound_format->second);
   dal::setGameParamSfo(std::move(*sfo));
+}
+
+// The census is printed on every stop path and the process then ends without running destructors,
+// so this is also where an --audio-dump file gets its final header.
+std::vector<std::string> audioCensusLines() {
+  const dal::AudioEngineStats engine = dal::audioEngineStats();
+  dal::finishAudioDump();
+  if (engine.output.empty()) return {};  // cellAudioInit never ran
+
+  const dal::CellAudioStats ports = dal::cellAudioPorts().stats();
+  std::vector<std::string> lines;
+  lines.push_back(std::format(
+      "audio {}: {} blocks ({} non-silent), skipped {}, dropped {}, underrun {} frames, notify {} sent {} failed, "
+      "max producer {:.2f} ms",
+      engine.output, engine.blocks, engine.non_silent_blocks, engine.skipped_blocks,
+      engine.output_stats.blocks_dropped, engine.output_stats.underrun_frames, ports.notifies_sent,
+      ports.notifies_failed, static_cast<double>(engine.max_producer_time.count()) / 1000.0));
+  std::string channels;
+  for (std::size_t c = 0; c < ports.nonzero_samples.size(); ++c) {
+    channels += std::format("{}{}:{}", c == 0 ? "" : " ", c, ports.nonzero_samples[c]);
+  }
+  lines.push_back(std::format("audio input: {} periods, non-zero samples per channel {}", ports.periods, channels));
+  return lines;
+}
+
+void configureAudio(const Options& opt) {
+  dal::AudioEngineConfig config;
+  // Only the wasapi choice builds a device output, so a run without it never touches COM.
+  if (opt.audio == "wasapi") config.make_output = [] { return dal::makeWasapiOutput(); };
+  config.dump = opt.audio_dump;
+  dal::configureAudioEngine(std::move(config));
+  dal::setAudioCensusProvider(&audioCensusLines);
 }
 
 }  // namespace
@@ -536,6 +596,8 @@ int main(int argc, char** argv) {
   } else {
     dal::setPadBackend(opt.pad);
   }
+
+  configureAudio(opt);
 
   // The device is created on the RSX thread when it starts, so it belongs to that thread.
   if (opt.render_vulkan) {

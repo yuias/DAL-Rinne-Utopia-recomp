@@ -33,6 +33,7 @@ struct CensusState {
   CensusResetFn unimplemented_reset = nullptr;
   CensusWriterFn rsx_stop_writer = nullptr;
   SailCensusFn sail_fn = nullptr;
+  AudioCensusFn audio_fn = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -164,6 +165,12 @@ void setSailCensusProvider(SailCensusFn fn) {
   s.sail_fn = fn;
 }
 
+void setAudioCensusProvider(AudioCensusFn fn) {
+  CensusState& s = state();
+  std::lock_guard lock(s.mutex);
+  s.audio_fn = fn;
+}
+
 void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset) {
   CensusState& s = state();
   std::lock_guard lock(s.mutex);
@@ -184,6 +191,7 @@ std::string formatCensus() {
   RsxCensusFn rsx_fn = nullptr;
   RsxUnimplementedFn unimplemented_fn = nullptr;
   SailCensusFn sail_fn = nullptr;
+  AudioCensusFn audio_fn = nullptr;
   {
     std::lock_guard lock(s.mutex);
 
@@ -228,6 +236,7 @@ std::string formatCensus() {
     rsx_fn = s.rsx_fn;
     unimplemented_fn = s.unimplemented_fn;
     sail_fn = s.sail_fn;
+    audio_fn = s.audio_fn;
   }
 
   if (rsx_fn != nullptr) {
@@ -268,6 +277,16 @@ std::string formatCensus() {
       out += std::format("\ncensus: sail {} movies", movies.size());
       for (const std::string& movie : movies) {
         out += "\n  " + movie;
+      }
+    }
+  }
+
+  if (audio_fn != nullptr) {
+    const std::vector<std::string> audio = audio_fn();
+    if (!audio.empty()) {
+      out += "\ncensus: audio";
+      for (const std::string& line : audio) {
+        out += "\n  " + line;
       }
     }
   }
@@ -321,6 +340,7 @@ void resetCensus() {
     s.rsx_stop_writer = nullptr;
     s.unimplemented_fn = nullptr;
     s.sail_fn = nullptr;
+    s.audio_fn = nullptr;
     unimplemented_reset = s.unimplemented_reset;
     s.unimplemented_reset = nullptr;
   }
