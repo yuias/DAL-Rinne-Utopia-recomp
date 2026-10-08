@@ -49,7 +49,9 @@ constexpr std::uint32_t kDeviceReadyOffset = 0x30;
 constexpr std::uint64_t kFlipTimeOffsetUs = 1000000;
 
 constexpr std::uint32_t kMethodCount = 0x4000;  // 16-bit register offsets, 4 bytes apart
-constexpr std::uint32_t kPumpBudgetWords = 4096;
+constexpr std::uint32_t kPumpSliceWords = 128;  // words per pump() call inside one lock hold
+// Checked after each slice, so one slice (a draw's write() can take about 1 ms) can exceed it.
+constexpr std::chrono::microseconds kMaxGuestLockHold{300};
 
 // Names of the registers the consumer interprets. The census prints hex for the others.
 struct MethodName {
@@ -584,12 +586,18 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
       std::vector<RsxCommand> commands;
       std::vector<RsxConsumer::FinishedCapture> captures;
       {
+        // The guest lock is a FIFO ticket lock shared with the audio engine and every guest thread, and
+        // the frame builder copies vertex and texture bytes inside write(). Pumping in small slices and
+        // leaving once the hold budget is spent lets the waiters in between; the loop re-queues for the rest.
         std::lock_guard<GuestLock> lock(guestLock());
+        const auto hold_start = Clock::now();
         if (pending_tick) {
           consumer->vblankTick();
           pending_tick = false;
         }
-        status = consumer->pump(kPumpBudgetWords);
+        do {
+          status = consumer->pump(kPumpSliceWords);
+        } while (status == FifoStatus::Budget && Clock::now() - hold_start < kMaxGuestLockHold);
         commands = consumer->takeCommands();
         captures = consumer->takeCaptures();
       }
