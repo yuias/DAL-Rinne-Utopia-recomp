@@ -192,6 +192,14 @@ void resetCellSail();
 // Handlers of the cellPamf module: cellPamfReaderGetNumberOfSpecificStreams.
 std::span<const HleEntry> cellPamfHandlers();
 
+// Handlers of the cellAudio module: Init, Quit, the port calls, GetPortConfig, GetPortBlockTag,
+// GetPortTimestamp and the notify queue registration. Init starts the audio engine.
+std::span<const HleEntry> cellAudioHandlers();
+
+// Forgets the cellAudio state (ports, registrations, counters) without touching guest memory or the
+// audio engine. Intended for tests.
+void resetCellAudio();
+
 // Handlers of the cellAtrac module: cellAtracSetDataAndGetMemSize only (a placeholder).
 std::span<const HleEntry> cellAtracHandlers();
 

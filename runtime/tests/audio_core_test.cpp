@@ -6,7 +6,9 @@
 // wavstat); without one they go to a temporary directory that is removed at the end.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -30,7 +32,13 @@
 #include "audio/audio_engine.h"
 #include "audio/audio_output.h"
 #include "audio/wav_file.h"
+#include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/threads.h"
+#include "dal/ppu_context.h"
+#include "hle/cell_audio_ports.h"
+#include "hle/hle.h"
+#include "lv2/sys_sync.h"
 
 namespace {
 
@@ -1002,6 +1010,437 @@ void testEngineResumesAfterStop() {
   }
 }
 
+// ---- cellAudio on synthetic guest memory ----
+
+constexpr std::uint32_t kAudioNotInit = 0x80310703;
+constexpr std::uint32_t kAudioAlreadyInit = 0x80310701;
+constexpr std::uint32_t kAudioParam = 0x80310704;
+constexpr std::uint32_t kAudioPortFull = 0x80310705;
+constexpr std::uint32_t kAudioAlreadyRun = 0x80310706;
+constexpr std::uint32_t kAudioPortNotOpen = 0x80310707;
+constexpr std::uint32_t kAudioPortNotRun = 0x80310708;
+constexpr std::uint32_t kAudioTransEvent = 0x80310709;
+constexpr std::uint32_t kAudioTagNotFound = 0x8031070f;
+constexpr std::uint64_t kNotifyKey = 0x8000cafe02460300;  // the game mixer's first notify queue key
+
+// One simulated guest thread that holds the guest lock, with guest memory reserved and the
+// cellAudio state, the event objects and the audio engine reset. Release the lock before the engine
+// is stopped: its producer may be waiting for it.
+class AudioGuest {
+ public:
+  AudioGuest() : caller_(0x01000000, dal::GuestThreadParams{}, 0, 0) {
+    dal::setLogSink([](std::string_view) {});
+    dal::resetSyncObjects();
+    dal::resetCellAudio();
+    dal::configureAudioEngine({});
+    CHECK(dal::process().memory.reserve());
+    base_ = dal::process().memory.base();
+    scratch_ = dal::process().main.allocate(0x10000, 0x10000);
+    CHECK(scratch_ != 0);
+    dal::guestLock().lock();
+  }
+  ~AudioGuest() {
+    dal::guestLock().unlock();
+    CHECK(dal::stopAudioEngineForTest());
+    dal::resetCellAudio();
+    dal::setLogSink({});
+  }
+
+  std::uint8_t* base() const { return base_; }
+  // Guest address of scratch byte `offset`.
+  std::uint32_t at(std::uint32_t offset) const { return scratch_ + offset; }
+
+  // Calls the handler of a cellAudio import and returns its result as the guest sees it in r3.
+  std::uint32_t call(std::string_view name, std::uint64_t r3 = 0, std::uint64_t r4 = 0, std::uint64_t r5 = 0) {
+    for (const dal::HleEntry& entry : dal::cellAudioHandlers()) {
+      if (name != entry.name) continue;
+      DalPpuContext* ctx = &caller_.context();
+      ctx->gpr[3] = r3;
+      ctx->gpr[4] = r4;
+      ctx->gpr[5] = r5;
+      entry.handler(ctx, base_);
+      return static_cast<std::uint32_t>(ctx->gpr[3]);
+    }
+    CHECK(false);
+    return 0;
+  }
+
+  // cellAudioInit, then stops the engine it started, so that only runPeriod drives periods: a real
+  // producer call that sneaks in while a timed receive gives up the guest lock would add a notify.
+  // A plain stop request is not enough, because one queued producer call still completes.
+  std::uint32_t initWithoutEngine() {
+    const std::uint32_t result = call("cellAudioInit");
+    dal::guestLock().unlock();
+    CHECK(dal::stopAudioEngineForTest());
+    dal::guestLock().lock();
+    return result;
+  }
+
+  // Writes a CellAudioPortParam at scratch `offset` and opens a port with it.
+  std::uint32_t open(std::uint32_t offset, std::uint64_t channels, std::uint64_t blocks, std::uint64_t attr,
+                     float level, std::uint32_t port_out) {
+    dalWrite64(base_, at(offset), channels);
+    dalWrite64(base_, at(offset + 8), blocks);
+    dalWrite64(base_, at(offset + 0x10), attr);
+    dalWrite32(base_, at(offset + 0x18), std::bit_cast<std::uint32_t>(level));
+    return call("cellAudioPortOpen", at(offset), port_out);
+  }
+
+  // Creates an event queue with `key` (PPU queue, FIFO, depth 2) through the syscall; returns its id.
+  std::uint32_t createQueue(std::uint64_t key) {
+    dalWrite32(base_, at(0x400), 1);
+    dalWrite32(base_, at(0x404), 1);
+    const std::uint64_t result = syscall(128, at(0x410), at(0x400), key, 2);
+    CHECK(result == 0);
+    return dalRead32(base_, at(0x410));
+  }
+
+  // The result of `sys_event_queue_receive(id, buffer, 1 ms)`; the event words come back in r4..r7.
+  std::uint64_t receive(std::uint32_t id, std::array<std::uint64_t, 4>& event) {
+    const std::uint64_t result = syscall(130, id, at(0x440), 1000);
+    DalPpuContext* ctx = &caller_.context();
+    event = {ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], ctx->gpr[7]};
+    return result;
+  }
+
+  std::uint64_t syscall(std::uint32_t number, std::uint64_t r3, std::uint64_t r4 = 0, std::uint64_t r5 = 0,
+                        std::uint64_t r6 = 0) {
+    DalPpuContext* ctx = &caller_.context();
+    ctx->gpr[11] = number;
+    ctx->gpr[3] = r3;
+    ctx->gpr[4] = r4;
+    ctx->gpr[5] = r5;
+    ctx->gpr[6] = r6;
+    dalSyscall(ctx, base_, 0x10000);
+    return ctx->gpr[3];
+  }
+
+  // The 32-bit result of the last syscall as a signed lv2 error.
+  static std::uint64_t err(std::uint32_t code) {
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(code)));
+  }
+
+ private:
+  dal::GuestThread caller_;
+  std::uint8_t* base_ = nullptr;
+  std::uint32_t scratch_ = 0;
+};
+
+void writeFloat(std::uint8_t* base, std::uint32_t addr, float value) {
+  dalWrite32(base, addr, std::bit_cast<std::uint32_t>(value));
+}
+
+// Runs one period and returns the stereo block.
+dal::AudioBlock runPeriod(AudioGuest& guest, std::uint64_t now_us) {
+  dal::AudioBlock out{};
+  dal::cellAudioPorts().producePeriod(guest.base(), now_us, out);
+  return out;
+}
+
+void testCellAudioStateErrors() {
+  AudioGuest guest;
+  // Everything but Init needs Init first.
+  for (const char* name : {"cellAudioQuit", "cellAudioPortOpen", "cellAudioGetPortConfig", "cellAudioPortStart",
+                           "cellAudioPortStop", "cellAudioPortClose", "cellAudioGetPortBlockTag",
+                           "cellAudioGetPortTimestamp", "cellAudioSetNotifyEventQueue",
+                           "cellAudioRemoveNotifyEventQueue"}) {
+    CHECK(guest.call(name, guest.at(0), guest.at(0x40), guest.at(0x80)) == kAudioNotInit);
+  }
+  CHECK(guest.initWithoutEngine() == 0);
+  CHECK(guest.call("cellAudioInit") == kAudioAlreadyInit);
+  CHECK(guest.call("cellAudioQuit") == 0);
+  CHECK(guest.call("cellAudioQuit") == kAudioNotInit);
+  CHECK(dal::cellAudioHandlers().size() == 11);
+}
+
+void testCellAudioPortOpenAndConfig() {
+  AudioGuest guest;
+  std::uint8_t* base = guest.base();
+  CHECK(guest.initWithoutEngine() == 0);
+
+  // The game's parameters.
+  CHECK(guest.open(0x00, 8, 8, 0, 1.0f, guest.at(0x60)) == 0);
+  CHECK(dalRead32(base, guest.at(0x60)) == 0);
+  CHECK(guest.call("cellAudioGetPortConfig", 0, guest.at(0x80)) == 0);
+  const std::uint32_t cell = dalRead32(base, guest.at(0x80));
+  const std::uint32_t memory = dalRead32(base, guest.at(0x80 + 0x1c));
+  CHECK(cell != 0 && cell % 16 == 0 && dal::process().memory.isCommitted(cell, 8));
+  CHECK(dalRead64(base, cell) == 0);
+  CHECK(memory != 0 && memory % 0x10000 == 0 && dal::process().memory.isCommitted(memory, 0x10000));
+  CHECK(dalRead32(base, guest.at(0x80 + 4)) == 1);  // opened
+  CHECK(dalRead64(base, guest.at(0x80 + 8)) == 8);
+  CHECK(dalRead64(base, guest.at(0x80 + 0x10)) == 8);
+  CHECK(dalRead32(base, guest.at(0x80 + 0x18)) == 0x10000);
+
+  // Start zeroes the port memory and marks the port running.
+  dalWrite32(base, memory + 0x100, 0x3f800000);
+  CHECK(guest.call("cellAudioPortStart", 0) == 0);
+  CHECK(dalRead32(base, memory + 0x100) == 0);
+  CHECK(guest.call("cellAudioGetPortConfig", 0, guest.at(0x80)) == 0);
+  CHECK(dalRead32(base, guest.at(0x80 + 4)) == 2);
+  CHECK(guest.call("cellAudioPortStart", 0) == kAudioAlreadyRun);
+
+  // A second port gets the next number and its own cell and memory.
+  CHECK(guest.open(0x00, 2, 4, 0, 1.0f, guest.at(0x60)) == 0);
+  CHECK(dalRead32(base, guest.at(0x60)) == 1);
+  CHECK(guest.call("cellAudioGetPortConfig", 1, guest.at(0xc0)) == 0);
+  CHECK(dalRead32(base, guest.at(0xc0)) == cell + 16);
+  CHECK(dalRead32(base, guest.at(0xc0 + 0x1c)) != memory);
+  CHECK(dalRead32(base, guest.at(0xc0 + 0x18)) == 2 * 4 * 1024);
+
+  // Stop, start again; closing works from any open state; the number is reused.
+  CHECK(guest.call("cellAudioPortStop", 1) == kAudioPortNotRun);
+  CHECK(guest.call("cellAudioPortStop", 0) == 0);
+  CHECK(guest.call("cellAudioPortStop", 0) == kAudioPortNotRun);
+  CHECK(guest.call("cellAudioPortStart", 0) == 0);
+  CHECK(guest.call("cellAudioPortClose", 0) == 0);
+  CHECK(guest.call("cellAudioPortClose", 0) == kAudioPortNotOpen);
+  CHECK(guest.call("cellAudioPortStart", 0) == kAudioPortNotOpen);
+  CHECK(guest.call("cellAudioGetPortConfig", 0, guest.at(0x80)) == 0);
+  CHECK(dalRead32(base, guest.at(0x80 + 4)) == 0x1010);
+  CHECK(guest.open(0x00, 8, 8, 0, 1.0f, guest.at(0x60)) == 0);
+  CHECK(dalRead32(base, guest.at(0x60)) == 0);
+
+  // Argument checks.
+  CHECK(guest.call("cellAudioGetPortConfig", 8, guest.at(0x80)) == kAudioParam);
+  CHECK(guest.call("cellAudioGetPortConfig", 0, 0) == kAudioParam);
+  CHECK(guest.call("cellAudioPortStart", 8) == kAudioParam);
+  CHECK(guest.call("cellAudioPortStop", 8) == kAudioParam);
+  CHECK(guest.call("cellAudioPortClose", 8) == kAudioParam);
+  CHECK(guest.call("cellAudioPortOpen", 0, guest.at(0x60)) == kAudioParam);
+  CHECK(guest.call("cellAudioPortOpen", guest.at(0), 0) == kAudioParam);
+  CHECK(guest.open(0x00, 4, 8, 0, 1.0f, guest.at(0x60)) == kAudioParam);
+  CHECK(guest.open(0x00, 2, 3, 0, 1.0f, guest.at(0x60)) == kAudioParam);
+  CHECK(guest.open(0x00, 2, 64, 0, 1.0f, guest.at(0x60)) == kAudioParam);
+
+  // Eight ports exist; a ninth open fails.
+  for (int i = 0; i < 6; ++i) CHECK(guest.open(0x00, 2, 2, 0, 1.0f, guest.at(0x60)) == 0);
+  CHECK(guest.open(0x00, 2, 2, 0, 1.0f, guest.at(0x60)) == kAudioPortFull);
+
+  CHECK(guest.call("cellAudioQuit") == 0);
+}
+
+void testCellAudioTagsAndTimestamps() {
+  AudioGuest guest;
+  std::uint8_t* base = guest.base();
+  CHECK(guest.initWithoutEngine() == 0);
+
+  // Periods before any port is open still count, so tags do not start at 0.
+  constexpr std::uint64_t kStart = 1'000'000;
+  for (std::uint64_t i = 0; i < 5; ++i) runPeriod(guest, kStart + i * 5333);
+  CHECK(dal::cellAudioPorts().stats().periods == 5);
+
+  CHECK(guest.open(0x00, 8, 8, 0, 1.0f, guest.at(0x60)) == 0);
+  CHECK(guest.call("cellAudioGetPortConfig", 0, guest.at(0x80)) == 0);
+  const std::uint32_t cell = dalRead32(base, guest.at(0x80));
+  CHECK(guest.call("cellAudioPortStart", 0) == 0);
+
+  const std::uint64_t t5 = kStart + 5 * 5333;
+  const std::uint32_t tag_out = guest.at(0x100);
+  const std::uint32_t stamp_out = guest.at(0x108);
+  CHECK(guest.call("cellAudioGetPortBlockTag", 0, 0, tag_out) == 0);
+  CHECK(dalRead64(base, tag_out) == 5);
+
+  // Period k publishes the next block with tag k; the cell holds the block the library mixes next.
+  for (std::uint64_t i = 0; i < 12; ++i) {
+    runPeriod(guest, t5 + i * 5333);
+    const std::uint64_t index = (i + 1) % 8;
+    CHECK(dalRead64(base, cell) == index);
+    CHECK(guest.call("cellAudioGetPortBlockTag", 0, index, tag_out) == 0);
+    CHECK(dalRead64(base, tag_out) == 5 + i);
+    CHECK(guest.call("cellAudioGetPortBlockTag", 0, (index + 1) % 8, tag_out) == 0);
+    if ((index + 1) % 8 > index) CHECK(dalRead64(base, tag_out) == 5 + i + 1);
+  }
+  // 12 periods since open: the latest period is number 16 at t5 + 11 periods.
+  const std::uint64_t latest_time = t5 + 11 * 5333;
+  dalWrite64(base, stamp_out, 0xdeadbeef);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 16, stamp_out) == 0);
+  CHECK(dalRead64(base, stamp_out) == latest_time);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 13, stamp_out) == 0);
+  CHECK(dalRead64(base, stamp_out) == latest_time - 3 * 5333);
+  // No history: tag 0 answers too, extrapolated back at one period per tag.
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 0, stamp_out) == 0);
+  CHECK(dalRead64(base, stamp_out) == latest_time - 16 * 5333);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 15, 0) == 0);  // null output: nothing written
+
+  // A tag that was never issued: error, output untouched.
+  dalWrite64(base, stamp_out, 0xdeadbeef);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 17, stamp_out) == kAudioTagNotFound);
+  CHECK(dalRead64(base, stamp_out) == 0xdeadbeef);
+
+  // Stopping freezes the counters but they still answer.
+  CHECK(guest.call("cellAudioPortStop", 0) == 0);
+  runPeriod(guest, t5 + 20 * 5333);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 16, stamp_out) == 0);
+  CHECK(dalRead64(base, stamp_out) == latest_time);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 0, 17, stamp_out) == kAudioTagNotFound);
+
+  // Argument checks: block number, port number, closed port, unwritten output.
+  CHECK(guest.call("cellAudioGetPortBlockTag", 0, 8, tag_out) == kAudioParam);
+  CHECK(guest.call("cellAudioGetPortBlockTag", 8, 0, tag_out) == kAudioParam);
+  CHECK(guest.call("cellAudioGetPortBlockTag", 1, 0, tag_out) == kAudioPortNotOpen);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 1, 0, stamp_out) == kAudioPortNotOpen);
+  CHECK(guest.call("cellAudioGetPortTimestamp", 8, 0, stamp_out) == kAudioParam);
+  CHECK(guest.call("cellAudioGetPortBlockTag", 0, 0, 0) == 0);
+}
+
+void testCellAudioMixing() {
+  AudioGuest guest;
+  std::uint8_t* base = guest.base();
+  CHECK(guest.initWithoutEngine() == 0);
+
+  // 8 channels: a ramp on all of them. Only the front pair reaches the output; the rest is counted.
+  CHECK(guest.open(0x00, 8, 8, 0, 0.25f, guest.at(0x60)) == 0);  // attr 0: the level argument is ignored
+  CHECK(guest.call("cellAudioGetPortConfig", 0, guest.at(0x80)) == 0);
+  const std::uint32_t cell = dalRead32(base, guest.at(0x80));
+  const std::uint32_t memory = dalRead32(base, guest.at(0x80 + 0x1c));
+
+  // Opened but not started: contributes nothing, the cell stays.
+  writeFloat(base, memory, 0.5f);
+  CHECK(std::ranges::all_of(runPeriod(guest, 1000), [](float s) { return s == 0.0f; }));
+  CHECK(dalRead64(base, cell) == 0);
+
+  CHECK(guest.call("cellAudioPortStart", 0) == 0);
+  for (std::uint32_t frame = 0; frame < 256; ++frame) {
+    for (std::uint32_t channel = 0; channel < 8; ++channel) {
+      const float value = channel == 0 ? static_cast<float>(frame) / 512.0f
+                          : channel == 1 ? -static_cast<float>(frame) / 1024.0f
+                                         : 0.25f * static_cast<float>(channel);
+      writeFloat(base, memory + (frame * 8 + channel) * 4, value);
+    }
+  }
+  const dal::AudioBlock out = runPeriod(guest, 2000);
+  bool front_intact = true;
+  for (std::uint32_t frame = 0; frame < 256; ++frame) {
+    front_intact = front_intact && out[2 * frame] == static_cast<float>(frame) / 512.0f &&
+                   out[2 * frame + 1] == -static_cast<float>(frame) / 1024.0f;
+  }
+  CHECK(front_intact);
+
+  // The consumed block is zeroed and the index advanced as a big-endian u64.
+  bool zeroed = true;
+  for (std::uint32_t offset = 0; offset < 0x2000; offset += 4) zeroed = zeroed && dalRead32(base, memory + offset) == 0;
+  CHECK(zeroed);
+  CHECK(base[cell + 7] == 1 && dalRead64(base, cell) == 1);
+
+  const dal::CellAudioStats stats = dal::cellAudioPorts().stats();
+  CHECK(stats.nonzero_samples[0] == 255 && stats.nonzero_samples[1] == 255);
+  for (std::size_t channel = 2; channel < 8; ++channel) CHECK(stats.nonzero_samples[channel] == 256);
+
+  // Block 1 was never written: the next period is silent and the index moves on.
+  CHECK(std::ranges::all_of(runPeriod(guest, 3000), [](float s) { return s == 0.0f; }));
+  CHECK(dalRead64(base, cell) == 2);
+  CHECK(guest.call("cellAudioPortClose", 0) == 0);
+
+  // 2 channels: scaled by the initial level only when the attribute asks for it; ports add up.
+  CHECK(guest.open(0x00, 2, 2, 0x1000, 0.5f, guest.at(0x60)) == 0);
+  const std::uint32_t scaled = dalRead32(base, guest.at(0x60));
+  CHECK(guest.open(0x00, 2, 4, 0, 0.25f, guest.at(0x60)) == 0);
+  const std::uint32_t plain = dalRead32(base, guest.at(0x60));
+  CHECK(guest.call("cellAudioGetPortConfig", scaled, guest.at(0x80)) == 0);
+  const std::uint32_t scaled_memory = dalRead32(base, guest.at(0x80 + 0x1c));
+  CHECK(guest.call("cellAudioGetPortConfig", plain, guest.at(0xc0)) == 0);
+  const std::uint32_t plain_memory = dalRead32(base, guest.at(0xc0 + 0x1c));
+  CHECK(guest.call("cellAudioPortStart", scaled) == 0);
+  CHECK(guest.call("cellAudioPortStart", plain) == 0);
+  for (std::uint32_t frame = 0; frame < 256; ++frame) {
+    writeFloat(base, scaled_memory + frame * 8, 0.25f);
+    writeFloat(base, scaled_memory + frame * 8 + 4, 0.5f);
+    writeFloat(base, plain_memory + frame * 8, 0.125f);
+    writeFloat(base, plain_memory + frame * 8 + 4, 0.0625f);
+  }
+  // Frame 255 overdrives: 3.0 * 0.5 + 0.125 clamps to 1.
+  writeFloat(base, scaled_memory + 255 * 8, 3.0f);
+  writeFloat(base, scaled_memory + 255 * 8 + 4, -3.0f);
+  const dal::AudioBlock mixed = runPeriod(guest, 4000);
+  CHECK(mixed[0] == 0.25f && mixed[1] == 0.3125f);
+  CHECK(mixed[2 * 255] == 1.0f && mixed[2 * 255 + 1] == -1.0f);
+  CHECK(dalRead64(base, dalRead32(base, guest.at(0x80))) == 1);
+  CHECK(dalRead64(base, dalRead32(base, guest.at(0xc0))) == 1);
+}
+
+void testCellAudioNotify() {
+  AudioGuest guest;
+  std::uint8_t* base = guest.base();
+  (void)base;
+  CHECK(guest.initWithoutEngine() == 0);
+  const std::uint32_t queue = guest.createQueue(kNotifyKey);
+  CHECK(queue != 0);
+
+  // Unknown keys, the local key and a second registration of the same queue fail.
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", kNotifyKey + 1) == kAudioTransEvent);
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", 0) == kAudioTransEvent);
+  CHECK(guest.call("cellAudioRemoveNotifyEventQueue", kNotifyKey) == kAudioTransEvent);
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", kNotifyKey) == 0);
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", kNotifyKey) == kAudioTransEvent);
+
+  // One event per period, even with no port started: source, then three zeros.
+  std::array<std::uint64_t, 4> event{};
+  runPeriod(guest, 1000);
+  CHECK(guest.receive(queue, event) == 0);
+  CHECK(event[0] == 0x1'0e00'0000 && event[1] == 0 && event[2] == 0 && event[3] == 0);
+
+  // The queue holds two events; the third is refused and only counted.
+  runPeriod(guest, 2000);
+  runPeriod(guest, 3000);
+  runPeriod(guest, 4000);
+  const dal::CellAudioStats stats = dal::cellAudioPorts().stats();
+  CHECK(stats.notifies_sent == 3 && stats.notifies_failed == 1);
+  CHECK(guest.receive(queue, event) == 0);
+  CHECK(guest.receive(queue, event) == 0);
+  CHECK(guest.receive(queue, event) == AudioGuest::err(0x8001000B));  // the fourth event never existed
+
+  // After Remove nothing more arrives.
+  CHECK(guest.call("cellAudioRemoveNotifyEventQueue", kNotifyKey) == 0);
+  CHECK(guest.call("cellAudioRemoveNotifyEventQueue", kNotifyKey) == kAudioTransEvent);
+  runPeriod(guest, 5000);
+  CHECK(guest.receive(queue, event) == AudioGuest::err(0x8001000B));
+  CHECK(dal::cellAudioPorts().stats().notifies_sent == 3);
+
+  // A destroyed queue only costs failed notifies, and its registration goes at the next Set.
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", kNotifyKey) == 0);
+  CHECK(guest.syscall(129, queue, 0) == 0);
+  runPeriod(guest, 6000);
+  CHECK(dal::cellAudioPorts().stats().notifies_failed == 2);
+  const std::uint32_t second = guest.createQueue(kNotifyKey + 1);
+  CHECK(guest.call("cellAudioSetNotifyEventQueue", kNotifyKey + 1) == 0);
+  runPeriod(guest, 7000);
+  CHECK(dal::cellAudioPorts().stats().notifies_failed == 2);
+  CHECK(dal::cellAudioPorts().stats().notifies_sent == 4);
+  CHECK(guest.receive(second, event) == 0);
+  // The third successful registration since reset has its own source.
+  CHECK(event[0] == 0x1'0e00'0000 + 2 * 0x100);
+}
+
+void testCellAudioEngine() {
+  AudioGuest guest;
+  CHECK(guest.call("cellAudioInit") == 0);
+  const auto periods = [] { return dal::cellAudioPorts().stats().periods; };
+
+  // Init starts the engine, which calls the producer once the guest lock is free.
+  dal::guestLock().unlock();
+  CHECK(waitFor([&] { return periods() >= 5; }));
+  dal::guestLock().lock();
+
+  // Quit returns while the engine may be waiting for the lock we hold, and the engine stops
+  // calling the producer (at most the call that was already under way completes).
+  CHECK(guest.call("cellAudioQuit") == 0);
+  dal::guestLock().unlock();
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  const std::uint64_t settled_calls = dal::audioEngineStats().blocks;
+  const std::uint64_t settled = periods();
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  CHECK(dal::audioEngineStats().blocks == settled_calls);
+  CHECK(periods() == settled);
+  dal::guestLock().lock();
+
+  // A second Init resumes the same engine.
+  CHECK(guest.call("cellAudioInit") == 0);
+  dal::guestLock().unlock();
+  CHECK(waitFor([&] { return periods() >= settled + 5; }));
+  dal::guestLock().lock();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1039,6 +1478,12 @@ int main(int argc, char** argv) {
   testEngineOutputOpenFails();
   testEngineFinishDumpDuringOpen();
   testEngineResumesAfterStop();
+  testCellAudioStateErrors();
+  testCellAudioPortOpenAndConfig();
+  testCellAudioTagsAndTimestamps();
+  testCellAudioMixing();
+  testCellAudioNotify();
+  testCellAudioEngine();
 
   if (!keep) fs::remove_all(g_dir, ec);
   std::printf("audio core tests: %d passed, %d failed\n", g_passed, g_failed);
