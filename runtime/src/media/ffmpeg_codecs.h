@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 
+#include "media/atrac_decoder.h"
 #include "media/ffmpeg_api.h"
 #include "media/movie_decoder.h"
 
@@ -126,9 +127,50 @@ class FfmpegCodecFactory final : public MediaCodecFactory {
   FfmpegCodecOptions options_;
 };
 
+// ATRAC3plus decoder for the raw frames of a RIFF file (media/at3_file.h): each packet is exactly
+// block_align bytes with no PAMF header, and each frame yields kAtrac3plusFrameSamples samples per
+// channel as interleaved host floats.
+class FfmpegAtracDecoder final : public AtracFrameDecoder {
+ public:
+  FfmpegAtracDecoder(const FfmpegApi& api, std::uint32_t channels, std::uint32_t sample_rate,
+                     std::uint32_t block_align)
+      : api_(api), channels_(channels), sample_rate_(sample_rate), block_align_(block_align) {}
+  ~FfmpegAtracDecoder() override;
+  FfmpegAtracDecoder(const FfmpegAtracDecoder&) = delete;
+  FfmpegAtracDecoder& operator=(const FfmpegAtracDecoder&) = delete;
+
+  bool open(std::string& error);
+
+  bool decode(std::span<const std::uint8_t> frame, std::span<float> out, std::string& error) override;
+  // Reopens the codec: the overlap of the previous frame is part of its private state, which
+  // avcodec_flush_buffers does not promise to clear.
+  void reset() override;
+
+ private:
+  void close();
+
+  FfmpegApi api_;
+  std::uint32_t channels_, sample_rate_, block_align_;
+  AVCodecContext* context_ = nullptr;
+  AVFrame* frame_ = nullptr;
+  AVPacket* packet_ = nullptr;
+};
+
+class FfmpegAtracDecoderFactory final : public AtracDecoderFactory {
+ public:
+  explicit FfmpegAtracDecoderFactory(const FfmpegApi& api) : api_(api) {}
+
+  // Needs 1..8 channels and a non-zero block_align and sample rate.
+  std::unique_ptr<AtracFrameDecoder> create(const At3Info& info, std::string& error) override;
+
+ private:
+  FfmpegApi api_;
+};
+
 // A factory over the FFmpeg DLLs next to the executable; null with the reason in `error` when they
 // cannot be loaded.
 std::unique_ptr<MediaCodecFactory> createFfmpegCodecFactory(std::string& error,
                                                             const FfmpegCodecOptions& options = {});
+std::unique_ptr<AtracDecoderFactory> createFfmpegAtracDecoderFactory(std::string& error);
 
 }  // namespace dal

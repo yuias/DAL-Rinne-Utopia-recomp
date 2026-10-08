@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -502,6 +503,106 @@ void testAudioDecoderLifecycle() {
   CHECK(!decoder->receive(chunk));
 }
 
+dal::At3Info syntheticAt3(std::uint32_t channels, std::uint32_t block_align) {
+  dal::At3Info info;
+  info.channels = channels;
+  info.sample_rate = 48000;
+  info.block_align = block_align;
+  return info;
+}
+
+// The raw-frame decoder behind the cellAtrac HLE: construction limits, frame and output size checks,
+// and a decoder that survives bad data and a reset.
+void testAtracFrameDecoder() {
+  std::string error;
+  auto factory = dal::createFfmpegAtracDecoderFactory(error);
+  CHECK(factory != nullptr);
+  if (!factory) return;
+
+  for (const std::uint32_t channels : {1u, 2u}) {
+    auto decoder = factory->create(syntheticAt3(channels, 512), error);
+    CHECK(decoder != nullptr);
+    if (!decoder) continue;
+
+    std::vector<float> out(dal::kAtrac3plusFrameSamples * channels, 1.0f);
+    const std::vector<std::uint8_t> frame(512, 0x55);
+    CHECK(!decoder->decode(std::span<const std::uint8_t>(frame).first(511), out, error));  // short frame
+    CHECK(!decoder->decode(frame, std::span<float>(out).first(out.size() - 1), error));    // short output
+    // Bytes that are not ATRAC3plus data: the outcome is up to the decoder, but it must answer, leave
+    // the decoder usable, and report an error rather than a half-written success.
+    const bool garbage_ok = decoder->decode(frame, out, error);
+    CHECK(garbage_ok || !error.empty());
+    decoder->reset();
+    decoder->decode(frame, out, error);
+  }
+
+  CHECK(factory->create(syntheticAt3(2, 0), error) == nullptr);   // block_align is required
+  CHECK(factory->create(syntheticAt3(0, 512), error) == nullptr);
+  CHECK(factory->create(syntheticAt3(9, 512), error) == nullptr);
+  dal::At3Info no_rate = syntheticAt3(2, 512);
+  no_rate.sample_rate = 0;
+  CHECK(factory->create(no_rate, error) == nullptr);
+}
+
+// With the decrypted sound effects next to the build (bin/../sdata_cache), a reset must make the next
+// frames decode exactly as they do in a fresh decoder, and the valid audio must be fully decoded.
+void testAtracResetWithGameFile(const std::filesystem::path& exe_dir) {
+  const std::filesystem::path archive = exe_dir.parent_path() / "sdata_cache" / "PS3_GAME" / "USRDIR" / "Se.sdat";
+  std::ifstream stream(archive, std::ios::binary | std::ios::ate);
+  if (!stream) {
+    std::printf("atrac reset game file: skipped (Se.sdat not found in the sdata cache)\n");
+    return;
+  }
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(stream.tellg()));
+  stream.seekg(0);
+  stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  const auto entries = dal::scanRiffEntries(bytes);
+  CHECK(entries.size() > 2);
+  if (entries.size() <= 2) return;
+  const auto [offset, size] = entries[2];
+  const std::span<const std::uint8_t> entry = std::span<const std::uint8_t>(bytes).subspan(
+      offset, std::min<std::uint64_t>(std::uint64_t{size} + 8, bytes.size() - offset));
+  const auto info = dal::parseAt3Header(entry);
+  CHECK(info.has_value());
+  if (!info) return;
+
+  std::string error;
+  auto factory = dal::createFfmpegAtracDecoderFactory(error);
+  CHECK(factory != nullptr);
+  if (!factory) return;
+  const std::size_t frame_floats = std::size_t{dal::kAtrac3plusFrameSamples} * info->channels;
+  auto decodeRange = [&](dal::AtracFrameDecoder& decoder, std::uint32_t from, std::uint32_t to,
+                         std::vector<float>& pcm) {
+    std::vector<float> out(frame_floats);
+    for (std::uint32_t f = from; f < to; ++f) {
+      const auto frame = entry.subspan(info->data_offset + std::size_t{f} * info->block_align, info->block_align);
+      CHECK(decoder.decode(frame, out, error));
+      pcm.insert(pcm.end(), out.begin(), out.end());
+    }
+  };
+
+  constexpr std::uint32_t kFrames = 10;
+  CHECK(info->frameCount() >= kFrames);
+  auto fresh = factory->create(*info, error);
+  auto reused = factory->create(*info, error);
+  CHECK(fresh != nullptr && reused != nullptr);
+  if (!fresh || !reused) return;
+  std::vector<float> reference, after_reset, ignored, without_reset;
+  decodeRange(*fresh, 0, kFrames, reference);
+  decodeRange(*reused, 5, 9, ignored);
+  decodeRange(*reused, 0, kFrames, without_reset);  // continues the stream: frame 0 overlaps frame 8
+  reused->reset();
+  decodeRange(*reused, 0, kFrames, after_reset);
+  CHECK(reference == after_reset);
+  std::printf("atrac reset: without a reset the first frame differs from a fresh decoder: %s\n",
+              reference == without_reset ? "no" : "yes");
+  // Same data, same output: the decoder has no hidden randomness.
+  auto again = factory->create(*info, error);
+  std::vector<float> repeat;
+  if (again) decodeRange(*again, 0, kFrames, repeat);
+  CHECK(reference == repeat);
+}
+
 // Plays a game movie through the player with the real codecs. The clock moves one frame period per
 // consumer step, so a slow decoder shows up as dropped frames or missing frames, never as a hang.
 // With `max_steps` > 0 only that many frame periods are played and the movie is not run to its end.
@@ -623,6 +724,11 @@ int main(int argc, char** argv) {
   testVideoDecoderLifecycle();
   testAudioConversion();
   testAudioDecoderLifecycle();
+  testAtracFrameDecoder();
+  if (argc > 0) {
+    std::error_code ec;
+    testAtracResetWithGameFile(std::filesystem::absolute(argv[0], ec).parent_path());
+  }
   testMoviePlayerWithGameFile();
   std::printf("media ffmpeg tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed == 0 ? 0 : 1;

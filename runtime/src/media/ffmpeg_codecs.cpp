@@ -629,6 +629,123 @@ bool FfmpegAudioDecoder::receiveDecoded(AudioChunk& out) {
   }
 }
 
+FfmpegAtracDecoder::~FfmpegAtracDecoder() {
+  close();
+  if (frame_ != nullptr) api_.av_frame_free(&frame_);
+  if (packet_ != nullptr) api_.av_packet_free(&packet_);
+}
+
+void FfmpegAtracDecoder::close() {
+  if (context_ != nullptr) api_.avcodec_free_context(&context_);
+}
+
+bool FfmpegAtracDecoder::open(std::string& error) {
+  const AVCodec* codec = api_.avcodec_find_decoder_by_name("atrac3plus");
+  if (codec == nullptr) {
+    error = "FFmpeg has no ATRAC3plus decoder";
+    return false;
+  }
+  if (frame_ == nullptr) frame_ = api_.av_frame_alloc();
+  if (packet_ == nullptr) packet_ = api_.av_packet_alloc();
+  context_ = api_.avcodec_alloc_context3(codec);
+  if (frame_ == nullptr || packet_ == nullptr || context_ == nullptr) {
+    error = "out of memory creating the ATRAC3plus decoder";
+    close();
+    return false;
+  }
+  context_->sample_rate = static_cast<int>(sample_rate_);
+  api_.av_channel_layout_default(&context_->ch_layout, static_cast<int>(channels_));
+  // The decoder refuses to open without it.
+  context_->block_align = static_cast<int>(block_align_);
+  context_->pkt_timebase = {1, static_cast<int>(sample_rate_)};
+  const int result = api_.avcodec_open2(context_, codec, nullptr);
+  if (result < 0) {
+    error = "cannot open the ATRAC3plus decoder: " + errorString(api_, result);
+    close();
+    return false;
+  }
+  return true;
+}
+
+bool FfmpegAtracDecoder::decode(std::span<const std::uint8_t> frame, std::span<float> out,
+                                std::string& error) {
+  if (context_ == nullptr) {
+    error = "the ATRAC3plus decoder is not open";
+    return false;
+  }
+  const std::size_t out_samples = std::size_t{kAtrac3plusFrameSamples} * channels_;
+  if (frame.size() != block_align_ || out.size() != out_samples) {
+    error = std::format("frame of {} bytes and output of {} floats, expected {} bytes and {} floats",
+                        frame.size(), out.size(), block_align_, out_samples);
+    return false;
+  }
+
+  // The packet owns padded memory, as the decoder's bitstream reader looks past the end.
+  if (api_.av_new_packet(packet_, static_cast<int>(block_align_)) < 0) {
+    error = "out of memory";
+    return false;
+  }
+  std::memcpy(packet_->data, frame.data(), frame.size());
+  int result = api_.avcodec_send_packet(context_, packet_);
+  api_.av_packet_unref(packet_);
+  if (result < 0) {
+    error = "send_packet failed: " + errorString(api_, result);
+    return false;
+  }
+  result = api_.avcodec_receive_frame(context_, frame_);
+  if (result < 0) {
+    error = "receive_frame failed: " + errorString(api_, result);
+    return false;
+  }
+
+  bool ok = true;
+  if (frame_->format != AV_SAMPLE_FMT_FLTP || frame_->ch_layout.nb_channels != static_cast<int>(channels_) ||
+      frame_->nb_samples != static_cast<int>(kAtrac3plusFrameSamples)) {
+    error = std::format("unexpected output: format {}, {} channels, {} samples", frame_->format,
+                        frame_->ch_layout.nb_channels, frame_->nb_samples);
+    ok = false;
+  }
+  const std::uint8_t* const* planes = frame_->extended_data != nullptr ? frame_->extended_data : frame_->data;
+  for (std::uint32_t c = 0; ok && c < channels_; ++c) {
+    if (planes[c] == nullptr) {
+      error = "missing sample plane";
+      ok = false;
+    }
+  }
+  if (ok) {
+    for (std::size_t i = 0; i < kAtrac3plusFrameSamples; ++i) {
+      for (std::size_t c = 0; c < channels_; ++c) {
+        std::memcpy(&out[i * channels_ + c], planes[c] + i * sizeof(float), sizeof(float));
+      }
+    }
+  }
+  api_.av_frame_unref(frame_);
+  return ok;
+}
+
+void FfmpegAtracDecoder::reset() {
+  close();
+  std::string error;
+  if (!open(error)) {
+    // Later decode() calls fail and the caller plays silence.
+    logWarn("ffmpeg atrac: cannot reopen the decoder: {}", error);
+  }
+}
+
+std::unique_ptr<AtracFrameDecoder> FfmpegAtracDecoderFactory::create(const At3Info& info, std::string& error) {
+  if (info.channels < 1 || info.channels > static_cast<std::uint32_t>(kMaxAudioChannels)) {
+    error = std::format("{} channels are outside 1..{}", info.channels, kMaxAudioChannels);
+    return nullptr;
+  }
+  if (info.block_align == 0 || info.sample_rate == 0) {
+    error = std::format("block_align {} and sample rate {} must be non-zero", info.block_align, info.sample_rate);
+    return nullptr;
+  }
+  auto decoder = std::make_unique<FfmpegAtracDecoder>(api_, info.channels, info.sample_rate, info.block_align);
+  if (!decoder->open(error)) return nullptr;
+  return decoder;
+}
+
 std::unique_ptr<VideoDecoder> FfmpegCodecFactory::createVideo(const PamfStream& stream,
                                                               const VideoOutputFormat& format,
                                                               std::string& error) {
@@ -666,6 +783,15 @@ std::unique_ptr<MediaCodecFactory> createFfmpegCodecFactory(std::string& error,
     return nullptr;
   }
   return std::make_unique<FfmpegCodecFactory>(*api, options);
+}
+
+std::unique_ptr<AtracDecoderFactory> createFfmpegAtracDecoderFactory(std::string& error) {
+  const auto& api = defaultFfmpeg();
+  if (!api) {
+    error = api.error();
+    return nullptr;
+  }
+  return std::make_unique<FfmpegAtracDecoderFactory>(*api);
 }
 
 }  // namespace dal
