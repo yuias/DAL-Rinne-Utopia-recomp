@@ -69,7 +69,7 @@ The tools work on the decrypted PPU executable, not on `EBOOT.BIN`.
 ## Building
 
 ```powershell
-pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [-EbootElf <path>] [-PpuDir <dir>] [-GameDir <dir>] [-LlvmBin <dir>]
+pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [-EbootElf <path>] [-GeneratedDir <dir>] [-GameDir <dir>] [-LlvmBin <dir>]
 ```
 
 - `-Preset` selects the CMake preset (`debug` by default, or `release`). Build output goes
@@ -82,9 +82,9 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
   (`sdat_tests`), the movie tests (`media_core`, `media_ffmpeg`, and with `-GameDir` also
   `movie_decode`; see [Movies](docs/movies.md)), the audio tests (`audio_core`, and `audio_wasapi`,
   which is skipped on a machine without an audio device, and, when the decrypted sdata cache
-  exists or can be built (`-PpuDir`, `-EbootElf`, `-GameDir` and `DAL_RPCS3_CRYPTO_DIR`),
+  exists or can be built (`-GeneratedDir`, `-EbootElf`, `-GameDir` and `DAL_RPCS3_CRYPTO_DIR`),
   `atrac_decode`; see [Audio](docs/audio.md)), the Python unit tests, and,
-  with `-PpuDir`, the link check of the generated code (`ppu_link`). With `-PpuDir`,
+  with `-GeneratedDir`, the link check of the generated code (`ppu_link`). With `-GeneratedDir`,
   `-EbootElf` and `-GameDir` together it also runs `game_boot`; see [Running the game](#running-the-game).
   When `DAL_RPCS3_CRYPTO_DIR` is set as well, it also runs `game_input`, which leaves the title
   screen with a pad script, and `game_audio`, which runs the same script with the audio dump and
@@ -93,7 +93,7 @@ pwsh -NoProfile -File tools/build.ps1 [-Preset debug|release] [-Clean] [-Test] [
   The full list is in [Tests](docs/tests.md).
 - `-EbootElf <path>` passes the decrypted ELF to the tests so the checks against the real
   executable run instead of being skipped.
-- `-PpuDir <dir>` compiles the C tree written by `emit --out <dir>` into the static library
+- `-GeneratedDir <dir>` compiles the C tree written by `emit --out <dir>` into the static library
   `dal_ppu_generated` and builds `dal_ppu_link_test`. It sets the CMake cache variable
   `DAL_PPU_GENERATED_DIR`. A relative path is resolved against the current directory. If the
   directory has no `sources.cmake`, configuration fails and prints the `emit` command to run.
@@ -113,8 +113,8 @@ Examples:
 ```powershell
 pwsh -NoProfile -File tools/build.ps1 -Preset debug -Clean -Test
 pwsh -NoProfile -File tools/build.ps1 -Preset release -Test -EbootElf game/EBOOT.elf
-pwsh -NoProfile -File tools/build.ps1 -Preset release -PpuDir generated/ppu -Test
-pwsh -NoProfile -File tools/build.ps1 -PpuDir generated/ppu -EbootElf game/EBOOT.elf -GameDir <game-dir> -Test
+pwsh -NoProfile -File tools/build.ps1 -Preset release -GeneratedDir generated/ppu -Test
+pwsh -NoProfile -File tools/build.ps1 -GeneratedDir generated/ppu -EbootElf game/EBOOT.elf -GameDir <game-dir> -Test
 ```
 
 CMake options for generated code (also usable with `cmake` directly):
@@ -137,7 +137,7 @@ CMake options for generated code (also usable with `cmake` directly):
 
 `dal_game` loads the decrypted `EBOOT.elf` into a 4 GiB guest address space, sets up the main
 PPU thread the way RPCS3 does and calls the entry function through the generated code. It is
-built only when `DAL_PPU_GENERATED_DIR` is set (`-PpuDir`), because it links the generated
+built only when `DAL_PPU_GENERATED_DIR` is set (`-GeneratedDir`), because it links the generated
 functions. The runtime core (`dal_runtime_core`, everything under `runtime/src/core`,
 `runtime/src/lv2`, `runtime/src/hle`, `runtime/src/rsx`, `runtime/src/audio` without the WASAPI output, and the demuxer, player and ATRAC3plus file parser in `runtime/src/media`) does not reference generated symbols and is always
 built, together with its unit tests (`runtime_core`). The renderer (`dal_render`, `runtime/src/render`)

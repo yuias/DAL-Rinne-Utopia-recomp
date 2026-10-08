@@ -10,7 +10,7 @@ files are registered only when those are configured, and configuration prints wh
 | `runtime_version`, `runtime_musttail` | The runtime stub starts, and the compiler supports `musttail` | - |
 | `tools_unittest` | The Python unit tests (below) | - |
 | `ppu_header_check`, `ppu_semantics` | Contract header and the semantics harness (see [Emitting C](emitter.md)) | - |
-| `ppu_link` | The generated code links | `-PpuDir` |
+| `ppu_link` | The generated code links | `-GeneratedDir` |
 | `runtime_core` | Runtime core unit tests (memory, threads, lv2, HLE, VFS, fake RSX) | - |
 | `sdat_tests` | SDAT decryption and decompression on synthetic data | - |
 | `render_core`, `vp_translator`, `fp_translator` | Renderer and shader translators (see [Rendering](rendering.md)) | a Vulkan 1.3 device for the rendering parts |
@@ -21,7 +21,7 @@ files are registered only when those are configured, and configuration prints wh
 | `audio_core` | Audio on synthetic data, with no device and no FFmpeg: the block ring, null output, WAV writer and reader, `wavStats`, `BlockClock` and its correction, the clock controller against a fake device, the engine with fake producers and outputs, the `cellAudio` state and handlers on synthetic guest memory, the AT3 parser, and the `cellAtrac` stream model and handlers with a fake decoder | - |
 | `audio_wasapi` | The WASAPI output: device loss and reopen, priming, high-water drops and the fill level on fake streams, then (when a render device exists) opening the default device, playing silence and a real device loss and reopen. Exit code 77 (skipped) when the machine has no render device. Runs serially, because it measures timing | a render device for the real-device part |
 | `atrac_decode` | `dal_audiotool at3` on the title BGM (entry 19 of the decrypted `Bgm.sdat`): frame count, sample count and the SHA-256 of the decoded PCM, pinned in `cmake/atrac_decode.cmake` | the sdata cache (registered when it exists or can be built), the FFmpeg DLLs |
-| `game_boot` | The game reaches a milestone in a 20 s run (below) | `-PpuDir`, `-EbootElf`, `-GameDir` |
+| `game_boot` | The game reaches a milestone in a 20 s run (below) | `-GeneratedDir`, `-EbootElf`, `-GameDir` |
 | `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus `DAL_RPCS3_CRYPTO_DIR` |
 | `game_audio_hdd_clean`, `game_audio` | The same run as `game_input` with `--audio none --audio-dump`: the `atrac` line of the audio census reports decoded frames with audible content (below) | as `game_input` |
 
@@ -33,7 +33,7 @@ conversion or the audio decoder differently, which needs new pins (the YUV hashe
 ## The `game_boot` test
 
 CTest registers `game_boot` only when `DAL_PPU_GENERATED_DIR`, `DAL_EBOOT_ELF` and
-`DAL_GAME_DIR` are all set (`-PpuDir`, `-EbootElf`, `-GameDir`); otherwise configuration prints
+`DAL_GAME_DIR` are all set (`-GeneratedDir`, `-EbootElf`, `-GameDir`); otherwise configuration prints
 that it is not registered. It runs `dal_game --game-dir <dir> --elf <elf>` with the arguments
 from the pin file (the run keeps its game data in `build/<preset>/game_hdd`), with a 60 s time
 limit, and passes when the output matches the milestone regular expression. The exit code is not

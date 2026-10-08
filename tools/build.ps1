@@ -6,7 +6,7 @@ param(
     [switch]$Clean,
     [switch]$Test,
     [string]$EbootElf,
-    [string]$PpuDir,
+    [string]$GeneratedDir,
     [string]$GameDir,
     [string]$LlvmBin = $env:DAL_LLVM_BIN
 )
@@ -39,8 +39,8 @@ $clangVersion | Select-Object -First 1
 
 # Resolved against the caller's location, before Push-Location. The directory need not exist:
 # CMake reports a missing one with the emit command to run.
-if ($PpuDir) {
-    $PpuDir = [System.IO.Path]::GetFullPath($PpuDir, $PWD.ProviderPath)
+if ($GeneratedDir) {
+    $GeneratedDir = [System.IO.Path]::GetFullPath($GeneratedDir, $PWD.ProviderPath)
 }
 if ($GameDir) {
     $GameDir = [System.IO.Path]::GetFullPath($GameDir, $PWD.ProviderPath)
@@ -57,8 +57,8 @@ try {
     if ($EbootElf) {
         $configureArgs += "-DDAL_EBOOT_ELF=$((Resolve-Path -LiteralPath $EbootElf).Path)"
     }
-    if ($PpuDir) {
-        $configureArgs += "-DDAL_PPU_GENERATED_DIR=$PpuDir"
+    if ($GeneratedDir) {
+        $configureArgs += "-DDAL_PPU_GENERATED_DIR=$GeneratedDir"
     }
     if ($GameDir) {
         $configureArgs += "-DDAL_GAME_DIR=$GameDir"

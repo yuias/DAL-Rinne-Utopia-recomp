@@ -1,12 +1,12 @@
 # Emitting C
 
 `emit` turns the function database and the ELF into C source. The flow is `recover`, then
-`emit`, then a build with `-PpuDir`:
+`emit`, then a build with `-GeneratedDir`:
 
 ```sh
 python tools/ps3tool.py recover <elf> -o config/functions.json
 python tools/ps3tool.py emit    <elf> --out generated/ppu --max-unhandled 0
-pwsh -NoProfile -File tools/build.ps1 -PpuDir generated/ppu -Test
+pwsh -NoProfile -File tools/build.ps1 -GeneratedDir generated/ppu -Test
 ```
 
 `emit` reads the function database (`--db`, default `config/functions.json`), checks that it
