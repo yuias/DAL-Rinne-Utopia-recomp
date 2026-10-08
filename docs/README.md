@@ -1,10 +1,13 @@
 # Development documentation
 
-How to build and run the game is in the [top-level README](../README.md). These files describe
-how the project works:
+How to build and play the game is in the [top-level README](../README.md). These files list every
+parameter and describe how the project works:
 
 | File | Contents |
 | --- | --- |
+| [building.md](building.md) | Every `tools/build.ps1` parameter, the CMake variables and the commands for test builds |
+| [runtime-options.md](runtime-options.md) | Every `dal_game` option, exit codes and stop lines, and example runs by purpose |
+| [status.md](status.md) | How far a run gets and what is not implemented |
 | [analysis-tools.md](analysis-tools.md) | ELF summary, SPU probe, disassembler, Ghidra cross-check, NID and syscall name tables, target pin |
 | [function-recovery.md](function-recovery.md) | Recovering function starts and extents, the function database and its report |
 | [emitter.md](emitter.md) | Turning the recovered functions into C, the contract header and the semantics harness |

@@ -77,7 +77,7 @@ enough to link and test generated code: dispatch works, and every hook that woul
 system (HLE calls, unknown targets, unhandled words, traps) prints a message and exits with
 an error status. Syscalls only set `r3` to 0. `ppu_stub.h` holds test-only additions. The stub
 is only for the link check, the header check and the semantics harness; the runtime that runs the
-game is described in [Running the game](../README.md#running-the-game).
+game is described in [Runtime internals](runtime.md).
 
 ## Semantics harness
 
@@ -129,4 +129,4 @@ Every instruction word in the code range of the pinned ELF has an emitter handle
   which lie within the architected estimate error, not the hardware estimate values.
 - The stub runtime does not implement import calls, lv2 syscalls, threads or memory
   allocation: it exits on import calls and returns 0 from syscalls. The runtime in `dal_game`
-  implements a subset; see [Running the game](../README.md#running-the-game).
+  implements a subset; see [Runtime internals](runtime.md).

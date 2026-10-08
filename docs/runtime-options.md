@@ -1,0 +1,126 @@
+# `dal_game` options
+
+The [top-level README](../README.md) shows the command for playing. This page lists every option of
+`dal_game`, its exit codes, and the options for unattended and diagnostic runs.
+
+```sh
+dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
+         [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok]
+         [--pad none|neutral|keyboard] [--pad-script FILE]
+         [--audio none|wasapi] [--audio-dump FILE]
+         [--load-only] [--png-dump DIR]
+         [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
+         [--shader-cache DIR] [--vk-validation] [--window]
+```
+
+`dal_game` loads the decrypted `EBOOT.elf` into a 4 GiB guest address space, sets up the main PPU
+thread the way RPCS3 does and calls the entry function through the generated code.
+
+## Options
+
+### Game files
+
+| Option | Meaning |
+| --- | --- |
+| `--game-dir DIR` | The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home` (`DIR/PS3_GAME/USRDIR`), `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. Required unless `--vfs-config` mounts `/dev_bdvd` (the executable can also come from `--elf`). `DIR/PS3_GAME/USRDIR` need not exist. |
+| `--elf PATH` | The decrypted executable. Default: `PS3_GAME/USRDIR/EBOOT.elf` on `/dev_bdvd` (`DIR/PS3_GAME/USRDIR/EBOOT.elf`, or where the configuration puts it). |
+| `--hdd-dir DIR` | Host directory behind `/dev_hdd0` and `/dev_hdd1` (`DIR/dev_hdd0`, `DIR/dev_hdd1`; created on demand), where the game keeps its game data and saves. Default: `build/<preset>/hdd`, next to the `bin` directory of the executable. |
+| `--sdata-cache DIR` | Directory of decrypted `.sdat` files, each at its path relative to the game directory, as written by `dal_sdat`. Default: `build/<preset>/sdata_cache` if it exists, which is where the build writes it. Without a cache `cellFsSdataOpen` fails. See [SDAT files](sdat.md). |
+| `--vfs-config FILE` | A JSON file that describes the virtual file system. The options above override the matching parts of it. See [VFS configuration file](virtual-file-system.md#vfs-configuration-file). |
+
+### Window, input and sound
+
+| Option | Meaning |
+| --- | --- |
+| `--window` | Show the frames in a window (implies `--render vulkan`). Closing the window stops the run with exit code 0. |
+| `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad. Default: `keyboard` with `--window` or `--pad-script`, otherwise `neutral`. `keyboard` without `--window` or `--pad-script` is a usage error. See [Input](runtime.md#input). |
+| `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It cannot be combined with `--pad none` or `--pad neutral`. See [Pad script](runtime.md#pad-script). |
+| `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with `--window`, otherwise `none`, so unattended runs and tests need no sound device. See [Audio](audio.md#options). |
+| `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. Its header is updated every second, so a run stopped by `--seconds` or by closing the window leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see [`dal_audiotool`](audio.md#dal_audiotool)). |
+| `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
+
+### Rendering
+
+| Option | Meaning |
+| --- | --- |
+| `--render none\|vulkan` | Whether the RSX commands are drawn (default `none`, unless `--dump-frames` or `--window` is given, which imply `vulkan`). See [Rendering](rendering.md#rendering). |
+| `--dump-frames DIR` | Write the displayed frame of every flip as `DIR/frame_<flip>.png` (flips counted from 1, six digits; RGB, 8 bits), with no window. `DIR` is created. |
+| `--dump-frames-every K` | Dump every `K`-th flip instead of every one (default 1). |
+| `--shader-cache DIR` | Directory of the SPIR-V cache (default `generated/shader_cache`). |
+| `--vk-validation` | Enable the Khronos validation layer. It comes with the Vulkan SDK; if it is not installed, `dal_game` logs a warning and goes on without it. |
+| `--rsx-capture N[,M...]` | Record the given frames (1-based flip numbers) as `.dalcap` files. See [Capture and replay](rendering.md#capture-and-replay). |
+
+The renderer options are a usage error (exit code 2) when the renderer is off. `--dump-frames` and
+`--window` switch it on; `--dump-frames-every`, `--shader-cache` and `--vk-validation` need one of
+them or `--render vulkan`; an explicit `--render none` conflicts with all of them. `--rsx-capture`
+does not need the renderer.
+
+Frame dumps are encoded on a worker thread, so dumping does not slow the game down. When the worker
+falls more than four frames behind, a frame is skipped and counted (`dal: render: dump skipped
+(queue full) at flip N`, and `dumps skipped (queue full)` in the end-of-run `dal: render:` line). At
+the end of a run the pending frames are written within 2 s. Each file is written as `.png.tmp` and
+renamed, so an interrupted run never leaves a truncated `.png`. A file that cannot be written is
+reported once and counted, and the run goes on.
+
+The log says which Vulkan device was chosen and how long the device and renderer took to start. If
+no device meets the requirements (Vulkan 1.3 with dynamic rendering, synchronization2 and shader
+demote-to-helper-invocation; a window also needs the Win32 surface and swapchain extensions), or
+the window cannot be created, the RSX thread logs the reason and the game goes on without rendering.
+
+### Diagnostics
+
+| Option | Meaning |
+| --- | --- |
+| `--seconds N` | Watchdog: stop after `N` seconds. 0 (the default) disables it. |
+| `--log FILE` | Also write every log line to `FILE`, which is truncated. |
+| `--log-level trace\|debug\|info\|warn\|error` | Lowest level that is logged (default `info`). `debug` adds diagnostics such as the 10 s window statistics; `trace` is the most verbose. Debug and trace lines carry a `debug: ` / `trace: ` tag. |
+| `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
+| `--strict` | Treat a jump to an address that is not a recovered function as a fatal error (see [Dispatch](runtime.md#dispatch)). |
+| `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
+| `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
+
+## Exit codes and stop lines
+
+Every run ends with one stop line on stderr and a census (see [Census](runtime.md#census)), then
+exits:
+
+| Code | Meaning | Stop line |
+| --- | --- | --- |
+| 0 | The guest called `sys_process_exit` or `_sys_process_exit`, the window was closed, or `--load-only` finished loading | `dal: stop: process exit status N`, `dal: stop: window closed` |
+| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable | `error: ...` (usage text) |
+| 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved | `dal: stop: fatal <kind>: ...` |
+| 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
+| 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
+| 6 | Stall: every live guest thread has been in an indefinite wait for at least 2 seconds | `dal: stop: stall (N threads blocked)` |
+| 7 | All guest threads ended without a process exit | `dal: stop: no guest threads left` |
+
+A fatal stop also prints the registers and the call trace (the most recent function entries) of
+the faulting guest thread. The runtime never calls `abort`: the CRT and Windows error dialogs are
+disabled, so a run always ends with an exit code, also when it is started from a script.
+
+## Examples by purpose
+
+A run that stops by itself after the title screen, with a log file:
+
+```sh
+dal_game --game-dir <game-dir> --seconds 165 --log run.log
+```
+
+Every 30th frame of the first 30 s as PNG files, without a window:
+
+```sh
+dal_game --game-dir <game-dir> --seconds 30 --dump-frames out/frames --dump-frames-every 30
+```
+
+Leaving the title screen without a person at the keyboard, with a fresh hdd directory (the script
+is the one the `game_input` test uses):
+
+```sh
+dal_game --game-dir <game-dir> --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt
+```
+
+Recording the game's sound to a file without playing it:
+
+```sh
+dal_game --game-dir <game-dir> --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt --audio-dump out/run.wav
+```

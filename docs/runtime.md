@@ -211,8 +211,9 @@ interface, so each module follows a documented policy that never blocks on a per
 the changes to the game. `--pad` picks the provider: `none` (no pad), `neutral` (a standard pad on
 port 0 that never changes) or `keyboard`. `--pad keyboard` is set up in `runtime/src/game_main.cpp`
 with `setPadProvider`, because it needs the window and the script thread; `setPadBackend` accepts
-only `none` and `neutral`. The defaults and the user-visible keys and script format are in the
-[README](../README.md#keyboard-and-pad-scripts).
+only `none` and `neutral`. The option defaults are in
+[`dal_game` options](runtime-options.md#window-input-and-sound) and the key table in the
+[README](../README.md#keyboard); the script format is [below](#pad-script).
 
 | Part | File | Role |
 | --- | --- | --- |
