@@ -6,8 +6,13 @@
 namespace dal {
 namespace {
 
+// Execute mask bits (src0 bits 18-20): the instruction runs in lanes whose condition register
+// value compares as less, equal or greater than zero.
+constexpr std::uint32_t kCondLess = 1;
+constexpr std::uint32_t kCondEqual = 2;
+constexpr std::uint32_t kCondGreater = 4;
 constexpr std::uint32_t kCondNever = 0;
-constexpr std::uint32_t kCondAlways = 7;
+constexpr std::uint32_t kCondAlways = kCondLess | kCondEqual | kCondGreater;
 
 constexpr std::uint32_t kSourceTemp = 0;
 constexpr std::uint32_t kSourceInput = 1;
@@ -79,6 +84,7 @@ class Translator {
   std::string clampText(const std::string& text, const char* lo, const char* hi);
   std::string halfText(const std::string& text);
   bool computeValue(const Instruction& in, std::uint32_t op, int constant_slot, Expr& out);
+  std::string predicate(const Instruction& in, std::uint32_t exec_mask);
   std::string destination(const Instruction& in);
   std::string assemble() const;
 
@@ -91,6 +97,7 @@ class Translator {
   std::uint32_t texture_units_ = 0;
   std::uint32_t constant_count_ = 0;   // inline constant blocks seen, referenced or not
   std::uint32_t constant_extent_ = 0;  // fc[] entries the emitted code reads
+  std::uint32_t cc_used_ = 0;          // bit n = condition register ccN is read or written
   bool col0_used_ = false;
   bool col1_used_ = false;
   bool uses_clamp_ = false;
@@ -217,6 +224,24 @@ bool Translator::computeValue(const Instruction& in, std::uint32_t op, int const
       out = {"max(" + a + ", " + b + ")", false};
       return true;
     }
+    case 0x0a:    // SLT
+    case 0x0b:    // SGE
+    case 0x0c:    // SLE
+    case 0x0d:    // SGT
+    case 0x0e:    // SNE
+    case 0x0f: {  // SEQ
+      static constexpr const char* kCompare[] = {"lessThan",    "greaterThanEqual", "lessThanEqual",
+                                                 "greaterThan", "notEqual",         "equal"};
+      const std::string a = operand(in, 0, constant_slot), b = operand(in, 1, constant_slot);
+      out = {std::format("vec4({}({}, {}))", kCompare[op - 0x0a], a, b), false};
+      return true;
+    }
+    case 0x10:  // FRC
+      out = {"fract(" + operand(in, 0, constant_slot) + ")", false};
+      return true;
+    case 0x11:  // FLR
+      out = {"floor(" + operand(in, 0, constant_slot) + ")", false};
+      return true;
     case 0x17:    // TEX
     case 0x18: {  // TXP
       const std::uint32_t unit = bits(in.w[0], 17, 4);
@@ -251,21 +276,16 @@ void Translator::translateInstruction(const Instruction& in, int constant_slot) 
   if (op == 0x00) return;  // NOP
 
   // No condition bit set disables the instruction; all set is unconditional. A partial condition
-  // gates per component on the condition register, which is not modelled.
+  // gates each written lane on the condition register.
   const std::uint32_t cond = bits(in.w[1], 18, 3);
   if (cond == kCondNever) return;
-  if (cond != kCondAlways) {
-    note("fp condition other than always");
-    return;
-  }
-  if (bits(in.w[0], 8, 1) != 0) {
-    note("fp condition code update");
-    return;
-  }
+  const std::string pred = predicate(in, cond);
 
   Expr value;
   if (!computeValue(in, op, constant_slot, value)) return;
-  if (bits(in.w[0], 30, 1) != 0) return;  // no destination register
+  const bool no_dest = bits(in.w[0], 30, 1) != 0;
+  const bool set_cond = bits(in.w[0], 8, 1) != 0;
+  if (no_dest && !set_cond) return;  // nothing observable
 
   // Result scale, destination precision, saturate, then the masked write.
   std::string text = value.compound ? "(" + value.text + ")" : value.text;
@@ -296,12 +316,52 @@ void Translator::translateInstruction(const Instruction& in, int constant_slot) 
     if (bits(in.w[0], 9 + i, 1) != 0) lanes += "xyzw"[i];
   }
   if (lanes.empty()) return;
-  const std::string dest = destination(in);
-  if (lanes == "xyzw") {
-    body_ += std::format("  {} = {};\n", dest, text);
-  } else {
-    body_ += std::format("  {}.{} = ({}).{};\n", dest, lanes, text, lanes);
+
+  // The condition register takes the value after scale, precision and saturate, like the
+  // destination does. With no destination only the register is written.
+  const std::string cc_name = std::format("cc{}", bits(in.w[1], 30, 1));
+  if (set_cond) cc_used_ |= 1u << bits(in.w[1], 30, 1);
+  const std::string suffix = lanes == "xyzw" ? "" : "." + lanes;
+  // A swizzle applies to a whole expression, so the masked form parenthesises it.
+  const std::string rhs = suffix.empty() ? text : "(" + text + ")" + suffix;
+  const auto assign = [&](const std::string& target) {
+    if (pred.empty()) {
+      body_ += std::format("  {}{} = {};\n", target, suffix, rhs);
+    } else {
+      body_ += std::format("  {0}{1} = mix({0}{1}, {2}, {3}{1});\n", target, suffix, rhs, pred);
+    }
+  };
+  if (no_dest) {
+    assign(cc_name);
+    return;
   }
+  const std::string dest = destination(in);
+  assign(dest);
+  if (set_cond) body_ += std::format("  {}{} = {}{};\n", cc_name, suffix, dest, suffix);
+}
+
+// A bvec4 expression that is true in the lanes where the instruction runs, or empty when it always
+// runs. Lane i of the result compares condition register lane swizzle[i] against zero.
+std::string Translator::predicate(const Instruction& in, std::uint32_t exec_mask) {
+  if (exec_mask == kCondAlways) return {};
+  const std::uint32_t reg = bits(in.w[1], 31, 1);
+  cc_used_ |= 1u << reg;
+  std::string cc = std::format("cc{}", reg);
+  const std::uint32_t swizzle = bits(in.w[1], 21, 8);
+  if (swizzle != 0xe4) {
+    cc += '.';
+    for (unsigned i = 0; i < 4; i++) cc += "xyzw"[bits(swizzle, 2 * i, 2)];
+  }
+  const char* compare = "";
+  switch (exec_mask) {
+    case kCondGreater | kCondEqual: compare = "greaterThanEqual"; break;
+    case kCondLess | kCondEqual: compare = "lessThanEqual"; break;
+    case kCondGreater | kCondLess: compare = "notEqual"; break;
+    case kCondGreater: compare = "greaterThan"; break;
+    case kCondLess: compare = "lessThan"; break;
+    default: compare = "equal"; break;  // kCondEqual
+  }
+  return std::format("{}({}, vec4(0.0))", compare, cc);
 }
 
 std::string Translator::assemble() const {
@@ -375,6 +435,9 @@ std::string Translator::assemble() const {
   }
   for (std::uint32_t i = 0; i < 64; i++) {
     if ((h_used & (1ull << i)) != 0) glsl += std::format("  vec4 h_{} = vec4(0.0);\n", i);
+  }
+  for (std::uint32_t i = 0; i < 2; i++) {
+    if ((cc_used_ & (1u << i)) != 0) glsl += std::format("  vec4 cc{} = vec4(0.0);\n", i);
   }
   // Colour reads are clamped to [0, 1]; two-sided lighting picks the back colour on back faces.
   const std::string back_face = std::format("(draw.flags & {}u) != 0u && !gl_FrontFacing", kFpFlagTwoSided);

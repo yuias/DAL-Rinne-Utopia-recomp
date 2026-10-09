@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -77,10 +78,20 @@ struct Asm {
   std::uint32_t input = 1;   // input register read by input-type sources
   std::uint32_t unit = 0;
   std::uint32_t dest_precision = 0, scale = 0, cond = 7;
+  const char* cond_swizzle = "xyzw";
+  std::uint32_t cc_read = 0, cc_write = 0;  // condition register indices (src0 bits 31 and 30)
   bool end = false, saturate = false, cc_update = false, no_dest = false, bx2 = false, indexed = false;
   Src src0 = inputSrc(), src1 = temp(0), src2 = temp(0);
 
   bool hasConstant() const { return src0.type == 2 || src1.type == 2 || src2.type == 2; }
+
+  std::uint32_t condSwizzleBits() const {
+    std::uint32_t bits = 0;
+    for (std::uint32_t i = 0; i < 4; i++) {
+      bits |= static_cast<std::uint32_t>(std::string("xyzw").find(cond_swizzle[i])) << (2 * i);
+    }
+    return bits;
+  }
 
   // Words as the hardware reads them; stored() swaps the halves like RsxDraw::fp_ucode.
   std::array<std::uint32_t, 4> words() const {
@@ -88,7 +99,8 @@ struct Asm {
                              (cc_update ? 1u << 8 : 0u) | (mask << 9) | (input << 13) | (unit << 17) |
                              (bx2 ? 1u << 21 : 0u) | (dest_precision << 22) | ((op & 0x3f) << 24) |
                              (no_dest ? 1u << 30 : 0u) | (saturate ? 1u << 31 : 0u);
-    const std::uint32_t w1 = src0.common() | (cond << 18) | (0xe4u << 21) | (src0.absolute ? 1u << 29 : 0u);
+    const std::uint32_t w1 = src0.common() | (cond << 18) | (condSwizzleBits() << 21) |
+                             (src0.absolute ? 1u << 29 : 0u) | (cc_write << 30) | (cc_read << 31);
     const std::uint32_t w2 = src1.common() | (src1.absolute ? 1u << 18 : 0u) | (src0.precision << 19) |
                              (src1.precision << 22) | (src2.precision << 25) | (scale << 28) |
                              ((op >> 6) << 31);
@@ -192,6 +204,43 @@ std::uint32_t expectedUnits(const std::string& name) {
   return name.starts_with("fp_beb1f05618778cfe") ? 0u : 1u;
 }
 
+// The dialogue text program (356 slots, 218 instructions, 138 inline constants) from the dump
+// directory; it is game-derived, so it is not tracked and the test is skipped without it. It
+// exercises every comparison, FRC, FLR, both forms of condition register update and per-lane
+// conditional execution. testDumps leaves it out because it has no expected body text.
+void testTextProgram() {
+  const std::vector<Dump> dumps = loadDumps();
+  const auto found = std::find_if(dumps.begin(), dumps.end(), [](const Dump& dump) {
+    return dump.name.starts_with("fp_c5a1c19123aa52bb");
+  });
+  if (found == dumps.end()) {
+    std::printf("fp translator: text program skipped: fp_c5a1c19123aa52bb.bin not present in generated/rsx\n");
+    return;
+  }
+  CHECK(found->words.size() == 1424);
+
+  const dal::GlslResult result = dal::translateFragmentProgram(found->words, 0x40, 1);
+  for (const std::string& entry : result.unimplemented) {
+    std::fprintf(stderr, "text program: unimplemented: %s\n", entry.c_str());
+  }
+  CHECK(result.ok);
+  CHECK(result.unimplemented.empty());
+  CHECK(result.texture_units == 1u);
+  CHECK(contains(result.glsl, "vec4 fc[138];"));  // 138 * 16 bytes, far below the uniform block limit
+  CHECK(contains(result.glsl, "vec4 cc0 = vec4(0.0);") && !contains(result.glsl, "cc1"));
+  CHECK(contains(result.glsl, "mix(r_0, "));
+  CHECK(contains(result.glsl, "notEqual(cc0.xxxx, vec4(0.0))"));
+  CHECK(contains(result.glsl, "lessThan(cc0.yyyy, vec4(0.0))"));
+  CHECK(contains(result.glsl, "fract(") && contains(result.glsl, "floor("));
+
+  const auto begin = std::chrono::steady_clock::now();
+  const bool ok = compiles(result, 0xf400);
+  const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin);
+  CHECK(ok);
+  std::printf("text program: %zu bytes of GLSL, shaderc %.1f ms (cache hits excluded)\n", result.glsl.size(),
+              elapsed.count());
+}
+
 void testDumps() {
   const std::vector<Dump> dumps = loadDumps();
   if (dumps.empty()) {
@@ -203,6 +252,7 @@ void testDumps() {
   bool printed = false;
   int seen = 0;
   for (const Dump& dump : dumps) {
+    if (dump.name.starts_with("fp_c5a1c19123aa52bb")) continue;  // covered by testTextProgram
     const dal::GlslResult result = dal::translateFragmentProgram(dump.words, controlFor(dump.name),
                                                                  texcoordControlFor(dump.name));
     CHECK(result.ok);
@@ -338,6 +388,172 @@ void testOperations() {
   CHECK(compiles(result, 0xf0f4));
 }
 
+void testCompareAndRounding() {
+  const struct {
+    std::uint32_t op;
+    const char* expected;
+  } cases[] = {
+      {0x0a, "  r_2 = vec4(lessThan(in_col0, h_1));\n"},
+      {0x0b, "  r_2 = vec4(greaterThanEqual(in_col0, h_1));\n"},
+      {0x0c, "  r_2 = vec4(lessThanEqual(in_col0, h_1));\n"},
+      {0x0d, "  r_2 = vec4(greaterThan(in_col0, h_1));\n"},
+      {0x0e, "  r_2 = vec4(notEqual(in_col0, h_1));\n"},
+      {0x0f, "  r_2 = vec4(equal(in_col0, h_1));\n"},
+      {0x10, "  r_2 = fract(in_col0);\n"},
+      {0x11, "  r_2 = floor(in_col0);\n"},
+  };
+  std::uint32_t key = 0xf100;
+  for (const auto& test : cases) {
+    Asm in;
+    in.op = test.op;
+    in.dest = 2;
+    in.src0 = inputSrc();
+    in.src1 = temp(1, true);
+    in.end = true;
+    const dal::GlslResult result = translate({in});
+    CHECK(result.ok);
+    CHECK(contains(result.glsl, test.expected));
+    CHECK(compiles(result, key++));
+  }
+
+  // The result scale and masked write apply to the 1.0 / 0.0 answer like any other value.
+  Asm masked;
+  masked.op = 0x0b;
+  masked.mask = 0x2;
+  masked.scale = 1;
+  masked.src0 = inputSrc("yyyy");
+  masked.src1 = temp(1);
+  masked.end = true;
+  const dal::GlslResult result = translate({masked});
+  CHECK(result.ok);
+  CHECK(contains(result.glsl, "  r_0.y = (vec4(greaterThanEqual(in_col0.yyyy, r_1)) * 2.0).y;\n"));
+}
+
+void testConditionalExecution() {
+  // Execute mask (lt = 1, eq = 2, gr = 4) to the per-lane predicate against zero.
+  const struct {
+    std::uint32_t mask;
+    const char* compare;
+  } table[] = {
+      {6, "greaterThanEqual"}, {3, "lessThanEqual"}, {5, "notEqual"},
+      {4, "greaterThan"},      {1, "lessThan"},      {2, "equal"},
+  };
+  std::uint32_t key = 0xf200;
+  for (const auto& entry : table) {
+    Asm mov;
+    mov.op = 1;
+    mov.cond = entry.mask;
+    mov.cond_swizzle = "yyyy";
+    mov.cc_read = 1;
+    mov.end = true;
+    const dal::GlslResult result = translate({mov});
+    CHECK(result.ok);
+    CHECK(contains(result.glsl, std::string("  r_0 = mix(r_0, in_col0, ") + entry.compare +
+                                    "(cc1.yyyy, vec4(0.0)));\n"));
+    CHECK(contains(result.glsl, "  vec4 cc1 = vec4(0.0);\n"));
+    CHECK(!contains(result.glsl, "cc0"));
+    CHECK(compiles(result, key++));
+  }
+
+  // Swizzled lanes map to the written lanes; a partial write mask selects per written lane.
+  Asm lanes;
+  lanes.op = 2;
+  lanes.mask = 0x5;  // x and z
+  lanes.cond = 1;
+  lanes.cond_swizzle = "wzyx";
+  lanes.end = true;
+  dal::GlslResult result = translate({lanes});
+  CHECK(result.ok);
+  CHECK(contains(result.glsl,
+                 "  r_0.xz = mix(r_0.xz, (in_col0 * r_0).xz, lessThan(cc0.wzyx, vec4(0.0)).xz);\n"));
+  CHECK(contains(result.glsl, "  vec4 cc0 = vec4(0.0);\n") && !contains(result.glsl, "cc1"));
+  CHECK(compiles(result, key++));
+
+  // All three bits is unconditional and does not need the register; none disables the instruction.
+  Asm always;
+  always.cond = 7;
+  always.cc_read = 1;
+  always.cond_swizzle = "zzzz";
+  always.end = true;
+  result = translate({always});
+  CHECK(result.ok && contains(result.glsl, "  r_0 = in_col0;\n") && !contains(result.glsl, "cc1"));
+  Asm never;
+  never.cond = 0;
+  never.end = true;
+  result = translate({never});
+  CHECK(result.ok && !contains(result.glsl, "  r_0 = ") && !contains(result.glsl, "mix("));
+}
+
+void testSetCondition() {
+  std::uint32_t key = 0xf300;
+
+  // No destination: the masked value goes to the register selected by src0 bit 30 and no temporary
+  // is touched. Scale, precision and saturate apply before the write.
+  Asm no_dest;
+  no_dest.op = 2;
+  no_dest.cc_update = true;
+  no_dest.no_dest = true;
+  no_dest.dest = 63;
+  no_dest.mask = 0x3;
+  no_dest.cc_write = 1;
+  no_dest.dest_precision = 2;
+  no_dest.src0 = inputSrc();
+  no_dest.src1 = temp(0);
+  Asm use;
+  use.op = 1;
+  use.cond = 1;
+  use.cc_read = 1;
+  use.cond_swizzle = "xxxx";
+  use.end = true;
+  dal::GlslResult result = translate({no_dest, use});
+  CHECK(result.ok);
+  CHECK(contains(result.glsl, "  cc1.xy = (fp_clamp(in_col0 * r_0, -2.0, 2.0)).xy;\n"));
+  CHECK(contains(result.glsl, "  r_0 = mix(r_0, in_col0, lessThan(cc1.xxxx, vec4(0.0)));\n"));
+  CHECK(!contains(result.glsl, "r_63") && !contains(result.glsl, "cc0"));
+  CHECK(compiles(result, key++));
+
+  // With a destination the register copies the masked destination value after the assignment.
+  Asm with_dest;
+  with_dest.op = 1;
+  with_dest.dest = 2;
+  with_dest.mask = 0x9;  // x and w
+  with_dest.cc_update = true;
+  with_dest.end = true;
+  result = translate({with_dest});
+  CHECK(result.ok);
+  CHECK(contains(result.glsl, "  r_2.xw = (in_col0).xw;\n  cc0.xw = r_2.xw;\n"));
+  CHECK(compiles(result, key++));
+
+  // A conditional update with a full mask: the condition gates the register write too.
+  Asm conditional;
+  conditional.op = 1;
+  conditional.cc_update = true;
+  conditional.no_dest = true;
+  conditional.cond = 4;
+  conditional.end = true;
+  result = translate({conditional});
+  CHECK(result.ok);
+  CHECK(contains(result.glsl, "  cc0 = mix(cc0, in_col0, greaterThan(cc0, vec4(0.0)));\n"));
+  CHECK(compiles(result, key++));
+
+  // Without the update bit a no-destination instruction produces nothing.
+  Asm nothing;
+  nothing.no_dest = true;
+  nothing.end = true;
+  result = translate({nothing});
+  CHECK(result.ok && !contains(result.glsl, "cc0") && !contains(result.glsl, "  r_0 = in_col0"));
+
+  // The first update must not leak into the declaration of the other register.
+  Asm second;
+  second.op = 1;
+  second.cc_update = true;
+  second.no_dest = true;
+  second.cc_write = 1;
+  second.end = true;
+  result = translate({second});
+  CHECK(result.ok && contains(result.glsl, "  vec4 cc1 = vec4(0.0);\n") && !contains(result.glsl, "vec4 cc0"));
+}
+
 void testModifiers() {
   // Masked write with result scale, destination precision and saturate.
   Asm mul;
@@ -431,17 +647,15 @@ void testUnimplementedReports() {
   result = translate({flow});
   CHECK(!result.ok && hasReport(result, "fp opcode 0x40"));
 
-  Asm conditional;
-  conditional.cond = 2;
-  conditional.end = true;
-  result = translate({conditional});
-  CHECK(!result.ok && hasReport(result, "condition"));
-
-  Asm cc;
-  cc.cc_update = true;
-  cc.end = true;
-  result = translate({cc});
-  CHECK(!result.ok && hasReport(result, "condition code"));
+  // An unsupported opcode is still reported when the instruction is conditional or updates a
+  // condition register.
+  Asm conditional_unknown;
+  conditional_unknown.op = 0x3e;
+  conditional_unknown.cond = 2;
+  conditional_unknown.cc_update = true;
+  conditional_unknown.end = true;
+  result = translate({conditional_unknown});
+  CHECK(!result.ok && hasReport(result, "fp opcode 0x3e"));
 
   Asm wpos;
   wpos.input = 0;
@@ -517,10 +731,14 @@ int main() {
   testTextureOnly();
   testConstants();
   testOperations();
+  testCompareAndRounding();
+  testConditionalExecution();
+  testSetCondition();
   testModifiers();
   testInputsAndEpilogue();
   testUnimplementedReports();
   testLayout();
+  testTextProgram();
   testDumps();
   std::printf("fp translator tests: %d passed, %d failed\n", g_passed, g_failed);
   return g_failed != 0 ? 1 : 0;
