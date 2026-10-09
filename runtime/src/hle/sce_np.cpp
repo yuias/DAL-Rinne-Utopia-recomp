@@ -34,52 +34,52 @@ bool g_initialized = false;
 
 // sceNpInit(u32 poolsize, void* poolptr)
 void npInit(DalPpuContext* ctx, std::uint8_t*) {
-  const std::uint32_t pool_size = argU32(ctx, 0);
-  const std::uint32_t pool_ptr = argU32(ctx, 1);
-  if (g_initialized) {
-    ctx->gpr[3] = kErrorAlreadyInitialized;
-    return;
-  }
-  if (pool_size == 0 || pool_ptr == 0) {
-    ctx->gpr[3] = kErrorInvalidArgument;
-    return;
-  }
-  if (pool_size < kMinPoolSize) {
-    ctx->gpr[3] = kErrorInsufficientBuffer;
-    return;
-  }
-  g_initialized = true;
-  ctx->gpr[3] = kCellOk;
+    const std::uint32_t pool_size = argU32(ctx, 0);
+    const std::uint32_t pool_ptr = argU32(ctx, 1);
+    if (g_initialized) {
+        ctx->gpr[3] = kErrorAlreadyInitialized;
+        return;
+    }
+    if (pool_size == 0 || pool_ptr == 0) {
+        ctx->gpr[3] = kErrorInvalidArgument;
+        return;
+    }
+    if (pool_size < kMinPoolSize) {
+        ctx->gpr[3] = kErrorInsufficientBuffer;
+        return;
+    }
+    g_initialized = true;
+    ctx->gpr[3] = kCellOk;
 }
 
 // sceNpTerm()
 void npTerm(DalPpuContext* ctx, std::uint8_t*) {
-  if (!g_initialized) {
-    ctx->gpr[3] = kErrorNotInitialized;
-    return;
-  }
-  g_initialized = false;
-  ctx->gpr[3] = kCellOk;
+    if (!g_initialized) {
+        ctx->gpr[3] = kErrorNotInitialized;
+        return;
+    }
+    g_initialized = false;
+    ctx->gpr[3] = kCellOk;
 }
 
 // sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
 void npDrmIsAvailable(DalPpuContext* ctx, std::uint8_t* base) {
-  const std::uint32_t path_addr = argU32(ctx, 1);
-  if (path_addr == 0) {
-    ctx->gpr[3] = kDrmErrorInvalidParam;
-    return;
-  }
-  const std::string path = readGuestString(base, path_addr, kDrmPathMax);
-  FsStat stat;
-  const std::uint32_t error = fsStatPath(path, stat);
-  logInfo("dal: np: sceNpDrmIsAvailable \"{}\" -> {:#x}", path, error);
-  ctx->gpr[3] = error;
+    const std::uint32_t path_addr = argU32(ctx, 1);
+    if (path_addr == 0) {
+        ctx->gpr[3] = kDrmErrorInvalidParam;
+        return;
+    }
+    const std::string path = readGuestString(base, path_addr, kDrmPathMax);
+    FsStat stat;
+    const std::uint32_t error = fsStatPath(path, stat);
+    logInfo("dal: np: sceNpDrmIsAvailable \"{}\" -> {:#x}", path, error);
+    ctx->gpr[3] = error;
 }
 
 constexpr HleEntry kHandlers[] = {
-    {kModule, 0x4885aa18, "sceNpTerm", npTerm},
-    {kModule, 0xad218faf, "sceNpDrmIsAvailable", npDrmIsAvailable},
-    {kModule, 0xbd28fdbf, "sceNpInit", npInit},
+        {kModule, 0x4885aa18, "sceNpTerm", npTerm},
+        {kModule, 0xad218faf, "sceNpDrmIsAvailable", npDrmIsAvailable},
+        {kModule, 0xbd28fdbf, "sceNpInit", npInit},
 };
 
 }  // namespace

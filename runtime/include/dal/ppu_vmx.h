@@ -53,9 +53,7 @@ DAL_FORCEINLINE void dalStvrx(uint8_t* base, uint32_t ea, DalVr v) {
 // address (RPCS3 `STVEBX`, `STVEHX`, `STVEWX`). The element loads need no helper: RPCS3 `LVEBX`,
 // `LVEHX` and `LVEWX` load the whole aligned block like `LVX`, which leaves the other elements
 // undefined by the architecture.
-DAL_FORCEINLINE void dalStvebx(uint8_t* base, uint32_t ea, DalVr v) {
-    dalWrite8(base, ea, DAL_VR_B(v, ea & 15u));
-}
+DAL_FORCEINLINE void dalStvebx(uint8_t* base, uint32_t ea, DalVr v) { dalWrite8(base, ea, DAL_VR_B(v, ea & 15u)); }
 
 DAL_FORCEINLINE void dalStvehx(uint8_t* base, uint32_t ea, DalVr v) {
     ea &= ~1u;
@@ -99,9 +97,7 @@ typedef int16_t DalS16x4 __attribute__((vector_size(8)));
 typedef uint16_t DalU16x4 __attribute__((vector_size(8)));
 
 // SAT is sticky: it is only ever set here, never cleared (mtvscr clears it).
-DAL_FORCEINLINE void dalSetSat(DalPpuContext* ctx, int clamped) {
-    ctx->vscr_sat |= (uint8_t)(clamped != 0);
-}
+DAL_FORCEINLINE void dalSetSat(DalPpuContext* ctx, int clamped) { ctx->vscr_sat |= (uint8_t)(clamped != 0); }
 
 // vperm: big-endian byte i of the result is concat(a, b)[c[i] & 31] (RPCS3 `VPERM`). In the host
 // layout that is b || a indexed by ~c & 31.
@@ -148,21 +144,13 @@ DAL_FORCEINLINE DalVr dalVspltisw(int32_t imm) {
 // big-endian byte 15 for the bit count; the architecture leaves the result undefined when the
 // other bytes differ, where RPCS3 `VSL`/`VSR` shift each byte by its own count. vslo/vsro shift by
 // whole octets, count = byte 15 bits 121:124 (RPCS3 `VSLO`: `b._u8[0] & 0x78`, host byte 0).
-DAL_FORCEINLINE DalVr dalVsl(DalVr a, DalVr b) {
-    return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 7u));
-}
+DAL_FORCEINLINE DalVr dalVsl(DalVr a, DalVr b) { return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 7u)); }
 
-DAL_FORCEINLINE DalVr dalVsr(DalVr a, DalVr b) {
-    return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 7u));
-}
+DAL_FORCEINLINE DalVr dalVsr(DalVr a, DalVr b) { return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 7u)); }
 
-DAL_FORCEINLINE DalVr dalVslo(DalVr a, DalVr b) {
-    return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 0x78u));
-}
+DAL_FORCEINLINE DalVr dalVslo(DalVr a, DalVr b) { return dalVrFromBits(dalVrBits(a) << (b.u8[0] & 0x78u)); }
 
-DAL_FORCEINLINE DalVr dalVsro(DalVr a, DalVr b) {
-    return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 0x78u));
-}
+DAL_FORCEINLINE DalVr dalVsro(DalVr a, DalVr b) { return dalVrFromBits(dalVrBits(a) >> (b.u8[0] & 0x78u)); }
 
 // Packs: the result holds a's elements in big-endian elements 0 .. n/2-1 and b's in the rest, which
 // is `b` then `a` in host lane order. The saturating packs set SAT when any element is clamped
@@ -263,15 +251,13 @@ DAL_FORCEINLINE DalVr dalVpkpx(DalVr a, DalVr b) {
 // 0x00 or 0xff (RPCS3 `VUPKHPX`).
 DAL_FORCEINLINE DalVr dalVupkhsb(DalVr b) {
     DalVr v;
-    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 8, 9, 10, 11, 12, 13, 14, 15),
-                                    DalS16x8);
+    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 8, 9, 10, 11, 12, 13, 14, 15), DalS16x8);
     return v;
 }
 
 DAL_FORCEINLINE DalVr dalVupklsb(DalVr b) {
     DalVr v;
-    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 1, 2, 3, 4, 5, 6, 7),
-                                    DalS16x8);
+    v.s16 = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 1, 2, 3, 4, 5, 6, 7), DalS16x8);
     return v;
 }
 
@@ -294,15 +280,13 @@ DAL_FORCEINLINE DalU32x4 dalUnpackPixels(DalS32x4 x) {
 
 DAL_FORCEINLINE DalVr dalVupkhpx(DalVr b) {
     DalVr v;
-    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 4, 5, 6, 7),
-                                                    DalS32x4));
+    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 4, 5, 6, 7), DalS32x4));
     return v;
 }
 
 DAL_FORCEINLINE DalVr dalVupklpx(DalVr b) {
     DalVr v;
-    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 0, 1, 2, 3),
-                                                    DalS32x4));
+    v.u32 = dalUnpackPixels(__builtin_convertvector(__builtin_shufflevector(b.s16, b.s16, 0, 1, 2, 3), DalS32x4));
     return v;
 }
 
@@ -323,12 +307,12 @@ DAL_FORCEINLINE void dalMtvscr(DalPpuContext* ctx, DalVr v) {
 // Integer add/subtract with saturation. SAT is set when any lane clamps, i.e. when the clamped result
 // differs from the wrapped one (RPCS3 `VADDSBS` etc. compare the same two values). The wrapped sum
 // is formed on the unsigned view because signed vector overflow is not defined.
-#define DAL_VMX_SATURATE(fn, builtin, op, view, uview)                                         \
-    DAL_FORCEINLINE DalVr fn(DalPpuContext* ctx, DalVr a, DalVr b) {                           \
-        DalVr v;                                                                               \
-        v.view = builtin(a.view, b.view);                                                      \
-        dalSetSat(ctx, __builtin_reduce_or(v.uview != (a.uview op b.uview)));                  \
-        return v;                                                                              \
+#define DAL_VMX_SATURATE(fn, builtin, op, view, uview)                        \
+    DAL_FORCEINLINE DalVr fn(DalPpuContext* ctx, DalVr a, DalVr b) {          \
+        DalVr v;                                                              \
+        v.view = builtin(a.view, b.view);                                     \
+        dalSetSat(ctx, __builtin_reduce_or(v.uview != (a.uview op b.uview))); \
+        return v;                                                             \
     }
 
 DAL_VMX_SATURATE(dalVaddubs, __builtin_elementwise_add_sat, +, u8, u8)
@@ -361,11 +345,11 @@ DAL_FORCEINLINE DalVr dalVsubcuw(DalVr a, DalVr b) {
 
 // Averages round up: (a + b + 1) >> 1 as (a | b) - ((a ^ b) >> 1), which cannot overflow. The shift
 // is arithmetic for the signed forms (RPCS3 `VAVGSB` etc.).
-#define DAL_VMX_AVERAGE(fn, view, uview, utype)                                                \
-    DAL_FORCEINLINE DalVr fn(DalVr a, DalVr b) {                                               \
-        DalVr v;                                                                               \
-        v.uview = (a.uview | b.uview) - (utype)((a.view ^ b.view) >> 1);                       \
-        return v;                                                                              \
+#define DAL_VMX_AVERAGE(fn, view, uview, utype)                          \
+    DAL_FORCEINLINE DalVr fn(DalVr a, DalVr b) {                         \
+        DalVr v;                                                         \
+        v.uview = (a.uview | b.uview) - (utype)((a.view ^ b.view) >> 1); \
+        return v;                                                        \
     }
 
 DAL_VMX_AVERAGE(dalVavgub, u8, u8, DalU8x16)
@@ -387,27 +371,27 @@ DAL_FORCEINLINE void dalSetCr6(DalPpuContext* ctx, DalVr result) {
 // its own count, taken modulo the element width, so no shift amount reaches the width. Left shifts
 // run on the unsigned view because shifting a negative value left is not defined in C. The rotate
 // uses (width - n) & (width - 1) so that n == 0 shifts by 0 instead of by the full width.
-#define DAL_VMX_SHIFTS(sfx, view, sview, utype, stype, mask)                                   \
-    DAL_FORCEINLINE DalVr dalVrl##sfx(DalVr a, DalVr b) {                                      \
-        DalVr v;                                                                               \
-        utype n = b.view & mask;                                                               \
-        v.view = (a.view << n) | (a.view >> ((mask + 1 - n) & mask));                          \
-        return v;                                                                              \
-    }                                                                                          \
-    DAL_FORCEINLINE DalVr dalVsl##sfx(DalVr a, DalVr b) {                                      \
-        DalVr v;                                                                               \
-        v.view = a.view << (b.view & mask);                                                    \
-        return v;                                                                              \
-    }                                                                                          \
-    DAL_FORCEINLINE DalVr dalVsr##sfx(DalVr a, DalVr b) {                                      \
-        DalVr v;                                                                               \
-        v.view = a.view >> (b.view & mask);                                                    \
-        return v;                                                                              \
-    }                                                                                          \
-    DAL_FORCEINLINE DalVr dalVsra##sfx(DalVr a, DalVr b) {                                     \
-        DalVr v;                                                                               \
-        v.sview = a.sview >> (stype)(b.view & mask);                                           \
-        return v;                                                                              \
+#define DAL_VMX_SHIFTS(sfx, view, sview, utype, stype, mask)          \
+    DAL_FORCEINLINE DalVr dalVrl##sfx(DalVr a, DalVr b) {             \
+        DalVr v;                                                      \
+        utype n = b.view & mask;                                      \
+        v.view = (a.view << n) | (a.view >> ((mask + 1 - n) & mask)); \
+        return v;                                                     \
+    }                                                                 \
+    DAL_FORCEINLINE DalVr dalVsl##sfx(DalVr a, DalVr b) {             \
+        DalVr v;                                                      \
+        v.view = a.view << (b.view & mask);                           \
+        return v;                                                     \
+    }                                                                 \
+    DAL_FORCEINLINE DalVr dalVsr##sfx(DalVr a, DalVr b) {             \
+        DalVr v;                                                      \
+        v.view = a.view >> (b.view & mask);                           \
+        return v;                                                     \
+    }                                                                 \
+    DAL_FORCEINLINE DalVr dalVsra##sfx(DalVr a, DalVr b) {            \
+        DalVr v;                                                      \
+        v.sview = a.sview >> (stype)(b.view & mask);                  \
+        return v;                                                     \
     }
 
 DAL_VMX_SHIFTS(b, u8, s8, DalU8x16, DalS8x16, 7)
@@ -438,10 +422,8 @@ DAL_FORCEINLINE DalVr dalVmulesb(DalVr a, DalVr b) {
 
 DAL_FORCEINLINE DalVr dalVmulosb(DalVr a, DalVr b) {
     DalVr v;
-    DalS16x8 ea = __builtin_convertvector(__builtin_shufflevector(a.s8, a.s8, 0, 2, 4, 6, 8, 10, 12, 14),
-                                          DalS16x8);
-    DalS16x8 eb = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 2, 4, 6, 8, 10, 12, 14),
-                                          DalS16x8);
+    DalS16x8 ea = __builtin_convertvector(__builtin_shufflevector(a.s8, a.s8, 0, 2, 4, 6, 8, 10, 12, 14), DalS16x8);
+    DalS16x8 eb = __builtin_convertvector(__builtin_shufflevector(b.s8, b.s8, 0, 2, 4, 6, 8, 10, 12, 14), DalS16x8);
     v.s16 = ea * eb;
     return v;
 }
@@ -499,15 +481,13 @@ DAL_FORCEINLINE uint32_t dalClampU32(DalPpuContext* ctx, uint64_t x) {
 // vmhraddshs adds 0x4000 before the shift (RPCS3 `VMHRADDSHS`).
 DAL_FORCEINLINE DalVr dalVmhaddshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
     DalVr v;
-    for (int i = 0; i < 8; i++)
-        v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i]) >> 15) + c.s16[i]);
+    for (int i = 0; i < 8; i++) v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i]) >> 15) + c.s16[i]);
     return v;
 }
 
 DAL_FORCEINLINE DalVr dalVmhraddshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c) {
     DalVr v;
-    for (int i = 0; i < 8; i++)
-        v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i] + 0x4000) >> 15) + c.s16[i]);
+    for (int i = 0; i < 8; i++) v.s16[i] = dalClampS16(ctx, (((int32_t)a.s16[i] * b.s16[i] + 0x4000) >> 15) + c.s16[i]);
     return v;
 }
 
@@ -545,8 +525,7 @@ DAL_FORCEINLINE DalVr dalVmsummbm(DalVr a, DalVr b, DalVr c) {
 DAL_FORCEINLINE DalVr dalVmsumuhm(DalVr a, DalVr b, DalVr c) {
     DalVr v;
     for (int i = 0; i < 4; i++)
-        v.u32[i] = c.u32[i] + (uint32_t)a.u16[2 * i] * b.u16[2 * i] +
-                   (uint32_t)a.u16[2 * i + 1] * b.u16[2 * i + 1];
+        v.u32[i] = c.u32[i] + (uint32_t)a.u16[2 * i] * b.u16[2 * i] + (uint32_t)a.u16[2 * i + 1] * b.u16[2 * i + 1];
     return v;
 }
 
@@ -562,7 +541,7 @@ DAL_FORCEINLINE DalVr dalVmsumuhs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c)
     DalVr v;
     for (int i = 0; i < 4; i++)
         v.u32[i] = dalClampU32(ctx, (uint64_t)c.u32[i] + (uint64_t)a.u16[2 * i] * b.u16[2 * i] +
-                                        (uint64_t)a.u16[2 * i + 1] * b.u16[2 * i + 1]);
+                                            (uint64_t)a.u16[2 * i + 1] * b.u16[2 * i + 1]);
     return v;
 }
 
@@ -570,7 +549,7 @@ DAL_FORCEINLINE DalVr dalVmsumshs(DalPpuContext* ctx, DalVr a, DalVr b, DalVr c)
     DalVr v;
     for (int i = 0; i < 4; i++)
         v.s32[i] = dalClampS32(ctx, (int64_t)c.s32[i] + (int64_t)a.s16[2 * i] * b.s16[2 * i] +
-                                        (int64_t)a.s16[2 * i + 1] * b.s16[2 * i + 1]);
+                                            (int64_t)a.s16[2 * i + 1] * b.s16[2 * i + 1]);
     return v;
 }
 
@@ -588,8 +567,7 @@ DAL_FORCEINLINE DalVr dalVsum4sbs(DalPpuContext* ctx, DalVr a, DalVr b) {
 
 DAL_FORCEINLINE DalVr dalVsum4shs(DalPpuContext* ctx, DalVr a, DalVr b) {
     DalVr v;
-    for (int i = 0; i < 4; i++)
-        v.s32[i] = dalClampS32(ctx, (int64_t)b.s32[i] + a.s16[2 * i] + a.s16[2 * i + 1]);
+    for (int i = 0; i < 4; i++) v.s32[i] = dalClampS32(ctx, (int64_t)b.s32[i] + a.s16[2 * i] + a.s16[2 * i + 1]);
     return v;
 }
 
@@ -633,9 +611,7 @@ DAL_FORCEINLINE DalVr dalFlushDenormals(const DalPpuContext* ctx, DalVr v) {
     return v;
 }
 
-DAL_FORCEINLINE DalU32x4 dalIsNanBits(DalU32x4 bits) {
-    return (DalU32x4)((bits & 0x7fffffffu) > 0x7f800000u);
-}
+DAL_FORCEINLINE DalU32x4 dalIsNanBits(DalU32x4 bits) { return (DalU32x4)((bits & 0x7fffffffu) > 0x7f800000u); }
 
 // RPCS3 `ppu_fix_vnan`: a NaN result becomes the default quiet NaN, whatever the host produced.
 DAL_FORCEINLINE DalU32x4 dalFixNanBits(DalU32x4 r) {
@@ -651,9 +627,7 @@ DAL_FORCEINLINE DalU32x4 dalSelectNan(DalU32x4 a, DalU32x4 rest) {
 
 // RPCS3 `ppu_set_vnan` with operands: the first NaN among the operands wins, otherwise the result
 // with a NaN replaced by the default NaN.
-DAL_FORCEINLINE DalU32x4 dalSetVnan1(DalU32x4 r, DalU32x4 a) {
-    return dalSelectNan(a, dalFixNanBits(r));
-}
+DAL_FORCEINLINE DalU32x4 dalSetVnan1(DalU32x4 r, DalU32x4 a) { return dalSelectNan(a, dalFixNanBits(r)); }
 
 DAL_FORCEINLINE DalU32x4 dalSetVnan2(DalU32x4 r, DalU32x4 a, DalU32x4 b) {
     return dalSelectNan(a, dalSelectNan(b, dalFixNanBits(r)));
@@ -762,13 +736,13 @@ DAL_FORCEINLINE DalVr dalVlogefp(DalVr b) {
 // fix_nj), which matters: a negative denormal rounds down to -1.0 unflushed but to -0 flushed.
 // VRFIN and VRFIZ flush the result only; flushing their input first gives the same result, so all
 // four share one shape here.
-#define DAL_VMX_ROUND(fn, builtin)                                                             \
-    DAL_FORCEINLINE DalVr fn(const DalPpuContext* ctx, DalVr b) {                              \
-        b = dalFlushDenormals(ctx, b);                                                         \
-        DalVr r;                                                                               \
-        r.f32 = builtin(b.f32);                                                                \
-        r.u32 = dalSetVnan1(r.u32, b.u32);                                                     \
-        return dalFlushDenormals(ctx, r);                                                      \
+#define DAL_VMX_ROUND(fn, builtin)                                \
+    DAL_FORCEINLINE DalVr fn(const DalPpuContext* ctx, DalVr b) { \
+        b = dalFlushDenormals(ctx, b);                            \
+        DalVr r;                                                  \
+        r.f32 = builtin(b.f32);                                   \
+        r.u32 = dalSetVnan1(r.u32, b.u32);                        \
+        return dalFlushDenormals(ctx, r);                         \
     }
 
 DAL_VMX_ROUND(dalVrfin, __builtin_elementwise_roundeven)

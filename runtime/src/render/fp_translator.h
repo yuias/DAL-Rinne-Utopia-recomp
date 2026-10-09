@@ -14,7 +14,7 @@ namespace dal {
 // ---- Interface contract shared with the vertex translator and the renderer ----
 
 // Descriptor set 0 bindings used by the fragment stage.
-inline constexpr std::uint32_t kFpConstantsBinding = 1;  // UBO: vec4 fc[N], std140, N = inline constants
+inline constexpr std::uint32_t kFpConstantsBinding = 1;          // UBO: vec4 fc[N], std140, N = inline constants
 inline constexpr std::uint32_t kFpDrawBinding = kVpDrawBinding;  // same buffer as the vertex stage
 inline constexpr std::uint32_t kFpTextureBindingBase = 3;        // sampler2D of unit n at base + n
 inline constexpr std::uint32_t kFpTextureUnitCount = 16;
@@ -46,11 +46,11 @@ inline constexpr std::uint32_t kFpFlagTwoSided = 1u << 0;
 inline constexpr std::uint32_t kFpFlagRound8Bit = 1u << 1;
 
 struct FpDrawUniforms {
-  std::uint32_t alpha_func;
-  float alpha_ref;
-  std::uint32_t flags;
-  std::uint32_t reserved;
-  float texture_scale[kFpTextureUnitCount][4];
+    std::uint32_t alpha_func;
+    float alpha_ref;
+    std::uint32_t flags;
+    std::uint32_t reserved;
+    float texture_scale[kFpTextureUnitCount][4];
 };
 static_assert(kFpDrawBlockOffset % 16 == 0);
 static_assert(sizeof(FpDrawUniforms) == 16 + 16 * kFpTextureUnitCount);
@@ -59,7 +59,7 @@ static_assert(offsetof(FpDrawUniforms, flags) == 8);
 static_assert(offsetof(FpDrawUniforms, texture_scale) == 16);
 
 // SET_SHADER_CONTROL bits the translator reads.
-inline constexpr std::uint32_t kFpControlDepthExport = 0xe;  // any bit: gl_FragDepth = clamp(R1.z, 0, 1)
+inline constexpr std::uint32_t kFpControlDepthExport = 0xe;   // any bit: gl_FragDepth = clamp(R1.z, 0, 1)
 inline constexpr std::uint32_t kFpControl32BitExport = 0x40;  // colour from R0 (set) or H0 (clear)
 
 // Program words are stored with their 16-bit halves swapped. RsxDraw::fp_ucode and ::fp_constants

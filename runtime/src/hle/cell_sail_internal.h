@@ -16,7 +16,7 @@
 namespace dal::sail_hle {
 
 inline bool guestMapped(std::uint32_t addr, std::uint32_t size) {
-  return addr != 0 && process().memory.isCommitted(addr, size);
+    return addr != 0 && process().memory.isCommitted(addr, size);
 }
 
 enum class AdapterKind { Graphics, Sound };
@@ -34,14 +34,14 @@ void resetAdapters();
 // What the player needs from the adapter bound to it: the game's callbacks (OPD addresses) and the
 // format the game asked for (guest-layout bytes, 0xff = unspecified).
 struct GraphicsBinding {
-  std::uint32_t arg = 0;
-  std::uint32_t format_changed = 0, alloc = 0, free = 0;
-  std::array<std::uint8_t, sail::kVideoFormatSize> preferred{};
+    std::uint32_t arg = 0;
+    std::uint32_t format_changed = 0, alloc = 0, free = 0;
+    std::array<std::uint8_t, sail::kVideoFormatSize> preferred{};
 };
 struct SoundBinding {
-  std::uint32_t arg = 0;
-  std::uint32_t format_changed = 0;
-  std::array<std::uint8_t, sail::kAudioFormatSize> preferred{};
+    std::uint32_t arg = 0;
+    std::uint32_t format_changed = 0;
+    std::array<std::uint8_t, sail::kAudioFormatSize> preferred{};
 };
 std::optional<GraphicsBinding> graphicsBoundTo(std::uint32_t player);
 std::optional<SoundBinding> soundBoundTo(std::uint32_t player);
@@ -60,16 +60,16 @@ bool clearPamfDatabase(std::uint8_t* base, std::uint32_t addr);
 
 // What GraphicsAdapterGetFrame reports for a frame that was copied into one of the game's buffers.
 struct VideoFrameResult {
-  std::uint32_t buffer = 0;
-  std::uint32_t session_id = 0, tag = 0;
-  std::int64_t pts = 0;  // 90 kHz, as in the file
+    std::uint32_t buffer = 0;
+    std::uint32_t session_id = 0, tag = 0;
+    std::int64_t pts = 0;  // 90 kHz, as in the file
 };
 
 // What SoundAdapterGetFrame reports: `frames` sample frames at `buffer`, valid until the next call.
 struct SoundFrameResult {
-  std::uint32_t buffer = 0;
-  std::uint32_t session_id = 0, tag = 0;
-  std::int64_t pts = 0;
+    std::uint32_t buffer = 0;
+    std::uint32_t session_id = 0, tag = 0;
+    std::int64_t pts = 0;
 };
 
 // Implemented by the player. takeVideoFrame copies the newest due frame of the stream open on
@@ -77,7 +77,6 @@ struct SoundFrameResult {
 // the end of the stream, which the game cannot learn any other way. takeSoundFrame returns the
 // cellSail result code for the call (kSyncNextOnTime with `out` filled, kSyncNoFrame, or an error).
 std::optional<VideoFrameResult> takeVideoFrame(std::uint8_t* base, std::uint32_t player);
-std::uint32_t takeSoundFrame(std::uint8_t* base, std::uint32_t player, std::uint32_t frames,
-                             SoundFrameResult& out);
+std::uint32_t takeSoundFrame(std::uint8_t* base, std::uint32_t player, std::uint32_t frames, SoundFrameResult& out);
 
 }  // namespace dal::sail_hle

@@ -55,51 +55,51 @@ inline constexpr std::uint32_t kRsxZcullCount = 8;
 inline constexpr std::uint32_t kRsxDisplayBufferCount = 8;
 
 struct RsxDisplayBuffer {
-  std::uint32_t offset = 0, pitch = 0, width = 0, height = 0;
+    std::uint32_t offset = 0, pitch = 0, width = 0, height = 0;
 };
 
 struct RsxTile {
-  bool bound = false;
-  std::uint32_t location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0, bank = 0;
+    bool bound = false;
+    std::uint32_t location = 0, offset = 0, size = 0, pitch = 0, comp = 0, base = 0, bank = 0;
 };
 
 struct RsxZcull {
-  bool bound = false;
-  std::uint32_t offset = 0, width = 0, height = 0, cull_start = 0, z_format = 0, aa_format = 0, zcull_dir = 0,
-                zcull_format = 0, s_func = 0, s_ref = 0, s_mask = 0;
+    bool bound = false;
+    std::uint32_t offset = 0, width = 0, height = 0, cull_start = 0, z_format = 0, aa_format = 0, zcull_dir = 0,
+                  zcull_format = 0, s_func = 0, s_ref = 0, s_mask = 0;
 };
 
 struct RsxState {
-  RsxState() {
-    io_of_ea.fill(kRsxUnmapped);
-    ea_of_io.fill(kRsxUnmapped);
-    io_map_size.fill(0);
-  }
+    RsxState() {
+        io_of_ea.fill(kRsxUnmapped);
+        ea_of_io.fill(kRsxUnmapped);
+        io_map_size.fill(0);
+    }
 
-  bool initialized = false;
-  std::uint32_t local_size = 0;
-  std::uint32_t io_address = 0, io_size = 0, context_pp = 0;
-  std::array<std::uint16_t, kRsxEaPages> io_of_ea;     // IO MiB of an EA MiB, 0xFFFF = unmapped
-  std::array<std::uint16_t, kRsxIoPages> ea_of_io;     // EA MiB of an IO MiB
-  std::array<std::uint16_t, kRsxEaPages> io_map_size;  // size in MiB of the mapping starting at an EA MiB
-  std::uint32_t command_begin = 0, fragment_count = 0;
-  std::uint32_t command_size = 0x400, segment_size = 0x100;  // gcmInfo defaults, in words
-  std::uint32_t wrap_callback = 0;                           // guest OPD of the command buffer wrap callback
+    bool initialized = false;
+    std::uint32_t local_size = 0;
+    std::uint32_t io_address = 0, io_size = 0, context_pp = 0;
+    std::array<std::uint16_t, kRsxEaPages> io_of_ea;     // IO MiB of an EA MiB, 0xFFFF = unmapped
+    std::array<std::uint16_t, kRsxIoPages> ea_of_io;     // EA MiB of an IO MiB
+    std::array<std::uint16_t, kRsxEaPages> io_map_size;  // size in MiB of the mapping starting at an EA MiB
+    std::uint32_t command_begin = 0, fragment_count = 0;
+    std::uint32_t command_size = 0x400, segment_size = 0x100;  // gcmInfo defaults, in words
+    std::uint32_t wrap_callback = 0;                           // guest OPD of the command buffer wrap callback
 
-  std::array<RsxDisplayBuffer, kRsxDisplayBufferCount> display{};
-  std::uint32_t display_count = 0;
-  std::array<RsxTile, kRsxTileCount> tiles{};
-  std::array<RsxZcull, kRsxZcullCount> zculls{};
+    std::array<RsxDisplayBuffer, kRsxDisplayBufferCount> display{};
+    std::uint32_t display_count = 0;
+    std::array<RsxTile, kRsxTileCount> tiles{};
+    std::array<RsxZcull, kRsxZcullCount> zculls{};
 
-  // The game's flip mode (RPCS3 `requested_vsync`); selects the present mode of the back end and does
-  // not delay flips.
-  bool requested_vsync = true;
-  std::uint32_t flip_status = kRsxFlipStatusDone;
-  // Microseconds on the system-time clock, set back by one second as RPCS3 does at RSX thread start
-  // and after every flip (`last_guest_flip_timestamp`).
-  std::uint64_t last_flip_time = 0;
-  std::uint64_t vblank_count = 0;
-  std::uint32_t flip_handler = 0, vblank_handler = 0, user_handler = 0;  // guest OPDs, 0 = none
+    // The game's flip mode (RPCS3 `requested_vsync`); selects the present mode of the back end and does
+    // not delay flips.
+    bool requested_vsync = true;
+    std::uint32_t flip_status = kRsxFlipStatusDone;
+    // Microseconds on the system-time clock, set back by one second as RPCS3 does at RSX thread start
+    // and after every flip (`last_guest_flip_timestamp`).
+    std::uint64_t last_flip_time = 0;
+    std::uint64_t vblank_count = 0;
+    std::uint32_t flip_handler = 0, vblank_handler = 0, user_handler = 0;  // guest OPDs, 0 = none
 };
 
 RsxState& rsxState();

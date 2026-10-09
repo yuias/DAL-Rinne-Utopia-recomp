@@ -39,9 +39,9 @@ namespace {
 
 constexpr char kModule[] = "cellSysutil";
 
-constexpr std::uint32_t kErrorParam = 0x8002b301;         // CELL_MSGDIALOG_ERROR_PARAM
-constexpr std::uint32_t kErrorNotOpened = 0x8002b302;     // CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED
-constexpr std::uint32_t kStringSize = 512;                // CELL_MSGDIALOG_STRING_SIZE
+constexpr std::uint32_t kErrorParam = 0x8002b301;      // CELL_MSGDIALOG_ERROR_PARAM
+constexpr std::uint32_t kErrorNotOpened = 0x8002b302;  // CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED
+constexpr std::uint32_t kStringSize = 512;             // CELL_MSGDIALOG_STRING_SIZE
 
 // CELL_MSGDIALOG_TYPE_* bit fields.
 constexpr std::uint32_t kTypeSeNormal = 1u << 0;
@@ -67,14 +67,14 @@ constexpr std::int32_t kResultNo = 2;
 using Clock = std::chrono::steady_clock;
 
 struct Dialog {
-  bool open = false;
-  std::uint32_t id = 0;  // distinguishes dialogs for the poll closures
-  std::uint32_t type = 0;
-  std::uint32_t callback = 0;
-  std::uint32_t userdata = 0;
-  std::optional<Clock::time_point> answer_at;  // auto-answer of a dialog with buttons
-  std::int32_t answer = kResultNone;
-  std::optional<Clock::time_point> close_at;  // cellMsgDialogClose
+    bool open = false;
+    std::uint32_t id = 0;  // distinguishes dialogs for the poll closures
+    std::uint32_t type = 0;
+    std::uint32_t callback = 0;
+    std::uint32_t userdata = 0;
+    std::optional<Clock::time_point> answer_at;  // auto-answer of a dialog with buttons
+    std::int32_t answer = kResultNone;
+    std::optional<Clock::time_point> close_at;  // cellMsgDialogClose
 };
 
 Dialog g_dialog;
@@ -86,156 +86,156 @@ std::uint32_t buttonType(std::uint32_t type) { return (type >> kTypeButtonShift)
 std::uint32_t barCount(std::uint32_t type) { return (type >> kTypeBarShift) & kTypeBarMask; }
 
 std::string describeType(std::uint32_t type) {
-  const char* buttons = "no buttons";
-  switch (buttonType(type)) {
-    case kButtonYesNo: buttons = "yes/no"; break;
-    case kButtonOk: buttons = "ok"; break;
-    default: break;
-  }
-  return std::format("{}, {}{}{}, {} bar(s)", buttons, (type & kTypeSeNormal) ? "normal" : "error",
-                     (type & kTypeBgInvisible) ? ", bg invisible" : "",
-                     (type & kTypeDisableCancel) ? ", cancel disabled" : "", barCount(type));
+    const char* buttons = "no buttons";
+    switch (buttonType(type)) {
+        case kButtonYesNo: buttons = "yes/no"; break;
+        case kButtonOk: buttons = "ok"; break;
+        default: break;
+    }
+    return std::format("{}, {}{}{}, {} bar(s)", buttons, (type & kTypeSeNormal) ? "normal" : "error",
+                       (type & kTypeBgInvisible) ? ", bg invisible" : "",
+                       (type & kTypeDisableCancel) ? ", cancel disabled" : "", barCount(type));
 }
 
 // Ends the dialog (RPCS3 `on_close`): DRAWING_END to the system callbacks, then the dialog's own
 // callback, both on the next cellSysutilCheckCallback.
 void finish(std::int32_t result) {
-  logInfo("dal: msgdialog: closed with button {}", result);
-  const std::uint32_t callback = g_dialog.callback;
-  const std::uint32_t userdata = g_dialog.userdata;
-  g_dialog = {};
-  queueSysutilEvent(kSysutilDrawingEnd, 0);
-  if (callback != 0) {
-    queueSysutilCall([callback, userdata, result](DalPpuContext* ctx, std::uint8_t* base) {
-      callGuestFunction(ctx, base, callback,
-                        {static_cast<std::uint64_t>(static_cast<std::int64_t>(result)), userdata});
-    });
-  }
+    logInfo("dal: msgdialog: closed with button {}", result);
+    const std::uint32_t callback = g_dialog.callback;
+    const std::uint32_t userdata = g_dialog.userdata;
+    g_dialog = {};
+    queueSysutilEvent(kSysutilDrawingEnd, 0);
+    if (callback != 0) {
+        queueSysutilCall([callback, userdata, result](DalPpuContext* ctx, std::uint8_t* base) {
+            callGuestFunction(ctx, base, callback,
+                              {static_cast<std::uint64_t>(static_cast<std::int64_t>(result)), userdata});
+        });
+    }
 }
 
 // Re-queues itself until the dialog it was started for ends, so each cellSysutilCheckCallback
 // looks at the deadlines once.
 void poll(std::uint32_t id) {
-  queueSysutilCall([id](DalPpuContext*, std::uint8_t*) {
-    if (!g_dialog.open || g_dialog.id != id) return;
-    const Clock::time_point now = Clock::now();
-    const bool answer_due = g_dialog.answer_at && *g_dialog.answer_at <= now;
-    const bool close_due = g_dialog.close_at && *g_dialog.close_at <= now;
-    // A button press that precedes the close timer wins (RPCS3: on_close is a one-shot state swap).
-    if (answer_due && (!close_due || *g_dialog.answer_at <= *g_dialog.close_at)) {
-      finish(g_dialog.answer);
-    } else if (close_due) {
-      finish(kResultNone);
-    } else {
-      poll(id);
-    }
-  });
+    queueSysutilCall([id](DalPpuContext*, std::uint8_t*) {
+        if (!g_dialog.open || g_dialog.id != id) return;
+        const Clock::time_point now = Clock::now();
+        const bool answer_due = g_dialog.answer_at && *g_dialog.answer_at <= now;
+        const bool close_due = g_dialog.close_at && *g_dialog.close_at <= now;
+        // A button press that precedes the close timer wins (RPCS3: on_close is a one-shot state swap).
+        if (answer_due && (!close_due || *g_dialog.answer_at <= *g_dialog.close_at)) {
+            finish(g_dialog.answer);
+        } else if (close_due) {
+            finish(kResultNone);
+        } else {
+            poll(id);
+        }
+    });
 }
 
 // cellMsgDialogOpen2(u32 type, const char* msgString, CellMsgDialogCallback callback,
 //                    void* userData, void* extParam)
 void open2(DalPpuContext* ctx, std::uint8_t* base) {
-  const std::uint32_t type = argU32(ctx, 0);
-  const std::uint32_t text_addr = argU32(ctx, 1);
-  const std::uint32_t callback = argU32(ctx, 2);
-  const std::uint32_t userdata = argU32(ctx, 3);
+    const std::uint32_t type = argU32(ctx, 0);
+    const std::uint32_t text_addr = argU32(ctx, 1);
+    const std::uint32_t callback = argU32(ctx, 2);
+    const std::uint32_t userdata = argU32(ctx, 3);
 
-  if (text_addr == 0 || (type & ~kTypeValidMask) != 0) {
-    ctx->gpr[3] = kErrorParam;
-    return;
-  }
-  const std::string text = readGuestString(base, text_addr, kStringSize);
-  if (text.size() >= kStringSize) {
-    ctx->gpr[3] = kErrorParam;
-    return;
-  }
+    if (text_addr == 0 || (type & ~kTypeValidMask) != 0) {
+        ctx->gpr[3] = kErrorParam;
+        return;
+    }
+    const std::string text = readGuestString(base, text_addr, kStringSize);
+    if (text.size() >= kStringSize) {
+        ctx->gpr[3] = kErrorParam;
+        return;
+    }
 
-  const std::uint32_t cursor = (type >> kTypeCursorShift) & kTypeCursorMask;
-  const std::uint32_t bars = barCount(type);
-  bool valid = false;
-  switch (buttonType(type)) {
-    case kButtonNone: valid = cursor == 0 && bars <= 2; break;
-    case kButtonYesNo: valid = cursor <= 1 && bars == 0; break;
-    case kButtonOk: valid = cursor == 0 && bars == 0; break;
-    default: break;
-  }
-  if (!valid) {
-    ctx->gpr[3] = kErrorParam;
-    return;
-  }
+    const std::uint32_t cursor = (type >> kTypeCursorShift) & kTypeCursorMask;
+    const std::uint32_t bars = barCount(type);
+    bool valid = false;
+    switch (buttonType(type)) {
+        case kButtonNone: valid = cursor == 0 && bars <= 2; break;
+        case kButtonYesNo: valid = cursor <= 1 && bars == 0; break;
+        case kButtonOk: valid = cursor == 0 && bars == 0; break;
+        default: break;
+    }
+    if (!valid) {
+        ctx->gpr[3] = kErrorParam;
+        return;
+    }
 
-  if (g_dialog.open) {
-    ctx->gpr[3] = kSysutilErrorBusy;
-    return;
-  }
-  const std::int32_t drawing = queueSysutilEvent(kSysutilDrawingBegin, 0);
-  if (drawing < 0) {
-    ctx->gpr[3] = static_cast<std::uint32_t>(drawing);
-    return;
-  }
+    if (g_dialog.open) {
+        ctx->gpr[3] = kSysutilErrorBusy;
+        return;
+    }
+    const std::int32_t drawing = queueSysutilEvent(kSysutilDrawingBegin, 0);
+    if (drawing < 0) {
+        ctx->gpr[3] = static_cast<std::uint32_t>(drawing);
+        return;
+    }
 
-  g_dialog = {};
-  g_dialog.open = true;
-  g_dialog.id = ++g_next_id;
-  g_dialog.type = type;
-  g_dialog.callback = callback;
-  g_dialog.userdata = userdata;
-  if (buttonType(type) != kButtonNone) {
-    g_dialog.answer = buttonType(type) == kButtonOk ? kResultYes : g_yes_no_answer;
-    g_dialog.answer_at = Clock::now() + g_answer_delay;
-  }
-  logInfo("dal: msgdialog: open type {:#x} ({}) callback {:#x} userdata {:#x}: {}", type,
-          describeType(type), callback, userdata, text);
-  if (g_dialog.answer_at) {
-    logInfo("dal: msgdialog: auto-answer {} in {} ms", g_dialog.answer, g_answer_delay.count());
-  }
-  poll(g_dialog.id);
-  ctx->gpr[3] = kCellOk;
+    g_dialog = {};
+    g_dialog.open = true;
+    g_dialog.id = ++g_next_id;
+    g_dialog.type = type;
+    g_dialog.callback = callback;
+    g_dialog.userdata = userdata;
+    if (buttonType(type) != kButtonNone) {
+        g_dialog.answer = buttonType(type) == kButtonOk ? kResultYes : g_yes_no_answer;
+        g_dialog.answer_at = Clock::now() + g_answer_delay;
+    }
+    logInfo("dal: msgdialog: open type {:#x} ({}) callback {:#x} userdata {:#x}: {}", type, describeType(type),
+            callback, userdata, text);
+    if (g_dialog.answer_at) {
+        logInfo("dal: msgdialog: auto-answer {} in {} ms", g_dialog.answer, g_answer_delay.count());
+    }
+    poll(g_dialog.id);
+    ctx->gpr[3] = kCellOk;
 }
 
 // cellMsgDialogClose(f32 delay): `delay` in milliseconds.
 void closeDialog(DalPpuContext* ctx, std::uint8_t*) {
-  if (!g_dialog.open) {
-    ctx->gpr[3] = kErrorNotOpened;
-    return;
-  }
-  const float delay = std::max(static_cast<float>(ctx->fpr[1].f64), 0.0f);
-  g_dialog.close_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-                                         std::chrono::duration<float, std::milli>(delay));
-  logInfo("dal: msgdialog: close requested in {} ms", delay);
-  ctx->gpr[3] = kCellOk;
+    if (!g_dialog.open) {
+        ctx->gpr[3] = kErrorNotOpened;
+        return;
+    }
+    const float delay = std::max(static_cast<float>(ctx->fpr[1].f64), 0.0f);
+    g_dialog.close_at =
+            Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float, std::milli>(delay));
+    logInfo("dal: msgdialog: close requested in {} ms", delay);
+    ctx->gpr[3] = kCellOk;
 }
 
 // Shared by the two progress bar handlers: a dialog must be open and the index within its bars.
 bool checkBar(DalPpuContext* ctx, std::uint32_t index) {
-  if (!g_dialog.open) {
-    ctx->gpr[3] = kErrorNotOpened;
-    return false;
-  }
-  if (index >= barCount(g_dialog.type)) {
-    ctx->gpr[3] = kErrorParam;
-    return false;
-  }
-  return true;
+    if (!g_dialog.open) {
+        ctx->gpr[3] = kErrorNotOpened;
+        return false;
+    }
+    if (index >= barCount(g_dialog.type)) {
+        ctx->gpr[3] = kErrorParam;
+        return false;
+    }
+    return true;
 }
 
 // cellMsgDialogProgressBarReset(u32 progressBarIndex)
 void progressBarReset(DalPpuContext* ctx, std::uint8_t*) {
-  if (!checkBar(ctx, argU32(ctx, 0))) return;
-  ctx->gpr[3] = kCellOk;
+    if (!checkBar(ctx, argU32(ctx, 0))) return;
+    ctx->gpr[3] = kCellOk;
 }
 
 // cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
 void progressBarInc(DalPpuContext* ctx, std::uint8_t*) {
-  if (!checkBar(ctx, argU32(ctx, 0))) return;
-  ctx->gpr[3] = kCellOk;
+    if (!checkBar(ctx, argU32(ctx, 0))) return;
+    ctx->gpr[3] = kCellOk;
 }
 
 constexpr HleEntry kHandlers[] = {
-    {kModule, 0x20543730, "cellMsgDialogClose", closeDialog},
-    {kModule, 0x7603d3db, "cellMsgDialogOpen2", open2},
-    {kModule, 0x7bc2c8a8, "cellMsgDialogProgressBarReset", progressBarReset},
-    {kModule, 0x94862702, "cellMsgDialogProgressBarInc", progressBarInc},
+        {kModule, 0x20543730, "cellMsgDialogClose", closeDialog},
+        {kModule, 0x7603d3db, "cellMsgDialogOpen2", open2},
+        {kModule, 0x7bc2c8a8, "cellMsgDialogProgressBarReset", progressBarReset},
+        {kModule, 0x94862702, "cellMsgDialogProgressBarInc", progressBarInc},
 };
 
 }  // namespace
@@ -243,23 +243,23 @@ constexpr HleEntry kHandlers[] = {
 std::span<const HleEntry> cellMsgDialogHandlers() { return kHandlers; }
 
 bool setDialogAnswer(std::string_view answer) {
-  if (answer == "yes" || answer == "ok") {
-    g_yes_no_answer = kResultYes;
-  } else if (answer == "no") {
-    g_yes_no_answer = kResultNo;
-  } else {
-    return false;
-  }
-  return true;
+    if (answer == "yes" || answer == "ok") {
+        g_yes_no_answer = kResultYes;
+    } else if (answer == "no") {
+        g_yes_no_answer = kResultNo;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 void setDialogAnswerDelay(std::chrono::milliseconds delay) { g_answer_delay = delay; }
 
 void resetCellMsgDialog() {
-  g_dialog = {};
-  g_next_id = 0;
-  g_yes_no_answer = kResultYes;
-  g_answer_delay = std::chrono::milliseconds(200);
+    g_dialog = {};
+    g_next_id = 0;
+    g_yes_no_answer = kResultYes;
+    g_answer_delay = std::chrono::milliseconds(200);
 }
 
 }  // namespace dal

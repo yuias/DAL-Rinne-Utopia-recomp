@@ -35,9 +35,9 @@ namespace dal {
 inline constexpr std::chrono::milliseconds kPadScriptTapHold{150};
 
 struct PadScriptEvent {
-  std::chrono::milliseconds at;
-  PadButtons buttons;
-  bool down;
+    std::chrono::milliseconds at;
+    PadButtons buttons;
+    bool down;
 };
 
 // Events sorted by time (stable); at equal times releases come before presses. An error is one line

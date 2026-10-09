@@ -45,8 +45,8 @@ inline constexpr double kClockKiPpmPerFrameSecond = 0.05;
 using AudioBlockProducer = std::function<void(std::span<float> block)>;
 
 struct AudioEngineConfig {
-  std::function<std::unique_ptr<AudioOutput>()> make_output;  // null: makeNullAudioOutput
-  std::filesystem::path dump;                                  // empty: no dump
+    std::function<std::unique_ptr<AudioOutput>()> make_output;  // null: makeNullAudioOutput
+    std::filesystem::path dump;                                 // empty: no dump
 };
 
 // Before boot. Replaces any earlier configuration; an engine that already started keeps its own.
@@ -66,18 +66,18 @@ void startAudioEngine(AudioBlockProducer producer);
 void requestAudioEngineStop();
 
 struct AudioEngineStats {
-  std::string output;  // "none", "wasapi", or "none (wasapi failed)"; empty before the first start
-  // Blocks the producer filled, and periods skipped because the thread woke late. Each skipped
-  // period was written to the dump and the output as silence, so blocks + skipped_blocks is the
-  // number of periods elapsed.
-  std::uint64_t blocks = 0;
-  std::uint64_t non_silent_blocks = 0;
-  std::uint64_t skipped_blocks = 0;
-  std::chrono::microseconds max_producer_time{0};  // includes the wait for the guest lock
-  // Rate of the engine's clock relative to 48 kHz (positive: faster). Zero for an output without a
-  // fill level, such as the null output.
-  double clock_ppm = 0.0;
-  AudioOutputStats output_stats;
+    std::string output;  // "none", "wasapi", or "none (wasapi failed)"; empty before the first start
+    // Blocks the producer filled, and periods skipped because the thread woke late. Each skipped
+    // period was written to the dump and the output as silence, so blocks + skipped_blocks is the
+    // number of periods elapsed.
+    std::uint64_t blocks = 0;
+    std::uint64_t non_silent_blocks = 0;
+    std::uint64_t skipped_blocks = 0;
+    std::chrono::microseconds max_producer_time{0};  // includes the wait for the guest lock
+    // Rate of the engine's clock relative to 48 kHz (positive: faster). Zero for an output without a
+    // fill level, such as the null output.
+    double clock_ppm = 0.0;
+    AudioOutputStats output_stats;
 };
 AudioEngineStats audioEngineStats();  // any thread
 
@@ -91,58 +91,58 @@ void finishAudioDump();
 bool stopAudioEngineForTest(AudioEngineStats* final_stats = nullptr);
 
 struct BlockClockPlan {
-  std::uint32_t produce = 0;  // blocks to ask the producer for
-  std::uint32_t skipped = 0;  // periods to cover with silence instead
+    std::uint32_t produce = 0;  // blocks to ask the producer for
+    std::uint32_t skipped = 0;  // periods to cover with silence instead
 };
 
 // The tick schedule, separate from the thread so it can be tested with made-up time points.
 class BlockClock {
- public:
-  using Clock = std::chrono::steady_clock;
+public:
+    using Clock = std::chrono::steady_clock;
 
-  // The first period is due one kAudioBlockPeriod after `start`.
-  explicit BlockClock(Clock::time_point start) : next_due_(start + kAudioBlockPeriod) {}
+    // The first period is due one kAudioBlockPeriod after `start`.
+    explicit BlockClock(Clock::time_point start) : next_due_(start + kAudioBlockPeriod) {}
 
-  // Runs the clock `ppm` parts per million faster (negative: slower) from the next period on. The
-  // schedule stays absolute: only the step from one due time to the next changes. Clamped to
-  // +-kClockMaxPpm; zero is exactly kAudioBlockPeriod.
-  void setCorrectionPpm(double ppm);
-  Clock::duration period() const { return period_; }
+    // Runs the clock `ppm` parts per million faster (negative: slower) from the next period on. The
+    // schedule stays absolute: only the step from one due time to the next changes. Clamped to
+    // +-kClockMaxPpm; zero is exactly kAudioBlockPeriod.
+    void setCorrectionPpm(double ppm);
+    Clock::duration period() const { return period_; }
 
-  // n periods are due at `now`: produce = min(n, 1 + kMaxCatchUpBlocks) and skipped = n - produce.
-  // The schedule moves to the first period after `now`.
-  BlockClockPlan due(Clock::time_point now);
-  Clock::time_point nextDue() const { return next_due_; }
+    // n periods are due at `now`: produce = min(n, 1 + kMaxCatchUpBlocks) and skipped = n - produce.
+    // The schedule moves to the first period after `now`.
+    BlockClockPlan due(Clock::time_point now);
+    Clock::time_point nextDue() const { return next_due_; }
 
- private:
-  Clock::time_point next_due_;
-  Clock::duration period_ = kAudioBlockPeriod;
+private:
+    Clock::time_point next_due_;
+    Clock::duration period_ = kAudioBlockPeriod;
 };
 
 // Steers the BlockClock by the output's fill level: a PI controller that once per
 // kClockUpdateInterval compares the mean fill of that interval with kFillTargetFrames. Pure, so it
 // can be tested with made-up time points.
 class BlockRateController {
- public:
-  using Clock = BlockClock::Clock;
+public:
+    using Clock = BlockClock::Clock;
 
-  // One reading of the output's fill level at `now`. nullopt (output not playing) abandons the
-  // interval under way and keeps the correction and the integral. Returns true when the correction
-  // was updated.
-  bool observe(Clock::time_point now, std::optional<std::uint64_t> fill_frames);
-  // Correction for the BlockClock, in ppm. Zero until the first interval has ended.
-  double ppm() const { return ppm_; }
-  // Mean fill of the last finished interval.
-  double lastMeanFill() const { return last_mean_fill_; }
+    // One reading of the output's fill level at `now`. nullopt (output not playing) abandons the
+    // interval under way and keeps the correction and the integral. Returns true when the correction
+    // was updated.
+    bool observe(Clock::time_point now, std::optional<std::uint64_t> fill_frames);
+    // Correction for the BlockClock, in ppm. Zero until the first interval has ended.
+    double ppm() const { return ppm_; }
+    // Mean fill of the last finished interval.
+    double lastMeanFill() const { return last_mean_fill_; }
 
- private:
-  bool window_open_ = false;
-  Clock::time_point window_start_{};
-  double window_sum_ = 0.0;
-  std::uint64_t window_count_ = 0;
-  double integral_ppm_ = 0.0;
-  double ppm_ = 0.0;
-  double last_mean_fill_ = 0.0;
+private:
+    bool window_open_ = false;
+    Clock::time_point window_start_{};
+    double window_sum_ = 0.0;
+    std::uint64_t window_count_ = 0;
+    double integral_ppm_ = 0.0;
+    double ppm_ = 0.0;
+    double last_mean_fill_ = 0.0;
 };
 
 }  // namespace dal

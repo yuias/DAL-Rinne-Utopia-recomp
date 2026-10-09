@@ -38,12 +38,7 @@ extern "C" {
 
 #define DAL_FORCEINLINE static inline __attribute__((always_inline))
 
-enum DalPpuLimits {
-    kDalTraceSize = 64,
-    kDalDcbzLine = 128,
-    kDalPreemptBudget = 4096,
-    kDalGuestGuardSize = 0x10000
-};
+enum DalPpuLimits { kDalTraceSize = 64, kDalDcbzLine = 128, kDalPreemptBudget = 4096, kDalGuestGuardSize = 0x10000 };
 
 enum DalSyncKind { kDalSyncHeavy = 0, kDalSyncLight = 1, kDalSyncEieio = 2, kDalSyncIsync = 3 };
 
@@ -92,7 +87,7 @@ typedef struct DalPpuContext {
     uint8_t xer_so, xer_ov, xer_ca, xer_count;
     uint32_t fpscr;
     uint32_t vrsave;
-    uint8_t vscr_nj, vscr_sat;  // NJ defaults to 1 (RPCS3 PPUThread.h `nj = true`); SAT is sticky
+    uint8_t vscr_nj, vscr_sat;        // NJ defaults to 1 (RPCS3 PPUThread.h `nj = true`); SAT is sticky
     uint32_t jump_target, jump_site;  // dynamic transfers (input of dalDispatch)
     uint32_t reserve_addr;
     uint64_t reserve_value;
@@ -121,8 +116,7 @@ typedef struct DalImportInfo {
     const char* name;
 } DalImportInfo;
 
-#define DAL_PPU_FUNC(name) \
-    DAL_NOINLINE void name(DalPpuContext* __restrict ctx, uint8_t* __restrict base)
+#define DAL_PPU_FUNC(name) DAL_NOINLINE void name(DalPpuContext* __restrict ctx, uint8_t* __restrict base)
 
 // Runtime hooks, implemented by the runtime.
 void dalDispatch(DalPpuContext* __restrict ctx, uint8_t* __restrict base);  // target = jump_target
@@ -141,7 +135,7 @@ bool dalStdcx(DalPpuContext* ctx, uint8_t* base, uint32_t ea, uint64_t value);
 void dalDcbz(DalPpuContext* ctx, uint8_t* base, uint32_t ea);
 void dalSync(DalPpuContext* ctx, uint32_t kind);  // DalSyncKind
 uint64_t dalMftb(DalPpuContext* ctx);
-uint64_t dalMffs(DalPpuContext* ctx);  // FPSCR image in the low 32 bits
+uint64_t dalMffs(DalPpuContext* ctx);                                    // FPSCR image in the low 32 bits
 void dalMtfsf(DalPpuContext* ctx, uint32_t field_mask, uint64_t value);  // bit 0x80 >> i = field i
 void dalMtfsb(DalPpuContext* ctx, uint32_t bit, uint32_t value);
 
@@ -201,8 +195,7 @@ DAL_FORCEINLINE DalVr dalReadVr(const uint8_t* base, uint32_t ea) {
 }
 
 DAL_FORCEINLINE void dalWriteVr(uint8_t* base, uint32_t ea, DalVr value) {
-    DalU8x16 raw =
-        __builtin_shufflevector(value.u8, value.u8, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    DalU8x16 raw = __builtin_shufflevector(value.u8, value.u8, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
     __builtin_memcpy(base + (ea & ~15u), &raw, sizeof raw);
 }
 
@@ -293,24 +286,24 @@ DAL_FORCEINLINE void dalEnter(DalPpuContext* ctx, uint8_t* base, uint32_t addr) 
 
 // Emitted code names its parameters `ctx` and `base`; the macros rely on that.
 #define DAL_ENTER(addr) dalEnter(ctx, base, (addr))
-#define DAL_LOOP(site) \
-    do {               \
-        (void)(site);  \
+#define DAL_LOOP(site)      \
+    do {                    \
+        (void)(site);       \
         dalLoop(ctx, base); \
     } while (0)
-#define DAL_CALL(fn, ret)  \
-    do {                   \
-        ctx->lr = (ret);   \
-        fn(ctx, base);     \
+#define DAL_CALL(fn, ret) \
+    do {                  \
+        ctx->lr = (ret);  \
+        fn(ctx, base);    \
     } while (0)
 // The target is evaluated before LR is written (bclrl may target LR itself).
-#define DAL_CALL_DYN(site, target, ret)   \
-    do {                                  \
+#define DAL_CALL_DYN(site, target, ret)       \
+    do {                                      \
         uint32_t dal_t_ = (uint32_t)(target); \
-        ctx->lr = (ret);                  \
-        ctx->jump_site = (site);          \
-        ctx->jump_target = dal_t_;        \
-        dalDispatch(ctx, base);           \
+        ctx->lr = (ret);                      \
+        ctx->jump_site = (site);              \
+        ctx->jump_target = dal_t_;            \
+        dalDispatch(ctx, base);               \
     } while (0)
 #define DAL_TAIL(fn) DAL_MUSTTAIL return fn(ctx, base)
 #define DAL_TAIL_DYN(site, target)                  \

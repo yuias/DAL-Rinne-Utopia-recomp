@@ -26,47 +26,47 @@ namespace dal {
 
 // Every FFmpeg function the runtime calls, grouped by the library that exports it.
 // X(library, function)
-#define DAL_FFMPEG_FUNCTIONS(X)       \
-  X(avutil, avutil_version)           \
-  X(avutil, av_malloc)                \
-  X(avutil, av_free)                  \
-  X(avutil, av_strerror)              \
-  X(avutil, av_frame_alloc)           \
-  X(avutil, av_frame_free)            \
-  X(avutil, av_frame_unref)           \
-  X(avutil, av_log_set_callback)      \
-  X(avutil, av_log_set_level)         \
-  X(avutil, av_log_format_line2)      \
-  X(avutil, av_channel_layout_default) \
-  X(avcodec, avcodec_version)         \
-  X(avcodec, avcodec_get_name)        \
-  X(avcodec, avcodec_find_decoder)    \
-  X(avcodec, avcodec_find_decoder_by_name) \
-  X(avcodec, avcodec_alloc_context3)  \
-  X(avcodec, avcodec_open2)           \
-  X(avcodec, avcodec_send_packet)     \
-  X(avcodec, avcodec_receive_frame)   \
-  X(avcodec, avcodec_flush_buffers)   \
-  X(avcodec, avcodec_free_context)    \
-  X(avcodec, av_parser_init)          \
-  X(avcodec, av_parser_parse2)        \
-  X(avcodec, av_parser_close)         \
-  X(avcodec, av_packet_alloc)         \
-  X(avcodec, av_packet_free)          \
-  X(avcodec, av_packet_unref)         \
-  X(avcodec, av_new_packet)           \
-  X(swscale, swscale_version)         \
-  X(swscale, sws_getCachedContext)    \
-  X(swscale, sws_setColorspaceDetails) \
-  X(swscale, sws_scale)               \
-  X(swscale, sws_freeContext)         \
-  X(swscale, sws_getCoefficients)
+#define DAL_FFMPEG_FUNCTIONS(X)              \
+    X(avutil, avutil_version)                \
+    X(avutil, av_malloc)                     \
+    X(avutil, av_free)                       \
+    X(avutil, av_strerror)                   \
+    X(avutil, av_frame_alloc)                \
+    X(avutil, av_frame_free)                 \
+    X(avutil, av_frame_unref)                \
+    X(avutil, av_log_set_callback)           \
+    X(avutil, av_log_set_level)              \
+    X(avutil, av_log_format_line2)           \
+    X(avutil, av_channel_layout_default)     \
+    X(avcodec, avcodec_version)              \
+    X(avcodec, avcodec_get_name)             \
+    X(avcodec, avcodec_find_decoder)         \
+    X(avcodec, avcodec_find_decoder_by_name) \
+    X(avcodec, avcodec_alloc_context3)       \
+    X(avcodec, avcodec_open2)                \
+    X(avcodec, avcodec_send_packet)          \
+    X(avcodec, avcodec_receive_frame)        \
+    X(avcodec, avcodec_flush_buffers)        \
+    X(avcodec, avcodec_free_context)         \
+    X(avcodec, av_parser_init)               \
+    X(avcodec, av_parser_parse2)             \
+    X(avcodec, av_parser_close)              \
+    X(avcodec, av_packet_alloc)              \
+    X(avcodec, av_packet_free)               \
+    X(avcodec, av_packet_unref)              \
+    X(avcodec, av_new_packet)                \
+    X(swscale, swscale_version)              \
+    X(swscale, sws_getCachedContext)         \
+    X(swscale, sws_setColorspaceDetails)     \
+    X(swscale, sws_scale)                    \
+    X(swscale, sws_freeContext)              \
+    X(swscale, sws_getCoefficients)
 
 // Member names match FFmpeg's own, so a call site reads like the FFmpeg documentation. The types
 // come from the headers, so a signature change breaks the build instead of the run.
 struct FfmpegApi {
 #define DAL_FFMPEG_MEMBER(library, name) decltype(&::name) name = nullptr;
-  DAL_FFMPEG_FUNCTIONS(DAL_FFMPEG_MEMBER)
+    DAL_FFMPEG_FUNCTIONS(DAL_FFMPEG_MEMBER)
 #undef DAL_FFMPEG_MEMBER
 };
 

@@ -16,29 +16,29 @@
 namespace dal {
 
 struct GameInputBackendOptions {
-  // false: foreground-only (the game); true: background input enabled (console tools, whose
-  // console window belongs to another process).
-  bool background_input = false;
+    // false: foreground-only (the game); true: background input enabled (console tools, whose
+    // console window belongs to another process).
+    bool background_input = false;
 };
 
 // Controller-kind reading of a device in GameInput's generic layout, for devices that do not report
 // the gamepad kind.
 struct GameInputRawReading {
-  std::vector<float> axes;
-  std::vector<std::uint8_t> buttons;  // 0 or 1 per button index
-  std::vector<std::uint8_t> switches;  // GameInputSwitchPosition per switch: 0 centre, 1 up, clockwise to 8
+    std::vector<float> axes;
+    std::vector<std::uint8_t> buttons;   // 0 or 1 per button index
+    std::vector<std::uint8_t> switches;  // GameInputSwitchPosition per switch: 0 centre, 1 up, clockwise to 8
 };
 
 class GameInputBackend : public GamepadBackend {
- public:
-  // nullopt when the device is gone, has no controller kind or has no reading.
-  virtual std::optional<GameInputRawReading> readRaw(std::uint64_t id) = 0;
+public:
+    // nullopt when the device is gone, has no controller kind or has no reading.
+    virtual std::optional<GameInputRawReading> readRaw(std::uint64_t id) = 0;
 };
 
 // Initialises GameInput v3, sets the focus policy explicitly, registers a device callback for
 // gamepad and controller kinds. The error names the step and the HRESULT.
 std::expected<std::shared_ptr<GameInputBackend>, std::string> makeGameInputBackend(
-    const GameInputBackendOptions& options);
+        const GameInputBackendOptions& options);
 
 // GameOverlayRenderer64.dll mapped, the Steam environment variables and the process id.
 SteamContext detectSteamContext();

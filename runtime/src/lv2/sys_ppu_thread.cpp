@@ -37,156 +37,155 @@ GuestThread* threadOf(DalPpuContext* ctx) { return static_cast<GuestThread*>(ctx
 
 // A thread that has exited and will never be joined is removed from the id manager in RPCS3.
 GuestThread* findLiveThread(DalPpuContext* ctx, std::uint32_t id) {
-  if (GuestThread* self = threadOf(ctx); self != nullptr && self->id() == id) return self;
-  GuestThread* thread = findThread(id);
-  if (thread == nullptr || thread->state() != ThreadState::Exited) return thread;
-  if (!thread->joinable()) return nullptr;
-  const auto it = g_join_states.find(id);
-  return it != g_join_states.end() && it->second == JoinState::Joined ? nullptr : thread;
+    if (GuestThread* self = threadOf(ctx); self != nullptr && self->id() == id) return self;
+    GuestThread* thread = findThread(id);
+    if (thread == nullptr || thread->state() != ThreadState::Exited) return thread;
+    if (!thread->joinable()) return nullptr;
+    const auto it = g_join_states.find(id);
+    return it != g_join_states.end() && it->second == JoinState::Joined ? nullptr : thread;
 }
 
 }  // namespace
 
-std::uint32_t ppuThreadCreate(std::uint8_t* base, std::uint32_t thread_id, std::uint32_t entry,
-                              std::uint64_t arg, std::int32_t priority, std::uint32_t stack_size,
-                              std::uint64_t flags, std::uint32_t name) {
-  // The firmware stub checks the id pointer before anything else.
-  if (thread_id == 0) return kCellEnomem;
+std::uint32_t ppuThreadCreate(std::uint8_t* base, std::uint32_t thread_id, std::uint32_t entry, std::uint64_t arg,
+                              std::int32_t priority, std::uint32_t stack_size, std::uint64_t flags,
+                              std::uint32_t name) {
+    // The firmware stub checks the id pointer before anything else.
+    if (thread_id == 0) return kCellEnomem;
 
-  const std::uint32_t r13 = allocateTls();
-  if (r13 == 0) return kCellEnomem;
+    const std::uint32_t r13 = allocateTls();
+    if (r13 == 0) return kCellEnomem;
 
-  // RPCS3 leaks the TLS block on the error paths; giving it back is harmless.
-  std::uint32_t result = kCellOk;
-  if (entry == 0) {
-    result = kCellEfault;
-  } else if (priority < kMinPriority || priority > kMaxPriority) {
-    result = kCellEinval;
-  } else if ((flags & (kCreateJoinable | kCreateInterrupt)) ==
-             (kCreateJoinable | kCreateInterrupt)) {
-    result = kCellEperm;
-  }
-
-  GuestThread* thread = nullptr;
-  if (result == kCellOk) {
-    GuestThreadParams params;
-    params.entry_opd = entry;
-    params.arg0 = arg;
-    params.arg1 = 0;
-    params.priority = priority;
-    params.stack_size = stack_size;
-    params.tls_r13 = r13;
-    params.joinable = (flags & kCreateJoinable) != 0;
-    if (name != 0) {
-      for (std::uint32_t i = 0; i < kMaxThreadNameChars && base[name + i] != 0; i++) {
-        params.name.push_back(static_cast<char>(base[name + i]));
-      }
+    // RPCS3 leaks the TLS block on the error paths; giving it back is harmless.
+    std::uint32_t result = kCellOk;
+    if (entry == 0) {
+        result = kCellEfault;
+    } else if (priority < kMinPriority || priority > kMaxPriority) {
+        result = kCellEinval;
+    } else if ((flags & (kCreateJoinable | kCreateInterrupt)) == (kCreateJoinable | kCreateInterrupt)) {
+        result = kCellEperm;
     }
-    thread = prepareGuestThread(params);
-    if (thread == nullptr) result = kCellEnomem;
-  }
-  if (result != kCellOk) {
-    freeTls(r13);
-    return result;
-  }
 
-  dalWrite64(base, thread_id, thread->id());
-  if ((flags & kCreateInterrupt) != 0) return kCellOk;
+    GuestThread* thread = nullptr;
+    if (result == kCellOk) {
+        GuestThreadParams params;
+        params.entry_opd = entry;
+        params.arg0 = arg;
+        params.arg1 = 0;
+        params.priority = priority;
+        params.stack_size = stack_size;
+        params.tls_r13 = r13;
+        params.joinable = (flags & kCreateJoinable) != 0;
+        if (name != 0) {
+            for (std::uint32_t i = 0; i < kMaxThreadNameChars && base[name + i] != 0; i++) {
+                params.name.push_back(static_cast<char>(base[name + i]));
+            }
+        }
+        thread = prepareGuestThread(params);
+        if (thread == nullptr) result = kCellEnomem;
+    }
+    if (result != kCellOk) {
+        freeTls(r13);
+        return result;
+    }
 
-  // lv2 would run a higher-priority thread at once. The game relies on it: its mixer thread (90)
-  // must store its notify queue key before the creator (1005) reads it.
-  GuestThread* creator = currentThread();
-  if (creator == nullptr || priority >= creator->priority()) {
-    startGuestThread(thread);
+    dalWrite64(base, thread_id, thread->id());
+    if ((flags & kCreateInterrupt) != 0) return kCellOk;
+
+    // lv2 would run a higher-priority thread at once. The game relies on it: its mixer thread (90)
+    // must store its notify queue key before the creator (1005) reads it.
+    GuestThread* creator = currentThread();
+    if (creator == nullptr || priority >= creator->priority()) {
+        startGuestThread(thread);
+        return kCellOk;
+    }
+    logDebug("dal: thread: {:#010x} {} prio {} starts before creator {:#010x} prio {}", thread->id(), thread->name(),
+             priority, creator->id(), creator->priority());
+    if (!startGuestThreadFirst(thread)) {
+        logInfo("dal: thread: {:#010x} {} not queued within {} ms; creator continues", thread->id(), thread->name(),
+                kStartFirstBound.count() / 1000);
+    }
+    creator->context().preempt_budget = kDalPreemptBudget;
     return kCellOk;
-  }
-  logDebug("dal: thread: {:#010x} {} prio {} starts before creator {:#010x} prio {}", thread->id(),
-           thread->name(), priority, creator->id(), creator->priority());
-  if (!startGuestThreadFirst(thread)) {
-    logInfo("dal: thread: {:#010x} {} not queued within {} ms; creator continues", thread->id(),
-            thread->name(), kStartFirstBound.count() / 1000);
-  }
-  creator->context().preempt_budget = kDalPreemptBudget;
-  return kCellOk;
 }
 
 void resetPpuThreadState() { g_join_states.clear(); }
 
 // 41 _sys_ppu_thread_exit(u64 value): the raw syscall; the HLE wrapper frees the TLS block first.
 void sysPpuThreadExit(DalPpuContext* ctx, std::uint8_t* base) {
-  (void)base;
-  exitCurrentThread(ctx->gpr[3]);
+    (void)base;
+    exitCurrentThread(ctx->gpr[3]);
 }
 
 // 43 sys_ppu_thread_yield: 0 after a switch to another thread, CELL_CANCEL when none was runnable.
 void sysPpuThreadYield(DalPpuContext* ctx, std::uint8_t* base) {
-  (void)base;
-  ctx->preempt_budget = kDalPreemptBudget;
-  ctx->gpr[3] = yieldGuestLock() ? kCellOk : kCellCancel;
+    (void)base;
+    ctx->preempt_budget = kDalPreemptBudget;
+    ctx->gpr[3] = yieldGuestLock() ? kCellOk : kCellCancel;
 }
 
 // 44 sys_ppu_thread_join(u32 thread_id, u64* vptr)
 void sysPpuThreadJoin(DalPpuContext* ctx, std::uint8_t* base) {
-  const auto id = static_cast<std::uint32_t>(ctx->gpr[3]);
-  const auto vptr = static_cast<std::uint32_t>(ctx->gpr[4]);
+    const auto id = static_cast<std::uint32_t>(ctx->gpr[3]);
+    const auto vptr = static_cast<std::uint32_t>(ctx->gpr[4]);
 
-  if (id == callerThreadId(ctx)) {
-    setResultCode(ctx, kCellEdeadlk);
-    return;
-  }
-  GuestThread* thread = findLiveThread(ctx, id);
-  if (thread == nullptr) {
-    setResultCode(ctx, kCellEsrch);
-    return;
-  }
-  // Detached threads and a thread that already has a joiner cannot be joined.
-  if (!thread->joinable() || g_join_states.contains(id)) {
-    setResultCode(ctx, kCellEinval);
-    return;
-  }
+    if (id == callerThreadId(ctx)) {
+        setResultCode(ctx, kCellEdeadlk);
+        return;
+    }
+    GuestThread* thread = findLiveThread(ctx, id);
+    if (thread == nullptr) {
+        setResultCode(ctx, kCellEsrch);
+        return;
+    }
+    // Detached threads and a thread that already has a joiner cannot be joined.
+    if (!thread->joinable() || g_join_states.contains(id)) {
+        setResultCode(ctx, kCellEinval);
+        return;
+    }
 
-  g_join_states[id] = JoinState::Claimed;
-  // The registry never frees threads, so the pointer stays valid across the wait.
-  blockingWait(thread->joiners(), [thread] { return thread->state() == ThreadState::Exited; },
-               "sys_ppu_thread_join", std::nullopt);
-  g_join_states[id] = JoinState::Joined;
+    g_join_states[id] = JoinState::Claimed;
+    // The registry never frees threads, so the pointer stays valid across the wait.
+    blockingWait(
+            thread->joiners(), [thread] { return thread->state() == ThreadState::Exited; }, "sys_ppu_thread_join",
+            std::nullopt);
+    g_join_states[id] = JoinState::Joined;
 
-  if (vptr == 0) {
-    setResultCode(ctx, kCellEfault);
-    return;
-  }
-  dalWrite64(base, vptr, thread->exitValue());
-  setResultCode(ctx, kCellOk);
+    if (vptr == 0) {
+        setResultCode(ctx, kCellEfault);
+        return;
+    }
+    dalWrite64(base, vptr, thread->exitValue());
+    setResultCode(ctx, kCellOk);
 }
 
 // 47 sys_ppu_thread_set_priority(u32 thread_id, s32 prio): stored only (no priority scheduling).
 // ppuThreadCreate compares the stored value of the creator with the priority of a new thread.
 void sysPpuThreadSetPriority(DalPpuContext* ctx, std::uint8_t* base) {
-  (void)base;
-  const auto prio = static_cast<std::int32_t>(ctx->gpr[4]);
-  if (prio < kMinPriority || prio > kMaxPriority) {
-    setResultCode(ctx, kCellEinval);
-    return;
-  }
-  GuestThread* thread = findLiveThread(ctx, static_cast<std::uint32_t>(ctx->gpr[3]));
-  if (thread == nullptr) {
-    setResultCode(ctx, kCellEsrch);
-    return;
-  }
-  thread->setPriority(prio);
-  setResultCode(ctx, kCellOk);
+    (void)base;
+    const auto prio = static_cast<std::int32_t>(ctx->gpr[4]);
+    if (prio < kMinPriority || prio > kMaxPriority) {
+        setResultCode(ctx, kCellEinval);
+        return;
+    }
+    GuestThread* thread = findLiveThread(ctx, static_cast<std::uint32_t>(ctx->gpr[3]));
+    if (thread == nullptr) {
+        setResultCode(ctx, kCellEsrch);
+        return;
+    }
+    thread->setPriority(prio);
+    setResultCode(ctx, kCellOk);
 }
 
 // 48 sys_ppu_thread_get_priority(u32 thread_id, s32* priop)
 void sysPpuThreadGetPriority(DalPpuContext* ctx, std::uint8_t* base) {
-  GuestThread* thread = findLiveThread(ctx, static_cast<std::uint32_t>(ctx->gpr[3]));
-  if (thread == nullptr) {
-    setResultCode(ctx, kCellEsrch);
-    return;
-  }
-  dalWrite32(base, static_cast<std::uint32_t>(ctx->gpr[4]),
-             static_cast<std::uint32_t>(thread->priority()));
-  setResultCode(ctx, kCellOk);
+    GuestThread* thread = findLiveThread(ctx, static_cast<std::uint32_t>(ctx->gpr[3]));
+    if (thread == nullptr) {
+        setResultCode(ctx, kCellEsrch);
+        return;
+    }
+    dalWrite32(base, static_cast<std::uint32_t>(ctx->gpr[4]), static_cast<std::uint32_t>(thread->priority()));
+    setResultCode(ctx, kCellOk);
 }
 
 }  // namespace dal

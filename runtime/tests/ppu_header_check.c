@@ -6,12 +6,12 @@
 
 static int g_failures;
 
-#define CHECK(cond)                                                      \
-    do {                                                                 \
-        if (!(cond)) {                                                   \
+#define CHECK(cond)                                                           \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
             fprintf(stderr, "check failed (line %d): %s\n", __LINE__, #cond); \
-            g_failures++;                                                \
-        }                                                                \
+            g_failures++;                                                     \
+        }                                                                     \
     } while (0)
 
 static DalPpuContext g_ctx;

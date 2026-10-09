@@ -45,7 +45,7 @@ inline constexpr std::uint32_t kMethodNv4097TextureReadSemaphoreRelease = 0x1D74
 // Registers the argument census (rsx/rsx_census.h) interprets.
 inline constexpr std::uint32_t kMethodNv4097SetSurfaceFormat = 0x0208;
 inline constexpr std::uint32_t kMethodNv4097SetShaderProgram = 0x08E4;
-inline constexpr std::uint32_t kMethodNv4097SetTransformProgram = 0x0B80;  // 32 registers
+inline constexpr std::uint32_t kMethodNv4097SetTransformProgram = 0x0B80;       // 32 registers
 inline constexpr std::uint32_t kMethodNv4097SetVertexDataArrayOffset = 0x1680;  // 16 registers
 inline constexpr std::uint32_t kMethodNv4097SetVertexDataArrayFormat = 0x1740;  // 16 registers
 inline constexpr std::uint32_t kMethodNv4097SetBeginEnd = 0x1808;
@@ -101,7 +101,7 @@ inline constexpr std::uint32_t kMethodNv4097SetDepthTestEnable = 0x0A74;
 inline constexpr std::uint32_t kMethodNv4097SetVertexDataScaled4sM = 0x0A80;  // 32 registers
 inline constexpr std::uint32_t kMethodNv4097SetTexCoordControl = 0x0B40;      // 10 registers
 inline constexpr std::uint32_t kMethodNv4097SetTwoSideLightEn = 0x142C;
-inline constexpr std::uint32_t kMethodNv4097SetVertexData3fM = 0x1500;        // 64 registers
+inline constexpr std::uint32_t kMethodNv4097SetVertexData3fM = 0x1500;  // 64 registers
 inline constexpr std::uint32_t kMethodNv4097SetVertexDataBaseOffset = 0x1738;
 inline constexpr std::uint32_t kMethodNv4097SetVertexDataBaseIndex = 0x173C;
 inline constexpr std::uint32_t kMethodNv4097SetCullFace = 0x1830;
@@ -142,65 +142,65 @@ inline constexpr std::uint32_t kMethodNv308aPoint = 0xA304;
 inline constexpr std::uint32_t kMethodNv308aSizeOut = 0xA308;
 inline constexpr std::uint32_t kMethodNv308aColor = 0xA400;  // 0x700 registers
 inline constexpr std::uint32_t kMethodNv3089ImageIn = 0xC40C;
-inline constexpr std::uint32_t kMethodGcmFlipHead = 0xE920;  // two registers, head 0 and 1
+inline constexpr std::uint32_t kMethodGcmFlipHead = 0xE920;        // two registers, head 0 and 1
 inline constexpr std::uint32_t kMethodGcmSetUserCommand = 0xEB00;  // two registers
 inline constexpr std::uint32_t kMethodGcmFlipCommand = 0xFEAC;
 
 class RsxSink {
- public:
-  virtual ~RsxSink() = default;
-  // Reads the big-endian word at an IO offset; false when the page is unmapped.
-  virtual bool readIo(std::uint32_t io, std::uint32_t& word) = 0;
-  // One register write; `method` is a byte offset. false = "cannot complete now" (semaphore
-  // acquire not satisfied, flip waiting for VBlank): the parser keeps the write and retries it on
-  // the next run.
-  virtual bool write(std::uint32_t method, std::uint32_t value) = 0;
-  // Asked after each completed write; true ends the run right there with Budget, before any further
-  // word is read, so the sink can do work outside the run that needs the state of exactly that write.
-  virtual bool stopAfterWrite() { return false; }
+public:
+    virtual ~RsxSink() = default;
+    // Reads the big-endian word at an IO offset; false when the page is unmapped.
+    virtual bool readIo(std::uint32_t io, std::uint32_t& word) = 0;
+    // One register write; `method` is a byte offset. false = "cannot complete now" (semaphore
+    // acquire not satisfied, flip waiting for VBlank): the parser keeps the write and retries it on
+    // the next run.
+    virtual bool write(std::uint32_t method, std::uint32_t value) = 0;
+    // Asked after each completed write; true ends the run right there with Budget, before any further
+    // word is read, so the sink can do work outside the run that needs the state of exactly that write.
+    virtual bool stopAfterWrite() { return false; }
 };
 
 enum class FifoStatus {
-  Idle,     // get == put, or spinning on a jump to itself
-  Waiting,  // a write returned false
-  Budget,   // max_words consumed, or the sink asked to stop after a write
-  Fault,    // malformed header or unmapped read; sticky until reset()
+    Idle,     // get == put, or spinning on a jump to itself
+    Waiting,  // a write returned false
+    Budget,   // max_words consumed, or the sink asked to stop after a write
+    Fault,    // malformed header or unmapped read; sticky until reset()
 };
 
 class FifoParser {
- public:
-  // Consumes words from `get` toward `put` (both IO offsets; the low two bits of put are ignored).
-  // `get` always names the next unread word, so it already points past a write that returned false:
-  // that write is kept inside the parser. After Fault `get` names the offending word.
-  FifoStatus run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink);
+public:
+    // Consumes words from `get` toward `put` (both IO offsets; the low two bits of put are ignored).
+    // `get` always names the next unread word, so it already points past a write that returned false:
+    // that write is kept inside the parser. After Fault `get` names the offending word.
+    FifoStatus run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink);
 
-  std::string_view lastFault() const { return fault_; }
-  // Method headers with at least one argument, for the census.
-  std::uint64_t headersParsed() const { return headers_; }
-  // Forgets a pending method, the call slot and the fault.
-  void reset();
-  // Where the guest-visible get register may point after a run that ended with `get`: the header
-  // of an unfinished command, so the guest never sees a command as consumed before it completed.
-  std::uint32_t commandGet(std::uint32_t get) const { return (remaining_ != 0 || pending_) ? command_get_ : get; }
+    std::string_view lastFault() const { return fault_; }
+    // Method headers with at least one argument, for the census.
+    std::uint64_t headersParsed() const { return headers_; }
+    // Forgets a pending method, the call slot and the fault.
+    void reset();
+    // Where the guest-visible get register may point after a run that ended with `get`: the header
+    // of an unfinished command, so the guest never sees a command as consumed before it completed.
+    std::uint32_t commandGet(std::uint32_t get) const { return (remaining_ != 0 || pending_) ? command_get_ : get; }
 
- private:
-  FifoStatus fail(std::string message);
+private:
+    FifoStatus fail(std::string message);
 
-  // Arguments of the current method still to be read, and the register the next one goes to.
-  std::uint32_t remaining_ = 0;
-  std::uint32_t method_ = 0;
-  std::uint32_t command_get_ = 0;  // IO offset of the current command's header
-  bool increment_ = true;
-  // A write the sink refused, retried first on the next run.
-  bool pending_ = false;
-  std::uint32_t pending_method_ = 0;
-  std::uint32_t pending_value_ = 0;
-  // Only one call level exists on the hardware.
-  bool in_call_ = false;
-  std::uint32_t return_get_ = 0;
-  std::uint64_t headers_ = 0;
-  std::string fault_;
-  bool faulted_ = false;
+    // Arguments of the current method still to be read, and the register the next one goes to.
+    std::uint32_t remaining_ = 0;
+    std::uint32_t method_ = 0;
+    std::uint32_t command_get_ = 0;  // IO offset of the current command's header
+    bool increment_ = true;
+    // A write the sink refused, retried first on the next run.
+    bool pending_ = false;
+    std::uint32_t pending_method_ = 0;
+    std::uint32_t pending_value_ = 0;
+    // Only one call level exists on the hardware.
+    bool in_call_ = false;
+    std::uint32_t return_get_ = 0;
+    std::uint64_t headers_ = 0;
+    std::string fault_;
+    bool faulted_ = false;
 };
 
 }  // namespace dal

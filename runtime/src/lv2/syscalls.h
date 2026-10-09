@@ -11,9 +11,9 @@ namespace dal {
 using GuestHandler = void (*)(DalPpuContext* ctx, uint8_t* base);
 
 struct SyscallEntry {
-  uint32_t number;
-  const char* name;       // null when the number has no known name
-  GuestHandler handler;   // null: the default handler runs
+    uint32_t number;
+    const char* name;      // null when the number has no known name
+    GuestHandler handler;  // null: the default handler runs
 };
 
 // Every syscall the game can issue plus every implemented one, sorted by number.

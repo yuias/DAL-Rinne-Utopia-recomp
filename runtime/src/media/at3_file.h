@@ -17,20 +17,20 @@ inline constexpr std::uint32_t kAtrac3plusFrameSamples = 2048;
 
 // `smpl` loop, inclusive. Positions are in decoder-output samples, so they count the encoder delay.
 struct At3Loop {
-  std::uint32_t start_sample = 0, end_sample = 0;
+    std::uint32_t start_sample = 0, end_sample = 0;
 };
 
 struct At3Info {
-  std::uint32_t channels = 0, sample_rate = 0, block_align = 0, bytes_per_second = 0;
-  std::uint32_t data_offset = 0, data_size = 0;  // offset in the parsed bytes and size of the `data` payload
-  std::uint32_t total_samples = 0;               // `fact`, first dword
-  // Encoder delay: the third `fact` dword, 0 when `fact` is shorter. The valid audio is the decoder
-  // output samples [delay, delay + total). FFmpeg's RIFF demuxer reads only the first dword, so this
-  // convention comes from the game's files: loop positions lie in this output range and the loop end
-  // is delay + total - 1 (off by one in 2 of 53 Se.sdat loops; see `dal_audiotool at3scan`).
-  std::uint32_t delay_samples = 0;
-  std::optional<At3Loop> loop;  // first loop of `smpl`
-  std::uint32_t frameCount() const { return block_align != 0 ? data_size / block_align : 0; }
+    std::uint32_t channels = 0, sample_rate = 0, block_align = 0, bytes_per_second = 0;
+    std::uint32_t data_offset = 0, data_size = 0;  // offset in the parsed bytes and size of the `data` payload
+    std::uint32_t total_samples = 0;               // `fact`, first dword
+    // Encoder delay: the third `fact` dword, 0 when `fact` is shorter. The valid audio is the decoder
+    // output samples [delay, delay + total). FFmpeg's RIFF demuxer reads only the first dword, so this
+    // convention comes from the game's files: loop positions lie in this output range and the loop end
+    // is delay + total - 1 (off by one in 2 of 53 Se.sdat loops; see `dal_audiotool at3scan`).
+    std::uint32_t delay_samples = 0;
+    std::optional<At3Loop> loop;  // first loop of `smpl`
+    std::uint32_t frameCount() const { return block_align != 0 ? data_size / block_align : 0; }
 };
 
 // Needs the bytes up to and including the `data` chunk header (the payload itself is not read);

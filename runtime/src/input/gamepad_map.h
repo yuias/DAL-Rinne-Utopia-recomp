@@ -21,7 +21,7 @@ inline constexpr float kRightStickDeadzone = 8689.0f / 32767.0f;
 inline constexpr std::uint8_t kTriggerPressThreshold = 30;
 
 struct GamepadMapping {
-  std::array<PadButton, static_cast<std::size_t>(GamepadButton::Count)> buttons;
+    std::array<PadButton, static_cast<std::size_t>(GamepadButton::Count)> buttons;
 };
 
 // Positional: A = Cross, B = Circle, X = Square, Y = Triangle. The triggers are not in the table;
@@ -29,9 +29,9 @@ struct GamepadMapping {
 const GamepadMapping& defaultGamepadMapping();
 
 struct MappedPad {
-  PadButtons buttons = 0;
-  PadAnalog analog;
-  bool operator==(const MappedPad&) const = default;
+    PadButtons buttons = 0;
+    PadAnalog analog;
+    bool operator==(const MappedPad&) const = default;
 };
 
 // Radial deadzone with rescaling: radius <= deadzone -> (0, 0); otherwise the radius maps linearly
@@ -44,8 +44,7 @@ std::uint8_t stickByte(float value);
 // Buttons by the mapping; sticks through the deadzone (y inverted: GameInput +y is up, CellPadData 0
 // is up); triggers: pressure lround(t * 255), L2/R2 pressed when pressure >= kTriggerPressThreshold
 // and the pressure word is 0 below it.
-MappedPad mapGamepadReading(const GamepadReading& reading,
-                            const GamepadMapping& mapping = defaultGamepadMapping());
+MappedPad mapGamepadReading(const GamepadReading& reading, const GamepadMapping& mapping = defaultGamepadMapping());
 
 // Several used pads on port 0: buttons OR; each stick axis the value farthest from 0x80 (ties: the
 // first); triggers the maximum.

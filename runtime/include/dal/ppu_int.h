@@ -7,14 +7,11 @@
 
 // Signed overflow of the 64-bit sum r = a + b: both addends have the same sign and the result's
 // differs (RPCS3 `ADD`; `SUBF` passes `~a` for the minuend).
-DAL_FORCEINLINE bool dalAddOverflows(uint64_t a, uint64_t b, uint64_t r) {
-    return ((a ^ r) & (b ^ r)) >> 63;
-}
+DAL_FORCEINLINE bool dalAddOverflows(uint64_t a, uint64_t b, uint64_t r) { return ((a ^ r) & (b ^ r)) >> 63; }
 
 // r = a + b + carry_in (0 or 1); XER.CA = carry out of bit 63 (RPCS3 `add64_flags`). The subtract
 // forms pass `~a` and a carry_in of 1 or CA, so CA = !borrow.
-DAL_FORCEINLINE uint64_t dalAddCarry(DalPpuContext* ctx, uint64_t a, uint64_t b,
-                                     uint64_t carry_in) {
+DAL_FORCEINLINE uint64_t dalAddCarry(DalPpuContext* ctx, uint64_t a, uint64_t b, uint64_t carry_in) {
     uint64_t sum = a + b;
     uint64_t r = sum + carry_in;
     ctx->xer_ca = (sum < a) | (r < sum);
@@ -27,9 +24,7 @@ DAL_FORCEINLINE uint64_t dalMullw(uint64_t a, uint64_t b) {
     return (uint64_t)((int64_t)(int32_t)a * (int64_t)(int32_t)b);
 }
 
-DAL_FORCEINLINE bool dalMullwOverflows(uint64_t product) {
-    return (int64_t)product != (int64_t)(int32_t)product;
-}
+DAL_FORCEINLINE bool dalMullwOverflows(uint64_t product) { return (int64_t)product != (int64_t)(int32_t)product; }
 
 // mulhw/mulhwu: high word of the 32x32 product. mulhw sign-extends the word into rD, mulhwu
 // zero-extends (RPCS3 `MULHW`, `MULHWU`).
@@ -49,9 +44,7 @@ DAL_FORCEINLINE uint64_t dalMulhd(uint64_t a, uint64_t b) {
     return (uint64_t)(((DalI128)(int64_t)a * (DalI128)(int64_t)b) >> 64);
 }
 
-DAL_FORCEINLINE uint64_t dalMulhdu(uint64_t a, uint64_t b) {
-    return (uint64_t)(((DalU128)a * (DalU128)b) >> 64);
-}
+DAL_FORCEINLINE uint64_t dalMulhdu(uint64_t a, uint64_t b) { return (uint64_t)(((DalU128)a * (DalU128)b) >> 64); }
 
 // mulld OV: the signed 128-bit product does not fit in 64 bits (RPCS3 `MULLD`).
 DAL_FORCEINLINE bool dalMulldOverflows(uint64_t a, uint64_t b, uint64_t low) {
@@ -119,13 +112,9 @@ DAL_FORCEINLINE uint64_t dalSrw(uint64_t v, uint64_t amount) {
 }
 
 // sld/srd: the amount is the low 7 bits of rB; 64..127 gives 0.
-DAL_FORCEINLINE uint64_t dalSld(uint64_t v, uint64_t amount) {
-    return (amount & 0x40) ? 0 : v << (amount & 63);
-}
+DAL_FORCEINLINE uint64_t dalSld(uint64_t v, uint64_t amount) { return (amount & 0x40) ? 0 : v << (amount & 63); }
 
-DAL_FORCEINLINE uint64_t dalSrd(uint64_t v, uint64_t amount) {
-    return (amount & 0x40) ? 0 : v >> (amount & 63);
-}
+DAL_FORCEINLINE uint64_t dalSrd(uint64_t v, uint64_t amount) { return (amount & 0x40) ? 0 : v >> (amount & 63); }
 
 // sraw/srawi: arithmetic shift of the sign-extended low word (`amount` is taken mod 64); CA = the
 // word is negative and a 1 bit was shifted out. Amounts above 31 give the sign fill (RPCS3 `SRAW`).
@@ -173,8 +162,7 @@ DAL_FORCEINLINE void dalWriteF32(uint8_t* base, uint32_t ea, double value) {
 
 // lswi/lswx: `count` bytes into consecutive registers starting at `rd` (wrapping after r31),
 // four per register from the high end; a final partial word is zero-filled (RPCS3 `LSWX`).
-DAL_FORCEINLINE void dalLoadString(DalPpuContext* ctx, const uint8_t* base, uint32_t ea,
-                                   uint32_t rd, uint32_t count) {
+DAL_FORCEINLINE void dalLoadString(DalPpuContext* ctx, const uint8_t* base, uint32_t ea, uint32_t rd, uint32_t count) {
     for (; count >= 4; count -= 4, ea += 4, rd = (rd + 1) & 31) {
         ctx->gpr[rd] = dalRead32(base, ea);
     }
@@ -188,8 +176,7 @@ DAL_FORCEINLINE void dalLoadString(DalPpuContext* ctx, const uint8_t* base, uint
 }
 
 // stswi/stswx, the mirror of dalLoadString (RPCS3 `STSWX`).
-DAL_FORCEINLINE void dalStoreString(const DalPpuContext* ctx, uint8_t* base, uint32_t ea,
-                                    uint32_t rs, uint32_t count) {
+DAL_FORCEINLINE void dalStoreString(const DalPpuContext* ctx, uint8_t* base, uint32_t ea, uint32_t rs, uint32_t count) {
     for (; count >= 4; count -= 4, ea += 4, rs = (rs + 1) & 31) {
         dalWrite32(base, ea, (uint32_t)ctx->gpr[rs]);
     }

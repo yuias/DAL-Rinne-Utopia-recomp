@@ -16,10 +16,10 @@
 namespace dal {
 
 struct ParamSfo {
-  std::map<std::string, std::uint32_t> ints;
-  std::map<std::string, std::string> strings;
+    std::map<std::string, std::uint32_t> ints;
+    std::map<std::string, std::string> strings;
 
-  bool empty() const { return ints.empty() && strings.empty(); }
+    bool empty() const { return ints.empty() && strings.empty(); }
 };
 
 // Entries with an unknown format are skipped. Errors: bad magic, truncated table, or an entry

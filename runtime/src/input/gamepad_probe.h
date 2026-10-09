@@ -35,18 +35,18 @@ std::string formatSteamContext(const SteamContext& steam);
 // `dal: pad: probe <id> <vid:pid> <formatted reading>` at Info when the text changed, and
 // `dal: pad: probe <id> <vid:pid> no gamepad reading` once per device that has none.
 class GamepadProbe {
- public:
-  explicit GamepadProbe(std::shared_ptr<GamepadBackend> backend) : backend_(std::move(backend)) {}
-  // One pass; the probe thread calls it every kGamepadProbeInterval and the tests call it directly.
-  void step();
+public:
+    explicit GamepadProbe(std::shared_ptr<GamepadBackend> backend) : backend_(std::move(backend)) {}
+    // One pass; the probe thread calls it every kGamepadProbeInterval and the tests call it directly.
+    void step();
 
- private:
-  struct DeviceState {
-    std::string last_text;
-    bool reported_missing = false;
-  };
-  std::shared_ptr<GamepadBackend> backend_;
-  std::map<std::uint64_t, DeviceState> devices_;
+private:
+    struct DeviceState {
+        std::string last_text;
+        bool reported_missing = false;
+    };
+    std::shared_ptr<GamepadBackend> backend_;
+    std::map<std::uint64_t, DeviceState> devices_;
 };
 
 // Logs the content of the file named by SteamVirtualGamepadInfo (first 4 KiB, line by line), or that

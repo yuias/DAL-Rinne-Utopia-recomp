@@ -32,11 +32,11 @@ void censusHleNote(const char* module, const char* name, std::string note);
 bool censusUnknownTarget(std::uint32_t target, std::uint32_t site);
 
 struct ThreadCensusEntry {
-  enum class State { Running, Blocked, Exited };
-  std::uint32_t id = 0;
-  std::string name;
-  State state = State::Running;
-  std::string blocked_in;  // meaningful for State::Blocked
+    enum class State { Running, Blocked, Exited };
+    std::uint32_t id = 0;
+    std::string name;
+    State state = State::Running;
+    std::string blocked_in;  // meaningful for State::Blocked
 };
 
 // Returns every guest thread ever created, in creation order. Registered by the thread layer so
@@ -46,20 +46,20 @@ void setThreadCensusProvider(ThreadCensusFn fn);
 
 // What the RSX consumer counted: one entry per distinct register written through the FIFO.
 struct RsxMethodCount {
-  std::uint32_t method = 0;  // byte offset of the register
-  std::uint64_t count = 0;
-  std::string name;  // empty when the register has no known name
+    std::uint32_t method = 0;  // byte offset of the register
+    std::uint64_t count = 0;
+    std::string name;  // empty when the register has no known name
 };
 
 struct RsxCensus {
-  std::uint64_t headers = 0;
-  std::uint64_t flips = 0;
-  std::vector<RsxMethodCount> methods;
-  // Guest interrupt handler calls made by the interrupt thread; the line is printed once any ran.
-  std::uint64_t vblank_handler_runs = 0, flip_handler_runs = 0, user_handler_runs = 0;
-  // Set while a renderer executes the commands; the line then ends with its draw counts.
-  bool rendering = false;
-  std::uint64_t draws_rendered = 0, draws_skipped = 0;
+    std::uint64_t headers = 0;
+    std::uint64_t flips = 0;
+    std::vector<RsxMethodCount> methods;
+    // Guest interrupt handler calls made by the interrupt thread; the line is printed once any ran.
+    std::uint64_t vblank_handler_runs = 0, flip_handler_runs = 0, user_handler_runs = 0;
+    // Set while a renderer executes the commands; the line then ends with its draw counts.
+    bool rendering = false;
+    std::uint64_t draws_rendered = 0, draws_skipped = 0;
 };
 
 // Registered by the RSX consumer; the section is printed only while a provider is set. The provider
@@ -70,8 +70,8 @@ void setRsxCensusProvider(RsxCensusFn fn);
 // What the RSX layer could not handle: one entry per "<category> <key>" with its count, most frequent
 // first, and the occurrences of kinds beyond the layer's cap.
 struct RsxUnimplementedCensus {
-  std::vector<std::pair<std::string, std::uint64_t>> kinds;
-  std::uint64_t dropped = 0;
+    std::vector<std::pair<std::string, std::uint64_t>> kinds;
+    std::uint64_t dropped = 0;
 };
 
 // The section is printed only while a provider is set and it reports something. `reset` runs from

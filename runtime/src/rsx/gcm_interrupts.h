@@ -12,7 +12,7 @@
 namespace dal {
 
 struct GcmInterruptCounts {
-  std::uint64_t vblank = 0, flip = 0, user = 0;  // handler calls made so far
+    std::uint64_t vblank = 0, flip = 0, user = 0;  // handler calls made so far
 };
 
 // Creates `_gcm_intr_thread` (a service thread) and installs the RSX interrupt hook that feeds it.

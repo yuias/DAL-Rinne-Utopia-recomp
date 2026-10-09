@@ -20,10 +20,10 @@ namespace dal {
 
 // An HLE function, identified by the module that exports it and its FNID.
 struct HleEntry {
-  const char* module;
-  uint32_t fnid;
-  const char* name;
-  GuestHandler handler;  // null: the default handler runs
+    const char* module;
+    uint32_t fnid;
+    const char* name;
+    GuestHandler handler;  // null: the default handler runs
 };
 
 // Handlers of the sysPrxForUser module.
@@ -115,8 +115,8 @@ std::span<const HleEntry> cellFsHandlers();
 std::span<const HleEntry> cellPadHandlers();
 
 // Index of each word in CellPadData::button, as far as a standard pad fills it.
-inline constexpr std::size_t kPadButtonDigital1 = 2;   // select, L3, R3, start, d-pad
-inline constexpr std::size_t kPadButtonDigital2 = 3;   // L2, R2, L1, R1, triangle, circle, cross, square
+inline constexpr std::size_t kPadButtonDigital1 = 2;  // select, L3, R3, start, d-pad
+inline constexpr std::size_t kPadButtonDigital2 = 3;  // L2, R2, L1, R1, triangle, circle, cross, square
 inline constexpr std::size_t kPadButtonAnalogRightX = 4;
 inline constexpr std::size_t kPadButtonAnalogRightY = 5;
 inline constexpr std::size_t kPadButtonAnalogLeftX = 6;
@@ -127,27 +127,27 @@ inline constexpr std::size_t kPadButtonCount = 24;
 
 // A pad port as a host input backend sees it right now.
 struct PadPortState {
-  bool connected = false;
-  std::uint32_t device_capability = 0;  // CELL_PAD_CAPABILITY_* bits
-  std::uint32_t device_type = 0;        // CELL_PAD_DEV_TYPE_*
-  std::array<std::uint16_t, kPadButtonCount> button{};  // host order; words 0 and 1 are unused
+    bool connected = false;
+    std::uint32_t device_capability = 0;                  // CELL_PAD_CAPABILITY_* bits
+    std::uint32_t device_type = 0;                        // CELL_PAD_DEV_TYPE_*
+    std::array<std::uint16_t, kPadButtonCount> button{};  // host order; words 0 and 1 are unused
 };
 
 // Source of pad input. cellPad calls it under the guest lock, so an implementation must return
 // without blocking (read an atomic snapshot that its own input thread updates). Ports are 0..6.
 class PadProvider {
- public:
-  virtual ~PadProvider() = default;
+public:
+    virtual ~PadProvider() = default;
 
-  // Current state of `port`. Return connected = false for a port without a pad.
-  virtual PadPortState poll(std::uint32_t port) = 0;
+    // Current state of `port`. Return connected = false for a port without a pad.
+    virtual PadPortState poll(std::uint32_t port) = 0;
 
-  // cellPadSetActDirect: motor values 0..255 (the small motor is on/off in hardware). Optional.
-  virtual void setVibration(std::uint32_t port, std::uint8_t small_motor, std::uint8_t large_motor) {
-    (void)port;
-    (void)small_motor;
-    (void)large_motor;
-  }
+    // cellPadSetActDirect: motor values 0..255 (the small motor is on/off in hardware). Optional.
+    virtual void setVibration(std::uint32_t port, std::uint8_t small_motor, std::uint8_t large_motor) {
+        (void)port;
+        (void)small_motor;
+        (void)large_motor;
+    }
 };
 
 // Neutral standard pad: sticks centred, no button pressed, sensors at rest.
@@ -207,12 +207,12 @@ std::span<const HleEntry> cellAtracHandlers();
 
 // Totals over every handle since start-up (or the last resetCellAtrac). Safe to read from any thread.
 struct CellAtracStats {
-  std::uint64_t decoders = 0;          // CreateDecoder calls that succeeded
-  std::uint64_t frames = 0;            // ATRAC3plus frames decoded
-  std::uint64_t non_silent = 0;        // of those, frames with audible content
-  std::uint64_t errors = 0;            // frames the decoder rejected
-  std::uint64_t without_decoder = 0;   // frames passed through with no decoder
-  std::uint64_t starved = 0;           // Decode calls that returned no samples for lack of buffered data
+    std::uint64_t decoders = 0;         // CreateDecoder calls that succeeded
+    std::uint64_t frames = 0;           // ATRAC3plus frames decoded
+    std::uint64_t non_silent = 0;       // of those, frames with audible content
+    std::uint64_t errors = 0;           // frames the decoder rejected
+    std::uint64_t without_decoder = 0;  // frames passed through with no decoder
+    std::uint64_t starved = 0;          // Decode calls that returned no samples for lack of buffered data
 };
 CellAtracStats cellAtracStats();
 
@@ -226,8 +226,8 @@ std::span<const HleEntry> cellGcmSysHandlers();
 // console's 0xF900000). Commits the RSX areas, maps the IO area and writes the context, control
 // register and configuration. Returns kCellOk or a CellGcmError code. Intended for tests; the
 // state is released with resetRsxState.
-std::uint32_t gcmInitBody(std::uint8_t* base, std::uint32_t context_pp, std::uint32_t cmd_size,
-                          std::uint32_t io_size, std::uint32_t io_address, std::uint32_t local_size);
+std::uint32_t gcmInitBody(std::uint8_t* base, std::uint32_t context_pp, std::uint32_t cmd_size, std::uint32_t io_size,
+                          std::uint32_t io_address, std::uint32_t local_size);
 
 // Forgets every initialized SPURS object and releases its thread group. Intended for tests.
 void resetSpurs();
@@ -251,9 +251,7 @@ std::uint64_t callGuestFunction(DalPpuContext* ctx, std::uint8_t* base, std::uin
                                 std::initializer_list<std::uint64_t> args);
 
 // Low 32 bits of argument register r(3 + n).
-inline std::uint32_t argU32(const DalPpuContext* ctx, int n) {
-  return static_cast<std::uint32_t>(ctx->gpr[3 + n]);
-}
+inline std::uint32_t argU32(const DalPpuContext* ctx, int n) { return static_cast<std::uint32_t>(ctx->gpr[3 + n]); }
 
 // Reads a NUL-terminated guest string of at most `max` bytes (the terminator is not required).
 std::string readGuestString(const std::uint8_t* base, std::uint32_t addr, std::uint32_t max);

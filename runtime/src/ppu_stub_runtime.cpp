@@ -82,8 +82,8 @@ void dalHleCall(DalPpuContext* ctx, uint8_t* base, uint32_t import_index) {
     (void)base;
     if (kDalPpuImports != nullptr && &kDalPpuImportCount != nullptr && import_index < kDalPpuImportCount) {
         const DalImportInfo& info = kDalPpuImports[import_index];
-        std::fprintf(stderr, "dal: HLE call %s::%s (import %u, stub 0x%08x, fnid 0x%08x)\n", info.module,
-                     info.name, import_index, info.stub, info.fnid);
+        std::fprintf(stderr, "dal: HLE call %s::%s (import %u, stub 0x%08x, fnid 0x%08x)\n", info.module, info.name,
+                     import_index, info.stub, info.fnid);
     } else {
         std::fprintf(stderr, "dal: HLE call, import index %u\n", import_index);
     }

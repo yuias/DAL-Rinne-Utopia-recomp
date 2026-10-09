@@ -27,12 +27,12 @@ inline constexpr std::uint8_t kVertexTypeCmp = 6;
 inline constexpr std::uint8_t kVertexTypeUint8 = 7;
 
 struct VertexAttribFormat {
-  std::uint8_t type = 0;
-  std::uint8_t size = 0;           // components in the guest array, 1..4
-  VkFormat format = VK_FORMAT_UNDEFINED;  // as the vertex shader reads the converted data
-  std::uint32_t guest_size = 0;    // bytes per guest element
-  std::uint32_t host_size = 0;     // bytes per converted element
-  bool widen = false;              // components are converted to 32-bit floats, see widenedFormat
+    std::uint8_t type = 0;
+    std::uint8_t size = 0;                  // components in the guest array, 1..4
+    VkFormat format = VK_FORMAT_UNDEFINED;  // as the vertex shader reads the converted data
+    std::uint32_t guest_size = 0;           // bytes per guest element
+    std::uint32_t host_size = 0;            // bytes per converted element
+    bool widen = false;                     // components are converted to 32-bit floats, see widenedFormat
 };
 
 // Nullopt for a type or size that has no conversion (compressed, type 0, ub256 other than 4 components).

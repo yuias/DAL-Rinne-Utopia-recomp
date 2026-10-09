@@ -10,29 +10,29 @@
 namespace dal {
 
 enum class ExitCode : int {
-  ProcessExit = 0,
-  Usage = 2,
-  Fatal = 3,
-  LoadError = 4,
-  Watchdog = 5,
-  Stall = 6,
-  NoThreads = 7,
+    ProcessExit = 0,
+    Usage = 2,
+    Fatal = 3,
+    LoadError = 4,
+    Watchdog = 5,
+    Stall = 6,
+    NoThreads = 7,
 };
 
 enum class FatalKind {
-  UnhandledInstruction,
-  Trap,
-  GuestFault,
-  UnknownTarget,
-  Internal,
+    UnhandledInstruction,
+    Trap,
+    GuestFault,
+    UnknownTarget,
+    Internal,
 };
 
 std::string_view fatalKindName(FatalKind kind);
 
 // One caller frame recovered from the guest stack. `function` is 0 when no function owns `lr`.
 struct GuestFrame {
-  std::uint32_t lr;
-  std::uint32_t function;
+    std::uint32_t lr;
+    std::uint32_t function;
 };
 
 inline constexpr std::size_t kMaxGuestFrames = 16;
@@ -47,8 +47,7 @@ std::uint32_t findOwningFunction(std::uint32_t addr);
 // frame (`*(back_chain + 16)`). Stops on a null, misaligned, non-ascending or non-committed link, or
 // after `max_frames`. Guest memory is only read after checking that it is committed stack, so a
 // corrupt chain cannot fault. Returns the number of frames written.
-std::size_t walkGuestStack(const DalPpuContext& ctx, const std::uint8_t* base, GuestFrame* out,
-                           std::size_t max_frames);
+std::size_t walkGuestStack(const DalPpuContext& ctx, const std::uint8_t* base, GuestFrame* out, std::size_t max_frames);
 
 // Registered by the census code so this file does not depend on it. Called exactly once, on the
 // way out of every stop path. Without a printer nothing is printed.

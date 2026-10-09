@@ -12,8 +12,8 @@ namespace dal {
 // already set; otherwise reserves the TLS area, gives the calling thread its block and stores the
 // thread pointer in ctx->gpr[13]. Returns r13. Call with the guest lock held (or before any guest
 // thread runs). The internal lwmutexes and mutexes the HLE version also creates are not made here.
-std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_t thread_id,
-                            std::uint32_t vaddr, std::uint32_t filesz, std::uint32_t memsz);
+std::uint32_t initializeTls(DalPpuContext* ctx, std::uint8_t* base, std::uint32_t thread_id, std::uint32_t vaddr,
+                            std::uint32_t filesz, std::uint32_t memsz);
 
 // Takes a TLS block for a new thread and returns its r13, or 0 when initializeTls has not run or
 // memory is exhausted.

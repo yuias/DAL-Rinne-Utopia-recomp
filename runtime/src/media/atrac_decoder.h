@@ -13,19 +13,19 @@
 namespace dal {
 
 class AtracFrameDecoder {
- public:
-  virtual ~AtracFrameDecoder() = default;
-  // One frame of block_align bytes -> kAtrac3plusFrameSamples x channels interleaved host floats.
-  // False with the reason on a bad frame; the caller then uses silence for that frame.
-  virtual bool decode(std::span<const std::uint8_t> frame, std::span<float> out, std::string& error) = 0;
-  virtual void reset() = 0;  // after a seek (loop); the next frame starts a new overlap
+public:
+    virtual ~AtracFrameDecoder() = default;
+    // One frame of block_align bytes -> kAtrac3plusFrameSamples x channels interleaved host floats.
+    // False with the reason on a bad frame; the caller then uses silence for that frame.
+    virtual bool decode(std::span<const std::uint8_t> frame, std::span<float> out, std::string& error) = 0;
+    virtual void reset() = 0;  // after a seek (loop); the next frame starts a new overlap
 };
 
 class AtracDecoderFactory {
- public:
-  virtual ~AtracDecoderFactory() = default;
-  // Null with the reason in `error` when the file's parameters cannot be decoded.
-  virtual std::unique_ptr<AtracFrameDecoder> create(const At3Info& info, std::string& error) = 0;
+public:
+    virtual ~AtracDecoderFactory() = default;
+    // Null with the reason in `error` when the file's parameters cannot be decoded.
+    virtual std::unique_ptr<AtracFrameDecoder> create(const At3Info& info, std::string& error) = 0;
 };
 
 // The factory is installed once at start-up, before any guest code runs. Null means silence.

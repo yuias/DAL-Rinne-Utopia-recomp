@@ -20,8 +20,8 @@ inline constexpr std::uint32_t kTranslatorVersion = 2;
 void setShaderCacheDir(const std::filesystem::path& dir);
 
 struct ShaderCompilerStats {
-  std::uint64_t cache_hits = 0;
-  std::uint64_t compiles = 0;  // shaderc invocations, successful or not
+    std::uint64_t cache_hits = 0;
+    std::uint64_t compiles = 0;  // shaderc invocations, successful or not
 };
 ShaderCompilerStats shaderCompilerStats();
 
@@ -30,8 +30,7 @@ ShaderCompilerStats shaderCompilerStats();
 // different texts never share a file, even under the same cache_key (which stays in the name for
 // readability, e.g. the ucode hash). A missing, short or corrupt file is recompiled and rewritten.
 // On failure the error is the shaderc message. Thread-safe.
-std::expected<std::vector<std::uint32_t>, std::string> compileGlsl(ShaderStage stage,
-                                                                   std::string_view glsl,
+std::expected<std::vector<std::uint32_t>, std::string> compileGlsl(ShaderStage stage, std::string_view glsl,
                                                                    std::uint64_t cache_key);
 
 }  // namespace dal

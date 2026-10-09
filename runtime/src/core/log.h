@@ -47,32 +47,32 @@ bool firstUse(std::string_view key);
 // A suppressed message is not formatted.
 template <typename... Args>
 void logTrace(std::format_string<Args...> fmt, Args&&... args) {
-  if (!logEnabled(LogLevel::Trace)) return;
-  logWrite(LogLevel::Trace, std::format(fmt, std::forward<Args>(args)...));
+    if (!logEnabled(LogLevel::Trace)) return;
+    logWrite(LogLevel::Trace, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logDebug(std::format_string<Args...> fmt, Args&&... args) {
-  if (!logEnabled(LogLevel::Debug)) return;
-  logWrite(LogLevel::Debug, std::format(fmt, std::forward<Args>(args)...));
+    if (!logEnabled(LogLevel::Debug)) return;
+    logWrite(LogLevel::Debug, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logInfo(std::format_string<Args...> fmt, Args&&... args) {
-  if (!logEnabled(LogLevel::Info)) return;
-  logWrite(LogLevel::Info, std::format(fmt, std::forward<Args>(args)...));
+    if (!logEnabled(LogLevel::Info)) return;
+    logWrite(LogLevel::Info, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logWarn(std::format_string<Args...> fmt, Args&&... args) {
-  if (!logEnabled(LogLevel::Warn)) return;
-  logWrite(LogLevel::Warn, std::format(fmt, std::forward<Args>(args)...));
+    if (!logEnabled(LogLevel::Warn)) return;
+    logWrite(LogLevel::Warn, std::format(fmt, std::forward<Args>(args)...));
 }
 
 template <typename... Args>
 void logError(std::format_string<Args...> fmt, Args&&... args) {
-  if (!logEnabled(LogLevel::Error)) return;
-  logWrite(LogLevel::Error, std::format(fmt, std::forward<Args>(args)...));
+    if (!logEnabled(LogLevel::Error)) return;
+    logWrite(LogLevel::Error, std::format(fmt, std::forward<Args>(args)...));
 }
 
 // Logs only the first time `key` is seen, so hot paths can report an unimplemented call without
@@ -80,14 +80,14 @@ void logError(std::format_string<Args...> fmt, Args&&... args) {
 // use up the key.
 template <typename... Args>
 void logOnce(LogLevel level, std::string_view key, std::format_string<Args...> fmt, Args&&... args) {
-  if (logEnabled(level) && firstUse(key)) {
-    logWrite(level, std::format(fmt, std::forward<Args>(args)...));
-  }
+    if (logEnabled(level) && firstUse(key)) {
+        logWrite(level, std::format(fmt, std::forward<Args>(args)...));
+    }
 }
 
 template <typename... Args>
 void logOnce(std::string_view key, std::format_string<Args...> fmt, Args&&... args) {
-  logOnce(LogLevel::Info, key, fmt, std::forward<Args>(args)...);
+    logOnce(LogLevel::Info, key, fmt, std::forward<Args>(args)...);
 }
 
 }  // namespace dal

@@ -11,11 +11,11 @@
 namespace dal {
 
 struct GlslResult {
-  std::string glsl;                        // empty unless ok
-  std::vector<std::string> unimplemented;  // e.g. "vp opcode ARL"; the draw is skipped and counted
-  std::uint32_t texture_units = 0;         // mask of sampled units (fragment programs only)
-  std::uint32_t inputs_used = 0;           // vertex programs: bit n = `layout(location = n) in vec4`
-  bool ok = false;
+    std::string glsl;                        // empty unless ok
+    std::vector<std::string> unimplemented;  // e.g. "vp opcode ARL"; the draw is skipped and counted
+    std::uint32_t texture_units = 0;         // mask of sampled units (fragment programs only)
+    std::uint32_t inputs_used = 0;           // vertex programs: bit n = `layout(location = n) in vec4`
+    bool ok = false;
 };
 
 // ---- Interface contract shared with the fragment translator and the renderer ----
@@ -34,15 +34,15 @@ inline constexpr std::uint32_t kVpDrawBinding = 2;       // UBO: VpDrawUniforms,
 // Bytes 64.. of binding 2 are free for the fragment stage's per-draw values (the vertex shader only
 // declares the first 64 bytes).
 struct VpDrawUniforms {
-  float viewport_scale[4];
-  float viewport_offset[4];
-  float clip_width;
-  float clip_height;
-  float clip_min;
-  float clip_max;
-  std::uint32_t output_mask;
-  float point_size;
-  std::uint32_t reserved[2];
+    float viewport_scale[4];
+    float viewport_offset[4];
+    float clip_width;
+    float clip_height;
+    float clip_min;
+    float clip_max;
+    std::uint32_t output_mask;
+    float point_size;
+    std::uint32_t reserved[2];
 };
 static_assert(sizeof(VpDrawUniforms) == 64);
 static_assert(offsetof(VpDrawUniforms, clip_width) == 32);
@@ -64,15 +64,15 @@ inline constexpr std::uint32_t kVaryingFog = 14;
 inline constexpr std::uint32_t kVaryingTexCoordCount = 10;  // locations 0..9
 
 constexpr int vpOutputSlotLocation(std::uint32_t slot) {
-  switch (slot) {
-    case 1: return kVaryingFrontDiffuse;
-    case 2: return kVaryingFrontSpecular;
-    case 3: return kVaryingBackDiffuse;
-    case 4: return kVaryingBackSpecular;
-    case 5: return kVaryingFog;
-    case 15: return 8;
-    default: return slot >= 7 && slot <= 14 ? static_cast<int>(slot - 7) : -1;
-  }
+    switch (slot) {
+        case 1: return kVaryingFrontDiffuse;
+        case 2: return kVaryingFrontSpecular;
+        case 3: return kVaryingBackDiffuse;
+        case 4: return kVaryingBackSpecular;
+        case 5: return kVaryingFog;
+        case 15: return 8;
+        default: return slot >= 7 && slot <= 14 ? static_cast<int>(slot - 7) : -1;
+    }
 }
 
 // `ucode` holds the program words in host order (RsxDraw::vp_ucode), starting at the first

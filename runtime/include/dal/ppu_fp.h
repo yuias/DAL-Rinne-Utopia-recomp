@@ -43,8 +43,7 @@ DAL_FORCEINLINE uint64_t dalFctidz(double b) { return dalSaturateInt64(__builtin
 // via `ppu_set_fpcc`). fcmpo is identical because no exception state is modelled.
 DAL_FORCEINLINE void dalFcmp(DalPpuContext* ctx, uint32_t field, double a, double b) {
     uint32_t un = __builtin_isnan(a) || __builtin_isnan(b);
-    uint32_t nibble = ((uint32_t)(a < b) << 3) | ((uint32_t)(a > b) << 2) |
-                      ((uint32_t)(a == b) << 1) | un;
+    uint32_t nibble = ((uint32_t)(a < b) << 3) | ((uint32_t)(a > b) << 2) | ((uint32_t)(a == b) << 1) | un;
     dalSetCrField(ctx, field, nibble);
     ctx->fpscr = (ctx->fpscr & ~0xF000u) | (nibble << 12);
 }

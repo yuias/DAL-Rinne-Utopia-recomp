@@ -18,25 +18,25 @@ namespace dal {
 // destroyed id is never handed out again and a stale id cannot alias a new object.
 template <class T>
 class IdMap {
- public:
-  IdMap(std::uint32_t base, std::uint32_t step) : base_(base), step_(step) {}
+public:
+    IdMap(std::uint32_t base, std::uint32_t step) : base_(base), step_(step) {}
 
-  std::uint32_t add(std::shared_ptr<T> object) {
-    const std::uint32_t id = base_ + next_++ * step_;
-    objects_.emplace(id, std::move(object));
-    return id;
-  }
-  // Callers keep the returned pointer while they wait, so an object outlives its id.
-  std::shared_ptr<T> find(std::uint32_t id) const {
-    const auto it = objects_.find(id);
-    return it != objects_.end() ? it->second : nullptr;
-  }
-  bool erase(std::uint32_t id) { return objects_.erase(id) != 0; }
-  std::size_t size() const { return objects_.size(); }
+    std::uint32_t add(std::shared_ptr<T> object) {
+        const std::uint32_t id = base_ + next_++ * step_;
+        objects_.emplace(id, std::move(object));
+        return id;
+    }
+    // Callers keep the returned pointer while they wait, so an object outlives its id.
+    std::shared_ptr<T> find(std::uint32_t id) const {
+        const auto it = objects_.find(id);
+        return it != objects_.end() ? it->second : nullptr;
+    }
+    bool erase(std::uint32_t id) { return objects_.erase(id) != 0; }
+    std::size_t size() const { return objects_.size(); }
 
- private:
-  std::uint32_t base_, step_, next_ = 0;
-  std::map<std::uint32_t, std::shared_ptr<T>> objects_;
+private:
+    std::uint32_t base_, step_, next_ = 0;
+    std::map<std::uint32_t, std::shared_ptr<T>> objects_;
 };
 
 inline constexpr std::uint32_t kMutexIdBase = 0x85000000;
@@ -59,14 +59,14 @@ inline constexpr std::uint32_t kSyncNotRecursive = 0x20;
 // lv2 timeouts are in microseconds, 0 meaning "wait forever" (nullopt: counts toward stall
 // detection). Long timeouts are clamped so the steady-clock deadline cannot overflow.
 inline std::optional<std::chrono::microseconds> waitTimeout(std::uint64_t microseconds) {
-  constexpr std::uint64_t kMaxWaitUs = 24ull * 3600 * 1000000;
-  if (microseconds == 0) return std::nullopt;
-  return std::chrono::microseconds(microseconds < kMaxWaitUs ? microseconds : kMaxWaitUs);
+    constexpr std::uint64_t kMaxWaitUs = 24ull * 3600 * 1000000;
+    if (microseconds == 0) return std::nullopt;
+    return std::chrono::microseconds(microseconds < kMaxWaitUs ? microseconds : kMaxWaitUs);
 }
 
 // lv2 errors reach the guest as sign-extended s32 values.
 inline void setResultCode(DalPpuContext* ctx, std::uint32_t code) {
-  ctx->gpr[3] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(code)));
+    ctx->gpr[3] = static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(code)));
 }
 
 // Id of the guest thread that owns `ctx` (the owner value of mutexes and lwmutexes).
@@ -93,10 +93,10 @@ std::uint32_t lwmutexUnlock(const DalPpuContext* ctx, std::uint8_t* base, std::u
 // addresses of their `sys_lwmutex_t`) and the `_lv2ppu` and `_lv2tls` mutexes (ids). All zero
 // until createProcessSyncObjects ran.
 struct ProcessSyncObjects {
-  std::uint32_t atexit_lwmutex = 0;
-  std::uint32_t prx_lwmutex = 0;
-  std::uint32_t once_mutex = 0;
-  std::uint32_t exit_mutex = 0;
+    std::uint32_t atexit_lwmutex = 0;
+    std::uint32_t prx_lwmutex = 0;
+    std::uint32_t once_mutex = 0;
+    std::uint32_t exit_mutex = 0;
 };
 const ProcessSyncObjects& processSyncObjects();
 void createProcessSyncObjects(std::uint8_t* base);
@@ -111,8 +111,8 @@ std::uint32_t eventQueueIdByKey(std::uint64_t ipc_key);
 // Sends an event to queue `id` like a connected port: hands it to the oldest receiver or stores it.
 // Returns kCellOk, kCellEbusy (queue full) or kCellEsrch (no such queue). Under the guest lock; may
 // be called from a host thread that holds it.
-std::uint32_t sendEventToQueue(std::uint32_t id, std::uint64_t source, std::uint64_t data1,
-                               std::uint64_t data2, std::uint64_t data3);
+std::uint32_t sendEventToQueue(std::uint32_t id, std::uint64_t source, std::uint64_t data1, std::uint64_t data2,
+                               std::uint64_t data3);
 
 // Forgets every event flag, event queue and event port (sys_event.cpp).
 void resetEventObjects();

@@ -17,27 +17,27 @@ constexpr char kModule[] = "cellSysmodule";
 
 // The id argument is a u16 in the SDK.
 void logModule(const char* verb, const DalPpuContext* ctx) {
-  const auto id = static_cast<std::uint16_t>(argU32(ctx, 0));
-  logOnce(std::format("sysmodule-{}-{}", verb, id), "dal: sysmodule: {} {:#06x}", verb, id);
+    const auto id = static_cast<std::uint16_t>(argU32(ctx, 0));
+    logOnce(std::format("sysmodule-{}-{}", verb, id), "dal: sysmodule: {} {:#06x}", verb, id);
 }
 
 // cellSysmoduleLoadModule(u16 id)
 void sysmoduleLoadModule(DalPpuContext* ctx, std::uint8_t* base) {
-  (void)base;
-  logModule("load", ctx);
-  ctx->gpr[3] = kCellOk;
+    (void)base;
+    logModule("load", ctx);
+    ctx->gpr[3] = kCellOk;
 }
 
 // cellSysmoduleUnloadModule(u16 id)
 void sysmoduleUnloadModule(DalPpuContext* ctx, std::uint8_t* base) {
-  (void)base;
-  logModule("unload", ctx);
-  ctx->gpr[3] = kCellOk;
+    (void)base;
+    logModule("unload", ctx);
+    ctx->gpr[3] = kCellOk;
 }
 
 constexpr HleEntry kHandlers[] = {
-    {kModule, 0x112a5ee9, "cellSysmoduleUnloadModule", sysmoduleUnloadModule},
-    {kModule, 0x32267a31, "cellSysmoduleLoadModule", sysmoduleLoadModule},
+        {kModule, 0x112a5ee9, "cellSysmoduleUnloadModule", sysmoduleUnloadModule},
+        {kModule, 0x32267a31, "cellSysmoduleLoadModule", sysmoduleLoadModule},
 };
 
 }  // namespace

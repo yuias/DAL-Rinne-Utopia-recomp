@@ -32,20 +32,20 @@ using RenderStatus = std::int32_t;
 // One opened, initialised stream on a render endpoint, used from the device thread only. The real
 // implementation wraps IAudioClient; tests substitute fakes to exercise device loss.
 class RenderStream {
- public:
-  virtual ~RenderStream() = default;
-  virtual std::string description() const = 0;
-  virtual std::uint32_t bufferFrames() const = 0;
-  // The endpoint's processing period; the audio engine takes the buffer in whole periods. 0 when
-  // unknown.
-  virtual std::uint32_t periodFrames() const = 0;
-  // Waits for the device's "buffer has room" signal. False on timeout.
-  virtual bool waitForBuffer(std::chrono::milliseconds timeout) = 0;
-  // Frames written and not yet played.
-  virtual RenderStatus pendingFrames(std::uint32_t& frames) = 0;
-  // Appends interleaved stereo frames (at most bufferFrames() - pendingFrames()).
-  virtual RenderStatus write(std::span<const float> samples) = 0;
-  virtual RenderStatus start() = 0;
+public:
+    virtual ~RenderStream() = default;
+    virtual std::string description() const = 0;
+    virtual std::uint32_t bufferFrames() const = 0;
+    // The endpoint's processing period; the audio engine takes the buffer in whole periods. 0 when
+    // unknown.
+    virtual std::uint32_t periodFrames() const = 0;
+    // Waits for the device's "buffer has room" signal. False on timeout.
+    virtual bool waitForBuffer(std::chrono::milliseconds timeout) = 0;
+    // Frames written and not yet played.
+    virtual RenderStatus pendingFrames(std::uint32_t& frames) = 0;
+    // Appends interleaved stereo frames (at most bufferFrames() - pendingFrames()).
+    virtual RenderStatus write(std::span<const float> samples) = 0;
+    virtual RenderStatus start() = 0;
 };
 
 // Opens a stream; null with the reason in `error` on failure.
@@ -57,8 +57,8 @@ using RenderStreamFactory = std::function<std::unique_ptr<RenderStream>(std::str
 RenderStreamFactory makeWasapiStreamFactory();
 
 struct WasapiOutputOptions {
-  std::chrono::milliseconds open_timeout{2000};      // how long open() waits for the device thread
-  std::chrono::milliseconds reopen_interval{2000};   // between reopen attempts after a device loss
+    std::chrono::milliseconds open_timeout{2000};     // how long open() waits for the device thread
+    std::chrono::milliseconds reopen_interval{2000};  // between reopen attempts after a device loss
 };
 
 std::unique_ptr<AudioOutput> makeWasapiOutput();
@@ -66,11 +66,11 @@ std::unique_ptr<AudioOutput> makeWasapiOutput();
 std::unique_ptr<AudioOutput> makeWasapiOutputForTest(RenderStreamFactory factory, WasapiOutputOptions options = {});
 
 struct RenderDeviceInfo {
-  std::string name;  // friendly name, UTF-8
-  bool is_default = false;
-  std::uint32_t mix_rate = 0, mix_channels = 0, mix_bits = 0;
-  bool mix_float = false;
-  double default_period_ms = 0, min_period_ms = 0;
+    std::string name;  // friendly name, UTF-8
+    bool is_default = false;
+    std::uint32_t mix_rate = 0, mix_channels = 0, mix_bits = 0;
+    bool mix_float = false;
+    double default_period_ms = 0, min_period_ms = 0;
 };
 
 // Active render endpoints. An empty list means the machine has none; an error means the device
