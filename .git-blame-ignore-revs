@@ -1,0 +1,3 @@
+# Formatting-only commits, skipped by git blame (git config blame.ignoreRevsFile .git-blame-ignore-revs).
+# style: format runtime and tools with clang-format
+7407116bf1354cf88c307ed71787856bf94dd416
