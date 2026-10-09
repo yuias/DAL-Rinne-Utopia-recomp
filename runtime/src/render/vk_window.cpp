@@ -25,7 +25,7 @@ namespace dal {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"DalGameWindow";
-constexpr wchar_t kWindowTitle[] = L"dal_game";
+constexpr wchar_t kWindowTitle[] = L"デート・ア・ライブ 凜祢ユートピア";
 constexpr std::uint64_t kAcquireTimeoutNs = 1'000'000'000ull;
 constexpr std::chrono::seconds kReportInterval{10};
 constexpr int kMaxSwapchainFailures = 3;
