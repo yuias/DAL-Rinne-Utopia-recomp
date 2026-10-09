@@ -109,6 +109,15 @@ function(dal_input_add)
     add_dependencies(dal_game dal_gameinput_runtime)
   endif()
 
+  # Pure core code behind the GamepadBackend interface; no GameInput or Windows.
+  add_executable(dal_input_core_tests runtime/tests/input_core_test.cpp)
+  target_compile_options(dal_input_core_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_input_core_tests PRIVATE dal_runtime_core)
+
+  add_test(NAME input_core COMMAND dal_input_core_tests)
+  set_tests_properties(input_core PROPERTIES
+    PASS_REGULAR_EXPRESSION "input core tests: [0-9]+ passed, 0 failed")
+
   # Exits 77 (skipped) when no GameInput runtime with API version 3 is available.
   add_executable(dal_input_gameinput_tests runtime/tests/input_gameinput_test.cpp)
   target_compile_options(dal_input_gameinput_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)

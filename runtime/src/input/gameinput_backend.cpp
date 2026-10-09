@@ -22,6 +22,9 @@
 #include <string_view>
 #include <utility>
 
+#include "core/log.h"
+#include "input/gamepad_probe.h"
+
 static_assert(GAMEINPUT_API_VERSION == 3, "the pinned v3 GameInput.h must win over the SDK's header");
 
 namespace dal {
@@ -245,25 +248,34 @@ class Backend final : public GameInputBackend {
     if (raw->pnpPath != nullptr) info.pnp_path = raw->pnpPath;
     if (raw->displayName != nullptr) info.display_name = raw->displayName;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    // The status callback can fire again for a device that is already listed.
-    const bool known = std::ranges::any_of(table_, [&](const Entry& e) { return e.device.Get() == device; });
-    if (known) return;
-    info.id = next_id_++;
-    table_.push_back({std::move(info), ComPtr<IGameInputDevice>(device)});
-    generation_.fetch_add(1, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // The status callback can fire again for a device that is already listed.
+      const bool known = std::ranges::any_of(table_, [&](const Entry& e) { return e.device.Get() == device; });
+      if (known) return;
+      info.id = next_id_++;
+      table_.push_back({info, ComPtr<IGameInputDevice>(device)});
+      generation_.fetch_add(1, std::memory_order_release);
+    }
+    // Logged outside the lock: the logger may block on its own output.
+    logInfo("dal: pad: device + {} {} rumble {} \"{}\"", formatGamepadVidPid(info), formatGamepadKinds(info.kinds),
+            info.rumble ? "yes" : "no", info.display_name);
+    logDebug("dal: pad: device {} path {}", info.id, info.pnp_path);
   }
 
   void removeDevice(IGameInputDevice* device) {
     ComPtr<IGameInputDevice> released;  // released after the lock
+    GamepadDeviceInfo info;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const auto it = std::ranges::find_if(table_, [&](const Entry& e) { return e.device.Get() == device; });
       if (it == table_.end()) return;
       released = std::move(it->device);
+      info = std::move(it->info);
       table_.erase(it);
       generation_.fetch_add(1, std::memory_order_release);
     }
+    logInfo("dal: pad: device - {}", formatGamepadVidPid(info));
   }
 
   // A reference to the device with `id`, or null when it is gone or lacks any of `required_kinds`.

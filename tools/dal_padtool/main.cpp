@@ -23,8 +23,10 @@
 #include <utility>
 #include <vector>
 
+#include "core/log.h"
 #include "core/sleeper.h"
 #include "input/gameinput_backend.h"
+#include "input/gamepad_probe.h"
 
 namespace {
 
@@ -87,20 +89,11 @@ bool parseSeconds(std::span<const std::string_view> args, double default_seconds
 }
 
 std::string idText(const dal::GamepadDeviceInfo& info) {
-  return std::format("{} {:04x}:{:04x}", info.id, info.vendor_id, info.product_id);
-}
-
-std::string kindsText(std::uint32_t kinds) {
-  const bool gamepad = (kinds & dal::kGamepadKindGamepad) != 0;
-  const bool controller = (kinds & dal::kGamepadKindController) != 0;
-  if (gamepad && controller) return "gamepad+controller";
-  if (gamepad) return "gamepad";
-  if (controller) return "controller";
-  return "none";
+  return std::format("{} {}", info.id, dal::formatGamepadVidPid(info));
 }
 
 std::string deviceLine(const dal::GamepadDeviceInfo& info) {
-  return std::format("{} {} rumble {} \"{}\" {}", idText(info), kindsText(info.kinds), info.rumble ? "yes" : "no",
+  return std::format("{} {} rumble {} \"{}\" {}", idText(info), dal::formatGamepadKinds(info.kinds), info.rumble ? "yes" : "no",
                      info.display_name, info.pnp_path);
 }
 
@@ -133,31 +126,6 @@ std::shared_ptr<dal::GameInputBackend> openBackend(bool settle) {
   return *backend;
 }
 
-// Rounds to the 0.05 steps that the watch output uses; adding 0.0f turns -0.0 into 0.0.
-float roundStep(float value) { return std::round(value * 20.0f) / 20.0f + 0.0f; }
-
-std::string valueText(float value) { return std::format("{:.2f}", roundStep(value)); }
-
-std::string buttonNames(dal::GamepadButtons buttons) {
-  static constexpr const char* kNames[] = {"Menu",         "View",      "A",         "B",         "X",
-                                           "Y",            "DPadUp",    "DPadDown",  "DPadLeft",  "DPadRight",
-                                           "LeftShoulder", "RightShoulder", "LeftThumbstick", "RightThumbstick"};
-  static_assert(std::size(kNames) == static_cast<std::size_t>(dal::GamepadButton::Count));
-  std::string text;
-  for (std::size_t i = 0; i < std::size(kNames); ++i) {
-    if ((buttons & (1u << i)) == 0) continue;
-    if (!text.empty()) text += '+';
-    text += kNames[i];
-  }
-  return text.empty() ? "none" : text;
-}
-
-std::string readingText(const dal::GamepadReading& r) {
-  return std::format("buttons {} lt {} rt {} ls ({},{}) rs ({},{})", buttonNames(r.buttons), valueText(r.left_trigger),
-                     valueText(r.right_trigger), valueText(r.left_x), valueText(r.left_y), valueText(r.right_x),
-                     valueText(r.right_y));
-}
-
 std::string rawText(const dal::GameInputRawReading& r) {
   std::string buttons;
   for (std::size_t i = 0; i < r.buttons.size(); ++i) {
@@ -165,7 +133,7 @@ std::string rawText(const dal::GameInputRawReading& r) {
   }
   std::string axes;
   for (std::size_t i = 0; i < r.axes.size(); ++i) {
-    axes += std::format("{}{}:{}", axes.empty() ? "" : " ", i, valueText(r.axes[i]));
+    axes += std::format("{}{}:{}", axes.empty() ? "" : " ", i, dal::formatGamepadValue(r.axes[i]));
   }
   std::string switches;
   for (std::size_t i = 0; i < r.switches.size(); ++i) {
@@ -232,7 +200,7 @@ int runWatch(std::span<const std::string_view> args) {
     for (const dal::GamepadDeviceInfo& info : devices) {
       if ((info.kinds & dal::kGamepadKindGamepad) != 0) {
         if (const auto reading = backend->read(info.id)) {
-          const std::string text = readingText(*reading);
+          const std::string text = dal::formatGamepadReading(*reading);
           std::string& last = last_gamepad[info.id];
           if (text != last) {
             last = text;
@@ -292,6 +260,8 @@ constexpr Subcommand kSubcommands[] = {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // The backend's device lines are for the game's log; the tool prints its own device lines.
+  dal::setLogLevel(dal::LogLevel::Warn);
   std::vector<std::string_view> args(argv + 1, argv + argc);
   if (args.empty()) {
     printUsage();

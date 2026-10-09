@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <memory>
@@ -32,6 +33,8 @@
 #include "dal/ppu_context.h"
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
+#include "input/gameinput_backend.h"
+#include "input/gamepad_probe.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_script.h"
 #include "lv2/vfs.h"
@@ -73,6 +76,7 @@ struct Options {
   bool vk_validation = false;
   bool no_window = false;
   bool window = false;  // settled after all arguments
+  bool pad_probe = false;
   std::string dump_frames;
   std::uint32_t dump_frames_every = 1;
   std::string shader_cache;
@@ -225,7 +229,7 @@ void printUsage() {
       "                [--log-level trace|debug|info|warn|error]\n"
       "                [--quiet-hle] [--load-only]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard]\n"
-      "                [--pad-script FILE] [--audio none|wasapi] [--audio-dump FILE]\n"
+      "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
       "                [--vk-validation] [--no-window]\n",
@@ -306,6 +310,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         return false;
       }
       opt.pad_script_events = std::move(*events);
+    } else if (arg == "--pad-probe") {
+      opt.pad_probe = true;
     } else if (arg == "--audio") {
       std::string name;
       if (!value(name)) return false;
@@ -375,6 +381,11 @@ bool parseArgs(int argc, char** argv, Options& opt) {
   if (render_option && !opt.render_vulkan) {
     std::fputs("error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need --render vulkan\n",
                stderr);
+    return false;
+  }
+  // GameInput delivers readings to the foreground window only, so unattended runs have nothing to probe.
+  if (opt.pad_probe && !opt.window) {
+    std::fputs("error: --pad-probe needs the window\n", stderr);
     return false;
   }
   // A window or a script is what makes a keyboard pad useful, so either one selects it by default.
@@ -671,6 +682,14 @@ int main(int argc, char** argv) {
   // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
   // The script clock starts here so that it matches --seconds within a few milliseconds.
   if (opt.keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, opt.keyboard);
+  // GameInput takes about a second to initialise, so the probe thread creates the backend itself.
+  if (opt.pad_probe) {
+    dal::startGamepadProbe(
+        []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
+          return dal::makeGameInputBackend({});
+        },
+        dal::detectSteamContext);
+  }
   dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
   dal::runSupervisor(opt.seconds);
 }
