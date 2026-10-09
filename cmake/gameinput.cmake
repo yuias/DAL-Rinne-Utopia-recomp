@@ -1,0 +1,11 @@
+# Pin of the Microsoft.GameInput NuGet package fetched by tools/fetch-gameinput.ps1 (API version 3).
+# The script reads these three values by regex, so keep each one on its own `set(...)` line.
+# The SHA-256 is of the .nupkg as served by api.nuget.org. It was computed locally and cross-checked
+# against the SHA-512 `packageHash` that nuget.org publishes for this version in its catalog entry
+# (https://api.nuget.org/v3/catalog0/data/2026.09.28.23.41.51/microsoft.gameinput.3.5.283.json).
+# The package ships its runtime only inside redist/GameInputRedist.msi; the script extracts the x64
+# GameInputRedist.dll from it, and DAL_GAMEINPUT_REDIST_SHA256 is the SHA-256 of that DLL.
+# When changing the pin, update THIRD_PARTY_NOTICES.md as well.
+set(DAL_GAMEINPUT_VERSION "3.5.283")
+set(DAL_GAMEINPUT_SHA256 "b5988cb8ff9d7009b6ddf6ad4e3ff87e91b00cc17ffcd5d628dabc21c208f100")
+set(DAL_GAMEINPUT_REDIST_SHA256 "acd2147c925276c80d0db1398d266024e051f72543f6503487953844c50b4da3")

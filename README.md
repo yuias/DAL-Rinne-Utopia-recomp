@@ -42,10 +42,12 @@ The supported executable has the SHA-256
 
 Run these from the repository root:
 
-1. Fetch FFmpeg, which decodes the movies and the game's sound. This is needed once.
+1. Fetch FFmpeg, which decodes the movies and the game's sound, and the GameInput package, which
+   provides the gamepad API. This is needed once.
 
    ```powershell
    pwsh -NoProfile -File tools/fetch-ffmpeg.ps1
+   pwsh -NoProfile -File tools/fetch-gameinput.ps1
    ```
 
 2. Recompile the executable into C source under `generated/ppu`:
