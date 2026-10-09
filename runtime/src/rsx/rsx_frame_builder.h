@@ -25,7 +25,8 @@ class RsxMemoryView {
   virtual bool read(std::uint32_t location, std::uint32_t offset, std::span<std::uint8_t> out) = 0;
 };
 
-// Live view over guest memory. Used under the guest lock.
+// Live view over guest memory. The RSX thread reads through it without the guest lock: like the
+// hardware, it relies on the game not freeing or unmapping memory a submitted draw still reads.
 class GuestRsxMemoryView final : public RsxMemoryView {
  public:
   explicit GuestRsxMemoryView(const std::uint8_t* base) : base_(base) {}
@@ -52,6 +53,13 @@ class RsxFrameBuilder {
   // Moves out what was built since the last call.
   std::vector<RsxCommand> takeCommands();
 
+  // Deferred mode: SET_BEGIN_END(0) only marks the draw as pending, and finishDraw() copies its guest
+  // bytes and builds the command. The caller must call finishDraw() before the next write, with the
+  // registers as that write left them. Off by default: the draw is built inside onWrite().
+  void setDeferDrawEnd(bool defer) { defer_draw_end_ = defer; }
+  bool drawPending() const { return draw_pending_; }
+  void finishDraw(const RsxRegisters& regs);
+
   // Color surfaces cleared or drawn to so far, indexed by RsxTextureDesc::rt_alias. Entries are only
   // appended or replaced in place, so an index stays valid for the life of the builder.
   std::span<const RsxSurface> knownSurfaces() const { return known_surfaces_; }
@@ -68,6 +76,7 @@ class RsxFrameBuilder {
   void beginDraw(std::uint32_t value);
   void addRange(bool indexed, std::uint32_t value);
   void endDraw(const RsxRegisters& regs);
+  void buildDraw(const RsxRegisters& regs);
   void clear(const RsxRegisters& regs, std::uint32_t mask);
   bool fillVertices(const RsxRegisters& regs, RsxDraw& draw, std::uint32_t vertex_base, std::uint32_t vertex_count);
   void fillTextures(const RsxRegisters& regs, RsxDraw& draw);
@@ -87,6 +96,8 @@ class RsxFrameBuilder {
   bool have_range_ = false, indexed_ = false;
   RsxPrimitive primitive_ = RsxPrimitive::Triangles;
   Range range_;
+  bool defer_draw_end_ = false;
+  bool draw_pending_ = false;  // the clause ended and buildDraw() has not run yet
 };
 
 }  // namespace dal

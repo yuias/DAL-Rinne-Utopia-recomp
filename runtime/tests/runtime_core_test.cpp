@@ -1917,6 +1917,7 @@ class FakeSink : public dal::RsxSink {
     writes.emplace_back(method, value);
     return true;
   }
+  bool stopAfterWrite() override { return !writes.empty() && writes.back() == stop_on; }
   void put(std::uint32_t at, std::initializer_list<std::uint32_t> list) {
     for (const std::uint32_t word : list) {
       words[at] = word;
@@ -1928,6 +1929,7 @@ class FakeSink : public dal::RsxSink {
   std::vector<std::pair<std::uint32_t, std::uint32_t>> writes;
   int refuse = 0;  // the next writes return false
   int attempts = 0;
+  std::pair<std::uint32_t, std::uint32_t> stop_on{0xFFFFFFFF, 0};  // the run stops after this write
 };
 
 using Writes = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
@@ -5219,6 +5221,21 @@ void testFifoParser() {
     CHECK((sink.writes == Writes{{0x1800, 1}, {0x1800, 2}, {0x1800, 3}, {0x1800, 9}}));
   }
 
+  // A sink that asks to stop ends the run right after that write, inside the command; the next run
+  // continues with the following argument.
+  {
+    FakeSink sink;
+    FifoParser parser;
+    sink.stop_on = {0x1808, 0};
+    sink.put(kBase, {0x40000000u | 0x1808 | (3u << 18), 5, 0, 7});
+    std::uint32_t get = kBase;
+    CHECK(parser.run(get, kBase + 16, 100, sink) == FifoStatus::Budget);
+    CHECK(get == kBase + 12 && parser.commandGet(get) == kBase);
+    CHECK((sink.writes == Writes{{0x1808, 5}, {0x1808, 0}}));
+    CHECK(parser.run(get, kBase + 16, 100, sink) == FifoStatus::Idle && get == kBase + 16);
+    CHECK((sink.writes == Writes{{0x1808, 5}, {0x1808, 0}, {0x1808, 7}}));
+  }
+
   // The method register wraps at 16 bits.
   {
     FakeSink sink;
@@ -6677,22 +6694,39 @@ void testRsxConsumer() {
     emit(0x1D8C, {0xFFFFFF00});
     emit(0x1D94, {0xF3});
     emit(dal::kMethodGcmFlipCommand, {1});
-    // Frame 2 leaves the surface offset unset, which the context reset made 0.
+    // Frame 2 leaves the surface offset unset, which the context reset made 0. Its draw reads three
+    // vertices of three floats from main memory at IO offset 0x80000.
+    for (std::uint32_t i = 0; i < 36; i++) base[area + 0x80000 + i] = static_cast<std::uint8_t>(i + 1);
     emit(0x0200, {1280u << 16});
     emit(0x0204, {720u << 16});
     emit(0x0208, {8u | (2u << 5) | (1u << 8)});
     emit(0x020C, {0x1400});
     emit(0x0220, {1});
     emit(0x1D94, {0xF3});
+    emit(dal::kMethodNv4097SetVertexDataArrayFormat, {2u | (3u << 4) | (12u << 8)});
+    emit(dal::kMethodNv4097SetVertexDataArrayOffset, {0x80080000});
+    emit(dal::kMethodNv4097SetBeginEnd, {5});
+    emit(dal::kMethodNv4097DrawArrays, {2u << 24});
+    emit(dal::kMethodNv4097SetBeginEnd, {0});
+    const std::uint32_t after_draw = at;
     emit(dal::kMethodGcmFlipCommand, {2});
     dalWrite32(base, kControl, at);
+
+    // The pump stops right after the draw end (a command of its own here, so get is published past it);
+    // the draw is built when the commands are taken, and the rest of the frame follows on the next pump.
+    CHECK(capturing.pump(200) == FifoStatus::Budget && capturing.stopAfterWrite());
+    CHECK(dalRead32(base, kControl + 4) == after_draw);
+    std::vector<dal::RsxCommand> live = capturing.takeCommands();
+    CHECK(!capturing.stopAfterWrite());
     CHECK(capturing.pump(200) == FifoStatus::Idle);
-    const std::vector<dal::RsxCommand> live = capturing.takeCommands();
-    CHECK(live.size() == 4 && std::holds_alternative<dal::RsxClear>(live[2]) &&
-          std::holds_alternative<dal::RsxFlip>(live[3]));
+    for (dal::RsxCommand& command : capturing.takeCommands()) live.push_back(std::move(command));
+    CHECK(live.size() == 5 && std::holds_alternative<dal::RsxClear>(live[2]) &&
+          std::holds_alternative<dal::RsxDraw>(live[3]) && std::holds_alternative<dal::RsxFlip>(live[4]));
     CHECK(std::get<dal::RsxClear>(live[0]).surfaces.color.offset == 0x100000);
     CHECK(std::get<dal::RsxClear>(live[2]).surfaces.color.offset == 0);
-    CHECK(std::get<dal::RsxFlip>(live[3]).flip_index == 1);
+    CHECK(std::get<dal::RsxFlip>(live[4]).flip_index == 1);
+    const dal::RsxDraw& draw = std::get<dal::RsxDraw>(live[3]);
+    CHECK(draw.count == 3 && draw.vertex_data.size() == 36 && draw.vertex_data[0] == 1 && draw.vertex_data[35] == 36);
 
     std::vector<dal::RsxConsumer::FinishedCapture> captures = capturing.takeCaptures();
     CHECK(captures.size() == 1 && captures[0].frame == 2);
@@ -6704,13 +6738,15 @@ void testRsxConsumer() {
     CHECK(reader.startRegisters().reg(dal::kMethodGcmFlipCommand) == 1);  // the flip write itself landed
     CHECK(reader.surfaces().size() == 1 && reader.surfaces()[0].offset == 0x100000 && reader.surfaces()[0].width == 1280);
     CHECK(reader.displayCount() == 2 && reader.display()[1].offset == 0x400000);
-    CHECK(captures[0].writes == reader.writeCount() && captures[0].writes == 6);
+    CHECK(captures[0].writes == reader.writeCount() && captures[0].writes == 11);
 
+    // The draw's memory reads were recorded ahead of its draw-end write, so the replay builds it too.
     dal::ReplayRsxMemoryView view;
     dal::RsxFrameBuilder replay_builder(view);
     dal::replayCapture(reader, view, replay_builder);
     const std::vector<dal::RsxCommand> replayed = replay_builder.takeCommands();
-    CHECK(replayed.size() == 2 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]));
+    CHECK(replayed.size() == 3 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]) &&
+          sameCommand(live[4], replayed[2]));
     CHECK(capturing.takeCaptures().empty());
   }
 

@@ -392,7 +392,20 @@ void RsxFrameBuilder::endDraw(const RsxRegisters& regs) {
   if (!in_draw_) return;
   in_draw_ = false;
   if (skip_draw_ || !have_range_) return;
+  if (defer_draw_end_) {
+    draw_pending_ = true;
+    return;
+  }
+  buildDraw(regs);
+}
 
+void RsxFrameBuilder::finishDraw(const RsxRegisters& regs) {
+  if (!draw_pending_) return;
+  draw_pending_ = false;
+  buildDraw(regs);
+}
+
+void RsxFrameBuilder::buildDraw(const RsxRegisters& regs) {
   RsxDraw draw;
   draw.primitive = primitive_;
   draw.indexed = indexed_;

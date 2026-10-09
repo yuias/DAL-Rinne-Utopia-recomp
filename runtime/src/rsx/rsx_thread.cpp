@@ -56,7 +56,7 @@ constexpr std::uint32_t kBlitColorRegisters = 0x700;  // NV308A_COLOR spans this
 
 constexpr std::uint32_t kMethodCount = 0x4000; // 16-bit register offsets, 4 bytes apart
 constexpr std::uint32_t kPumpSliceWords = 128;  // words per pump() call inside one lock hold
-// Checked after each slice, so one slice (a draw's write() can take about 1 ms) can exceed it.
+// Checked after each slice, so one slice can exceed it.
 constexpr std::chrono::microseconds kMaxGuestLockHold{300};
 
 // Names of the registers the consumer interprets. The census prints hex for the others.
@@ -129,8 +129,13 @@ bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
   if (builder_ != nullptr) {
     regs_->apply(method, value);
     builder_->onWrite(*regs_, method, value);
-    // After the builder, so the memory it read is recorded ahead of the write that caused the read.
-    if (capture_ != nullptr) capture_->onWrite(method, value);
+    // After the builder, so the memory it read is recorded ahead of the write that caused the read. A
+    // draw end is recorded by finishPendingDraw(), after the copies.
+    if (builder_->drawPending()) {
+      pending_end_ = {method, value};
+    } else if (capture_ != nullptr) {
+      capture_->onWrite(method, value);
+    }
     // Only a completed flip command gets here. The next frame starts from the state this flip left,
     // which includes its context reset and this write.
     if (method == kMethodGcmFlipCommand && capture_ == nullptr && captureWanted(flips_reached_ + 1)) {
@@ -140,6 +145,14 @@ bool RsxConsumer::write(std::uint32_t method, std::uint32_t value) {
   return true;
 }
 
+bool RsxConsumer::stopAfterWrite() { return builder_ != nullptr && builder_->drawPending(); }
+
+void RsxConsumer::finishPendingDraw() {
+  if (builder_ == nullptr || !builder_->drawPending()) return;
+  builder_->finishDraw(*regs_);
+  if (capture_ != nullptr) capture_->onWrite(pending_end_.first, pending_end_.second);
+}
+
 void RsxConsumer::enableFrameBuilder() {
   if (builder_ != nullptr) return;
   regs_ = std::make_unique<RsxRegisters>();
@@ -147,6 +160,7 @@ void RsxConsumer::enableFrameBuilder() {
   memory_view_ = std::make_unique<GuestRsxMemoryView>(base_);
   recording_view_ = std::make_unique<RsxRecordingMemoryView>(*memory_view_);
   builder_ = std::make_unique<RsxFrameBuilder>(*recording_view_);
+  builder_->setDeferDrawEnd(true);
 }
 
 void RsxConsumer::disableFrameBuilder() {
@@ -191,7 +205,9 @@ void RsxConsumer::finishCapture(std::uint32_t buffer) {
 std::vector<RsxConsumer::FinishedCapture> RsxConsumer::takeCaptures() { return std::exchange(finished_captures_, {}); }
 
 std::vector<RsxCommand> RsxConsumer::takeCommands() {
-  return builder_ != nullptr ? builder_->takeCommands() : std::vector<RsxCommand>{};
+  if (builder_ == nullptr) return {};
+  finishPendingDraw();
+  return builder_->takeCommands();
 }
 
 void RsxConsumer::countCommands(const std::vector<RsxCommand>& commands) {
@@ -475,6 +491,11 @@ void RsxConsumer::publishGet(std::uint32_t get) {
 }
 
 FifoStatus RsxConsumer::pump(std::uint32_t max_words) {
+  // The guest may already see `get` past a pending draw (when the draw end was the last argument of its
+  // command), as on the hardware, where get is the fetch position. It reuses draw memory only after a later label, report or flip, which the writes after
+  // the draw produce; so the draw is copied before any of them runs. Normally takeCommands() already
+  // did this outside the lock.
+  finishPendingDraw();
   if (faulted_) return FifoStatus::Fault;
   if (!get_known_) {
     get_ = dalRead32(base_, kRsxControlAddr + kControlGet);
@@ -648,9 +669,10 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
       std::vector<RsxCommand> commands;
       std::vector<RsxConsumer::FinishedCapture> captures;
       {
-        // The guest lock is a FIFO ticket lock shared with the audio engine and every guest thread, and
-        // the frame builder copies vertex and texture bytes inside write(). Pumping in small slices and
-        // leaving once the hold budget is spent lets the waiters in between; the loop re-queues for the rest.
+        // The guest lock is a FIFO ticket lock shared with the audio engine and every guest thread.
+        // Pumping in small slices and leaving once the hold budget is spent lets the waiters in between;
+        // the loop re-queues for the rest. A pump also stops after each draw end, whose vertex and
+        // texture bytes takeCommands() then copies without the lock.
         std::lock_guard<GuestLock> lock(guestLock());
         const auto hold_start = Clock::now();
         if (pending_tick) {
@@ -659,10 +681,11 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
         }
         do {
           status = consumer->pump(kPumpSliceWords);
-        } while (status == FifoStatus::Budget && Clock::now() - hold_start < kMaxGuestLockHold);
-        commands = consumer->takeCommands();
-        captures = consumer->takeCaptures();
+        } while (status == FifoStatus::Budget && !consumer->stopAfterWrite() &&
+                 Clock::now() - hold_start < kMaxGuestLockHold);
       }
+      commands = consumer->takeCommands();
+      captures = consumer->takeCaptures();
       dispatchCommands(consumer, executor.get(), std::move(commands));
       if (!captures.empty()) writeCaptures(captures);
     } while (status == FifoStatus::Budget);

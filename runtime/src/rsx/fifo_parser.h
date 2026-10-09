@@ -155,12 +155,15 @@ class RsxSink {
   // acquire not satisfied, flip waiting for VBlank): the parser keeps the write and retries it on
   // the next run.
   virtual bool write(std::uint32_t method, std::uint32_t value) = 0;
+  // Asked after each completed write; true ends the run right there with Budget, before any further
+  // word is read, so the sink can do work outside the run that needs the state of exactly that write.
+  virtual bool stopAfterWrite() { return false; }
 };
 
 enum class FifoStatus {
   Idle,     // get == put, or spinning on a jump to itself
   Waiting,  // a write returned false
-  Budget,   // max_words consumed with work left
+  Budget,   // max_words consumed, or the sink asked to stop after a write
   Fault,    // malformed header or unmapped read; sticky until reset()
 };
 

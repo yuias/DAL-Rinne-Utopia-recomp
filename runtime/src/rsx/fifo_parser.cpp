@@ -22,6 +22,7 @@ FifoStatus FifoParser::run(std::uint32_t& get, std::uint32_t put, std::uint32_t 
     if (pending_) {
       if (!sink.write(pending_method_, pending_value_)) return FifoStatus::Waiting;
       pending_ = false;
+      if (sink.stopAfterWrite()) return FifoStatus::Budget;
     }
     if (get == put) return FifoStatus::Idle;
     if (words >= max_words) return FifoStatus::Budget;

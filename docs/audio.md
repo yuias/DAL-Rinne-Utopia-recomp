@@ -62,8 +62,8 @@ and a block is then consumed before the mixer rewrote it, which plays as silence
 the music. The long holder was the RSX thread with the frame builder on (the window, `--render
 vulkan`): it now pumps the command buffer in slices of 128 words and ends a hold once it has lasted
 300 us (`kPumpSliceWords`, `kMaxGuestLockHold` in `runtime/src/rsx/rsx_thread.cpp`), then queues
-again behind the other waiters. One draw's data copy cannot be split, so a single hold can still be
-about 1 ms.
+again behind the other waiters. A pump also stops after each draw end, and the draw's index, vertex
+and texture bytes are copied after the lock is released, so a hold no longer contains a draw's copy.
 
 Two more timing facts matter for the sound:
 

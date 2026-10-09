@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/census.h"
@@ -45,16 +46,21 @@ void setRsxInterruptHook(void (*hook)(RsxInterrupt kind, std::uint32_t arg));
 inline constexpr std::uint32_t kRsxVBlankPeriodUs = 16667;
 
 // Register state and effects behind the parser. All members are used under the guest lock except
-// census(), which only touches atomics.
+// census(), which only touches atomics, and takeCommands()/takeCaptures(), which only touch state the
+// RSX thread owns.
 class RsxConsumer final : public RsxSink {
  public:
   explicit RsxConsumer(std::uint8_t* base);
 
   bool readIo(std::uint32_t io, std::uint32_t& word) override;
   bool write(std::uint32_t method, std::uint32_t value) override;
+  // True after the write that ends a draw clause: the run stops there so that takeCommands() can copy
+  // the draw's guest bytes outside the guest lock with the registers that draw used.
+  bool stopAfterWrite() override;
 
   // Parses what the guest has put since the last call (at most `max_words` words), then publishes
-  // `get` to the control register. After Fault nothing is consumed any more.
+  // `get` to the control register. After Fault nothing is consumed any more. A draw still pending from
+  // the last run is built first.
   FifoStatus pump(std::uint32_t max_words);
 
   // False when a pump would find nothing new for this raw (big-endian already decoded) put value.
@@ -76,7 +82,8 @@ class RsxConsumer final : public RsxSink {
   bool frameBuilderEnabled() const { return builder_ != nullptr; }
   // Drops the frame builder again. Only while nothing was written yet and no capture is enabled.
   void disableFrameBuilder();
-  // Commands built since the last call; with the guest lock held, like write().
+  // Commands built since the last call, after building a pending draw. Needs no guest lock (only the
+  // pump's thread may call it); the draw's copies then run without it.
   std::vector<RsxCommand> takeCommands();
   // Counts the commands by kind for the stop line; any thread.
   void countCommands(const std::vector<RsxCommand>& commands);
@@ -94,7 +101,7 @@ class RsxConsumer final : public RsxSink {
     std::uint64_t writes = 0, ranges = 0;
     RsxCaptureFile file;
   };
-  // Captures completed since the last call; with the guest lock held, like write().
+  // Captures completed since the last call; same thread rules as takeCommands().
   std::vector<FinishedCapture> takeCaptures();
 
   bool faulted() const { return faulted_; }
@@ -111,6 +118,8 @@ class RsxConsumer final : public RsxSink {
   void flip(std::uint32_t buffer);
   void userCommand(std::uint32_t cause);
   void publishGet(std::uint32_t get);
+  // Builds the draw the last SET_BEGIN_END(0) left pending and records that write in the capture.
+  void finishPendingDraw();
   // Effective address of `offset` in the context DMA `location`; false when out of range or not
   // one of the areas the consumer serves.
   bool resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size, std::uint32_t& ea) const;
@@ -157,6 +166,8 @@ class RsxConsumer final : public RsxSink {
   std::uint32_t capture_frame_ = 0;
   std::uint64_t flips_reached_ = 0;  // flip commands the parser has reached (the builder's flip index)
   std::vector<FinishedCapture> finished_captures_;
+  // The write that left the draw pending (method, value): the capture records it after the draw's memory reads.
+  std::pair<std::uint32_t, std::uint32_t> pending_end_{0, 0};
 };
 
 // Receives the commands the frame builder produced, in order, on the RSX thread without the guest lock.

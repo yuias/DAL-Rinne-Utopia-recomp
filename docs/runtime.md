@@ -114,7 +114,9 @@ ends with the process; a refusal is logged as a warning and the default tick sta
 
 The RSX thread and the audio engine are host threads that take the same guest lock. The RSX thread
 therefore pumps the command buffer in slices of 128 words and leaves the lock once a hold has lasted
-300 us, so that the game's mixer can run between the slices (see [Audio](audio.md#guest-lock)).
+300 us, so that the game's mixer can run between the slices (see [Audio](audio.md#guest-lock)). It
+also leaves the lock after each draw end and copies the draw's guest bytes without it; the game only
+reuses that memory after a later label, report or flip, which the RSX thread writes after the copy.
 
 Thread ids start at `0x01000000`. lv2 interrupt threads are not implemented; the one interrupt
 thread the game needs is the GCM interrupt thread described under [Fake RSX](rendering.md#fake-rsx).

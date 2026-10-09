@@ -1,5 +1,7 @@
 #include "rsx/rsx_state.h"
 
+#include <atomic>
+
 #include "core/guest_memory.h"
 
 namespace dal {
@@ -29,7 +31,8 @@ std::condition_variable_any& rsxGetAdvanced() { return g_get_advanced; }
 
 bool rsxIoToEa(std::uint32_t io, std::uint32_t& ea) {
   if (io >= kRsxIoSpaceSize) return false;
-  const std::uint32_t page = g_state.ea_of_io[io >> kPageShift];
+  // The RSX thread copies draw data without the guest lock, so this table is read and written atomically.
+  const std::uint32_t page = std::atomic_ref(g_state.ea_of_io[io >> kPageShift]).load(std::memory_order_relaxed);
   if (page >= kEaPageLimit) return false;
   ea = (page << kPageShift) | (io & kPageMask);
   return true;
@@ -63,7 +66,7 @@ std::uint32_t rsxMapEaIo(std::uint32_t ea, std::uint32_t io, std::uint32_t size)
   const std::uint32_t pages = size >> kPageShift;
   for (std::uint32_t i = 0; i < pages; i++) {
     g_state.io_of_ea[ea_page + i] = static_cast<std::uint16_t>(io_page + i);
-    g_state.ea_of_io[io_page + i] = static_cast<std::uint16_t>(ea_page + i);
+    std::atomic_ref(g_state.ea_of_io[io_page + i]).store(static_cast<std::uint16_t>(ea_page + i), std::memory_order_relaxed);
   }
   g_state.io_map_size[ea_page] = static_cast<std::uint16_t>(pages);
   return 0;
@@ -103,7 +106,7 @@ std::uint32_t rsxUnmapEa(std::uint32_t ea) {
 
   for (std::uint32_t i = 0; i < pages; i++) {
     g_state.io_of_ea[start_page + i] = kRsxUnmapped;
-    g_state.ea_of_io[io_page + i] = kRsxUnmapped;
+    std::atomic_ref(g_state.ea_of_io[io_page + i]).store(kRsxUnmapped, std::memory_order_relaxed);
   }
   g_state.io_map_size[start_page] = 0;
   return 0;
