@@ -2,6 +2,7 @@
 // GameInput, so nothing here needs a pad, a Windows input runtime or generated code.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -25,9 +26,12 @@
 
 #include "core/log.h"
 #include "input/gamepad_backend.h"
+#include "input/gamepad_hub.h"
 #include "input/gamepad_map.h"
 #include "input/gamepad_probe.h"
 #include "input/gamepad_select.h"
+#include "input/keyboard_pad.h"
+#include "input/pad_buttons.h"
 
 namespace {
 
@@ -90,6 +94,30 @@ class FakeBackend final : public dal::GamepadBackend {
     entries_.push_back(entry);
     ++generation_;
     return entry.info.id;
+  }
+
+  // Plugs in a described device (its id is replaced) and returns its id.
+  std::uint64_t add(dal::GamepadDeviceInfo info) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry entry;
+    entry.info = std::move(info);
+    entry.info.id = next_id_++;
+    entries_.push_back(entry);
+    ++generation_;
+    return entry.info.id;
+  }
+
+  int reads(std::uint64_t id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const Entry& entry : entries_) {
+      if (entry.info.id == id) return entry.reads;
+    }
+    return 0;
+  }
+
+  std::vector<std::pair<std::uint64_t, dal::GamepadRumble>> rumbleCalls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rumble_calls_;
   }
 
   void remove(std::uint64_t id) {
@@ -852,6 +880,471 @@ void testGamepadUseName() {
   CHECK(dal::gamepadUseName(dal::GamepadUse::NotGamepad) == "not a gamepad");
 }
 
+using Clock = dal::KeyboardPadState::Clock;
+using std::chrono::milliseconds;
+
+constexpr dal::PadButtons kCross = dal::padButtonBit(dal::PadButton::Cross);
+constexpr dal::PadButtons kCircle = dal::padButtonBit(dal::PadButton::Circle);
+
+// Debug lines (focus changes) are dropped at the default level.
+class DebugLogLevel {
+ public:
+  DebugLogLevel() { dal::setLogLevel(dal::LogLevel::Debug); }
+  ~DebugLogLevel() { dal::setLogLevel(dal::LogLevel::Info); }
+  DebugLogLevel(const DebugLogLevel&) = delete;
+  DebugLogLevel& operator=(const DebugLogLevel&) = delete;
+};
+
+dal::GamepadReading readingWith(dal::GamepadButton button) {
+  dal::GamepadReading reading;
+  reading.buttons = gamepadButtonBit(button);
+  return reading;
+}
+
+void testHubFirstStepUsesPad() {
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t id = backend->add(xboxPad(0));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {});
+  const Clock::time_point t0 = Clock::now();
+
+  CHECK(!state->gamepadConnected());
+  hub.step(t0);
+  CHECK(hub.usedCount() == 1);
+  CHECK(state->gamepadConnected());
+  CHECK(log.count("dal: pad: gamepad 045e:0b13 used") == 1);
+  CHECK(state->reported(t0) == 0);
+
+  backend->setReading(id, readingWith(GamepadButton::A));
+  hub.step(t0 + milliseconds(10));
+  CHECK(state->held(dal::InputSource::Gamepad) == kCross);
+  CHECK(state->reported(t0 + milliseconds(10)) == kCross);
+
+  // Sticks and triggers reach the analog snapshot; a trigger past the threshold presses L2.
+  dal::GamepadReading reading;
+  reading.left_x = 1.0f;
+  reading.right_y = -1.0f;
+  reading.left_trigger = 1.0f;
+  backend->setReading(id, reading);
+  hub.step(t0 + milliseconds(20));
+  CHECK(state->analog().left_x == 0xFF);
+  CHECK(state->analog().right_y == 0xFF);  // GameInput +y is up, CellPadData 0xFF is down
+  CHECK(state->analog().l2 == 0xFF);
+  CHECK(state->held(dal::InputSource::Gamepad) == dal::padButtonBit(dal::PadButton::L2));
+
+  // Steps without a change publish nothing and log nothing.
+  hub.step(t0 + milliseconds(30));
+  CHECK(log.lines().size() == 1);
+  // A keyboard-free state: the other sources are untouched.
+  CHECK(state->held(dal::InputSource::Keyboard) == 0 && state->held(dal::InputSource::Script) == 0);
+}
+
+void testHubPadRemoved() {
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t id = backend->add(xboxPad(0));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {});
+  const Clock::time_point t0 = Clock::now();
+
+  dal::GamepadReading reading = readingWith(GamepadButton::A);
+  reading.left_x = 1.0f;
+  backend->setReading(id, reading);
+  hub.step(t0);
+  CHECK(state->reported(t0) == kCross);
+
+  backend->remove(id);
+  hub.step(t0 + milliseconds(20));
+  CHECK(hub.usedCount() == 0);
+  CHECK(!state->gamepadConnected());
+  CHECK(state->held(dal::InputSource::Gamepad) == 0);
+  CHECK(state->analog() == dal::PadAnalog{});
+  // Released like a button let go: the 60 ms minimum visible time still applies.
+  CHECK(state->reported(t0 + milliseconds(20)) == kCross);
+  CHECK(state->reported(t0 + milliseconds(59)) == kCross);
+  CHECK(state->reported(t0 + milliseconds(61)) == 0);
+}
+
+void testHubMergesTwoPads() {
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t first = backend->add(xboxPad(0));
+  const std::uint64_t second = backend->add(xboxPad(0));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {});
+
+  dal::GamepadReading a = readingWith(GamepadButton::A);
+  a.left_x = 0.5f;
+  a.right_trigger = 0.5f;
+  dal::GamepadReading b = readingWith(GamepadButton::B);
+  b.left_x = -1.0f;
+  b.right_trigger = 1.0f;
+  backend->setReading(first, a);
+  backend->setReading(second, b);
+  hub.step(Clock::now());
+
+  CHECK(hub.usedCount() == 2);
+  CHECK((state->held(dal::InputSource::Gamepad) & (kCross | kCircle)) == (kCross | kCircle));
+  CHECK(state->analog().left_x == 0x00);  // the value farthest from centre
+  CHECK(state->analog().r2 == 0xFF);      // the larger trigger
+}
+
+void testHubSteamVirtualPadOnly() {
+  LogCapture log;
+  const std::string path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#1#4321)";
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t physical = backend->add(xboxPad(0));
+  const std::uint64_t virtual_pad = backend->add(steamVirtualPad(0, path));
+  const std::uint64_t keyboard = backend->add(keyboardInterface(0));
+  dal::SteamContext steam;
+  steam.overlay_loaded = true;
+  steam.process_id = 4321;
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {.steam = steam});
+
+  backend->setReading(physical, readingWith(GamepadButton::B));
+  backend->setReading(virtual_pad, readingWith(GamepadButton::A));
+  backend->setReading(keyboard, readingWith(GamepadButton::X));
+  hub.step(Clock::now());
+  hub.step(Clock::now());
+
+  CHECK(hub.usedCount() == 1);
+  CHECK(backend->reads(physical) == 0);
+  CHECK(backend->reads(keyboard) == 0);
+  CHECK(backend->reads(virtual_pad) == 2);
+  CHECK(state->held(dal::InputSource::Gamepad) == kCross);
+  CHECK(log.count("dal: pad: gamepad 045e:0b13 handled by steam (steam slot 1)") == 1);
+  CHECK(log.count("dal: pad: gamepad 045e:028e used (steam slot 1)") == 1);
+  CHECK(log.count("dal: pad: gamepad 3434:d030 not a gamepad") == 1);
+}
+
+void testHubUseChangeIsLoggedOnce() {
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  backend->add(xboxPad(0));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {});
+
+  hub.step(Clock::now());
+  backend->add(keyboardInterface(0));
+  hub.step(Clock::now());
+  hub.step(Clock::now());
+  // The first pad is not logged again when only another device arrives.
+  CHECK(log.count("dal: pad: gamepad 045e:0b13 used") == 1);
+  CHECK(log.count("dal: pad: gamepad 3434:d030 not a gamepad") == 1);
+  CHECK(log.lines().size() == 2);
+  CHECK(hub.usedCount() == 1);
+  CHECK(state->gamepadConnected());
+}
+
+void testHubFocusGate() {
+  DebugLogLevel debug;
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t id = backend->add(xboxPad(0));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  bool foreground = true;
+  dal::GamepadHub hub(backend, state, {.is_foreground = [&] { return foreground; }});
+  const Clock::time_point t0 = Clock::now();
+
+  dal::GamepadReading reading = readingWith(GamepadButton::A);
+  reading.left_x = 1.0f;
+  backend->setReading(id, reading);
+  state->setVibration(0, 200);
+  hub.step(t0);
+  CHECK(state->reported(t0) == kCross);
+  CHECK(state->analog().left_x == 0xFF);
+  CHECK(backend->rumbleCalls().size() == 1);
+  CHECK(log.count("paused") == 0);
+
+  // Background: released at once (no minimum visible time), analog neutral, rumble stopped once, and
+  // no reads while it lasts.
+  foreground = false;
+  hub.step(t0 + milliseconds(10));
+  CHECK(state->held(dal::InputSource::Gamepad) == 0);
+  CHECK(state->reported(t0 + milliseconds(10)) == 0);
+  CHECK(state->analog() == dal::PadAnalog{});
+  auto calls = backend->rumbleCalls();
+  CHECK(calls.size() == 2);
+  if (calls.size() == 2) CHECK(calls[1].second == dal::GamepadRumble{});
+  const int reads_before = backend->reads(id);
+  hub.step(t0 + milliseconds(20));
+  hub.step(t0 + milliseconds(30));
+  CHECK(backend->reads(id) == reads_before);
+  CHECK(backend->rumbleCalls().size() == 2);
+  CHECK(log.count("dal: pad: gamepad input paused (background)") == 1);
+  // The port stays connected while the process is in the background.
+  CHECK(state->gamepadConnected());
+
+  // Foreground again: reads resume and the game's current vibration is sent again.
+  foreground = true;
+  hub.step(t0 + milliseconds(40));
+  CHECK(backend->reads(id) == reads_before + 1);
+  CHECK(state->held(dal::InputSource::Gamepad) == kCross);
+  CHECK(state->analog().left_x == 0xFF);
+  calls = backend->rumbleCalls();
+  CHECK(calls.size() == 3);
+  if (calls.size() == 3) CHECK(calls[2].second.low_frequency == 200.0f / 255.0f);
+  CHECK(log.count("dal: pad: gamepad input resumed") == 1);
+}
+
+void testHubFirstStepInBackground() {
+  DebugLogLevel debug;
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t id = backend->add(xboxPad(0));
+  backend->setReading(id, readingWith(GamepadButton::A));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  bool foreground = false;
+  dal::GamepadHub hub(backend, state, {.is_foreground = [&] { return foreground; }});
+  const Clock::time_point t0 = Clock::now();
+
+  // The first step only records the focus state: no pause line, no reads, but the pad counts as present.
+  hub.step(t0);
+  hub.step(t0 + milliseconds(10));
+  CHECK(state->gamepadConnected());
+  CHECK(backend->reads(id) == 0);
+  CHECK(state->held(dal::InputSource::Gamepad) == 0);
+  CHECK(log.count("paused") == 0 && log.count("resumed") == 0);
+
+  foreground = true;
+  hub.step(t0 + milliseconds(20));
+  CHECK(log.count("dal: pad: gamepad input resumed") == 1);
+  CHECK(backend->reads(id) == 1);
+  CHECK(state->held(dal::InputSource::Gamepad) == kCross);
+}
+
+void testHubVibration() {
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t pad = backend->add(xboxPad(0));
+  dal::GamepadDeviceInfo plain = xboxPad(0);
+  plain.rumble = false;
+  backend->add(plain);
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {});
+  const Clock::time_point t0 = Clock::now();
+
+  // Nothing requested: nothing sent.
+  hub.step(t0);
+  CHECK(backend->rumbleCalls().empty());
+
+  state->setVibration(0, 200);
+  hub.step(t0 + milliseconds(4));
+  auto calls = backend->rumbleCalls();
+  CHECK(calls.size() == 1);
+  if (calls.size() == 1) {
+    CHECK(calls[0].first == pad);
+    CHECK(calls[0].second.low_frequency == 200.0f / 255.0f && calls[0].second.high_frequency == 0.0f);
+  }
+  // Unchanged vibration: no further call, however many steps.
+  hub.step(t0 + milliseconds(8));
+  hub.step(t0 + milliseconds(12));
+  CHECK(backend->rumbleCalls().size() == 1);
+
+  // A pad that arrives later gets the current vibration, and the first pad is not told again.
+  const std::uint64_t late = backend->add(xboxPad(0));
+  hub.step(t0 + milliseconds(16));
+  calls = backend->rumbleCalls();
+  CHECK(calls.size() == 2);
+  if (calls.size() == 2) {
+    CHECK(calls[1].first == late);
+    CHECK(calls[1].second.low_frequency == 200.0f / 255.0f);
+  }
+
+  // A new request reaches every pad with motors once.
+  state->setVibration(5, 0);
+  hub.step(t0 + milliseconds(20));
+  hub.step(t0 + milliseconds(24));
+  calls = backend->rumbleCalls();
+  CHECK(calls.size() == 4);
+  if (calls.size() == 4) {
+    CHECK(calls[2].second.high_frequency == 1.0f && calls[2].second.low_frequency == 0.0f);
+    CHECK(calls[3].second == calls[2].second);
+  }
+
+  // Stopping is sent too.
+  state->setVibration(0, 0);
+  hub.step(t0 + milliseconds(28));
+  CHECK(backend->rumbleCalls().size() == 6);
+}
+
+// A pad that stays connected but stops being used (Steam's virtual pad arrives) is told to stop.
+void testHubRumbleStopsWhenPadIsNoLongerUsed() {
+  const std::string path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#1#4321)";
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t physical = backend->add(xboxPad(0));
+  dal::SteamContext steam;
+  steam.overlay_loaded = true;
+  steam.process_id = 4321;
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::GamepadHub hub(backend, state, {.steam = steam});
+  const Clock::time_point t0 = Clock::now();
+
+  state->setVibration(0, 200);
+  hub.step(t0);
+  auto calls = backend->rumbleCalls();
+  CHECK(calls.size() == 1);
+  if (calls.size() == 1) {
+    CHECK(calls[0].first == physical);
+    CHECK(calls[0].second.low_frequency == 200.0f / 255.0f);
+  }
+
+  // The physical pad becomes HandledBySteam: it is stopped once, the virtual pad gets the vibration.
+  const std::uint64_t virtual_pad = backend->add(steamVirtualPad(0, path));
+  hub.step(t0 + milliseconds(4));
+  calls = backend->rumbleCalls();
+  CHECK(calls.size() == 3);
+  if (calls.size() == 3) {
+    CHECK(calls[1].first == physical && calls[1].second == dal::GamepadRumble{});
+    CHECK(calls[2].first == virtual_pad && calls[2].second.low_frequency == 200.0f / 255.0f);
+  }
+
+  // The virtual pad disappears while nothing vibrates: the physical pad, already at rest, is not
+  // told again.
+  state->setVibration(0, 0);
+  hub.step(t0 + milliseconds(8));
+  backend->remove(virtual_pad);
+  hub.step(t0 + milliseconds(12));
+  calls = backend->rumbleCalls();
+  CHECK(calls.size() == 4);  // only the virtual pad's stop
+  if (calls.size() == 4) CHECK(calls[3].first == virtual_pad && calls[3].second == dal::GamepadRumble{});
+  CHECK(hub.usedCount() == 1);
+}
+
+void testHubProviderFollowsPlugging() {
+  auto backend = std::make_shared<FakeBackend>();
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  Clock::time_point now = Clock::now();
+  const auto provider =
+      dal::makeKeyboardPadProvider(state, [&] { return now; }, {.always_connected = false});
+  dal::GamepadHub hub(backend, state, {});
+
+  hub.step(now);
+  CHECK(!provider->poll(0).connected);
+
+  const std::uint64_t id = backend->add(xboxPad(0));
+  now += milliseconds(10);
+  hub.step(now);
+  CHECK(provider->poll(0).connected);
+
+  backend->setReading(id, readingWith(GamepadButton::A));
+  now += milliseconds(10);
+  hub.step(now);
+  CHECK(provider->poll(0).connected);
+  CHECK((provider->poll(0).button[3] & (1u << 6)) != 0);  // Cross is bit 6 of word 3
+
+  backend->remove(id);
+  now += milliseconds(10);
+  hub.step(now);
+  CHECK(!provider->poll(0).connected);
+}
+
+// A backend that cannot be created is one warning, and the pad stays disconnected.
+void testHubThreadUnavailable() {
+  LogCapture log;
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::startGamepadHub(
+      []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
+        return std::unexpected("no runtime");
+      },
+      state, {});
+  CHECK(log.waitFor("dal: pad: gameinput unavailable: no runtime; gamepads disabled"));
+  CHECK(log.lines().size() == 1);
+  CHECK(!state->gamepadConnected());
+}
+
+// Neither a state nor the probe: nothing to do, and the factory is never called.
+void testHubThreadNothingToDo() {
+  bool called = false;
+  dal::startGamepadHub(
+      [&]() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
+        called = true;
+        return std::unexpected("unused");
+      },
+      nullptr, {});
+  CHECK(!called);
+}
+
+// The detached threads never end. They are silent once the device list is stable, which later tests
+// rely on: they check exact log line counts.
+void testHubThreadFeedsPad() {
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  const std::uint64_t id = backend->add(xboxPad(0));
+  backend->setReading(id, readingWith(GamepadButton::A));
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  const auto provider = dal::makeKeyboardPadProvider(state, {}, {.always_connected = false});
+  dal::startGamepadHub(
+      [backend]() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> { return backend; },
+      state, {});
+
+  const auto wait_for = [&](auto condition) {
+    const auto end = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < end && !condition()) std::this_thread::sleep_for(milliseconds(2));
+  };
+  wait_for([&] { return state->gamepadConnected(); });
+
+  // A guest thread polls under the guest lock while the hub thread keeps writing (the reading flips
+  // between pressed and idle); neither may block the other.
+  std::atomic<bool> stop{false};
+  std::thread guest([&] {
+    for (int i = 0; i < 10000 || !stop.load(); ++i) provider->poll(0);
+  });
+  for (int i = 0; i < 25; ++i) {
+    backend->setReading(id, i % 2 == 0 ? dal::GamepadReading{} : readingWith(GamepadButton::A));
+    std::this_thread::sleep_for(milliseconds(2));
+  }
+  stop = true;
+  guest.join();
+
+  backend->setReading(id, readingWith(GamepadButton::A));
+  wait_for([&] { return state->held(dal::InputSource::Gamepad) == kCross; });
+  CHECK(state->gamepadConnected());
+  CHECK(state->held(dal::InputSource::Gamepad) == kCross);
+  CHECK(provider->poll(0).connected);
+}
+
+void testHubThreadStartLinesWithProbe() {
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  backend->add(0x045e, 0x028e);
+  auto state = std::make_shared<dal::KeyboardPadState>();
+  dal::startGamepadHub(
+      [backend]() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> { return backend; },
+      state,
+      {.detect_steam =
+           [] {
+             dal::SteamContext steam;
+             steam.overlay_loaded = true;
+             steam.env["SteamGameId"] = "42";
+             return steam;
+           },
+       .probe = true});
+  CHECK(log.waitFor("dal: pad: probe 1 045e:028e buttons none"));
+  const std::vector<std::string> lines = log.lines();
+  CHECK(lines.size() == 5);
+  if (lines.size() == 5) {
+    CHECK(lines[0].ends_with("dal: pad: gameinput fake"));
+    CHECK(lines[1].ends_with("dal: pad: steam overlay loaded; SteamGameId=42"));
+    CHECK(lines[2].ends_with("dal: pad: probe SteamVirtualGamepadInfo unset"));
+    CHECK(lines[3].ends_with("dal: pad: gamepad 045e:028e used"));
+    CHECK(lines[4].ends_with("dal: pad: probe 1 045e:028e buttons none lt 0.00 rt 0.00 ls (0.00,0.00) rs (0.00,0.00)"));
+  }
+  CHECK(state->gamepadConnected());
+}
+
+// Probe only (no state): the same thread logs the probe lines and has no pad to feed.
+void testHubThreadProbeOnly() {
+  LogCapture log;
+  auto backend = std::make_shared<FakeBackend>();
+  backend->add(0x045e, 0x028e);
+  dal::startGamepadHub(
+      [backend]() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> { return backend; },
+      nullptr, {.probe = true});
+  CHECK(log.waitFor("dal: pad: probe 1 045e:028e buttons none"));
+  CHECK(log.lines().size() == 4);
+  CHECK(log.count("dal: pad: gamepad ") == 0);
+}
+
 // The probe thread never ends, so this runs last and the program leaves with _Exit (like the game).
 // The fake's reading never changes, so the thread is silent after its start lines; that is what makes
 // ~LogCapture's unsynchronised sink swap safe.
@@ -904,6 +1397,21 @@ int main() {
   testSelectIgnoreList();
   testSelectNoSteam();
   testGamepadUseName();
+  testHubFirstStepUsesPad();
+  testHubPadRemoved();
+  testHubMergesTwoPads();
+  testHubSteamVirtualPadOnly();
+  testHubUseChangeIsLoggedOnce();
+  testHubFocusGate();
+  testHubFirstStepInBackground();
+  testHubVibration();
+  testHubRumbleStopsWhenPadIsNoLongerUsed();
+  testHubProviderFollowsPlugging();
+  testHubThreadUnavailable();
+  testHubThreadNothingToDo();
+  testHubThreadFeedsPad();
+  testHubThreadStartLinesWithProbe();
+  testHubThreadProbeOnly();
   testProbeThreadStartLines();
 
   std::printf("input core tests: %d passed, %d failed\n", g_passed, g_failed);
