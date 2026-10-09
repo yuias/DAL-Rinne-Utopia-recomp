@@ -7,9 +7,11 @@ This repository contains no game data (see [Licence and legal notice](#licence-a
 No executables, keys, or decrypted binaries are included or accepted by version control; you
 supply your own `EBOOT.elf`, and all tool output is written to ignored directories.
 
-Current state: the game boots, plays its three intro movies with sound and reaches the title
-screen; NEW GAME starts the opening movie. Only what these first screens use is drawn. See
-[Status](docs/status.md).
+Current state: the game boots, plays its intro movies with sound and reaches the title screen.
+NEW GAME plays the opening movie and then the first story scenes, with their pictures, music and
+the message window (speaker name and dialogue text). It can be played with the keyboard, an
+Xbox-family gamepad or a DualShock 4. How far beyond these first scenes it works has not been
+checked. See [Status](docs/status.md).
 
 ## Prerequisites
 

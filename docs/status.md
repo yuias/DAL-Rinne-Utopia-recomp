@@ -30,7 +30,11 @@ screen it plays its three intro movies (`if_logo.pam`, `ch_logo.pam`, `op.pam`, 
 95 s) at their 29.97 fps rate, then shows the title screen.
 
 With the keyboard, a gamepad or a pad script it leaves the title screen: Circle skips the notice screen and the
-movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`.
+movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`
+(about 83 s, not skippable). The first story scenes follow: event pictures and the message window
+with the speaker's name and the dialogue text are drawn. The frames were checked for about half a
+minute into the story and the in-game sound for about five minutes; later scenes, choices and saving
+were not tried.
 The game's sound runs through its own mixer: the movie audio, the music and the sound effects reach
 the speakers when the window is shown and appear in the `--audio-dump` file in every run. Voice, which the
 game streams through `cellAtrac`, is covered by unit tests only: no scene a standard run reaches has
@@ -43,8 +47,9 @@ effects are silent.
 
 ## Not implemented
 
-- Graphics beyond the first scenes: only what the game's title screens use is drawn. Whatever the
-  renderer meets and cannot handle is listed in the `rsx unimplemented` census (see
+- Graphics beyond the first story scenes: only what the scenes reached so far use is implemented
+  (for example, no swizzled, mipmapped or cube textures). Whatever the renderer meets and cannot
+  handle is listed in the `rsx unimplemented` census (see
   [Rendering](rendering.md#rendering)). Known gaps are the ZPASS report values (the constant 0 is
   written, no occlusion query runs) and user clip planes (the vertex translator does not write the
   clip distances).
