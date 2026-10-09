@@ -19,6 +19,7 @@
 #include "core/threads.h"
 #include "dal/ppu_context.h"
 #include "rsx/gcm_interrupts.h"
+#include "rsx/rsx_decode.h"
 #include "rsx/rsx_state.h"
 #include "rsx/rsx_unimplemented.h"
 
@@ -48,7 +49,12 @@ constexpr std::uint32_t kFlipSemaphoreOffset = 0x10;  // the label the flip comm
 constexpr std::uint32_t kDeviceReadyOffset = 0x30;
 constexpr std::uint64_t kFlipTimeOffsetUs = 1000000;
 
-constexpr std::uint32_t kMethodCount = 0x4000;  // 16-bit register offsets, 4 bytes apart
+// NV3062 colour formats the inline blit copies word for word (RPCS3 `blit_engine::transfer_destination_format`).
+constexpr std::uint32_t kBlitFormatA8R8G8B8 = 10;
+constexpr std::uint32_t kBlitFormatY32 = 11;
+constexpr std::uint32_t kBlitColorRegisters = 0x700;  // NV308A_COLOR spans this many registers
+
+constexpr std::uint32_t kMethodCount = 0x4000; // 16-bit register offsets, 4 bytes apart
 constexpr std::uint32_t kPumpSliceWords = 128;  // words per pump() call inside one lock hold
 // Checked after each slice, so one slice (a draw's write() can take about 1 ms) can exceed it.
 constexpr std::chrono::microseconds kMaxGuestLockHold{300};
@@ -103,6 +109,9 @@ void RsxConsumer::resetDmaRegisters() {
   dma_406e_ = kDmaSemaphoreR;
   dma_semaphore_ = kDmaSemaphoreRw;
   dma_report_ = kDmaReportLocal;
+  // The NV3062 destination is set once per boot by the game and falls back to local memory with every
+  // context reset (the register table in rsx_registers.cpp).
+  blit_dma_ = kRsxContextDmaLocal;
 }
 
 bool RsxConsumer::readIo(std::uint32_t io, std::uint32_t& word) {
@@ -258,6 +267,24 @@ bool RsxConsumer::execute(std::uint32_t method, std::uint32_t value) {
     case kMethodNv4097GetReport:
       getReport(value);
       return true;
+    case kMethodNv3062SetContextDmaImageDestin:
+      blit_dma_ = value;
+      return true;
+    case kMethodNv3062SetColorFormat:
+      blit_format_ = value;
+      return true;
+    case kMethodNv3062SetPitch:
+      blit_pitch_ = value;
+      return true;
+    case kMethodNv3062SetOffsetDestin:
+      blit_offset_ = value;
+      return true;
+    case kMethodNv308aPoint:
+      blit_point_ = value;
+      return true;
+    case kMethodNv308aSizeOut:
+      blit_size_out_ = value;
+      return true;
     case kMethodGcmSetUserCommand:
     case kMethodGcmSetUserCommand + 4:  // two registers share the handler
       userCommand(value);
@@ -266,8 +293,43 @@ bool RsxConsumer::execute(std::uint32_t method, std::uint32_t value) {
       flip(value);
       return true;
     default:
+      if (method >= kMethodNv308aColor && method < kMethodNv308aColor + kBlitColorRegisters * 4) {
+        inlineBlitWord(method, value);
+      }
       return true;
   }
+}
+
+void RsxConsumer::inlineBlitWord(std::uint32_t method, std::uint32_t value) {
+  const std::uint32_t index = (method - kMethodNv308aColor) >> 2;
+  const std::uint32_t width = blit_size_out_ & 0xFFFF;
+  if (index >= width) return;
+  // Only the plain word copies are done; the other formats need a conversion that is not implemented.
+  if (blit_format_ != kBlitFormatA8R8G8B8 && blit_format_ != kBlitFormatY32) {
+    rsxNoteUnimplemented("method", std::format("NV308A_COLOR format {}", blit_format_));
+    return;
+  }
+  // Source pitch is the low half and destination pitch the high half of NV3062_SET_PITCH.
+  const std::uint64_t offset =
+      rsxInlineBlitOffset(blit_offset_, blit_pitch_ >> 16, blit_point_ & 0xFFFF, blit_point_ >> 16, index);
+  std::uint32_t ea = 0;
+  bool ok = false;
+  if (offset <= 0xFFFFFFFFull && (offset & 3) == 0) {
+    const std::uint32_t off = static_cast<std::uint32_t>(offset);
+    if (blit_dma_ == kRsxContextDmaLocal) {
+      ok = off < kRsxLocalSize && kRsxLocalSize - off >= 4 && process().memory.isCommitted(kRsxLocalBase + off, 4);
+      ea = kRsxLocalBase + off;
+    } else if (blit_dma_ == kRsxContextDmaMain) {
+      ok = rsxIoToEa(off, ea) && process().memory.isCommitted(ea, 4);
+    }
+  }
+  if (!ok) {
+    rsxNoteUnimplemented("method", "NV308A_COLOR destination out of range");
+    logOnce("rsx-blit-bad-address", "dal: rsx: NV308A inline blit to offset {:#x} in DMA {:#010x} ignored", offset,
+            blit_dma_);
+    return;
+  }
+  dalWrite32(base_, ea, value);
 }
 
 bool RsxConsumer::resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size,

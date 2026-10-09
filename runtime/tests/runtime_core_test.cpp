@@ -6530,6 +6530,58 @@ void testRsxConsumer() {
   CHECK(run() == FifoStatus::Idle);
   CHECK(countContaining(lines, "pending user command cause 3") == 1);
 
+  // NV308A inline blit: the color words land at offset + (x + i) * 4 + pitch * y, big-endian, in local
+  // memory or through the IO map. The pitch is the high half of NV3062_SET_PITCH.
+  CHECK(dal::rsxInlineBlitOffset(0x01882180, 0x1000, 4, 0, 0) == 0x01882190);
+  CHECK(dal::rsxInlineBlitOffset(0x01882180, 0x1000, 4, 2, 3) == 0x01882190 + 12 + 0x2000);
+  CHECK(dal::rsxInlineBlitOffset(0xFFFFFFFC, 0xFFFF, 0xFFFF, 0xFFFF, 0) > 0xFFFFFFFFull);  // no wrap
+  {
+    dal::rsxUnimplementedReset();
+    constexpr std::uint32_t kLocalOffset = 0x1000, kIoOffset = 0x8000;
+    const std::uint32_t local_ea = 0xC0000000 + kLocalOffset;
+    const std::uint32_t io_ea = area + kIoOffset;
+    for (std::uint32_t i = 0; i < 8; i++) {
+      dalWrite32(base, local_ea + i * 4, 0xAAAAAAAA);
+      dalWrite32(base, io_ea + i * 4, 0xAAAAAAAA);
+    }
+    const auto blit = [&](std::uint32_t dma, std::uint32_t format, std::uint32_t offset, std::uint32_t point,
+                          std::uint32_t width, std::initializer_list<std::uint32_t> words) {
+      emit(dal::kMethodNv3062SetColorFormat, {format, 0x10001000});  // format, pitch
+      if (dma != 0) emit(dal::kMethodNv3062SetContextDmaImageDestin, {dma});
+      emit(dal::kMethodNv3062SetOffsetDestin, {offset});
+      emit(dal::kMethodNv308aPoint, {point, width | (1u << 16), width | (1u << 16)});
+      emit(dal::kMethodNv308aColor, words);
+      CHECK(run() == FifoStatus::Idle);
+    };
+    // Point x = 4 (as in the game), 4 words, Y32; the destination DMA stays at its post-flip default (local).
+    blit(0, 11, kLocalOffset - 16, 0x00000004, 4, {0x00000000, 0x3F80, 0x01020304, 0x0A0B0C0D});
+    CHECK(dalRead32(base, local_ea) == 0 && dalRead32(base, local_ea + 4) == 0x3F80);
+    CHECK(dalRead32(base, local_ea + 8) == 0x01020304 && dalRead32(base, local_ea + 12) == 0x0A0B0C0D);
+    CHECK(base[local_ea + 8] == 0x01 && base[local_ea + 11] == 0x04);  // big-endian in guest memory
+    CHECK(dalRead32(base, local_ea + 16) == 0xAAAAAAAA);
+    // A8R8G8B8 through the IO map, second row: y = 1 adds one pitch (0x1000).
+    blit(dal::kRsxContextDmaMain, 10, kIoOffset - 0x1000, 0x00010000, 2, {0x11111111, 0x22222222});
+    CHECK(dalRead32(base, io_ea) == 0x11111111 && dalRead32(base, io_ea + 4) == 0x22222222);
+    CHECK(dalRead32(base, io_ea + 8) == 0xAAAAAAAA);
+    // Words beyond the width are dropped.
+    blit(dal::kRsxContextDmaLocal, 11, kLocalOffset + 32, 0, 1, {7, 8, 9});
+    CHECK(dalRead32(base, local_ea + 32) == 7 && dalRead32(base, local_ea + 36) != 8);
+    CHECK(unimplementedCount("method NV308A_COLOR destination out of range") == 0);
+    // Formats that need a conversion write nothing and are counted.
+    dalWrite32(base, local_ea + 64, 0xAAAAAAAA);
+    blit(dal::kRsxContextDmaLocal, 4, kLocalOffset + 64, 0, 1, {0x55555555});
+    CHECK(dalRead32(base, local_ea + 64) == 0xAAAAAAAA && unimplementedCount("method NV308A_COLOR format 4") == 1);
+    // Out-of-range destinations are skipped and reported once.
+    blit(dal::kRsxContextDmaLocal, 11, 0x0F900000, 0, 2, {1, 2});
+    blit(dal::kRsxContextDmaLocal, 11, 0xFFFFFFF0, 0x00FF0000, 1, {3});
+    blit(dal::kRsxContextDmaMain, 11, 0x3F000000, 0, 1, {4});
+    blit(0x12345678, 11, 0, 0, 1, {5});
+    blit(dal::kRsxContextDmaLocal, 11, kLocalOffset + 2, 0, 1, {6});  // unaligned
+    CHECK(unimplementedCount("method NV308A_COLOR destination out of range") == 6);
+    CHECK(countContaining(lines, "NV308A inline blit") == 1 && !consumer.faulted());
+    dal::rsxUnimplementedReset();
+  }
+
   // The census counts completed writes by register: a flip counts once.
   const dal::RsxCensus census = consumer.census();
   const auto countOf = [&](std::uint32_t method) -> std::uint64_t {

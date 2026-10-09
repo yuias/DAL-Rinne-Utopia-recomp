@@ -29,6 +29,14 @@ namespace dal {
 
 enum class RsxInterrupt { VBlank, Flip, User };
 
+// Byte offset inside the destination DMA object of word `index` of an NV308A inline blit. 64-bit so a
+// hostile offset cannot wrap into a valid range.
+constexpr std::uint64_t rsxInlineBlitOffset(std::uint32_t offset, std::uint32_t pitch, std::uint32_t point_x,
+                                            std::uint32_t point_y, std::uint32_t index) {
+  return static_cast<std::uint64_t>(offset) + (static_cast<std::uint64_t>(point_x) + index) * 4 +
+         static_cast<std::uint64_t>(pitch) * point_y;
+}
+
 // Called by the RSX thread with the guest lock held. `arg` is the head (1) for VBlank and Flip and
 // the cause for User. No-op while unset.
 void setRsxInterruptHook(void (*hook)(RsxInterrupt kind, std::uint32_t arg));
@@ -98,6 +106,8 @@ class RsxConsumer final : public RsxSink {
   void releaseNv406e(std::uint32_t value);
   void releaseNv4097(std::uint32_t value, bool swizzle);
   void getReport(std::uint32_t value);
+  // One NV308A_COLOR register write: the word goes to the NV3062 destination surface.
+  void inlineBlitWord(std::uint32_t method, std::uint32_t value);
   void flip(std::uint32_t buffer);
   void userCommand(std::uint32_t cause);
   void publishGet(std::uint32_t get);
@@ -120,6 +130,11 @@ class RsxConsumer final : public RsxSink {
   // Latched registers: semaphore offsets and context DMA objects.
   std::uint32_t offset_406e_ = 0x30, offset_4097_ = 0;
   std::uint32_t dma_406e_ = 0, dma_semaphore_ = 0, dma_report_ = 0;
+
+  // NV3062 destination surface and NV308A point/size, latched for the inline blit. The DMA object is
+  // set by resetDmaRegisters().
+  std::uint32_t blit_dma_ = 0, blit_offset_ = 0, blit_pitch_ = 0, blit_format_ = 0;
+  std::uint32_t blit_point_ = 0, blit_size_out_ = 0;
 
   std::uint64_t last_timestamp_ns_ = 0;
 
