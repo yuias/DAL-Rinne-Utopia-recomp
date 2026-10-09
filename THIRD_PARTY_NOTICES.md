@@ -43,7 +43,8 @@ the gamepads are disabled; the keyboard keeps working.
 
 ## FFmpeg
 
-The runtime decodes movies with FFmpeg (`libavcodec`, `libavutil`, `libswscale`; `libavcodec`
+The runtime decodes the movies (H.264 video and ATRAC3plus audio) and the game's ATRAC3plus sound
+(music and sound effects) with FFmpeg (`libavcodec`, `libavutil`, `libswscale`; `libavcodec`
 also imports `libswresample`, none of whose functions the runtime calls). FFmpeg is not part of
 this repository and no FFmpeg binary is tracked. `tools/fetch-ffmpeg.ps1` downloads a pinned,
 SHA-256 verified build into `generated/deps/ffmpeg` (`-From <zip>` takes a local copy of the
@@ -73,9 +74,10 @@ from the directory of the executable, so their dependencies are looked up only i
 and in the Windows system directory (not in `PATH` or the working directory). They can be replaced
 by another build of the same major versions (`avcodec-63`, `avutil-61`, `swresample-7`,
 `swscale-10`) without rebuilding this project; a different major version is reported as
-unavailable. Without usable DLLs the runtime logs one warning,
-`dal: sail: codecs unavailable: <reason>`, and every movie plays as black frames without sound
-for the duration of its stream, then ends normally.
+unavailable. Without usable DLLs the runtime logs two warnings,
+`dal: sail: codecs unavailable: <reason>` and `dal: atrac: no decoder: <reason>`. Every movie then
+plays as black frames without sound for the duration of its stream and ends normally, and the
+game's music and sound effects (`cellAtrac`) are silent.
 
 ### Source code
 

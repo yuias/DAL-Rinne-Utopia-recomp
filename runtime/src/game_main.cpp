@@ -232,10 +232,10 @@ void printUsage() {
       "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--log-level trace|debug|info|warn|error]\n"
-      "                [--quiet-hle] [--load-only]\n"
+      "                [--quiet-hle] [--load-only] [--png-dump DIR]\n"
       "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
       "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
-      "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
+      "                [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
       "                [--vk-validation] [--no-window]\n",
       stderr);

@@ -9,7 +9,8 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
          [--pad none|neutral|keyboard|gamepad|keyboard+gamepad] [--pad-script FILE] [--pad-probe]
          [--audio none|wasapi] [--audio-dump FILE]
          [--load-only] [--png-dump DIR]
-         [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
+         [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]
+         [--dump-frames DIR] [--dump-frames-every K]
          [--shader-cache DIR] [--vk-validation] [--no-window]
 ```
 
@@ -50,11 +51,12 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 | `--shader-cache DIR` | Directory of the SPIR-V cache (default `generated/shader_cache`). |
 | `--vk-validation` | Enable the Khronos validation layer. It comes with the Vulkan SDK; if it is not installed, `dal_game` logs a warning and goes on without it. |
 | `--rsx-capture N[,M...]` | Record the given frames (1-based flip numbers) as `.dalcap` files. See [Capture and replay](rendering.md#capture-and-replay). |
+| `--rsx-census FILE` | Count the arguments the game writes to the RSX registers (surface and texture formats, vertex layouts, primitive types, draw sizes, render state, flip and vblank rates) and write them to `FILE` as JSON when the run stops. The fragment and vertex programs the game used are written next to it as `generated/rsx/fp_<hash>.bin` and `vp_<hash>.bin` (relative to the working directory). The directories are created; the file is truncated. |
 
 The renderer options are a usage error (exit code 2) when the renderer is off. The window and
 `--dump-frames` switch it on; `--dump-frames-every`, `--shader-cache` and `--vk-validation` need one
 of them or `--render vulkan`; an explicit `--render none` conflicts with all of them.
-`--rsx-capture` does not need the renderer.
+`--rsx-capture` and `--rsx-census` do not need the renderer.
 
 Frame dumps are encoded on a worker thread, so dumping does not slow the game down. When the worker
 falls more than four frames behind, a frame is skipped and counted (`dal: render: dump skipped
@@ -89,7 +91,7 @@ exits:
 | --- | --- | --- |
 | 0 | The guest called `sys_process_exit` or `_sys_process_exit`, the window was closed, or `--load-only` finished loading | `dal: stop: process exit status N`, `dal: stop: window closed` |
 | 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable | `error: ...` (usage text) |
-| 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved | `dal: stop: fatal <kind>: ...` |
+| 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved; also the stops the game itself asks for (`cellGameContentErrorDialog`, a failed trophy registration) | `dal: stop: fatal <kind>: ...`, or a `dal: stop: ...` line naming the call |
 | 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
 | 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
 | 6 | Stall: every live guest thread has been in an indefinite wait for at least 2 seconds | `dal: stop: stall (N threads blocked)` |
@@ -101,7 +103,8 @@ disabled, so a run always ends with an exit code, also when it is started from a
 
 ## Examples by purpose
 
-A run that stops by itself after the title screen, with a log file:
+A run that stops by itself at a time limit, with a log file (the three intro movies last about
+109 s together, so a shorter limit ends the run during them):
 
 ```sh
 dal_game --game-dir <game-dir> --no-window --seconds 165 --log run.log

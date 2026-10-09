@@ -27,8 +27,7 @@ assets (the decrypted `.sdat` files and the texture files its decode threads ope
 registers the trophy context, runs the save-data load (a first boot finds no data, which the game
 accepts), and drives its frame loop with the vblank handler running at 60 Hz. After the warning
 screen it plays its three intro movies (`if_logo.pam`, `ch_logo.pam`, `op.pam`, about 7 s, 7 s and
-95 s) at their 29.97 fps rate, then shows the title screen, where it stays without input (a 165 s
-run ends at the watchdog, exit code 5).
+95 s) at their 29.97 fps rate, then shows the title screen.
 
 With the keyboard, a gamepad or a pad script it leaves the title screen: Circle skips the notice screen and the
 movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`.

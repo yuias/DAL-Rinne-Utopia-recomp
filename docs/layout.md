@@ -12,7 +12,7 @@
 | `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used only to parse the VFS configuration |
 | `externals/Vulkan-Headers`, `externals/volk`, `externals/VulkanMemoryAllocator` | Vulkan headers, the run-time loader and the memory allocator of the renderer |
 | `runtime/src/render/` | The renderer (`dal_render`): Vulkan context, render targets, textures, pipelines, window and swapchain, vertex program and fragment program translators, shader compiler and cache, PNG output; see [Rendering](rendering.md#rendering) |
-| `runtime/src/media/` | Movie support: the PAMF header parser and MPEG-PS demuxer and the host movie player (in the runtime core), and the FFmpeg loader and decoders (`dal_media`); see [Movies](movies.md) |
+| `runtime/src/media/` | Movie and ATRAC3plus support: the PAMF header parser and MPEG-PS demuxer, the host movie player, the AT3 file parser and the ATRAC frame-decoder interface (all in the runtime core), and the FFmpeg loader with the movie and ATRAC3plus decoders (`dal_media`); see [Movies](movies.md) and [Audio](audio.md#cellatrac) |
 | `tools/dal_moviedump/` | `dal_moviedump`, which decodes a `.pam` file without the game; see [Movies](movies.md#dal_moviedump) |
 | `tools/fetch-ffmpeg.ps1`, `cmake/ffmpeg.cmake`, `cmake/Media.cmake`, `cmake/movie_decode.cmake` | FFmpeg fetch script and pin, the media targets, and the pin file of the `movie_decode` test |
 | `tools/dal_rsxreplay/` | `dal_rsxreplay`, which replays an RSX capture without the game; see [Capture and replay](rendering.md#capture-and-replay) |

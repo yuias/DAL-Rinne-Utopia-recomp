@@ -45,10 +45,16 @@ stored but not acted on.
   the decoders behind the codec interfaces in `movie_decoder.h`. H.264 is decoded with frame
   threads and converted with swscale (the streams signal BT.709, limited range). ATRAC3plus is
   decoded to interleaved big-endian float, the format the game asks for. There is no resampling;
-  all three movies are 48 kHz stereo.
+  all three movies are 48 kHz stereo. The same file also holds the raw-frame ATRAC3plus decoder
+  behind `atrac_decoder.h`, which is not part of movie playback (see below).
+- `runtime/src/media/at3_file.*` and `atrac_decoder.h` (runtime core): the parser for the
+  ATRAC3plus RIFF/WAVE files in the game's archives (format, `fact` delay and `smpl` loop, archive
+  scan) and the frame-decoder interface that `cellAtrac` uses for the game's music and sound
+  effects. Movies do not use them; they are described under [Audio](audio.md#cellatrac).
 
-FFmpeg is used as the LGPL DLLs of a pinned build, loaded at run time (no import libraries);
-see `THIRD_PARTY_NOTICES.md`. `tools/fetch-ffmpeg.ps1 [-From <zip>] [-Force]` downloads the build
+FFmpeg is used as the LGPL DLLs of a pinned build, loaded at run time (no import libraries); it
+decodes the movies and, through the interface above, the `cellAtrac` sounds. See
+`THIRD_PARTY_NOTICES.md`. `tools/fetch-ffmpeg.ps1 [-From <zip>] [-Force]` downloads the build
 named in `cmake/ffmpeg.cmake`, checks its SHA-256, and extracts it to
 `generated/deps/ffmpeg/<asset name>/` with a `.verified-sha256` marker (exit codes: 0 success, 1
 failure, 2 usage error). Configuration fails with a hint to run the script while it is missing;
@@ -60,7 +66,9 @@ the FFmpeg licence and the notice next to the executables.
 Media problems are never fatal:
 
 - Without usable FFmpeg DLLs the runtime logs `dal: sail: codecs unavailable: <reason>` once, and
-  each movie plays as black frames without sound for the duration of its stream.
+  each movie plays as black frames without sound for the duration of its stream. The same DLLs
+  decode the game's `cellAtrac` sounds, so it also logs `dal: atrac: no decoder: <reason>` and the
+  music and sound effects are silent (see [Audio](audio.md#cellatrac)).
 - A file that cannot be opened or parsed is logged (`dal: sail: <path> cannot be played: ...`);
   the game's calls still complete, and the summary line says `not played: <reason>`.
 - Demux and decode errors are counted and the affected data is skipped.
@@ -115,12 +123,15 @@ decoded planes and the ARGB output, and `moviedump ok` or `moviedump failed`. `-
 line per frame, `--png-dir` writes frames as PNG, `--audio` also decodes the audio (sample counts,
 PCM SHA-256 of the big-endian float output, levels) and `--wav` writes it as a 16-bit WAV file. The
 `--expect-*` options turn it into a check: it exits with 1 when one fails (2 on a usage error).
+It reads movies only; the ATRAC3plus files of the game's archives are handled by `dal_audiotool at3`
+(see [`dal_audiotool`](audio.md#dal_audiotool)).
 
 ## Tests
 
 - `media_core` (no FFmpeg): PAMF parser and demuxer, the movie player with fake codecs, and the
   cellSail HLE driven through fake guest callbacks.
-- `media_ffmpeg`: the FFmpeg loader, both decoders and the conversions.
+- `media_ffmpeg`: the FFmpeg loader, the H.264 and ATRAC3plus decoders (also the raw-frame one
+  behind `cellAtrac`) and the conversions.
 - `movie_decode`: `dal_moviedump` on `ch_logo.pam` with pinned hashes (`cmake/movie_decode.cmake`).
 
 See [Tests](tests.md) for when each one is registered and which use the game files.
