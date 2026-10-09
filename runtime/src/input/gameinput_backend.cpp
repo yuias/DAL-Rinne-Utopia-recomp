@@ -177,10 +177,8 @@ class Backend final : public GameInputBackend {
   void setRumble(std::uint64_t id, const GamepadRumble& rumble) override {
     const ComPtr<IGameInputDevice> device = find(id, 0);
     if (!device) return;
-    if (rumble.low_frequency == 0.0f && rumble.high_frequency == 0.0f) {
-      device->SetRumbleState(nullptr);
-      return;
-    }
+    // Stopping passes zeroed params: the installed 3.5 runtime crashes on the nullptr the header
+    // allows.
     GameInputRumbleParams params{};
     // std::clamp passes NaN through, and the motors must never get it.
     const auto motor = [](float v) { return std::isnan(v) ? 0.0f : std::clamp(v, 0.0f, 1.0f); };
