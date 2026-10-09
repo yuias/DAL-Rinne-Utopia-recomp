@@ -8,8 +8,8 @@ No executables, keys, or decrypted binaries are included or accepted by version 
 supply your own `EBOOT.elf`, and all tool output is written to ignored directories.
 
 Current state: the game boots, plays its three intro movies with sound and reaches the title
-screen; NEW GAME starts the opening movie. Only what these first screens use is drawn, and the
-keyboard is the only input. See [Status](docs/status.md).
+screen; NEW GAME starts the opening movie. Only what these first screens use is drawn. See
+[Status](docs/status.md).
 
 ## Prerequisites
 
@@ -104,12 +104,18 @@ place on AZERTY and QWERTZ keyboards:
 The game confirms with Circle (the `X` key), which also skips the notice screen and the intro
 movies. If keys do nothing, click the window to give it keyboard focus.
 
+### Gamepad
+
+A connected Xbox-family gamepad works in the window together with the keyboard; it needs the
+GameInput runtime from the build step above. The button mapping, the dead zone, Steam and the
+`gameinput unavailable` warning are in [Input](docs/input.md).
+
 ## Documentation
 
 Development material is under [`docs/`](docs/README.md): build and run parameters, tests, the
 analysis tools, function recovery, the C emitter, runtime internals, the virtual file system,
-rendering, movies, audio, the repository layout, and a guide for applying the method to other PS3
-games.
+rendering, movies, audio, gamepad input, the repository layout, and a guide for applying the method
+to other PS3 games.
 
 ## Licence and legal notice
 

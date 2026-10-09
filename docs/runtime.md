@@ -202,24 +202,26 @@ interface, so each module follows a documented policy that never blocks on a per
   so unattended runs need no sound device; the game's mixer and the `cellAudio` clock run either way
   (see [Audio](audio.md#options)). A device or decoder problem degrades to silence with one warning.
 - **Input**: see `--pad` and [Input](#input). The pad on port 0 comes from a provider
-  (`runtime/src/hle/hle.h`): none, neutral, or the keyboard with an optional pad script. A gamepad
-  backend would plug in the same way; none is implemented.
+  (`runtime/src/hle/hle.h`): none, neutral, or the host pad state that the keyboard, a pad script and
+  gamepads write. Runs with `--no-window` never load a gamepad backend.
 
 ## Input
 
 `cellPad` asks a `PadProvider` for the state of a port on every `cellPadGetData` call and reports
 the changes to the game. `--pad` picks the provider: `none` (no pad), `neutral` (a standard pad on
-port 0 that never changes) or `keyboard`. `--pad keyboard` is set up in `runtime/src/game_main.cpp`
-with `setPadProvider`, because it needs the window and the script thread; `setPadBackend` accepts
-only `none` and `neutral`. The option defaults are in
+port 0 that never changes), `keyboard`, `gamepad` or `keyboard+gamepad`. The last three are set up in
+`runtime/src/game_main.cpp` with `setPadProvider`, because they need the window and the script or
+gamepad thread; `setPadBackend` accepts only `none` and `neutral`. The option defaults are in
 [`dal_game` options](runtime-options.md#window-input-and-sound) and the key table in the
-[README](../README.md#keyboard); the script format is [below](#pad-script).
+[README](../README.md#keyboard); the script format is [below](#pad-script). Gamepads (mapping,
+selection, Steam, the GameInput runtime, log lines and tools) are described in [Input](input.md).
 
 | Part | File | Role |
 | --- | --- | --- |
-| Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `padStateFromButtons` (digital words, pressure words at 0xFF for pressed buttons, sticks centred, everything else as the neutral pad) and the button names used by scripts |
-| State and provider | `runtime/src/input/keyboard_pad.*` | The scan-code table, `KeyboardPadState` and the keyboard provider (port 0 always connected, other ports empty) |
+| Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `PadAnalog` (sticks and trigger pressure), `padStateFromButtons` and `padStateFromInput` (digital words, pressure words at 0xFF for pressed buttons or the analog trigger value, sticks, everything else as the neutral pad) and the button names used by scripts |
+| State and provider | `runtime/src/input/keyboard_pad.*` | The scan-code table, `KeyboardPadState` (the state of every host source: keyboard, script, gamepad) and the provider for port 0 (always connected, or connected only while a gamepad is in use with `--pad gamepad`; other ports empty) |
 | Script | `runtime/src/input/pad_script.*` | The script parser and the player thread |
+| Gamepad | `runtime/src/input/gamepad_*`, `gameinput_backend.*` | Backend interface, GameInput backend, mapping, selection, the gamepad thread and `--pad-probe`; see [Input](input.md#design) |
 | Window | `runtime/src/render/vk_window.*` | Key and focus messages from the window thread; turns the IME off for the window |
 
 The renderer library does not depend on `input/`: the window reports raw scan codes through
@@ -228,12 +230,14 @@ callbacks, and `game_main.cpp` connects them to the state.
 ### Threading
 
 `poll` runs on guest threads under the guest lock, so it must never block or take a lock that the
-window thread or the script thread holds. `KeyboardPadState` is therefore lock-free: one atomic
-mask of held buttons and one atomic press time per button for each source (`Keyboard`, written by
-the window thread, and `Script`, written by the script thread). `poll` only reads them. All accesses
-are relaxed, because each bit and each time is independent, and a stale read delays a change by one
-poll. The script thread is detached and owns a `shared_ptr` to the state; nothing joins it, because
-the process ends with `std::_Exit`.
+window thread, the script thread or the gamepad thread holds. `KeyboardPadState` is therefore
+lock-free: one atomic mask of held buttons and one atomic press time per button for each source
+(`Keyboard`, written by the window thread, `Script`, written by the script thread, and `Gamepad`,
+written by the gamepad thread), one atomic with the sticks and trigger pressure of the gamepad, one
+for its connection flag and one for the latest vibration request. `poll` only reads them. All
+accesses are relaxed, because each bit and each time is independent, and a stale read delays a
+change by one poll. The script and gamepad threads are detached and own a `shared_ptr` to the state;
+nothing joins them, because the process ends with `std::_Exit`.
 
 ### Key handling
 
@@ -248,7 +252,8 @@ the process ends with `std::_Exit`.
 - Both opposite D-pad directions held cancel each other. A held direction beats the 60 ms tail of a
   released opposite one; with two tails the later press wins.
 - `WM_KILLFOCUS` releases every `Keyboard` button at once (a key-up is not delivered to a window
-  without focus). Script buttons are a separate source and stay. `Alt` combinations still reach the
+  without focus). Script buttons are a separate source and stay; the gamepad thread releases its own
+  source when the process loses the foreground window. `Alt` combinations still reach the
   default window procedure, so `Alt+F4` closes the window.
 - The press mode that the game sets with `cellPadSetPortSetting` decides whether `cellPad` copies
   the pressure words to the game; the game under test turns it on (`dal: pad: port 0 setting 0x2`).
@@ -295,14 +300,15 @@ A script that holds a direction while it taps a button:
 
 ### Log lines
 
-All pad lines start with `dal: pad:`; the script lines carry the `[host]` prefix.
+All pad lines start with `dal: pad:`; the script lines carry the `[host]` prefix. The lines of
+gamepads (`gameinput`, `steam`, `device`, `gamepad`, `probe`) are in [Input](input.md#log-lines).
 
 | Line | Level | Source |
 | --- | --- | --- |
 | `dal: pad: init max_connect N` | info | `cellPadInit` |
 | `dal: pad: port N connected` or `disconnected` | info | the first change of a port to that state |
 | `dal: pad: port N setting 0xS (press on\|off, sensor on\|off)` | info | `cellPadSetPortSetting`, once per port and value |
-| `dal: pad: keyboard` followed by ` (window)` and ` (script <file name>, <n> events)` as they apply | info | start-up with `--pad keyboard` |
+| `dal: pad: <pad>` followed by ` (window)` and ` (script <file name>, <n> events)` as they apply | info | start-up with `--pad keyboard`, `gamepad` or `keyboard+gamepad` (`<pad>` is the value) |
 | `dal: pad: script <s>.<ms> s: press\|release <buttons>` | info | the player thread, one line per event |
 | `dal: pad: key 0x<scan code> down\|up -> <button>` | debug | a mapped key, window thread; unmapped keys and repeats are not logged |
 
@@ -328,8 +334,10 @@ and the movies and confirmed NEW GAME. Without input the game is still in the in
 time. The run stops at 40 s, before `world.pam` (83 s, not skippable with Circle) ends. The pad
 code itself is covered by `runtime_core` (`testPadButtons`, `testKeyboardPadScanCodes`,
 `testKeyboardPadState`, `testKeyboardPadProvider`, `testKeyboardPadThreads`, `testPadScriptParse`,
-`testPadScriptErrors`, `testPadScriptPlay`) and the key message conversion by `render_core`
-(`testKeyMessages`).
+`testPadScriptErrors`, `testPadScriptPlay`), the gamepad source of the state by `runtime_core`
+(`testPadStateFromInput`, `testGamepadSourceState`, `testGamepadPadProvider`, `testGamepadCellPad`),
+the rest of the gamepad code by `input_core` and `input_gameinput` (see [Tests](tests.md)), and the
+key message conversion by `render_core` (`testKeyMessages`).
 
 Scripts live in `tools/pad_scripts/`.
 

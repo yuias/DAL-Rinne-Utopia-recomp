@@ -18,7 +18,9 @@
 | `tools/dal_rsxreplay/` | `dal_rsxreplay`, which replays an RSX capture without the game; see [Capture and replay](rendering.md#capture-and-replay) |
 | `cmake/Render.cmake`, `cmake/rsx_replay.cmake` | Renderer targets and tests, and the pin file of the `rsx_replay` test |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
-| `runtime/src/input/` | Pad buttons, the keyboard pad provider and the pad script player; see [Input](runtime.md#input) |
+| `runtime/src/input/` | Pad buttons, the host pad state and provider, the pad script player, and the gamepad code (backend interface, GameInput backend `dal_input_gameinput`, mapping, selection, hub, probe); see [Input](runtime.md#input) and [Gamepads](input.md) |
+| `tools/dal_padtool/` | `dal_padtool`: GameInput devices, live readings and rumble; see [`dal_padtool`](input.md#dal_padtool) |
+| `tools/fetch-gameinput.ps1`, `cmake/gameinput.cmake`, `cmake/Input.cmake` | GameInput package fetch script and pin, and the input targets and tests (`input_core`, `input_gameinput`) |
 | `runtime/src/audio/` | Audio: the output interface, the null output, the audio engine with its block clock, WAV files (in the runtime core), and the WASAPI output (`dal_audio_wasapi`); see [Audio](audio.md) |
 | `tools/dal_audiotool/` | `dal_audiotool`: WAV statistics, device list, tone and WAV playback, ATRAC3plus archive scan and decode; see [`dal_audiotool`](audio.md#dal_audiotool) |
 | `cmake/Audio.cmake`, `cmake/atrac_decode.cmake`, `cmake/game_audio.cmake` | Audio targets and tests (`audio_core`, `audio_wasapi`), and the pin files of the `atrac_decode` and `game_audio` tests |
@@ -36,7 +38,7 @@
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |
 | `config/ghidra_summary.json`, `config/extra_seeds.json`, `config/functions.json` | Ghidra summary, extra function starts and the recovered function database; see [Function recovery](function-recovery.md#function-recovery) |
 | `docs/` | Development documentation |
-| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg) |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput) |
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |
 | `build/` | Build output (git-ignored) |
 | `game/` | Suggested place for your own `EBOOT.elf` (git-ignored) |

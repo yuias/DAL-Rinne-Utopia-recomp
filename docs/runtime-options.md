@@ -6,7 +6,7 @@ The [top-level README](../README.md) shows the command for playing. This page li
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
          [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok]
-         [--pad none|neutral|keyboard] [--pad-script FILE]
+         [--pad none|neutral|keyboard|gamepad|keyboard+gamepad] [--pad-script FILE] [--pad-probe]
          [--audio none|wasapi] [--audio-dump FILE]
          [--load-only] [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--dump-frames DIR] [--dump-frames-every K]
@@ -32,9 +32,10 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 
 | Option | Meaning |
 | --- | --- |
-| `--no-window` | Run without a window, for unattended runs and tests. By default `dal_game` shows the frames in a window (which implies `--render vulkan`), and closing it stops the run with exit code 0. An explicit `--render none` also turns the window off. |
-| `--pad none\|neutral\|keyboard` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad. Default: `keyboard` with the window or `--pad-script`, otherwise `neutral`. `keyboard` without the window or `--pad-script` is a usage error. See [Input](runtime.md#input). |
-| `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It cannot be combined with `--pad none` or `--pad neutral`. See [Pad script](runtime.md#pad-script). |
+| `--no-window` | Run without a window, for unattended runs and tests. By default `dal_game` shows the frames in a window (which implies `--render vulkan`), and closing it stops the run with exit code 0. An explicit `--render none` also turns the window off. Without the window GameInput is never loaded, so these runs need no gamepad or GameInput runtime. |
+| `--pad none\|neutral\|keyboard\|gamepad\|keyboard+gamepad` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad, `gamepad` the connected gamepads, and `keyboard+gamepad` both at once. With `gamepad`, port 0 is connected only while a gamepad is in use; otherwise it is always connected. Default: `keyboard+gamepad` with the window; `keyboard` with `--no-window` and `--pad-script`; otherwise `neutral`. `keyboard` without the window or `--pad-script` is a usage error, and so are `gamepad` and `keyboard+gamepad` with `--no-window`: unattended runs never load GameInput. See [Input](runtime.md#input) and [Gamepads](input.md#gamepads). |
+| `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It needs `--pad keyboard` or `keyboard+gamepad` (the default with the window) and cannot be combined with `none`, `neutral` or `gamepad`. See [Pad script](runtime.md#pad-script). |
+| `--pad-probe` | Diagnostic for gamepads: logs every game controller that GameInput reports, every change of their readings and what the process knows about Steam, as `dal: pad: probe ...` lines. Needs the window (a usage error with `--no-window`) and is independent of `--pad`; it never changes the pad. See [`--pad-probe`](input.md#--pad-probe). |
 | `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. See [Audio](audio.md#options). |
 | `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. Its header is updated every second, so a run stopped by `--seconds` or by closing the window leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see [`dal_audiotool`](audio.md#dal_audiotool)). |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |

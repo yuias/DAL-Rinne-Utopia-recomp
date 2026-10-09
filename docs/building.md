@@ -38,6 +38,7 @@ These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<
 | `DAL_EBOOT_ELF` | empty | Set by `-EbootElf`. |
 | `DAL_RPCS3_CRYPTO_DIR` | empty | A local `key_vault.h`, or its directory, to use instead of downloading the pinned copy (see [SDAT files](sdat.md#keys)). `build.ps1` has no parameter for it. |
 | `DAL_FFMPEG_DIR` | empty | An extracted FFmpeg build to use instead of `generated/deps/ffmpeg/<pinned build>` (see [Movies](movies.md)). |
+| `DAL_GAMEINPUT_DIR` | empty | An extracted `Microsoft.GameInput` package to use instead of `generated/deps/gameinput/<pinned version>` (see [Input](input.md#the-gameinput-package)). Configure needs the package from `tools/fetch-gameinput.ps1`. |
 | `DAL_PPU_WERROR` | `ON` | Add `-Werror` for generated code and the code that mirrors it (header check, semantics harness, link test). Every such target is compiled with `-O1 -march=x86-64-v3 -ffp-contract=off -fpatchable-function-entry=8 -Wall -Wextra`, whatever the preset's optimization level. |
 
 No tracked file contains a game path: they are command-line arguments, CMake cache variables, or a

@@ -30,7 +30,7 @@ screen it plays its three intro movies (`if_logo.pam`, `ch_logo.pam`, `op.pam`, 
 95 s) at their 29.97 fps rate, then shows the title screen, where it stays without input (a 165 s
 run ends at the watchdog, exit code 5).
 
-With the keyboard or a pad script it leaves the title screen: Circle skips the notice screen and the
+With the keyboard, a gamepad or a pad script it leaves the title screen: Circle skips the notice screen and the
 movies and confirms NEW GAME, after which the game loads its event script and plays `world.pam`.
 The game's sound runs through its own mixer: the movie audio, the music and the sound effects reach
 the speakers when the window is shown and appear in the `--audio-dump` file in every run. Voice, which the
@@ -55,9 +55,10 @@ effects are silent.
   `cellAtrac` calls this game makes are implemented.
 - Movies: only the `cellSail` calls this game makes are implemented (PAMF files with H.264 video and
   ATRAC3plus audio). Repeat mode is stored but not acted on.
-- Input: the `neutral`, `none` and `keyboard` pad providers; no gamepad backend. The keyboard has a
-  fixed mapping, no analog sticks, no vibration, and only port 0; there is no mouse or `cellKb`
-  input.
+- Input: the `neutral`, `none`, `keyboard`, `gamepad` and `keyboard+gamepad` pad providers. The
+  keyboard has a fixed mapping, no analog sticks and no vibration; gamepads are read through
+  GameInput with a fixed mapping, and only an Xbox Wireless Controller was verified (a DualShock 4 is
+  not used). Only port 0 exists; there is no mouse or `cellKb` input. See [Input](input.md).
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are not
   scheduled.
 - Every import of this game has a handler, but some are minimal (for example `cellSpurs`, which only

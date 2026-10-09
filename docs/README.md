@@ -17,6 +17,7 @@ parameter and describe how the project works:
 | [rendering.md](rendering.md) | Fake RSX, the Vulkan renderer, and capture and replay |
 | [movies.md](movies.md) | cellSail HLE, PAMF demuxing, FFmpeg decoding and `dal_moviedump` |
 | [audio.md](audio.md) | `cellAudio` and `cellAtrac`, the audio engine and block clock, the WASAPI output, options, log lines and `dal_audiotool` |
+| [input.md](input.md) | Gamepads: supported pads, mapping, the GameInput runtime, Steam, the gamepad thread, device selection, log lines, `--pad-probe` and `dal_padtool` |
 | [tests.md](tests.md) | CTest targets, the `game_boot`, `game_input` and `game_audio` tests and the Python unit tests |
 | [layout.md](layout.md) | Repository layout |
 | [porting-guide.md](porting-guide.md) | Applying the method to another PS3 game |
