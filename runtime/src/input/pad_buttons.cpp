@@ -45,6 +45,23 @@ PadPortState padStateFromButtons(PadButtons buttons) {
   return state;
 }
 
+PadPortState padStateFromInput(PadButtons buttons, const PadAnalog& analog, PadButtons analog_pressure) {
+  PadPortState state = padStateFromButtons(buttons);
+  state.button[kPadButtonAnalogRightX] = analog.right_x;
+  state.button[kPadButtonAnalogRightY] = analog.right_y;
+  state.button[kPadButtonAnalogLeftX] = analog.left_x;
+  state.button[kPadButtonAnalogLeftY] = analog.left_y;
+  // A button that is not pressed keeps pressure 0 whatever the mask says.
+  const PadButtons analog_pressed = buttons & analog_pressure;
+  if ((analog_pressed & padButtonBit(PadButton::L2)) != 0) {
+    state.button[padPressureWord(PadButton::L2)] = analog.l2;
+  }
+  if ((analog_pressed & padButtonBit(PadButton::R2)) != 0) {
+    state.button[padPressureWord(PadButton::R2)] = analog.r2;
+  }
+  return state;
+}
+
 std::string_view padButtonName(PadButton b) {
   const std::size_t index = static_cast<std::size_t>(b);
   return index < kNames.size() ? kNames[index] : std::string_view{};

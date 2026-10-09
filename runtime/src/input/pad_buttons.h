@@ -2,7 +2,7 @@
 //
 // Bit and word positions follow RPCS3 `rpcs3/Emu/Io/pad_types.h`: `CELL_PAD_CTRL_*` for the digital
 // bits of CELL_PAD_BTN_OFFSET_DIGITAL1 / DIGITAL2 and `CELL_PAD_BTN_OFFSET_PRESS_*` for the pressure
-// words. Host providers (keyboard, script, later a gamepad) share this model.
+// words. Host providers (keyboard, script, gamepad) share this model.
 
 #pragma once
 
@@ -39,6 +39,19 @@ std::size_t padPressureWord(PadButton b);
 // pressed button at 0xFF (keys are digital; a real pad reports 0xFF fully pressed). Sticks,
 // sensors, capability and type stay as neutral, so an empty mask equals neutralPadState() exactly.
 PadPortState padStateFromButtons(PadButtons buttons);
+
+// The analog part of a pad in CellPadData units: sticks 0 = left/up, 0xFF = right/down, 0x80 centre;
+// trigger pressure 0..0xFF.
+struct PadAnalog {
+  std::uint8_t left_x = 0x80, left_y = 0x80, right_x = 0x80, right_y = 0x80;
+  std::uint8_t l2 = 0, r2 = 0;
+  bool operator==(const PadAnalog&) const = default;
+};
+
+// padStateFromButtons(buttons) with the stick words 4..7 from `analog`. The pressure word of a
+// pressed L2/R2 is analog.l2/r2 when that button is in `analog_pressure`, otherwise 0xFF. An empty
+// mask with a default PadAnalog equals neutralPadState() exactly.
+PadPortState padStateFromInput(PadButtons buttons, const PadAnalog& analog, PadButtons analog_pressure);
 
 // Lower-case names used by the pad script: select l3 r3 start up right down left l2 r2 l1 r1
 // triangle circle cross square. padButtonName returns an empty view for PadButton::Count.

@@ -3542,6 +3542,290 @@ void testKeyboardPadThreads() {
   CHECK(polls > 0);
 }
 
+void testPadStateFromInput() {
+  using dal::PadButton;
+  constexpr dal::PadButtons kL2 = dal::padButtonBit(PadButton::L2);
+  constexpr dal::PadButtons kR2 = dal::padButtonBit(PadButton::R2);
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+
+  // An idle pad is the neutral state word for word, so GetData keeps reporting no change.
+  CHECK(samePadState(dal::padStateFromInput(0, {}, 0), dal::neutralPadState()));
+  CHECK(samePadState(dal::padStateFromInput(kCross, {}, 0), dal::padStateFromButtons(kCross)));
+
+  // Words 4..7 are right x, right y, left x, left y (hle.h); nothing else changes.
+  dal::PadAnalog sticks;
+  sticks.left_x = 0x11;
+  sticks.left_y = 0x22;
+  sticks.right_x = 0x33;
+  sticks.right_y = 0x44;
+  dal::PadPortState expected = dal::neutralPadState();
+  expected.button[4] = 0x33;
+  expected.button[5] = 0x44;
+  expected.button[6] = 0x11;
+  expected.button[7] = 0x22;
+  CHECK(samePadState(dal::padStateFromInput(0, sticks, 0), expected));
+  // Trigger values alone do nothing without the button.
+  dal::PadAnalog triggers;
+  triggers.l2 = 0x40;
+  triggers.r2 = 0x90;
+  CHECK(samePadState(dal::padStateFromInput(0, triggers, kL2 | kR2), dal::neutralPadState()));
+
+  // The L2/R2 pressure words (18, 19) take the analog value only for buttons in the mask.
+  const std::size_t l2_word = dal::padPressureWord(PadButton::L2);
+  const std::size_t r2_word = dal::padPressureWord(PadButton::R2);
+  CHECK(l2_word == 18 && r2_word == 19);
+  dal::PadPortState both = dal::padStateFromInput(kL2 | kR2 | kCross, triggers, kL2 | kR2);
+  CHECK(both.button[l2_word] == 0x40 && both.button[r2_word] == 0x90 && both.button[14] == 0xFF);
+  dal::PadPortState one = dal::padStateFromInput(kL2 | kR2, triggers, kL2);
+  CHECK(one.button[l2_word] == 0x40 && one.button[r2_word] == 0xFF);
+  dal::PadPortState none = dal::padStateFromInput(kL2 | kR2, triggers, 0);
+  CHECK(none.button[l2_word] == 0xFF && none.button[r2_word] == 0xFF);
+  CHECK(one.button[dal::kPadButtonDigital2] == 0x03);
+}
+
+void testGamepadSourceState() {
+  using State = dal::KeyboardPadState;
+  using std::chrono::milliseconds;
+  using dal::PadButton;
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+  constexpr dal::PadButtons kStart = dal::padButtonBit(PadButton::Start);
+  constexpr dal::PadButtons kUp = dal::padButtonBit(PadButton::Up);
+  constexpr dal::PadButtons kDown = dal::padButtonBit(PadButton::Down);
+  const State::Clock::time_point t0 = State::Clock::time_point{} + std::chrono::seconds(100);
+
+  // setHeld stamps only newly set bits: Cross keeps the time of its first report.
+  State state;
+  state.setHeld(dal::InputSource::Gamepad, kCross, t0);
+  CHECK(state.held(dal::InputSource::Gamepad) == kCross && state.held(dal::InputSource::Keyboard) == 0 &&
+        state.held() == kCross);
+  const State::Clock::time_point t1 = t0 + std::chrono::seconds(1);
+  state.setHeld(dal::InputSource::Gamepad, kCross | kStart, t1);
+  state.setHeld(dal::InputSource::Gamepad, kStart, t1 + milliseconds(10));
+  CHECK(state.held() == kStart);
+  CHECK(state.reported(t1 + milliseconds(30)) == kStart);  // Cross was pressed 1 s ago: no tail left
+  // A released bit keeps its tail from the press time, then goes.
+  state.setHeld(dal::InputSource::Gamepad, 0, t1 + milliseconds(20));
+  CHECK(state.held() == 0);
+  CHECK(state.reported(t1 + milliseconds(30)) == kStart);
+  CHECK(state.reported(t1 + milliseconds(59)) == kStart);
+  CHECK(state.reported(t1 + milliseconds(70)) == 0);
+
+  // A tap shorter than one poll is still seen, and a held bit is not re-stamped by the next report.
+  const State::Clock::time_point t2 = t1 + std::chrono::seconds(10);
+  state.setHeld(dal::InputSource::Gamepad, kCross, t2);
+  state.setHeld(dal::InputSource::Gamepad, kCross, t2 + milliseconds(50));
+  state.setHeld(dal::InputSource::Gamepad, 0, t2 + milliseconds(55));
+  CHECK(state.reported(t2 + milliseconds(59)) == kCross);
+  CHECK(state.reported(t2 + milliseconds(61)) == 0);
+
+  // The d-pad rule applies to the gamepad source: Up on the pad with Down on the keyboard cancel.
+  const State::Clock::time_point t3 = t2 + std::chrono::seconds(10);
+  State dpad;
+  dpad.setHeld(dal::InputSource::Gamepad, kUp, t3);
+  CHECK(dpad.reported(t3 + std::chrono::seconds(1)) == kUp);
+  dpad.setButtons(dal::InputSource::Keyboard, kDown, true, t3);
+  CHECK(dpad.held() == (kUp | kDown));
+  CHECK(dpad.reported(t3 + std::chrono::seconds(1)) == 0);
+  dpad.setHeld(dal::InputSource::Gamepad, 0, t3 + std::chrono::seconds(2));
+  CHECK(dpad.reported(t3 + std::chrono::seconds(3)) == kDown);
+
+  // releaseAll(Gamepad) drops the gamepad's buttons at once and leaves the keyboard alone.
+  const State::Clock::time_point t4 = t3 + std::chrono::seconds(10);
+  State released;
+  released.setHeld(dal::InputSource::Gamepad, kCross, t4);
+  released.setButtons(dal::InputSource::Keyboard, kStart, true, t4);
+  released.releaseAll(dal::InputSource::Gamepad);
+  CHECK(released.held() == kStart && released.reported(t4 + milliseconds(5)) == kStart);
+
+  // Analog snapshot, connection flag and vibration start neutral and round-trip exactly.
+  State values;
+  CHECK(values.analog() == dal::PadAnalog{} && !values.gamepadConnected());
+  const std::pair<std::uint8_t, std::uint8_t> no_vibration{0, 0};
+  CHECK(values.vibration() == no_vibration);
+  dal::PadAnalog analog;
+  analog.left_x = 1;
+  analog.left_y = 2;
+  analog.right_x = 3;
+  analog.right_y = 4;
+  analog.l2 = 5;
+  analog.r2 = 255;
+  values.setAnalog(analog);
+  CHECK(values.analog() == analog);
+  values.setAnalog({});
+  CHECK(values.analog() == dal::PadAnalog{});
+  values.setGamepadConnected(true);
+  CHECK(values.gamepadConnected());
+  values.setGamepadConnected(false);
+  CHECK(!values.gamepadConnected());
+  const std::pair<std::uint8_t, std::uint8_t> motors{7, 200};
+  values.setVibration(7, 200);
+  CHECK(values.vibration() == motors);
+}
+
+void testGamepadPadProvider() {
+  using State = dal::KeyboardPadState;
+  using std::chrono::milliseconds;
+  using dal::PadButton;
+  constexpr dal::PadButtons kL2 = dal::padButtonBit(PadButton::L2);
+  const std::size_t l2_word = dal::padPressureWord(PadButton::L2);
+  const std::size_t r2_word = dal::padPressureWord(PadButton::R2);
+
+  auto state = std::make_shared<State>();
+  State::Clock::time_point now = State::Clock::time_point{} + std::chrono::seconds(50);
+  std::unique_ptr<dal::PadProvider> provider = dal::makeKeyboardPadProvider(state, [&] { return now; });
+  CHECK(samePadState(provider->poll(0), dal::neutralPadState()));
+
+  // A trigger alone reports its analog value; sticks come from the snapshot.
+  dal::PadAnalog analog;
+  analog.l2 = 0x55;
+  analog.right_x = 0x10;
+  analog.left_y = 0xF0;
+  state->setHeld(dal::InputSource::Gamepad, kL2, now);
+  state->setAnalog(analog);
+  dal::PadPortState polled = provider->poll(0);
+  CHECK(polled.button[dal::kPadButtonDigital2] == 0x01);
+  CHECK(polled.button[l2_word] == 0x55 && polled.button[r2_word] == 0);
+  CHECK(polled.button[4] == 0x10 && polled.button[5] == 0x80 && polled.button[6] == 0x80 &&
+        polled.button[7] == 0xF0);
+
+  // The keyboard or the script holding L2 as well makes it fully pressed, even with a half trigger.
+  state->setButtons(dal::InputSource::Keyboard, kL2, true, now);
+  CHECK(provider->poll(0).button[l2_word] == 0xFF);
+  state->setButtons(dal::InputSource::Keyboard, kL2, false, now);
+  CHECK(provider->poll(0).button[l2_word] == 0x55);
+  state->setButtons(dal::InputSource::Script, kL2, true, now);
+  CHECK(provider->poll(0).button[l2_word] == 0xFF);
+  state->setButtons(dal::InputSource::Script, kL2, false, now);
+
+  // A trigger released within the minimum visible time keeps the bit, now fully pressed.
+  now += std::chrono::seconds(1);
+  state->setHeld(dal::InputSource::Gamepad, 0, now);
+  state->setHeld(dal::InputSource::Gamepad, kL2, now);
+  state->setHeld(dal::InputSource::Gamepad, 0, now + milliseconds(10));
+  state->setAnalog({});
+  now += milliseconds(20);
+  polled = provider->poll(0);
+  CHECK(polled.button[dal::kPadButtonDigital2] == 0x01 && polled.button[l2_word] == 0xFF);
+  now += milliseconds(100);
+  CHECK(samePadState(provider->poll(0), dal::neutralPadState()));
+
+  // Vibration reaches the shared state for port 0 only.
+  const std::pair<std::uint8_t, std::uint8_t> motors{3, 4};
+  provider->setVibration(0, 3, 4);
+  provider->setVibration(1, 9, 9);
+  CHECK(state->vibration() == motors);
+
+  // always_connected = false: port 0 follows the gamepad connection and is a plain empty port otherwise.
+  auto pad_only = std::make_shared<State>();
+  std::unique_ptr<dal::PadProvider> gamepad_provider =
+      dal::makeKeyboardPadProvider(pad_only, [&] { return now; }, {.always_connected = false});
+  CHECK(!gamepad_provider->poll(0).connected);
+  pad_only->setGamepadConnected(true);
+  CHECK(samePadState(gamepad_provider->poll(0), dal::neutralPadState()));
+  CHECK(!gamepad_provider->poll(1).connected);
+  pad_only->setGamepadConnected(false);
+  CHECK(!gamepad_provider->poll(0).connected);
+  CHECK(provider->poll(0).connected);  // the default provider ignores the flag
+}
+
+void testGamepadCellPad() {
+  using State = dal::KeyboardPadState;
+  using dal::PadButton;
+  constexpr dal::PadButtons kCross = dal::padButtonBit(PadButton::Cross);
+  constexpr dal::PadButtons kL2 = dal::padButtonBit(PadButton::L2);
+
+  dal::setLogSink([](std::string_view) {});
+  dal::resetCensus();
+  dal::resetLogOnce();
+  dal::resetCellPad();
+  dal::Process& p = dal::process();
+  CHECK(p.memory.reserve());
+  std::uint8_t* base = p.memory.base();
+  const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+  CHECK(scratch != 0);
+  const std::uint32_t info = scratch, data = scratch + 0x200, act = scratch + 0x400;
+
+  enum Import : std::uint32_t { Init, End, SetPortSetting, GetData, GetInfo2, SetActDirect, ImportCount };
+  const DalImportInfo imports[] = {
+      {0x00800000, 0x1cf98800, "sys_io", "cellPadInit"},
+      {0x00800010, 0x4d9b75d5, "sys_io", "cellPadEnd"},
+      {0x00800020, 0x578e3c98, "sys_io", "cellPadSetPortSetting"},
+      {0x00800030, 0x8b72cda1, "sys_io", "cellPadGetData"},
+      {0x00800040, 0xa703a51d, "sys_io", "cellPadGetInfo2"},
+      {0x00800050, 0xf65544ee, "sys_io", "cellPadSetActDirect"},
+  };
+  dal::installImports(imports, ImportCount);
+  auto ctx = std::make_unique<DalPpuContext>();
+  auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0) {
+    ctx->gpr[3] = a;
+    ctx->gpr[4] = b;
+    dalHleCall(ctx.get(), base, which);
+    return static_cast<std::uint32_t>(ctx->gpr[3]);
+  };
+  constexpr std::uint32_t kNoDevice = 0x80121107;
+  const auto len = [&] { return static_cast<std::int32_t>(dalRead32(base, data)); };
+  const auto word = [&](std::uint32_t i) { return dalRead16(base, data + 4 + 2 * i); };
+
+  auto state = std::make_shared<State>();
+  State::Clock::time_point now = State::Clock::time_point{} + std::chrono::seconds(10);
+  dal::setPadProvider(dal::makeKeyboardPadProvider(state, [&] { return now; }, {.always_connected = false}));
+  CHECK(call(Init, 4) == 0);
+  CHECK(call(SetPortSetting, 0, 2) == 0);
+
+  // No gamepad yet: nothing connected, and the game is told nothing.
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 4) == 0 && dalRead32(base, info + 12) == 0);
+  CHECK(call(GetData, 0, data) == kNoDevice);
+  std::memset(base + act, 0, 8);
+  base[act] = 1;
+  base[act + 1] = 200;
+  CHECK(call(SetActDirect, 0, act) == kNoDevice);
+
+  // Plugging in shows the assign-changed flag once; the first report then carries everything.
+  state->setGamepadConnected(true);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 4) == 1 && dalRead32(base, info + 12) == 3);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 1);
+  CHECK(call(GetData, 0, data) == 0 && len() == 20 && word(2) == 0 && word(3) == 0);
+  CHECK(word(4) == 0x80 && word(7) == 0x80);
+
+  // An idle gamepad source (empty mask, default analog) reports no change, however often it is set.
+  state->setHeld(dal::InputSource::Gamepad, 0, now);
+  state->setAnalog({});
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+  now += std::chrono::seconds(1);
+  state->setHeld(dal::InputSource::Gamepad, 0, now);
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+
+  // A trigger pull and a stick move are reported with their analog values.
+  dal::PadAnalog analog;
+  analog.l2 = 0x77;
+  analog.left_x = 0xC0;
+  state->setHeld(dal::InputSource::Gamepad, kL2 | kCross, now);
+  state->setAnalog(analog);
+  CHECK(call(GetData, 0, data) == 0 && len() == 20);
+  CHECK(word(3) == 0x41 && word(6) == 0xC0 && word(18) == 0x77 && word(14) == 0xFF);
+  state->setHeld(dal::InputSource::Gamepad, 0, now);
+  state->setAnalog({});
+  now += std::chrono::seconds(1);
+  CHECK(call(GetData, 0, data) == 0 && len() == 20 && word(3) == 0 && word(6) == 0x80);
+  CHECK(call(GetData, 0, data) == 0 && len() == 0);
+
+  // cellPadSetActDirect stores (small, large) for the gamepad thread.
+  const std::pair<std::uint8_t, std::uint8_t> motors{1, 200};
+  CHECK(call(SetActDirect, 0, act) == 0 && state->vibration() == motors);
+
+  // Unplugging shows the flag once as well.
+  state->setGamepadConnected(false);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 4) == 0 && dalRead32(base, info + 12) == 2);
+  CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 12) == 0);
+  CHECK(call(GetData, 0, data) == kNoDevice);
+
+  dal::resetCellPad();
+  p.main.free(scratch);
+  dal::setLogSink({});
+  dal::resetCensus();
+  dal::resetLogOnce();
+}
+
 struct ScriptEventSpec {
   int at_ms;
   dal::PadButtons buttons;
@@ -7763,6 +8047,10 @@ int main(int argc, char** argv) {
   testKeyboardPadState();
   testKeyboardPadProvider();
   testKeyboardPadThreads();
+  testPadStateFromInput();
+  testGamepadSourceState();
+  testGamepadPadProvider();
+  testGamepadCellPad();
   testPadScriptParse();
   testPadScriptErrors();
   testPadScriptPlay();
