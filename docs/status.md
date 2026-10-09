@@ -56,8 +56,8 @@ effects are silent.
   ATRAC3plus audio). Repeat mode is stored but not acted on.
 - Input: the `neutral`, `none`, `keyboard`, `gamepad` and `keyboard+gamepad` pad providers. The
   keyboard has a fixed mapping, no analog sticks and no vibration; gamepads are read through
-  GameInput with a fixed mapping, and only an Xbox Wireless Controller was verified (a DualShock 4 is
-  not used). Only port 0 exists; there is no mouse or `cellKb` input. See [Input](input.md).
+  GameInput with a fixed mapping; an Xbox Wireless Controller and a DualShock 4 (second model, no
+  vibration) were verified, and the first DualShock 4 model is not used. Only port 0 exists; there is no mouse or `cellKb` input. See [Input](input.md).
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are not
   scheduled.
 - Every import of this game has a handler, but some are minimal (for example `cellSpurs`, which only

@@ -20,10 +20,16 @@ pad or on the GameInput runtime.
   `gamepad+controller` with rumble, and buttons, d-pad, both sticks, both triggers and vibration were
   checked with it. Other Xbox-family pads should behave the same if GameInput reports them as
   gamepads; they were not tried.
-- **DualShock 4: not supported, not verified.** Over Bluetooth GameInput lists it as a generic
-  controller (`054c:05c4 controller rumble no`) without the gamepad kind. The game only uses devices
-  with the gamepad kind, so it logs the pad as `not a gamepad` and ignores it. Whether Steam Input
-  presents it differently was not checked.
+- **Verified:** a DualShock 4 (second model, `054c:09cc`) over Bluetooth. GameInput lists it as
+  `gamepad+controller` without rumble and maps it by position: Cross, Circle, Square and Triangle
+  read as A, B, X and Y; Share and Options as View and Menu; L1/R1, L2/R2, L3/R3, the d-pad and both
+  sticks as on the Xbox pad (full range on every axis). The PS button and the touch pad have no
+  gamepad button and are not read. In the game the pad is selected and the title menu works with it.
+  No vibration: GameInput reports no rumble for it.
+- **DualShock 4, first model (`054c:05c4`): not supported.** It was seen once over Bluetooth as a
+  generic controller without the gamepad kind, so the game logs it as `not a gamepad` and ignores it.
+- While Steam runs with its PlayStation controller support on, Steam takes the DualShock 4 and no
+  input from it reaches the game or `dal_padtool`. Quit Steam or turn that setting off.
 - Other pads are used only if GameInput reports them with the gamepad kind. A device without it is
   logged as `not a gamepad` and ignored.
 
@@ -119,7 +125,8 @@ What was observed with an Xbox Wireless Controller:
   both cases.
 - Whether Steam Input remaps the buttons the game reads (binding A to Y and pressing A) was not
   verified. Do not rely on Steam's controller configuration to remap.
-- The DualShock 4 was not tried through Steam.
+- The DualShock 4 was not tried through a Steam shortcut; see Supported pads for Steam running
+  in the background.
 
 The selection code (below) already handles a Steam virtual pad should one appear: it reads the virtual
 pad and ignores the physical pad behind it. That path is covered by unit tests with a path format
@@ -254,8 +261,9 @@ window is in the background. Add `--log-level debug --log FILE` to keep the devi
 
 ## `dal_padtool`
 
-`build/release/bin/dal_padtool.exe` uses the same backend without the game. It reads in the
-background too, because its console window belongs to another process. Output goes to stdout. Exit
+`build/release/bin/dal_padtool.exe` uses the same backend without the game. It asks GameInput for
+background input, because its console window belongs to another process. That works for the Xbox pad
+but not for the DualShock 4, whose input arrives only while the console window is in the foreground. Output goes to stdout. Exit
 codes: 0 on success, 1 when GameInput is unavailable (the message names the reason, on stderr), 2 on
 a usage error.
 

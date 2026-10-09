@@ -106,9 +106,10 @@ movies. If keys do nothing, click the window to give it keyboard focus.
 
 ### Gamepad
 
-A connected Xbox-family gamepad works in the window together with the keyboard; it needs the
-GameInput runtime from the build step above. The button mapping, the dead zone, Steam and the
-`gameinput unavailable` warning are in [Input](docs/input.md).
+A connected Xbox-family gamepad or DualShock 4 (second model) works in the window together with the
+keyboard; it needs the GameInput runtime from the build step above. Quit Steam, or turn off its
+PlayStation controller support, before using a DualShock 4. The button mapping, the dead zone, Steam
+and the `gameinput unavailable` warning are in [Input](docs/input.md).
 
 ## Documentation
 
