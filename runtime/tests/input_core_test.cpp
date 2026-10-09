@@ -397,16 +397,6 @@ void testSteamVirtualGamepadInfoLog() {
   std::filesystem::remove(file);
 }
 
-void testProbeUnavailableBackend() {
-  LogCapture log;
-  dal::startGamepadProbe(
-      []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
-        return std::unexpected(std::string("no runtime"));
-      },
-      [] { return dal::SteamContext{}; });
-  CHECK(log.waitFor("dal: pad: gameinput unavailable: no runtime; gamepads disabled"));
-}
-
 dal::GamepadReading readingWithButton(GamepadButton button) {
   dal::GamepadReading reading;
   reading.buttons = gamepadButtonBit(button);
@@ -1345,32 +1335,6 @@ void testHubThreadProbeOnly() {
   CHECK(log.count("dal: pad: gamepad ") == 0);
 }
 
-// The probe thread never ends, so this runs last and the program leaves with _Exit (like the game).
-// The fake's reading never changes, so the thread is silent after its start lines; that is what makes
-// ~LogCapture's unsynchronised sink swap safe.
-void testProbeThreadStartLines() {
-  LogCapture log;
-  auto backend = std::make_shared<FakeBackend>();
-  backend->add(0x045e, 0x028e);
-  dal::startGamepadProbe(
-      [backend]() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> { return backend; },
-      [] {
-        dal::SteamContext steam;
-        steam.overlay_loaded = true;
-        steam.env["SteamGameId"] = "42";
-        return steam;
-      });
-  CHECK(log.waitFor("dal: pad: probe 1 045e:028e buttons none"));
-  const std::vector<std::string> lines = log.lines();
-  CHECK(lines.size() == 4);
-  if (lines.size() == 4) {
-    CHECK(lines[0].ends_with("dal: pad: gameinput fake"));
-    CHECK(lines[1].ends_with("dal: pad: steam overlay loaded; SteamGameId=42"));
-    CHECK(lines[2].ends_with("dal: pad: probe SteamVirtualGamepadInfo unset"));
-    CHECK(lines[3].ends_with("dal: pad: probe 1 045e:028e buttons none lt 0.00 rt 0.00 ls (0.00,0.00) rs (0.00,0.00)"));
-  }
-}
-
 }  // namespace
 
 int main() {
@@ -1381,7 +1345,6 @@ int main() {
   testProbeReportsMissingReadingOnce();
   testProbeFollowsDevices();
   testSteamVirtualGamepadInfoLog();
-  testProbeUnavailableBackend();
   testMapButtonTable();
   testMapIdleReading();
   testStickByte();
@@ -1412,7 +1375,6 @@ int main() {
   testHubThreadFeedsPad();
   testHubThreadStartLinesWithProbe();
   testHubThreadProbeOnly();
-  testProbeThreadStartLines();
 
   std::printf("input core tests: %d passed, %d failed\n", g_passed, g_failed);
   std::fflush(stdout);

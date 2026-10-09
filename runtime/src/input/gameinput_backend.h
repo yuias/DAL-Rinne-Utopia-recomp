@@ -43,4 +43,8 @@ std::expected<std::shared_ptr<GameInputBackend>, std::string> makeGameInputBacke
 // GameOverlayRenderer64.dll mapped, the Steam environment variables and the process id.
 SteamContext detectSteamContext();
 
+// Whether the foreground window belongs to this process. The hub releases the gamepad's buttons while
+// it does not, whatever GameInput reports for a background process.
+bool processOwnsForegroundWindow();
+
 }  // namespace dal

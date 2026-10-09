@@ -55,11 +55,4 @@ void logSteamVirtualGamepadInfo(const SteamContext& steam);
 
 using GamepadBackendFactory = std::function<std::expected<std::shared_ptr<GamepadBackend>, std::string>()>;
 
-// Starts a detached thread that creates the backend (GameInput takes about a second to initialise,
-// which must not delay the boot), logs the start lines, then runs the probe every
-// kGamepadProbeInterval. `detect_steam` runs right after the backend exists, so `overlay loaded`
-// reflects the state at GameInput initialisation. A backend that cannot be created is one warning
-// and the end of the thread. Nothing joins the thread: the process ends with std::_Exit.
-void startGamepadProbe(GamepadBackendFactory make_backend, std::function<SteamContext()> detect_steam);
-
 }  // namespace dal

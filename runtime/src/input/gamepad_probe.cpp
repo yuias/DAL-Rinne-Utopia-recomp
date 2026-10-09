@@ -7,7 +7,6 @@
 #include <fstream>
 #include <iterator>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include "core/log.h"
@@ -120,27 +119,6 @@ void logSteamVirtualGamepadInfo(const SteamContext& steam) {
     if (line.ends_with('\r')) line.remove_suffix(1);
     logInfo("dal: pad: probe SteamVirtualGamepadInfo: {}", line);
   }
-}
-
-void startGamepadProbe(GamepadBackendFactory make_backend, std::function<SteamContext()> detect_steam) {
-  std::thread([make_backend = std::move(make_backend), detect_steam = std::move(detect_steam)] {
-    auto backend = make_backend();
-    if (!backend || !*backend) {
-      logWarn("dal: pad: gameinput unavailable: {}; gamepads disabled",
-              backend ? std::string("no backend") : backend.error());
-      return;
-    }
-    const SteamContext steam = detect_steam();
-    logInfo("dal: pad: gameinput {}", (*backend)->description());
-    logInfo("dal: pad: steam {}", formatSteamContext(steam));
-    logSteamVirtualGamepadInfo(steam);
-
-    GamepadProbe probe(*backend);
-    for (;;) {
-      probe.step();
-      std::this_thread::sleep_for(kGamepadProbeInterval);
-    }
-  }).detach();
 }
 
 }  // namespace dal

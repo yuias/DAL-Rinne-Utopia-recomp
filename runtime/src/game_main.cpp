@@ -34,7 +34,7 @@
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
 #include "input/gameinput_backend.h"
-#include "input/gamepad_probe.h"
+#include "input/gamepad_hub.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_script.h"
 #include "lv2/vfs.h"
@@ -64,7 +64,8 @@ struct Options {
   std::string audio;  // --audio as given; empty until the defaults are settled after all arguments
   std::string audio_dump;
   std::vector<dal::PadScriptEvent> pad_script_events;
-  // Set when the keyboard is the pad. The window thread and the script thread write to it.
+  // The host pad state, set for every --pad that reads host input (keyboard, gamepad, both). The
+  // window thread, the script thread and the gamepad thread each write their own source of it.
   std::shared_ptr<dal::KeyboardPadState> keyboard;
   unsigned seconds = 0;
   bool strict = false;
@@ -82,6 +83,9 @@ struct Options {
   std::string shader_cache;
   std::vector<std::uint32_t> rsx_capture_frames;
 };
+
+bool padUsesKeyboard(std::string_view pad) { return pad == "keyboard" || pad == "keyboard+gamepad"; }
+bool padUsesGamepad(std::string_view pad) { return pad == "gamepad" || pad == "keyboard+gamepad"; }
 
 // The Vulkan device and the renderer for the RSX thread. Built and destroyed on that thread; the
 // counters are published for the census, which reads them from another one.
@@ -174,8 +178,9 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
     dal::PresenterOptions presenter_options;
     presenter_options.frame_slots = dal::RsxRenderer::kFramesInFlight;
     presenter_options.on_close = [] { dal::stopProcess(dal::ExitCode::ProcessExit, "dal: stop: window closed"); };
-    if (opt.keyboard) {
+    if (opt.keyboard && padUsesKeyboard(opt.pad)) {
       // These run on the window thread; the state is lock-free, so the guest never waits on it.
+      // Focus loss releases the keyboard source only: the gamepad thread is the sole writer of its own.
       presenter_options.on_key = [keyboard = opt.keyboard](const dal::KeyMessage& key) {
         keyboard->keyEvent(key.scan_code, key.down, key.repeat, dal::KeyboardPadState::Clock::now());
         if (key.repeat) return;
@@ -228,7 +233,7 @@ void printUsage() {
       "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
       "                [--log-level trace|debug|info|warn|error]\n"
       "                [--quiet-hle] [--load-only]\n"
-      "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard]\n"
+      "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
       "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
       "                [--render none|vulkan] [--rsx-capture N[,M...]]\n"
       "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
@@ -297,8 +302,9 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     } else if (arg == "--pad") {
       std::string name;
       if (!value(name)) return false;
-      if (name != "none" && name != "neutral" && name != "keyboard") {
-        std::fprintf(stderr, "error: --pad needs none, neutral or keyboard\n");
+      if (name != "none" && name != "neutral" && name != "keyboard" && name != "gamepad" &&
+          name != "keyboard+gamepad") {
+        std::fprintf(stderr, "error: --pad needs none, neutral, keyboard, gamepad or keyboard+gamepad\n");
         return false;
       }
       opt.pad = name;
@@ -390,13 +396,18 @@ bool parseArgs(int argc, char** argv, Options& opt) {
   }
   // A window or a script is what makes a keyboard pad useful, so either one selects it by default.
   const bool pad_input = opt.window || !opt.pad_script.empty();
-  if (opt.pad.empty()) opt.pad = pad_input ? "keyboard" : "neutral";
+  if (opt.pad.empty()) opt.pad = opt.window ? "keyboard+gamepad" : pad_input ? "keyboard" : "neutral";
   if (opt.pad == "keyboard" && !pad_input) {
     std::fputs("error: --pad keyboard needs the window or --pad-script\n", stderr);
     return false;
   }
-  if (!opt.pad_script.empty() && opt.pad != "keyboard") {
-    std::fputs("error: --pad-script needs --pad keyboard\n", stderr);
+  // GameInput delivers readings to the foreground window only.
+  if (padUsesGamepad(opt.pad) && !opt.window) {
+    std::fprintf(stderr, "error: --pad %s needs the window\n", opt.pad.c_str());
+    return false;
+  }
+  if (!opt.pad_script.empty() && !padUsesKeyboard(opt.pad)) {
+    std::fputs("error: --pad-script needs --pad keyboard or keyboard+gamepad\n", stderr);
     return false;
   }
   // A window means somebody is listening; unattended runs must not need a sound device.
@@ -655,18 +666,19 @@ int main(int argc, char** argv) {
     dal::logWarn("dal: timer: the 1 ms resolution request was refused; timed waits use the default tick");
   }
 
-  // The window thread and the script thread share `opt.keyboard`; the executor factory below copies
+  // The window, script and gamepad threads share `opt.keyboard`; the executor factory below copies
   // the options, so it is created first.
-  if (opt.pad == "keyboard") {
+  if (padUsesKeyboard(opt.pad) || padUsesGamepad(opt.pad)) {
     opt.keyboard = std::make_shared<dal::KeyboardPadState>();
-    dal::setPadProvider(dal::makeKeyboardPadProvider(opt.keyboard));
+    // With the keyboard in the pad, port 0 is always there; a gamepad-only pad follows the hardware.
+    dal::setPadProvider(dal::makeKeyboardPadProvider(opt.keyboard, {}, {.always_connected = opt.pad != "gamepad"}));
     std::string where;
     if (opt.window) where += " (window)";
     if (!opt.pad_script.empty()) {
       where += std::format(" (script {}, {} events)", std::filesystem::path(opt.pad_script).filename().string(),
                            opt.pad_script_events.size());
     }
-    dal::logInfo("dal: pad: keyboard{}", where);
+    dal::logInfo("dal: pad: {}{}", opt.pad, where);
   } else {
     dal::setPadBackend(opt.pad);
   }
@@ -682,13 +694,17 @@ int main(int argc, char** argv) {
   // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
   // The script clock starts here so that it matches --seconds within a few milliseconds.
   if (opt.keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, opt.keyboard);
-  // GameInput takes about a second to initialise, so the probe thread creates the backend itself.
-  if (opt.pad_probe) {
-    dal::startGamepadProbe(
+  // GameInput takes about a second to initialise, so the gamepad thread creates the backend itself.
+  // The probe alone (no gamepad in the pad) runs the thread without a state to write.
+  if (padUsesGamepad(opt.pad) || opt.pad_probe) {
+    dal::startGamepadHub(
         []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
           return dal::makeGameInputBackend({});
         },
-        dal::detectSteamContext);
+        padUsesGamepad(opt.pad) ? opt.keyboard : nullptr,
+        {.is_foreground = dal::processOwnsForegroundWindow,
+         .detect_steam = dal::detectSteamContext,
+         .probe = opt.pad_probe});
   }
   dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
   dal::runSupervisor(opt.seconds);

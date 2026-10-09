@@ -341,4 +341,12 @@ SteamContext detectSteamContext() {
   return context;
 }
 
+bool processOwnsForegroundWindow() {
+  const HWND foreground = GetForegroundWindow();
+  if (foreground == nullptr) return false;
+  DWORD process_id = 0;
+  GetWindowThreadProcessId(foreground, &process_id);
+  return process_id == GetCurrentProcessId();
+}
+
 }  // namespace dal
