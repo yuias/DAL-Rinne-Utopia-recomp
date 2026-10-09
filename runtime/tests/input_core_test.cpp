@@ -2,6 +2,8 @@
 // GameInput, so nothing here needs a pad, a Windows input runtime or generated code.
 
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,6 +22,7 @@
 
 #include "core/log.h"
 #include "input/gamepad_backend.h"
+#include "input/gamepad_map.h"
 #include "input/gamepad_probe.h"
 
 namespace {
@@ -371,6 +375,225 @@ void testProbeUnavailableBackend() {
   CHECK(log.waitFor("dal: pad: gameinput unavailable: no runtime; gamepads disabled"));
 }
 
+dal::GamepadReading readingWithButton(GamepadButton button) {
+  dal::GamepadReading reading;
+  reading.buttons = gamepadButtonBit(button);
+  return reading;
+}
+
+void testMapButtonTable() {
+  struct Row {
+    GamepadButton from;
+    dal::PadButton to;
+  };
+  const Row rows[] = {
+      {GamepadButton::A, dal::PadButton::Cross},
+      {GamepadButton::B, dal::PadButton::Circle},
+      {GamepadButton::X, dal::PadButton::Square},
+      {GamepadButton::Y, dal::PadButton::Triangle},
+      {GamepadButton::DPadUp, dal::PadButton::Up},
+      {GamepadButton::DPadDown, dal::PadButton::Down},
+      {GamepadButton::DPadLeft, dal::PadButton::Left},
+      {GamepadButton::DPadRight, dal::PadButton::Right},
+      {GamepadButton::LeftShoulder, dal::PadButton::L1},
+      {GamepadButton::RightShoulder, dal::PadButton::R1},
+      {GamepadButton::View, dal::PadButton::Select},
+      {GamepadButton::Menu, dal::PadButton::Start},
+      {GamepadButton::LeftThumbstick, dal::PadButton::L3},
+      {GamepadButton::RightThumbstick, dal::PadButton::R3},
+  };
+  static_assert(std::size(rows) == static_cast<std::size_t>(GamepadButton::Count));
+  for (const Row& row : rows) {
+    const dal::MappedPad pad = dal::mapGamepadReading(readingWithButton(row.from));
+    CHECK(pad.buttons == dal::padButtonBit(row.to));
+    CHECK(pad.analog == dal::PadAnalog{});
+  }
+
+  dal::GamepadReading all;
+  all.buttons = gamepadButtonBit(GamepadButton::A) | gamepadButtonBit(GamepadButton::B) |
+                gamepadButtonBit(GamepadButton::DPadUp);
+  CHECK(dal::mapGamepadReading(all).buttons ==
+        (dal::padButtonBit(dal::PadButton::Cross) | dal::padButtonBit(dal::PadButton::Circle) |
+         dal::padButtonBit(dal::PadButton::Up)));
+}
+
+void testMapIdleReading() {
+  CHECK(dal::mapGamepadReading(dal::GamepadReading{}) == dal::MappedPad{});
+
+  // Noise inside the deadzones and below the trigger threshold is still idle.
+  dal::GamepadReading noisy;
+  noisy.left_x = 0.1f;
+  noisy.left_y = -0.15f;
+  noisy.right_x = -0.15f;
+  noisy.right_y = 0.15f;
+  noisy.left_trigger = 29.0f / 255.0f;
+  noisy.right_trigger = 0.05f;
+  CHECK(dal::mapGamepadReading(noisy) == dal::MappedPad{});
+}
+
+void testStickByte() {
+  CHECK(dal::stickByte(0.0f) == 0x80);
+  CHECK(dal::stickByte(-0.0f) == 0x80);
+  CHECK(dal::stickByte(1.0f) == 0xFF);
+  CHECK(dal::stickByte(-1.0f) == 0x00);
+  // Out-of-range input is clamped.
+  CHECK(dal::stickByte(1.5f) == 0xFF);
+  CHECK(dal::stickByte(-1.5f) == 0x00);
+  CHECK(dal::stickByte(0.5f) == 191);   // lround(1.5 * 127.5) = 191
+  CHECK(dal::stickByte(-0.5f) == 64);   // lround(0.5 * 127.5) = 64
+}
+
+void testMapSticks() {
+  dal::GamepadReading reading;
+  reading.left_x = 1.0f;
+  CHECK(dal::mapGamepadReading(reading).analog.left_x == 0xFF);
+  reading.left_x = -1.0f;
+  CHECK(dal::mapGamepadReading(reading).analog.left_x == 0x00);
+
+  // GameInput +y is up and CellPadData 0 is up.
+  reading = {};
+  reading.left_y = 1.0f;
+  reading.right_y = -1.0f;
+  dal::MappedPad pad = dal::mapGamepadReading(reading);
+  CHECK(pad.analog.left_y == 0x00);
+  CHECK(pad.analog.right_y == 0xFF);
+  CHECK(pad.analog.left_x == 0x80 && pad.analog.right_x == 0x80);
+
+  // Each stick has its own deadzone.
+  reading = {};
+  reading.left_x = 0.23f;   // below 0.2395
+  reading.right_x = 0.25f;  // below 0.2652
+  CHECK(dal::mapGamepadReading(reading) == dal::MappedPad{});
+  reading.left_x = 0.25f;   // above the left deadzone
+  reading.right_x = 0.28f;  // above the right deadzone
+  pad = dal::mapGamepadReading(reading);
+  CHECK(pad.analog.left_x != 0x80);
+  CHECK(pad.analog.right_x != 0x80);
+
+  // Just outside the deadzone the output is near the centre: the rescaling avoids a jump.
+  reading = {};
+  reading.left_x = dal::kLeftStickDeadzone + 0.001f;
+  reading.right_y = -(dal::kRightStickDeadzone + 0.001f);
+  pad = dal::mapGamepadReading(reading);
+  CHECK(std::abs(static_cast<int>(pad.analog.left_x) - 0x80) <= 2);
+  CHECK(pad.analog.left_x != 0x00);
+  CHECK(std::abs(static_cast<int>(pad.analog.right_y) - 0x80) <= 2);
+
+  // The deadzone is radial: each axis alone is inside it, but the diagonal (radius 0.28) is outside,
+  // while a diagonal of radius 0.21 is idle.
+  const auto [zx, zy] = dal::applyRadialDeadzone(0.15f, 0.15f, dal::kLeftStickDeadzone);
+  CHECK(zx == 0.0f && zy == 0.0f);
+  const auto [ox, oy] = dal::applyRadialDeadzone(0.2f, 0.2f, dal::kLeftStickDeadzone);
+  CHECK(ox > 0.0f && oy > 0.0f);
+  const auto [ex, ey] = dal::applyRadialDeadzone(0.0f, 0.0f, dal::kLeftStickDeadzone);
+  CHECK(ex == 0.0f && ey == 0.0f);
+
+  // Direction is kept and a full deflection stays 1.
+  const auto [fx, fy] = dal::applyRadialDeadzone(0.0f, -1.0f, dal::kRightStickDeadzone);
+  CHECK(fx == 0.0f && std::abs(fy + 1.0f) < 1e-6f);
+}
+
+void testMapDiagonalClamped() {
+  // (1, 1) has radius sqrt(2); it is clamped to radius 1, not to the square's corner.
+  const auto [x, y] = dal::applyRadialDeadzone(1.0f, 1.0f, dal::kLeftStickDeadzone);
+  CHECK(std::abs(x - y) < 1e-6f);
+  CHECK(std::abs(x - std::sqrt(0.5f)) < 1e-5f);
+  const int expected = dal::stickByte(std::sqrt(0.5f));
+  CHECK(dal::stickByte(x) == dal::stickByte(y));
+  CHECK(std::abs(static_cast<int>(dal::stickByte(x)) - expected) <= 1);
+
+  dal::GamepadReading reading;
+  reading.left_x = 1.0f;
+  reading.left_y = 1.0f;
+  const dal::MappedPad pad = dal::mapGamepadReading(reading);
+  CHECK(std::abs(static_cast<int>(pad.analog.left_x) - expected) <= 1);
+  // The y byte mirrors the x byte around the centre because y is inverted.
+  CHECK(std::abs(static_cast<int>(pad.analog.left_x) + static_cast<int>(pad.analog.left_y) - 255) <= 1);
+}
+
+void testMapTriggers() {
+  dal::GamepadReading reading;
+  reading.left_trigger = 29.0f / 255.0f;
+  reading.right_trigger = 29.0f / 255.0f;
+  dal::MappedPad pad = dal::mapGamepadReading(reading);
+  CHECK(pad.buttons == 0);
+  CHECK(pad.analog.l2 == 0 && pad.analog.r2 == 0);
+
+  reading.left_trigger = 30.0f / 255.0f;
+  pad = dal::mapGamepadReading(reading);
+  CHECK(pad.buttons == dal::padButtonBit(dal::PadButton::L2));
+  CHECK(pad.analog.l2 == 30);
+  CHECK(pad.analog.r2 == 0);
+
+  reading.left_trigger = 1.0f;
+  reading.right_trigger = 1.0f;
+  pad = dal::mapGamepadReading(reading);
+  CHECK(pad.buttons == (dal::padButtonBit(dal::PadButton::L2) | dal::padButtonBit(dal::PadButton::R2)));
+  CHECK(pad.analog.l2 == 255 && pad.analog.r2 == 255);
+
+  // The right trigger is R2 on its own.
+  reading = {};
+  reading.right_trigger = 0.5f;
+  pad = dal::mapGamepadReading(reading);
+  CHECK(pad.buttons == dal::padButtonBit(dal::PadButton::R2));
+  CHECK(pad.analog.r2 == 128);  // lround(127.5)
+}
+
+void testMergeMappedPads() {
+  CHECK(dal::mergeMappedPads({}) == dal::MappedPad{});
+
+  dal::MappedPad first;
+  first.buttons = dal::padButtonBit(dal::PadButton::Cross);
+  first.analog.left_x = 0x90;  // 16 right of centre
+  first.analog.left_y = 0x10;  // 112 up
+  first.analog.right_x = 0x80;
+  first.analog.l2 = 40;
+  dal::MappedPad second;
+  second.buttons = dal::padButtonBit(dal::PadButton::Circle);
+  second.analog.left_x = 0x10;  // 112 left: farther than the first
+  second.analog.left_y = 0xA0;  // 32 down: nearer than the first
+  second.analog.right_x = 0xF0;
+  second.analog.l2 = 200;
+  second.analog.r2 = 7;
+
+  const dal::MappedPad pads[] = {first, second};
+  const dal::MappedPad merged = dal::mergeMappedPads(pads);
+  CHECK(merged.buttons == (dal::padButtonBit(dal::PadButton::Cross) | dal::padButtonBit(dal::PadButton::Circle)));
+  CHECK(merged.analog.left_x == 0x10);
+  CHECK(merged.analog.left_y == 0x10);
+  CHECK(merged.analog.right_x == 0xF0);
+  CHECK(merged.analog.right_y == 0x80);
+  CHECK(merged.analog.l2 == 200);
+  CHECK(merged.analog.r2 == 7);
+
+  // One pad merges to itself.
+  const dal::MappedPad one[] = {second};
+  CHECK(dal::mergeMappedPads(one) == second);
+
+  // Equal distance on opposite sides: the first pad wins.
+  dal::MappedPad left, right;
+  left.analog.left_x = 0x40;   // 64 left
+  right.analog.left_x = 0xC0;  // 64 right
+  const dal::MappedPad tie[] = {left, right};
+  CHECK(dal::mergeMappedPads(tie).analog.left_x == 0x40);
+  const dal::MappedPad tie_swapped[] = {right, left};
+  CHECK(dal::mergeMappedPads(tie_swapped).analog.left_x == 0xC0);
+}
+
+void testRumbleFromCellPad() {
+  CHECK(dal::rumbleFromCellPad(0, 0) == dal::GamepadRumble{});
+  const dal::GamepadRumble small = dal::rumbleFromCellPad(1, 0);
+  CHECK(small.high_frequency == 1.0f && small.low_frequency == 0.0f);
+  const dal::GamepadRumble full_small = dal::rumbleFromCellPad(255, 0);
+  CHECK(full_small.high_frequency == 1.0f);
+  const dal::GamepadRumble large = dal::rumbleFromCellPad(0, 255);
+  CHECK(large.low_frequency == 1.0f && large.high_frequency == 0.0f);
+  const dal::GamepadRumble half = dal::rumbleFromCellPad(0, 128);
+  CHECK(half.low_frequency == 128.0f / 255.0f && half.high_frequency == 0.0f);
+  const dal::GamepadRumble both = dal::rumbleFromCellPad(3, 255);
+  CHECK(both.low_frequency == 1.0f && both.high_frequency == 1.0f);
+}
+
 // The probe thread never ends, so this runs last and the program leaves with _Exit (like the game).
 // The fake's reading never changes, so the thread is silent after its start lines; that is what makes
 // ~LogCapture's unsynchronised sink swap safe.
@@ -408,6 +631,14 @@ int main() {
   testProbeFollowsDevices();
   testSteamVirtualGamepadInfoLog();
   testProbeUnavailableBackend();
+  testMapButtonTable();
+  testMapIdleReading();
+  testStickByte();
+  testMapSticks();
+  testMapDiagonalClamped();
+  testMapTriggers();
+  testMergeMappedPads();
+  testRumbleFromCellPad();
   testProbeThreadStartLines();
 
   std::printf("input core tests: %d passed, %d failed\n", g_passed, g_failed);
