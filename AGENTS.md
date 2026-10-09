@@ -9,6 +9,12 @@
 - Do not add comments that merely mark generated or modified sections.
 - Prefer `//` over `/* */`. Both are acceptable, but be consistent within a file.
 
+## C/C++ formatting
+
+- Format C/C++ under `runtime/` and `tools/` with `clang-format` and the repository's `.clang-format`
+  (Google style with 4-space indentation, 120 columns). `generated/` and `externals/` are not formatted.
+- The Google Style Guide below applies to naming only; layout follows `.clang-format`.
+
 ## C/C++ Naming conventions
 
 Google C++ Style Guide (https://google.github.io/styleguide/cppguide.html) with the following modifications.
