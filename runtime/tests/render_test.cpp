@@ -1038,6 +1038,7 @@ struct TextureOptions {
   float coord_scale = 1.0f;     // texture coordinates run 0..coord_scale over the quad
   std::uint32_t pitch = 0;      // Memory scene: row pitch in bytes (0: no padding); padding holds junk
   bool unnormalized = false;    // _UN format: coordinates are in texels
+  std::uint32_t dxt = 0;        // Memory scene: base format 0x86/0x87/0x88 for a 4x4 block-compressed texture
 };
 
 constexpr std::uint32_t kAliasOffset = 0x50000;
@@ -1068,6 +1069,26 @@ std::vector<std::uint8_t> makeTexturedCapture(const TextureOptions& options) {
       }
     }
     scene.bindTexture(kTextureOffset, kTextureSize, kTextureSize, pitch, options.unnormalized ? 0x40u : 0u);
+    if (options.dxt != 0) {
+      // One 4x4 block (alpha bytes first for DXT23 and DXT45). Colors: red 0xF800 and blue 0x001F as
+      // little-endian halves, then one row of 2-bit indices per byte: color0, color1, color2, color3.
+      std::uint32_t at = kTextureOffset;
+      if (options.dxt == 0x87) {
+        scene.memory().putWord(0, at, 0x88888888);  // explicit 4-bit alpha 8 for every texel
+        scene.memory().putWord(0, at + 4, 0x88888888);
+        at += 8;
+      } else if (options.dxt == 0x88) {
+        scene.memory().putWord(0, at, 0x80800000);  // both alpha endpoints 0x80, all indices 0
+        scene.memory().putWord(0, at + 4, 0);
+        at += 8;
+      }
+      scene.memory().putWord(0, at, 0x00F81F00);
+      scene.memory().putWord(0, at + 4, 0x0055AAFF);
+      // The pitch register of a compressed texture is ignored; give it a value that is not the row size.
+      scene.write(dal::kMethodNv4097SetTextureFormat, 1u | (2u << 4) | ((options.dxt | 0x20u) << 8) | (1u << 16));
+      scene.write(dal::kMethodNv4097SetTextureImageRect, (4u << 16) | 4u);
+      scene.write(dal::kMethodNv4097SetTextureControl3, 0);
+    }
   }
   scene.write(dal::kMethodNv4097SetTextureControl1, options.remap);
   scene.write(dal::kMethodNv4097SetTextureAddress, options.wrap | (options.wrap << 8) | (1u << 16));
@@ -1267,6 +1288,41 @@ void testRendererTextures(dal::VkContext& ctx) {
   CHECK(renderer.stats().feedback_copies == 1);
   CHECK(pixelArgb(bgra, width, 32, 32) == 0xFF996633 && pixelArgb(bgra, width, 2, 2) == kAliasColor);
   expectNoNotes();
+
+  // 4x4 block-compressed textures magnified 8 times: texel rows 0 and 1 hold color0 (red) and color1
+  // (blue) exactly, row 2 and 3 their blends. DXT1 is opaque, DXT23 carries alpha 0x88 and DXT45 0x80.
+  if (ctx.hasTextureBC()) {
+    const std::uint64_t uploads_before = renderer.stats().texture_uploads;
+    const auto within = [](std::uint32_t argb, std::uint32_t expected) {
+      for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+        const int a = static_cast<int>((argb >> shift) & 0xFF);
+        const int b = static_cast<int>((expected >> shift) & 0xFF);
+        if (std::abs(a - b) > 2) return false;
+      }
+      return true;
+    };
+    for (const std::uint32_t dxt : {0x86u, 0x87u, 0x88u}) {
+      TextureOptions block;
+      block.dxt = dxt;
+      render(block);
+      const std::uint32_t alpha = dxt == 0x86 ? 0xFF000000u : dxt == 0x87 ? 0x88000000u : 0x80000000u;
+      CHECK(pixelArgb(bgra, width, 20, 20) == (alpha | 0xFF0000));
+      CHECK(pixelArgb(bgra, width, 44, 28) == (alpha | 0x0000FF));
+      CHECK(within(pixelArgb(bgra, width, 30, 36), alpha | 0xAA0055));
+      CHECK(within(pixelArgb(bgra, width, 30, 44), alpha | 0x5500AA));
+      CHECK(pixelArgb(bgra, width, 2, 2) == 0xFF000000);
+      expectNoNotes();
+    }
+    CHECK(renderer.stats().texture_uploads == uploads_before + 3);
+
+    // The remap applies to compressed images as to A8R8G8B8 ones.
+    TextureOptions swapped_block;
+    swapped_block.dxt = 0x86;
+    swapped_block.remap = 0xAA6C;
+    render(swapped_block);
+    CHECK(pixelArgb(bgra, width, 20, 20) == 0xFF0000FF && pixelArgb(bgra, width, 44, 28) == 0xFFFF0000);
+    expectNoNotes();
+  }
 
   CHECK(renderer.valid());
   dal::rsxUnimplementedReset();

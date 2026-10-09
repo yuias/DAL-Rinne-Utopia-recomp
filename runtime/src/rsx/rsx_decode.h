@@ -37,6 +37,34 @@ inline constexpr std::uint32_t kRsxTextureBaseMask = 0x9F;
 inline constexpr std::uint32_t kRsxTextureLinearFlag = 0x20;        // CELL_GCM_TEXTURE_LN; clear = swizzled
 inline constexpr std::uint32_t kRsxTextureUnnormalizedFlag = 0x40;  // CELL_GCM_TEXTURE_UN; clear = _NR (normalized coords)
 inline constexpr std::uint32_t kRsxTextureA8R8G8B8 = 0x85;
+inline constexpr std::uint32_t kRsxTextureDxt1 = 0x86;   // S3TC BC1, 8-byte blocks
+inline constexpr std::uint32_t kRsxTextureDxt23 = 0x87;  // BC2, 16-byte blocks
+inline constexpr std::uint32_t kRsxTextureDxt45 = 0x88;  // BC3, 16-byte blocks
+
+// Bytes of one 4x4 block of a DXT format (the base format after masking the layout and normalization
+// flags); 0 for any other format.
+constexpr std::uint32_t rsxTextureBlockBytes(std::uint32_t format) {
+  switch (format & kRsxTextureBaseMask) {
+    case kRsxTextureDxt1: return 8;
+    case kRsxTextureDxt23:
+    case kRsxTextureDxt45: return 16;
+    default: return 0;
+  }
+}
+
+// Block-compressed textures are never swizzled and are stored as rows of 4x4 blocks, each row
+// ceil(width / 4) blocks wide. Both functions return 0 for a non-DXT format.
+constexpr std::uint64_t rsxCompressedRowBytes(std::uint32_t format, std::uint32_t width) {
+  return static_cast<std::uint64_t>((width + 3) / 4) * rsxTextureBlockBytes(format);
+}
+constexpr std::uint64_t rsxCompressedSize(std::uint32_t format, std::uint32_t width, std::uint32_t height) {
+  return rsxCompressedRowBytes(format, width) * ((height + 3) / 4);
+}
+
+// Formats whose bytes the frame builder copies and the renderer samples.
+constexpr bool rsxTextureFormatSampleable(std::uint32_t format) {
+  return (format & kRsxTextureBaseMask) == kRsxTextureA8R8G8B8 || rsxTextureBlockBytes(format) != 0;
+}
 
 // SET_INDEX_ARRAY_DMA type field (RPCS3 `CELL_GCM_DRAW_INDEX_ARRAY_TYPE_*`).
 inline constexpr std::uint32_t kRsxIndexTypeU32 = 0;

@@ -260,6 +260,13 @@ std::unique_ptr<VkContext> createVkContext(const VkContextOptions& options, std:
   features13.synchronization2 = VK_TRUE;
   features13.shaderDemoteToHelperInvocation = VK_TRUE;
 
+  // Optional: DXT guest textures fall back to the placeholder without it.
+  VkPhysicalDeviceFeatures supported_features{};
+  vkGetPhysicalDeviceFeatures(chosen.device, &supported_features);
+  ctx->has_texture_bc_ = supported_features.textureCompressionBC == VK_TRUE;
+  VkPhysicalDeviceFeatures enabled_features{};
+  enabled_features.textureCompressionBC = ctx->has_texture_bc_ ? VK_TRUE : VK_FALSE;
+
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queue_info{};
   queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -270,6 +277,7 @@ std::unique_ptr<VkContext> createVkContext(const VkContextOptions& options, std:
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.pNext = &features13;
+  device_info.pEnabledFeatures = &enabled_features;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
   device_info.enabledExtensionCount = static_cast<std::uint32_t>(device_exts.size());

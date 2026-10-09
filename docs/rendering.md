@@ -47,7 +47,9 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   kept in a render target cache keyed by memory location and offset. A texture whose address is
   a known render target is sampled from that target (render target aliasing), and a draw that
   samples the target it renders to reads a copy of it. Other textures are uploaded from the
-  guest bytes into B8G8R8A8 images; a unit without a usable texture reads a 1x1 magenta image.
+  guest bytes into B8G8R8A8 images (linear A8R8G8B8) or BC1/BC2/BC3 images (DXT1/DXT23/DXT45,
+  one 2D mip level, block rows copied as stored whatever the layout bit says); a unit without a
+  usable texture reads a 1x1 magenta image.
   Cull mode, depth state, viewport, scissor, topology and blend constants are dynamic state;
   pipelines are cached by what is baked into them.
 - **Readback** is gated. Copying the display buffer back to the host costs 8 MiB per flip at 1080p,

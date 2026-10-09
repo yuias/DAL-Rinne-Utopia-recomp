@@ -722,10 +722,15 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
         rsxNoteUnimplemented("state", "texture data short");
         continue;
       }
-      // The copy reads pitch * (height - 1) + width * 4 bytes from the staging buffer.
-      const std::uint64_t row_bytes = static_cast<std::uint64_t>(texture->width) * 4;
-      if (texture->pitch < row_bytes ||
-          texture->data_size < static_cast<std::uint64_t>(texture->pitch) * (texture->height - 1) + row_bytes) {
+      // The copy reads pitch * (height - 1) + width * 4 bytes from the staging buffer, or whole block rows
+      // for a compressed texture.
+      const bool compressed = rsxTextureBlockBytes(texture->format) != 0;
+      const std::uint64_t row_bytes = compressed ? rsxCompressedRowBytes(texture->format, texture->width)
+                                                 : static_cast<std::uint64_t>(texture->width) * 4;
+      const std::uint64_t needed = compressed
+                                       ? rsxCompressedSize(texture->format, texture->width, texture->height)
+                                       : static_cast<std::uint64_t>(texture->pitch) * (texture->height - 1) + row_bytes;
+      if (texture->pitch < row_bytes || texture->data_size < needed) {
         rsxNoteUnimplemented("state", "texture data short");
         continue;
       }
@@ -739,15 +744,24 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
       if (std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
         UploadRef staging;
         if (!allocUpload(texture->data_size, staging)) return false;
-        // Guest texels are big-endian words A, R, G, B in memory; byte swapped they are B8G8R8A8 texels.
         const std::uint8_t* source = draw.texture_data.data() + texture->data_offset;
-        for (std::size_t i = 0; i + 4 <= texture->data_size; i += 4) {
-          std::uint32_t word;
-          std::memcpy(&word, source + i, 4);
-          word = std::byteswap(word);
-          std::memcpy(staging.data + i, &word, 4);
+        if (compressed) {
+          // Blocks are stored the way Vulkan expects them.
+          std::memcpy(staging.data, source, texture->data_size);
+        } else {
+          // Guest texels are big-endian words A, R, G, B in memory; byte swapped they are B8G8R8A8 texels.
+          for (std::size_t i = 0; i + 4 <= texture->data_size; i += 4) {
+            std::uint32_t word;
+            std::memcpy(&word, source + i, 4);
+            word = std::byteswap(word);
+            std::memcpy(staging.data + i, &word, 4);
+          }
         }
-        textures_->recordUpload(cmd, *image, staging.buffer, staging.offset, texture->pitch / 4);
+        // Row length in texels: a block covers 4 texels.
+        const std::uint32_t row_length =
+            compressed ? static_cast<std::uint32_t>(row_bytes / rsxTextureBlockBytes(texture->format)) * 4
+                       : texture->pitch / 4;
+        textures_->recordUpload(cmd, *image, staging.buffer, staging.offset, row_length);
         uploaded.push_back(image.get());
         stats_.texture_uploads++;
       }

@@ -5738,7 +5738,21 @@ void testRsxDecode() {
   CHECK(dal::decodeTexture(*regs, 1).pitch == 0x12345);
   regs->apply(0x1A04 + 0x20, 1u | (2u << 4) | (0x86u << 8) | (1u << 16));
   CHECK(!dal::decodeTexture(*regs, 1).linear_layout);
-  CHECK(unimplementedCount("texture format DXT1_SZ_NR") == 1);
+  CHECK(unimplementedCount("texture format DXT1_SZ_NR") == 0);  // block-compressed formats are sampled
+  regs->apply(0x1A04 + 0x20, 1u | (2u << 4) | (0x84u << 8) | (1u << 16));
+  dal::rsxUnimplementedReset();
+  const dal::RsxTextureDesc r5g6b5 = dal::decodeTexture(*regs, 1);
+  CHECK(r5g6b5.format == 0x84);
+  CHECK(unimplementedCount("texture format R5G6B5_SZ_NR") == 1);
+
+  // Block-compressed sizes: 4x4 blocks of 8 (DXT1) or 16 (DXT23, DXT45) bytes, partial blocks rounded up.
+  CHECK(dal::rsxTextureBlockBytes(0x86) == 8 && dal::rsxTextureBlockBytes(0x87 | 0x20) == 16);
+  CHECK(dal::rsxTextureBlockBytes(0x88 | 0x40) == 16 && dal::rsxTextureBlockBytes(0x85) == 0);
+  CHECK(dal::rsxCompressedRowBytes(0x86, 16) == 32 && dal::rsxCompressedRowBytes(0x88, 17) == 80);
+  CHECK(dal::rsxCompressedSize(0x86, 16, 8) == 64 && dal::rsxCompressedSize(0x88, 17, 5) == 160);
+  CHECK(dal::rsxCompressedSize(0x87, 1, 1) == 16 && dal::rsxCompressedSize(0x85, 16, 16) == 0);
+  CHECK(dal::rsxTextureFormatSampleable(0x85 | 0x20) && dal::rsxTextureFormatSampleable(0x88));
+  CHECK(!dal::rsxTextureFormatSampleable(0x84));
   regs->apply(0x1A04, 1u | (2u << 4) | ((0x85u | 0x20u | 0x40u) << 8) | (1u << 16));
   CHECK(!dal::decodeTexture(*regs, 0).normalized);
   CHECK(unimplementedCount("texture format A8R8G8B8_LN_UN") == 0);  // the renderer scales the coordinates
@@ -6029,6 +6043,41 @@ void testRsxFrameBuilder() {
   CHECK(textured.textures[2].unit == 2 && textured.textures[2].data_size == 0);
   CHECK(unimplementedCount("texture layout swizzled") == 1);
   CHECK(unimplementedCount("state texture location 0x0") == 0);
+
+  // Block-compressed textures copy whole block rows whatever the layout bit and the pitch register say:
+  // unit 3 is a swizzled-flag DXT45 8x5 (2x2 blocks of 16 bytes), unit 4 a linear DXT1 6x4 with a
+  // padded pitch register (2x1 blocks of 8 bytes), unit 5 a DXT1 with two mip levels (counted, no bytes).
+  write(0x1A0C, 0);
+  write(0x1A0C + 0x20, 0);
+  write(0x1A0C + 0x40, 0);
+  const auto dxtUnit = [&](std::uint32_t unit, std::uint32_t fmt, std::uint32_t mips, std::uint32_t width,
+                           std::uint32_t height, std::uint32_t pitch) {
+    write(0x1A00 + unit * 0x20, 0x3000);
+    write(0x1A04 + unit * 0x20, 1u | (2u << 4) | (fmt << 8) | (mips << 16));
+    write(0x1A0C + unit * 0x20, 0x80000000);
+    write(0x1A18 + unit * 0x20, (width << 16) | height);
+    write(0x1840 + unit * 4, pitch);
+  };
+  dxtUnit(3, 0x88, 1, 8, 5, 0);
+  dxtUnit(4, 0x86 | 0x20, 1, 6, 4, 0x1000);
+  dxtUnit(5, 0x86, 2, 8, 8, 0);
+  write(0x1808, 5);
+  write(0x1814, 2u << 24);
+  write(0x1808, 0);
+  commands = builder.takeCommands();
+  CHECK(commands.size() == 1);
+  const dal::RsxDraw& compressed = std::get<dal::RsxDraw>(commands[0]);
+  CHECK(compressed.textures.size() == 3);
+  CHECK(compressed.textures[0].unit == 3 && compressed.textures[0].data_size == 64 && compressed.textures[0].pitch == 32);
+  CHECK(compressed.textures[1].unit == 4 && compressed.textures[1].data_size == 16 && compressed.textures[1].pitch == 16);
+  CHECK(compressed.textures[2].unit == 5 && compressed.textures[2].data_size == 0);
+  CHECK(compressed.texture_data.size() == 64 + 16);
+  CHECK(compressed.texture_data[0] == (0 ^ 0x5A) && compressed.texture_data[63] == (63 ^ 0x5A));
+  CHECK(compressed.texture_data[compressed.textures[1].data_offset] == (0 ^ 0x5A) &&
+        compressed.texture_data[compressed.textures[1].data_offset + 15] == (15 ^ 0x5A));
+  CHECK(unimplementedCount("texture layout swizzled") == 1);  // compressed formats are never counted as swizzled
+  CHECK(unimplementedCount("texture layout mips 2") == 1);
+  CHECK(unimplementedCount("texture format DXT45_SZ_NR") == 0);
 
   // The fragment program with an inline constant keeps its place in the ucode but zeroed; programs
   // that differ only in the constant hash equal.

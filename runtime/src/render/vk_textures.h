@@ -16,15 +16,20 @@
 
 namespace dal {
 
-// Every sampled image is B8G8R8A8: render targets as they are, guest textures after a 32-bit byte swap
-// of each texel on upload (guest bytes A, R, G, B become B, G, R, A). Its channels therefore read as the
-// guest's R, G, B, A, and the identity remap gives an identity view (which keeps border colours defined).
+// Sampled images are B8G8R8A8 for render targets and A8R8G8B8 guest textures (after a 32-bit byte swap
+// of each texel on upload, guest bytes A, R, G, B become B, G, R, A), and BC1/BC2/BC3 for DXT1/DXT23/DXT45
+// guest textures (block bytes uploaded as stored). Their channels read as the guest's R, G, B, A, and the
+// identity remap gives an identity view (which keeps border colours defined).
 //
 // Component mapping of a view for the texture's SET_TEXTURE_CONTROL1 word: bits 0..7 select the source
 // channel of A, R, G, B (two bits each: A = 0, R = 1, G = 2, B = 3) and bits 8..15 say whether the
 // channel reads it (2), is forced to 1 or to 0. The identity word is 0xAAE4. Only the low 16 bits are used;
 // the override bits of the high half matter for formats other than A8R8G8B8.
 VkComponentMapping textureComponentMapping(std::uint32_t remap);
+
+// Vulkan format of the image that holds a guest texture of RSX format `rsx_format` (flag bits ignored);
+// UNDEFINED for a format that is not sampled.
+VkFormat textureVkFormat(std::uint32_t rsx_format);
 
 // The border colour word (ARGB) as the remap delivers it to the shader.
 std::uint32_t remapBorderColor(std::uint32_t border, std::uint32_t remap);
@@ -103,10 +108,13 @@ class TextureCache {
  private:
   using Key = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
 
-  std::shared_ptr<TextureImage> create(std::uint32_t width, std::uint32_t height, VkImageUsageFlags usage);
+  std::shared_ptr<TextureImage> create(std::uint32_t width, std::uint32_t height, VkFormat format,
+                                       VkImageUsageFlags usage);
+  bool formatUsable(VkFormat format);
   void fail(std::string message);
 
   VkContext& context_;
+  std::map<VkFormat, bool> format_usable_;
   std::string error_;
   std::uint64_t tick_ = 0;
   std::map<Key, std::shared_ptr<TextureImage>> images_;

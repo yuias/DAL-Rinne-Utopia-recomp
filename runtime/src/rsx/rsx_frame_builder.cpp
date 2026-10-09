@@ -274,8 +274,8 @@ bool RsxFrameBuilder::fillVertices(const RsxRegisters& regs, RsxDraw& draw, std:
   return true;
 }
 
-// Texture bytes are copied for the one layout the renderer supports: linear, 2D, one mip level, a
-// supported format. A texture at a known render target is an alias and carries no bytes. RPCS3 takes
+// Texture bytes are copied for the layouts the renderer supports: 2D, one mip level, A8R8G8B8 linear or
+// DXT1/DXT23/DXT45 in any layout (block rows, see below). A texture at a known render target is an alias and carries no bytes. RPCS3 takes
 // the pitch from the row size when the register is 0 (`texture_cache.h` upload path).
 void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
   for (std::uint32_t unit = 0; unit < kRsxTextureUnitCount; unit++) {
@@ -288,18 +288,29 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
       continue;
     }
 
-    if (!t.linear_layout) rsxNoteUnimplemented("texture layout", "swizzled");
+    // Block-compressed rows are always contiguous, whatever the layout bit says.
+    const bool compressed = rsxTextureBlockBytes(t.format) != 0;
+    if (!t.linear_layout && !compressed) rsxNoteUnimplemented("texture layout", "swizzled");
     if (t.cubemap) rsxNoteUnimplemented("texture layout", "cubemap");
     if (t.mips > 1) rsxNoteUnimplemented("texture layout", std::format("mips {}", t.mips));
     if (t.dimension != 2) rsxNoteUnimplemented("texture layout", std::format("dimension {}", t.dimension));
 
-    const bool supported_format = (t.format & kRsxTextureBaseMask) == kRsxTextureA8R8G8B8;
-    const bool supported_layout = t.linear_layout && !t.cubemap && t.mips <= 1 && t.dimension == 2;
+    const bool supported_format = rsxTextureFormatSampleable(t.format);
+    const bool supported_layout =
+        (t.linear_layout || compressed) && !t.cubemap && t.mips <= 1 && t.dimension == 2;
     if (supported_format && supported_layout && t.width != 0 && t.height != 0) {
-      const std::uint64_t row = static_cast<std::uint64_t>(t.width) * 4;
-      if (t.pitch == 0) t.pitch = static_cast<std::uint32_t>(row);
-      // The last row only needs its pixels, not the padding up to the pitch.
-      const std::uint64_t size = static_cast<std::uint64_t>(t.pitch) * (t.height - 1) + row;
+      std::uint64_t row, size;
+      if (compressed) {
+        // The pitch register is not used for the block rows (the game's value is a block row or 0).
+        row = rsxCompressedRowBytes(t.format, t.width);
+        size = rsxCompressedSize(t.format, t.width, t.height);
+        t.pitch = static_cast<std::uint32_t>(row);
+      } else {
+        row = static_cast<std::uint64_t>(t.width) * 4;
+        if (t.pitch == 0) t.pitch = static_cast<std::uint32_t>(row);
+        // The last row only needs its pixels, not the padding up to the pitch.
+        size = static_cast<std::uint64_t>(t.pitch) * (t.height - 1) + row;
+      }
       if (t.pitch < row) {
         rsxNoteUnimplemented("texture layout", "pitch below row size");
       } else if (draw.texture_data.size() + size > kRsxMaxTextureBytes) {

@@ -167,8 +167,39 @@ void TextureCache::fail(std::string message) {
   if (error_.empty()) error_ = std::move(message);
 }
 
-std::shared_ptr<TextureImage> TextureCache::create(std::uint32_t width, std::uint32_t height, VkImageUsageFlags usage) {
-  constexpr VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+VkFormat textureVkFormat(std::uint32_t rsx_format) {
+  switch (rsx_format & kRsxTextureBaseMask) {
+    case kRsxTextureA8R8G8B8: return VK_FORMAT_B8G8R8A8_UNORM;
+    case kRsxTextureDxt1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case kRsxTextureDxt23: return VK_FORMAT_BC2_UNORM_BLOCK;
+    case kRsxTextureDxt45: return VK_FORMAT_BC3_UNORM_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+  }
+}
+
+bool TextureCache::formatUsable(VkFormat format) {
+  const auto it = format_usable_.find(format);
+  if (it != format_usable_.end()) return it->second;
+  bool usable = true;
+  if (format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || format == VK_FORMAT_BC2_UNORM_BLOCK ||
+      format == VK_FORMAT_BC3_UNORM_BLOCK) {
+    // The feature has to be enabled on the device, not only supported by it.
+    usable = context_.hasTextureBC();
+    if (usable) {
+      VkFormatProperties props{};
+      vkGetPhysicalDeviceFormatProperties(context_.physicalDevice(), format, &props);
+      constexpr VkFormatFeatureFlags kNeeded = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                               VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      usable = (props.optimalTilingFeatures & kNeeded) == kNeeded;
+    }
+  }
+  format_usable_[format] = usable;
+  return usable;
+}
+
+std::shared_ptr<TextureImage> TextureCache::create(std::uint32_t width, std::uint32_t height, VkFormat format,
+                                                   VkImageUsageFlags usage) {
   const VkPhysicalDeviceProperties& props = context_.deviceProperties();
   if (width == 0 || height == 0 || width > props.limits.maxImageDimension2D || height > props.limits.maxImageDimension2D) {
     rsxNoteUnimplemented("texture layout", std::format("size {}x{}", width, height));
@@ -179,7 +210,12 @@ std::shared_ptr<TextureImage> TextureCache::create(std::uint32_t width, std::uin
   texture->format = format;
   texture->width = width;
   texture->height = height;
-  texture->bytes = static_cast<VkDeviceSize>(width) * height * 4;
+  const std::uint32_t block_bytes = format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK                                ? 8
+                                    : format == VK_FORMAT_BC2_UNORM_BLOCK || format == VK_FORMAT_BC3_UNORM_BLOCK ? 16
+                                                                                                                : 0;
+  texture->bytes = block_bytes != 0
+                       ? static_cast<VkDeviceSize>((width + 3) / 4) * ((height + 3) / 4) * block_bytes
+                       : static_cast<VkDeviceSize>(width) * height * 4;
 
   VkImageCreateInfo image_info{};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -204,8 +240,14 @@ std::shared_ptr<TextureImage> TextureCache::create(std::uint32_t width, std::uin
 }
 
 std::shared_ptr<TextureImage> TextureCache::acquire(const RsxTextureDesc& texture) {
-  if ((texture.format & kRsxTextureBaseMask) != kRsxTextureA8R8G8B8) {
+  const VkFormat format = textureVkFormat(texture.format);
+  if (format == VK_FORMAT_UNDEFINED) {
     rsxNoteUnimplemented("texture format", rsxTextureFormatName(texture.format));
+    return nullptr;
+  }
+  if (!formatUsable(format)) {
+    rsxNoteUnimplemented("texture format", std::format("{} (device lacks block compression)",
+                                                       rsxTextureFormatName(texture.format)));
     return nullptr;
   }
   const Key key{texture.location, texture.offset, texture.format, texture.width, texture.height, texture.pitch};
@@ -215,7 +257,7 @@ std::shared_ptr<TextureImage> TextureCache::acquire(const RsxTextureDesc& textur
     return it->second;
   }
   std::shared_ptr<TextureImage> created =
-      create(texture.width, texture.height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      create(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   if (!created) return nullptr;
   created->last_used = ++tick_;
   images_[key] = created;
@@ -227,7 +269,7 @@ std::shared_ptr<TextureImage> TextureCache::scratch(std::uint32_t width, std::ui
   const auto it = scratch_.find(key);
   if (it != scratch_.end()) return it->second;
   std::shared_ptr<TextureImage> created =
-      create(width, height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      create(width, height, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   if (!created) return nullptr;
   if (scratch_.size() >= kMaxScratchImages) scratch_.clear();
   scratch_[key] = created;
