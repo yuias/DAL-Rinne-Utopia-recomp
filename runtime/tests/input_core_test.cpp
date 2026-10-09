@@ -1,6 +1,7 @@
 // Self-checking unit tests for the gamepad code in the runtime core. A fake backend stands in for
 // GameInput, so nothing here needs a pad, a Windows input runtime or generated code.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -15,15 +16,18 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/log.h"
 #include "input/gamepad_backend.h"
 #include "input/gamepad_map.h"
 #include "input/gamepad_probe.h"
+#include "input/gamepad_select.h"
 
 namespace {
 
@@ -594,6 +598,260 @@ void testRumbleFromCellPad() {
   CHECK(both.low_frequency == 1.0f && both.high_frequency == 1.0f);
 }
 
+// Device paths measured with the Xbox Wireless Controller over Bluetooth LE; the Bluetooth address
+// is replaced and the tail after the interface is synthetic.
+constexpr const char* kXboxPhysicalPath =
+    R"(\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}&Dev&VID_045e&PID_0b13&REV_0509&0123456789ab&IG_00#c&1a2b3c4d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030})";
+constexpr const char* kXboxName = "Bluetooth LE XINPUT compatible input device";
+
+// Values of the recorded Steam shortcut runs (with and without per-game Steam Input). The variable
+// holds 55 entries; these are representative ones of the recorded vendors, none of them 0x045e.
+constexpr const char* kRecordedIgnoreDevices =
+    "0x28de/0x1102,0x28de/0x1142,0x28de/0x11ff,0x2dc8/0x6101,0x0f0d/0x0092,0x0000/0x11fb";
+
+dal::GamepadDeviceInfo xboxPad(std::uint64_t id) {
+  dal::GamepadDeviceInfo info;
+  info.id = id;
+  info.vendor_id = 0x045e;
+  info.product_id = 0x0b13;
+  info.kinds = dal::kGamepadKindGamepad | dal::kGamepadKindController;
+  info.rumble = true;
+  info.pnp_path = kXboxPhysicalPath;
+  info.display_name = kXboxName;
+  return info;
+}
+
+// The keyboard's second HID interface, which GameInput lists as a generic controller.
+dal::GamepadDeviceInfo keyboardInterface(std::uint64_t id) {
+  dal::GamepadDeviceInfo info;
+  info.id = id;
+  info.vendor_id = 0x3434;
+  info.product_id = 0xd030;
+  info.kinds = dal::kGamepadKindController;
+  return info;
+}
+
+dal::GamepadDeviceInfo steamVirtualPad(std::uint64_t id, std::string path) {
+  dal::GamepadDeviceInfo info;
+  info.id = id;
+  info.vendor_id = 0x045e;
+  info.product_id = 0x028e;
+  info.kinds = dal::kGamepadKindGamepad | dal::kGamepadKindController;
+  info.rumble = true;
+  info.pnp_path = std::move(path);
+  return info;
+}
+
+void testSteamVirtualPath() {
+  const std::string path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#2#4321)";
+  const auto pad = dal::parseSteamVirtualPath(path);
+  CHECK(pad.has_value());
+  if (pad) {
+    CHECK(pad->real_vendor_id == 0x045e);
+    CHECK(pad->real_product_id == 0x0b13);
+    CHECK(pad->slot == 2);
+    CHECK(pad->process_id == 4321);
+  }
+
+  // Four-digit hex ids, lower case, and no process id.
+  const auto lower = dal::parseSteamVirtualPath(R"(\\.\pipe\hid#vid_045e&pid_028e&ig_00#054c&05c4&abcdef#0)");
+  CHECK(lower.has_value());
+  if (lower) {
+    CHECK(lower->real_vendor_id == 0x054c);
+    CHECK(lower->real_product_id == 0x05c4);
+    CHECK(lower->slot == 0);
+    CHECK(lower->process_id == 0);
+  }
+
+  // Physical paths are not virtual pads, whatever their VID/PID.
+  CHECK(!dal::parseSteamVirtualPath(kXboxPhysicalPath));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\?\HID#VID_045E&PID_028E&IG_00#7&2a3b4c5d&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030})"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_054C&PID_05C4#45e&b13&1f4a#2#4321)"));
+  CHECK(!dal::parseSteamVirtualPath(""));
+
+  // Truncated or malformed.
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13#2#4321)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#two#4321)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#2#pid)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#12345&b13&1f4a#2#4321)"));
+  CHECK(!dal::parseSteamVirtualPath(R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#xyz&b13&1f4a#2#4321)"));
+}
+
+void testParseIgnoreDevices() {
+  using Id = std::pair<std::uint16_t, std::uint16_t>;
+  using Ids = std::vector<Id>;
+  const Ids recorded = dal::parseIgnoreDevices(kRecordedIgnoreDevices);
+  CHECK(recorded.size() == 6);
+  CHECK(recorded.front() == Id(0x28de, 0x1102));
+  CHECK(recorded.back() == Id(0x0000, 0x11fb));
+  CHECK(std::ranges::none_of(recorded, [](const auto& id) { return id.first == 0x045e; }));
+
+  // Malformed entries are skipped; the rest is kept, spaces and capitals are tolerated.
+  const Ids mixed = dal::parseIgnoreDevices("0x28DE/0x1102, 0x045e/*,junk,0x12345/0x1,0x1/,/0x1,0x054c/0x05c4,,0xzz/0x1");
+  CHECK(mixed.size() == 2);
+  if (mixed.size() == 2) {
+    CHECK(mixed[0] == Id(0x28de, 0x1102));
+    CHECK(mixed[1] == Id(0x054c, 0x05c4));
+  }
+  CHECK(dal::parseIgnoreDevices("").empty());
+  CHECK(dal::parseIgnoreDevices("not a list").empty());
+  CHECK(dal::parseIgnoreDevices("28de/1102").empty());
+}
+
+// Environment of the recorded Steam shortcut runs.
+dal::SteamContext recordedSteamContext() {
+  dal::SteamContext steam;
+  steam.overlay_loaded = true;
+  steam.process_id = 4321;
+  steam.env["EnableConfiguratorSupport"] = "4096";
+  steam.env["SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD"] = "1";
+  steam.env["SDL_GAMECONTROLLER_IGNORE_DEVICES"] = kRecordedIgnoreDevices;
+  steam.env["SteamAppId"] = "2510826688";
+  steam.env["SteamGameId"] = "10783918510917550080";
+  steam.env["SteamOverlayGameId"] = "10783918510917550080";
+  steam.env["SteamVirtualGamepadInfo"] = "";
+  return steam;
+}
+
+// Recorded runs with the Xbox pad only (plain, and as a Steam shortcut with Steam Input on and off):
+// each gives one used pad and the keyboard interface as NotGamepad, in either arrival order (the
+// Bluetooth pad settles late).
+void testSelectRecordedRuns() {
+  struct Run {
+    const char* name;
+    dal::SteamContext steam;
+  };
+  const Run runs[] = {
+      {"plain, no Steam", {}},
+      {"Steam shortcut, per-game Steam Input on", recordedSteamContext()},
+      {"Steam shortcut, per-game Steam Input off", recordedSteamContext()},
+  };
+  for (const Run& run : runs) {
+    for (const bool pad_first : {true, false}) {
+      std::vector<dal::GamepadDeviceInfo> devices;
+      if (pad_first) devices = {xboxPad(1), keyboardInterface(2)};
+      else devices = {keyboardInterface(1), xboxPad(2)};
+
+      const auto selection = dal::selectGamepads(devices, run.steam);
+      CHECK(selection.size() == 2);
+      if (selection.size() != 2) continue;
+      const std::size_t pad = pad_first ? 0 : 1;
+      const std::size_t keyboard = 1 - pad;
+      CHECK(selection[pad].id == devices[pad].id);
+      CHECK(selection[pad].use == dal::GamepadUse::Used);
+      CHECK(!selection[pad].steam);
+      CHECK(selection[keyboard].id == devices[keyboard].id);
+      CHECK(selection[keyboard].use == dal::GamepadUse::NotGamepad);
+      const auto used = std::ranges::count(selection, dal::GamepadUse::Used, &dal::GamepadSelection::use);
+      CHECK(used == 1);
+      if (used != 1) std::fprintf(stderr, "run: %s\n", run.name);
+    }
+  }
+}
+
+void testSelectSteamVirtualPad() {
+  const std::string own_path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#1#4321)";
+  const std::string other_path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#1#999)";
+  const std::string no_pid_path = R"(\\.\pipe\HID#VID_045E&PID_028E&IG_00#45e&b13&1f4a#3)";
+  dal::SteamContext steam;
+  steam.overlay_loaded = true;
+  steam.process_id = 4321;
+
+  // The virtual pad of this process is used and its physical pad is dropped.
+  {
+    const std::vector<dal::GamepadDeviceInfo> devices = {xboxPad(1), steamVirtualPad(2, own_path), keyboardInterface(3)};
+    const auto selection = dal::selectGamepads(devices, steam);
+    CHECK(selection.size() == 3);
+    if (selection.size() == 3) {
+      CHECK(selection[0].use == dal::GamepadUse::HandledBySteam);
+      CHECK(selection[0].steam && selection[0].steam->slot == 1);
+      CHECK(selection[1].use == dal::GamepadUse::Used);
+      CHECK(selection[1].steam && selection[1].steam->process_id == 4321);
+      CHECK(selection[2].use == dal::GamepadUse::NotGamepad);
+    }
+  }
+  // A virtual pad of another process is not read; a path without a process id is.
+  {
+    const std::vector<dal::GamepadDeviceInfo> devices = {steamVirtualPad(1, other_path), steamVirtualPad(2, no_pid_path)};
+    const auto selection = dal::selectGamepads(devices, steam);
+    CHECK(selection.size() == 2);
+    if (selection.size() == 2) {
+      CHECK(selection[0].use == dal::GamepadUse::OtherProcess);
+      CHECK(selection[1].use == dal::GamepadUse::Used);
+      CHECK(selection[1].steam && selection[1].steam->slot == 3);
+    }
+  }
+  // The virtual pad stands for a physical pad of another model than the Xbox pad: that one stays used.
+  {
+    dal::GamepadDeviceInfo ds4 = xboxPad(1);
+    ds4.vendor_id = 0x054c;
+    ds4.product_id = 0x05c4;
+    const std::vector<dal::GamepadDeviceInfo> devices = {ds4, xboxPad(2), steamVirtualPad(3, own_path)};
+    const auto selection = dal::selectGamepads(devices, steam);
+    CHECK(selection.size() == 3);
+    if (selection.size() == 3) {
+      CHECK(selection[0].use == dal::GamepadUse::Used);
+      CHECK(selection[1].use == dal::GamepadUse::HandledBySteam);
+      CHECK(selection[2].use == dal::GamepadUse::Used);
+    }
+  }
+}
+
+void testSelectIgnoreList() {
+  dal::GamepadDeviceInfo ds4 = xboxPad(1);
+  ds4.vendor_id = 0x054c;
+  ds4.product_id = 0x05c4;
+  const std::vector<dal::GamepadDeviceInfo> devices = {ds4, xboxPad(2)};
+
+  // Steam lists the DS4 as handled: with the overlay loaded the physical DS4 is dropped.
+  dal::SteamContext steam = recordedSteamContext();
+  steam.env["SDL_GAMECONTROLLER_IGNORE_DEVICES"] = std::string(kRecordedIgnoreDevices) + ",0x054c/0x05c4";
+  auto selection = dal::selectGamepads(devices, steam);
+  CHECK(selection.size() == 2);
+  if (selection.size() == 2) {
+    CHECK(selection[0].use == dal::GamepadUse::HandledBySteam);
+    CHECK(!selection[0].steam);
+    CHECK(selection[1].use == dal::GamepadUse::Used);
+  }
+
+  // The variable alone, without the overlay, is not a Steam marker.
+  steam.overlay_loaded = false;
+  selection = dal::selectGamepads(devices, steam);
+  CHECK(selection.size() == 2);
+  if (selection.size() == 2) {
+    CHECK(selection[0].use == dal::GamepadUse::Used);
+    CHECK(selection[1].use == dal::GamepadUse::Used);
+  }
+}
+
+void testSelectNoSteam() {
+  dal::GamepadDeviceInfo ds4 = xboxPad(2);
+  ds4.vendor_id = 0x054c;
+  ds4.product_id = 0x05c4;
+  const std::vector<dal::GamepadDeviceInfo> devices = {xboxPad(1), ds4, keyboardInterface(3), xboxPad(4)};
+  const auto selection = dal::selectGamepads(devices, dal::SteamContext{});
+  CHECK(selection.size() == 4);
+  if (selection.size() == 4) {
+    CHECK(selection[0].use == dal::GamepadUse::Used);
+    CHECK(selection[1].use == dal::GamepadUse::Used);
+    CHECK(selection[2].use == dal::GamepadUse::NotGamepad);
+    CHECK(selection[3].use == dal::GamepadUse::Used);
+    CHECK(selection[3].id == 4);
+  }
+  CHECK(dal::selectGamepads(std::span<const dal::GamepadDeviceInfo>{}, dal::SteamContext{}).empty());
+}
+
+void testGamepadUseName() {
+  CHECK(dal::gamepadUseName(dal::GamepadUse::Used) == "used");
+  CHECK(dal::gamepadUseName(dal::GamepadUse::HandledBySteam) == "handled by steam");
+  CHECK(dal::gamepadUseName(dal::GamepadUse::OtherProcess) == "other process");
+  CHECK(dal::gamepadUseName(dal::GamepadUse::NotGamepad) == "not a gamepad");
+}
+
 // The probe thread never ends, so this runs last and the program leaves with _Exit (like the game).
 // The fake's reading never changes, so the thread is silent after its start lines; that is what makes
 // ~LogCapture's unsynchronised sink swap safe.
@@ -639,6 +897,13 @@ int main() {
   testMapTriggers();
   testMergeMappedPads();
   testRumbleFromCellPad();
+  testSteamVirtualPath();
+  testParseIgnoreDevices();
+  testSelectRecordedRuns();
+  testSelectSteamVirtualPad();
+  testSelectIgnoreList();
+  testSelectNoSteam();
+  testGamepadUseName();
   testProbeThreadStartLines();
 
   std::printf("input core tests: %d passed, %d failed\n", g_passed, g_failed);

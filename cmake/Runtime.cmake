@@ -116,6 +116,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/sys_prx_for_user.cpp
     runtime/src/input/gamepad_map.cpp
     runtime/src/input/gamepad_probe.cpp
+    runtime/src/input/gamepad_select.cpp
     runtime/src/input/keyboard_pad.cpp
     runtime/src/input/pad_buttons.cpp
     runtime/src/input/pad_script.cpp
