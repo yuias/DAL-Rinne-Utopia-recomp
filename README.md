@@ -50,13 +50,21 @@ Run these from the repository root:
    pwsh -NoProfile -File tools/fetch-gameinput.ps1
    ```
 
-2. Recompile the executable into C source under `generated/ppu`:
+2. Install the GameInput runtime, which reads the gamepads. This is needed once and requires
+   administrator rights; without it gamepads are disabled and the keyboard still works.
+   `<version>` is the directory under `generated/deps/gameinput`.
+
+   ```powershell
+   msiexec /i generated\deps\gameinput\<version>\redist\GameInputRedist.msi
+   ```
+
+3. Recompile the executable into C source under `generated/ppu`:
 
    ```powershell
    python tools/ps3tool.py emit <game-dir>/PS3_GAME/USRDIR/EBOOT.elf --out generated/ppu
    ```
 
-3. Build:
+4. Build:
 
    ```powershell
    pwsh -NoProfile -File tools/build.ps1 -Preset release -GeneratedDir generated/ppu -GameDir <game-dir>

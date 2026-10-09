@@ -14,11 +14,9 @@ Gamepads are read with Microsoft's GameInput API (version 3). The `Microsoft.Gam
 package is not part of this repository. `tools/fetch-gameinput.ps1` downloads the pinned package
 from <https://www.nuget.org/packages/Microsoft.GameInput> into `generated/deps/gameinput` and
 verifies its SHA-256 (`-From <nupkg>` takes a local copy and applies the same check); the pin is
-in `cmake/gameinput.cmake`. The build uses the package's `GameInput.h` and `GameInput.lib`. The
-package ships its runtime only inside `redist/GameInputRedist.msi`: the fetch script extracts the
-x64 `GameInputRedist.dll` from that MSI (with the Windows Installer API and `expand.exe`, without
-installing anything), checks it against a pinned SHA-256, and the build copies it next to `dal_game`
-together with the package's `LICENSE.txt` and `NOTICE.txt` (`bin/licenses/gameinput/`).
+in `cmake/gameinput.cmake`. The build uses only the package's `GameInput.h` and `GameInput.lib`;
+nothing from the package is copied into the build output. The runtime is Microsoft's GameInput
+redistributable, which the user installs from the package's `redist/GameInputRedist.msi`.
 
 | | |
 | --- | --- |
@@ -31,19 +29,17 @@ together with the package's `LICENSE.txt` and `NOTICE.txt` (`bin/licenses/gamein
 
 The public header and the static library are licensed under the MIT License; the text is in the
 header and in `GameInput.cpp`. The package's `LICENSE.txt` is the licence of the redistributable
-runtime (`GameInputRedist.dll`, `GameInputRedist.msi`); it allows distributing that code in
-applications, and it travels with the copied DLL. `NOTICE.txt` lists the third-party component that
-the package incorporates (Fusion, MIT License). The runtime is not tracked in this repository; it
-reaches the build output only through the user's own fetch and build.
+runtime (`GameInputRedist.dll`, `GameInputRedist.msi`), and `NOTICE.txt` lists the third-party
+component that the package incorporates (Fusion, MIT License). This project neither copies nor
+redistributes the runtime.
 
 ### Run-time loading
 
 `GameInput.lib` is a static loader: it links no GameInput DLL, so the executables start on a machine
-without a GameInput runtime. At the first GameInput call it picks the newest of the in-box
-`GameInput.dll`, an installed `GameInputRedist.dll`, and the `GameInputRedist.dll` next to the
-executable; the copied DLL (3.5.283) provides API version 3 without installing anything. If no
-runtime that implements API version 3 is found, `dal_game` logs one warning and the gamepads are
-disabled; the keyboard keeps working.
+without a GameInput runtime. At the first GameInput call it uses the runtime installed on the
+machine (the in-box `GameInput.dll` or the installed `GameInputRedist.dll`). If no runtime that
+implements API version 3 is found, `dal_game` logs one warning that names `GameInputRedist.msi` and
+the gamepads are disabled; the keyboard keeps working.
 
 ## FFmpeg
 

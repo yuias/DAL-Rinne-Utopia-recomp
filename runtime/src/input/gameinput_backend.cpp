@@ -77,8 +77,9 @@ std::string failure(std::string_view step, HRESULT hr) {
         break;
       }
     }
+    text += "; install GameInputRedist.msi from the Microsoft.GameInput package";
   } else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)) {
-    text += ": no GameInput runtime found";
+    text += ": no GameInput runtime found; install GameInputRedist.msi from the Microsoft.GameInput package";
   }
   return text;
 }
