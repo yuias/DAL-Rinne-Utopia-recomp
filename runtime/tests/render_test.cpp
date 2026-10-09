@@ -1041,6 +1041,7 @@ struct TextureOptions {
   std::uint32_t pitch = 0;      // Memory scene: row pitch in bytes (0: no padding); padding holds junk
   bool unnormalized = false;    // _UN format: coordinates are in texels
   std::uint32_t dxt = 0;        // Memory scene: base format 0x86/0x87/0x88 for a 4x4 block-compressed texture
+  bool zero_height = false;     // Memory scene: the image rect says 0 rows, so no bytes are copied
 };
 
 constexpr std::uint32_t kAliasOffset = 0x50000;
@@ -1091,6 +1092,7 @@ std::vector<std::uint8_t> makeTexturedCapture(const TextureOptions& options) {
       scene.write(dal::kMethodNv4097SetTextureImageRect, (4u << 16) | 4u);
       scene.write(dal::kMethodNv4097SetTextureControl3, 0);
     }
+    if (options.zero_height) scene.write(dal::kMethodNv4097SetTextureImageRect, kTextureSize << 16);
   }
   scene.write(dal::kMethodNv4097SetTextureControl1, options.remap);
   scene.write(dal::kMethodNv4097SetTextureAddress, options.wrap | (options.wrap << 8) | (1u << 16));
@@ -1325,6 +1327,13 @@ void testRendererTextures(dal::VkContext& ctx) {
     CHECK(pixelArgb(bgra, width, 20, 20) == 0xFF0000FF && pixelArgb(bgra, width, 44, 28) == 0xFFFF0000);
     expectNoNotes();
   }
+
+  // A texture without bytes samples the magenta placeholder, and that is counted.
+  TextureOptions empty;
+  empty.zero_height = true;
+  render(empty);
+  CHECK(pixelArgb(bgra, width, 32, 32) == 0xFFFF00FF);
+  CHECK(unimplementedCount("texture placeholder: no texture data") == 1);
 
   CHECK(renderer.valid());
   dal::rsxUnimplementedReset();

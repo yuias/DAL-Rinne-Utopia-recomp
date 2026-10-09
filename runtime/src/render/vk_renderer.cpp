@@ -613,8 +613,8 @@ bool RsxRenderer::vertexFormatSupported(VkFormat format) {
 }
 
 // Fills the image info and coordinate scale of every texture unit the draw's fragment program samples.
-// A unit without a usable texture (disabled, a layout or format that was counted by the frame builder)
-// keeps the placeholder. Texture memory is uploaded again for every draw, as the guest may have changed
+// A unit without a usable texture keeps the placeholder, and every such case is counted with
+// rsxNoteUnimplemented, so a census without texture kinds means no placeholder was sampled. Texture memory is uploaded again for every draw, as the guest may have changed
 // it between draws.
 //
 // A texture at a known render target samples that target's image. When the target is the one the draw
@@ -682,7 +682,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
         surface.format = RsxColorFormat::A8R8G8B8;
         target = acquireColor(surface);
         if (!valid()) return false;
-        if (!target) continue;
+        if (!target) {
+          rsxNoteUnimplemented("texture", "placeholder: render target unavailable");
+          continue;
+        }
       }
 
       if (target.get() == &color) {
@@ -692,7 +695,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
             fail(textures_->error());
             return false;
           }
-          if (!feedback_copy) continue;
+          if (!feedback_copy) {
+            rsxNoteUnimplemented("texture", "placeholder: feedback copy unavailable");
+            continue;
+          }
           reference(feedback_copy);
           transition(*target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
           textures_->recordCopy(cmd, *feedback_copy, target->image);
@@ -739,7 +745,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
         fail(textures_->error());
         return false;
       }
-      if (!image) continue;
+      if (!image) {
+        rsxNoteUnimplemented("texture", "placeholder: image unavailable");
+        continue;
+      }
       reference(image);
       if (std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
         UploadRef staging;
@@ -766,6 +775,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
         stats_.texture_uploads++;
       }
       view = textures_->view(*image, texture->remap);
+    } else {
+      // The frame builder copied no bytes. It notes why for most cases, but not for a zero width or height.
+      rsxNoteUnimplemented("texture", "placeholder: no texture data");
+      continue;
     }
 
     const VkSampler sampler = textures_->sampler(*texture);
@@ -773,7 +786,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
       fail(textures_->error());
       return false;
     }
-    if (view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) continue;
+    if (view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) {
+      rsxNoteUnimplemented("texture", "placeholder: view or sampler unavailable");
+      continue;
+    }
     infos[unit] = {sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
   }
   return true;
