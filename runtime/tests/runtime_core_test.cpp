@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <initializer_list>
@@ -3928,7 +3929,9 @@ void testPadScriptErrors() {
   const auto missing = dal::loadPadScript(std::filesystem::path("no_such_dir") / "no_such_script.txt");
   CHECK(!missing && missing.error().starts_with("cannot open"));
 
-  const std::filesystem::path file = std::filesystem::temp_directory_path() / "dal_pad_script_test.txt";
+  const std::filesystem::path file = std::filesystem::temp_directory_path() /
+      std::format("dal_pad_script_test_{}.txt",
+                  std::chrono::steady_clock::now().time_since_epoch().count());  // unique under ctest -j
   {
     std::ofstream out(file, std::ios::binary);
     out << "# test\n2 tap start\n";

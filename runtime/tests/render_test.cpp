@@ -460,7 +460,9 @@ void testRendererClear(dal::VkContext& ctx) {
 void testRendererReadbackGate(dal::VkContext& ctx) {
   dal::rsxUnimplementedReset();
   std::error_code ec;
-  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "dal_render_test_dump";
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() /
+      std::format("dal_render_test_dump_{}",
+                  std::chrono::steady_clock::now().time_since_epoch().count());  // unique under parallel runs
   std::filesystem::remove_all(dir, ec);
 
   dal::RenderOptions options;

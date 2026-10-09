@@ -3,10 +3,12 @@
 // the integrity checks rather than the real key set.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <span>
 #include <string>
@@ -139,7 +141,9 @@ void testCmac() {
 }
 
 void testKeyParsing() {
-  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "dal_sdat_test_keys";
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() /
+      std::format("dal_sdat_test_keys_{}",
+                  std::chrono::steady_clock::now().time_since_epoch().count());  // unique under parallel runs
   std::filesystem::create_directories(dir);
   {
     std::ofstream f(dir / "key_vault.h");
