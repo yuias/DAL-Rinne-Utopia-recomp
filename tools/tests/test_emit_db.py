@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ps3recomp import cell, emit, emit_db
 from ps3recomp.elf import ElfFile
@@ -204,6 +205,13 @@ class CensusTest(unittest.TestCase):
 
 
 class EmitCensusCliTest(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        # The committed config/overrides.json is pinned to the game, not to the fixture.
+        patcher = mock.patch.object(emit, "DEFAULT_OVERRIDES", self.tmp / "no-overrides.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_cli(self, argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

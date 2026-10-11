@@ -12,9 +12,14 @@ from pathlib import Path
 from . import cell
 from .elf import ElfError
 from .emit_core import EmitEnv, EmitStats, emit_function
-from .emit_db import census_doc, census_lines, check_db_matches, load_function_db, take_census
-from .emit_output import (FunctionRecord, build_report, func_name, import_name,
-                          read_thunk_words, render_trampoline, report_lines, write_output)
+from .emit_db import (FunctionDb, census_doc, census_lines, check_db_matches, load_function_db,
+                      take_census)
+from .emit_output import (FunctionRecord, OverrideTexts, build_report, func_name, hexs,
+                          import_name, read_thunk_words, render_trampoline, report_lines,
+                          write_output)
+from .emit_overrides import (DEFAULT_OVERRIDES, OverrideConfig, check_overrides, load_overrides,
+                             orig_name, render_handler_header, render_handler_stubs,
+                             render_overrides_source)
 from .ghidra import _load_default_config
 from .info import (EXIT_IO, EXIT_NOT_PPU_ELF, REPO_ROOT, CliError, parse_ppu_elf, read_input,
                    reject_encrypted)
@@ -39,6 +44,28 @@ def _write_text(path: Path, text: str) -> None:
         raise CliError(EXIT_IO, "cannot write %s: %s" % (path, e.strerror))
 
 
+def _load_checked_overrides(args: argparse.Namespace, sha256: str,
+                            db: FunctionDb) -> OverrideConfig | None:
+    if args.no_overrides:
+        return None
+    explicit = args.overrides is not None
+    config = load_overrides(Path(args.overrides) if explicit else DEFAULT_OVERRIDES,
+                            required=explicit)
+    if config is not None:
+        check_overrides(config, elf_sha256=sha256, db=db)
+    return config
+
+
+def _overrides_section(args: argparse.Namespace, config: OverrideConfig | None,
+                       self_loops: dict[int, bool]) -> dict:
+    entries = config.entries if config is not None else ()
+    return {"enabled": not args.no_overrides,
+            "file_sha256": config.file_sha256 if config is not None else None,
+            "entries": [{"address": hexs(e.address), "kind": e.kind, "handler": e.handler,
+                         "label": e.label, "self_entry_loop": self_loops[e.address]}
+                        for e in entries]}
+
+
 def _run(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     data = read_input(args.elf)
@@ -53,6 +80,9 @@ def _run(args: argparse.Namespace) -> int:
 
     db = load_function_db(Path(args.db) if args.db else DEFAULT_DB)
     check_db_matches(db, sha256, text_range, code_range)
+    # Before anything is written: a bad overrides file must leave the output untouched.
+    overrides = _load_checked_overrides(args, sha256, db)
+    entries = overrides.entries if overrides is not None else ()
     try:
         image = CodeImage.from_elf(elf, code_range)
     except ElfError as e:
@@ -74,10 +104,20 @@ def _run(args: argparse.Namespace) -> int:
         comments=args.comments)
     stats = EmitStats()
     functions = []
+    overridden = {e.address: e for e in entries}
+    self_loops = {}
     for fn in db.functions:
         addrs = fn.addrs()
-        text = emit_function(image, fn.entry, addrs, env, stats, name=func_name(fn.entry),
-                             title=fn.name)
+        entry = overridden.get(fn.entry)
+        if entry is None:
+            text = emit_function(image, fn.entry, addrs, env, stats, name=func_name(fn.entry),
+                                 title=fn.name)
+        else:
+            # The wrapper keeps the name call sites use; the body moves to `_orig`.
+            text = emit_function(image, fn.entry, addrs, env, stats,
+                                 name=orig_name(func_name(fn.entry)), title=fn.name or entry.label,
+                                 enter=False)
+            self_loops[fn.entry] = "\nL_%08x:\n" % fn.entry in text
         functions.append(FunctionRecord(fn.entry, len(addrs), text))
 
     thunk_texts = []
@@ -89,10 +129,17 @@ def _run(args: argparse.Namespace) -> int:
             without_toc_save.append(thunk.addr)
 
     out_dir = Path(args.out) if args.out else DEFAULT_OUT
-    summary = write_output(out_dir, sha256, functions, db.thunks, thunk_texts, args.chunks)
+    wrappers = {e.address: func_name(e.address) for e in entries}
+    texts = OverrideTexts(originals=[e.address for e in entries],
+                          source=render_overrides_source(sha256, entries, wrappers),
+                          handlers=render_handler_header(sha256, entries),
+                          stubs=render_handler_stubs(sha256, entries))
+    summary = write_output(out_dir, sha256, functions, db.thunks, thunk_texts, args.chunks, texts)
     report = build_report(sha256=sha256, db_sha256=db.file_sha256, stats=stats,
                           functions=functions, thunks=db.thunks, without_toc_save=without_toc_save,
-                          summary=summary, elapsed=time.perf_counter() - started)
+                          summary=summary,
+                          overrides=_overrides_section(args, overrides, self_loops),
+                          elapsed=time.perf_counter() - started)
     report_path = Path(args.report) if args.report else DEFAULT_REPORT
     _write_text(report_path, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     for line in report_lines(report, str(out_dir)):
@@ -137,6 +184,11 @@ def _parser() -> argparse.ArgumentParser:
                         help="census path (default: generated/analysis/emit_census.json)")
     parser.add_argument("--max-unhandled", type=_non_negative_int, metavar="N",
                         help="exit 9 if more than N words are emitted as unhandled")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--overrides", metavar="PATH",
+                       help="overrides file (default: config/overrides.json, may be absent)")
+    group.add_argument("--no-overrides", action="store_true",
+                       help="ignore the overrides file and emit every function unchanged")
     return parser
 
 

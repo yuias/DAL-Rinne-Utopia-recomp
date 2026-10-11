@@ -28,6 +28,9 @@ HEADER_NAME = "ppu_funcs.h"
 IMPORTS_NAME = "ppu_imports.c"
 TABLES_NAME = "ppu_tables.c"
 SOURCES_NAME = "sources.cmake"
+OVERRIDES_NAME = "ppu_overrides.c"
+OVERRIDE_HANDLERS_NAME = "ppu_override_handlers.h"
+OVERRIDE_STUBS_NAME = "ppu_override_stubs.c"
 
 
 def hexs(value: int) -> str:
@@ -115,10 +118,15 @@ def c_string(text: str | None) -> str:
     return '"%s"' % "".join(out)
 
 
-def render_funcs_header(sha256: str, entries: Sequence[int], thunks: Sequence[DbThunk]) -> str:
+def render_funcs_header(sha256: str, entries: Sequence[int], thunks: Sequence[DbThunk],
+                        originals: Sequence[int] = ()) -> str:
     lines = [banner(sha256).rstrip("\n"), "#pragma once", "", '#include "dal/ppu.h"', ""]
     lines += ["DAL_PPU_FUNC(%s);" % func_name(entry) for entry in entries]
     lines += ["DAL_PPU_FUNC(%s);" % import_name(t.addr) for t in thunks]
+    if originals:
+        lines += ["", "// Original bodies of the entries in the overrides file; fn_%08x is the "
+                      "wrapper."]
+        lines += ["DAL_PPU_FUNC(%s_orig);" % func_name(entry) for entry in originals]
     return "\n".join(lines) + "\n"
 
 
@@ -145,11 +153,14 @@ def render_tables(sha256: str, entries: Sequence[int], thunks: Sequence[DbThunk]
     return "\n".join(lines) + "\n"
 
 
-def render_sources(sha256: str, files: Sequence[str]) -> str:
+def render_sources(sha256: str, files: Sequence[str], stub_files: Sequence[str] = ()) -> str:
     # CMake comments start with '#', so this file cannot use the C-style banner.
     lines = [banner(sha256, "#").rstrip("\n"), "set(DAL_PPU_GENERATED_SOURCES"]
     lines += ['    "${CMAKE_CURRENT_LIST_DIR}/%s"' % name for name in files]
     lines.append(")")
+    if stub_files:
+        lines.append("set(DAL_PPU_OVERRIDE_STUB_SOURCES %s)"
+                     % " ".join('"${CMAKE_CURRENT_LIST_DIR}/%s"' % name for name in stub_files))
     return "\n".join(lines) + "\n"
 
 
@@ -183,6 +194,15 @@ class FunctionRecord:
     text: str
 
 
+@dataclass(frozen=True)
+class OverrideTexts:
+    """Override-related output, rendered by emit_overrides (which imports this module)."""
+    originals: Sequence[int]        # entries whose body is emitted as fn_%08x_orig, ascending
+    source: str                     # ppu_overrides.c
+    handlers: str                   # ppu_override_handlers.h
+    stubs: str                      # ppu_override_stubs.c
+
+
 @dataclass
 class OutputSummary:
     chunks: list[dict]
@@ -191,11 +211,12 @@ class OutputSummary:
 
 def write_output(out_dir: Path, sha256: str, functions: Sequence[FunctionRecord],
                  thunks: Sequence[DbThunk], thunk_texts: Sequence[str],
-                 chunk_count: int) -> OutputSummary:
+                 chunk_count: int, overrides: OverrideTexts) -> OutputSummary:
     """Write the generated tree; returns the per-chunk figures for the report."""
     entries = [fn.entry for fn in functions]
     plan = plan_chunks([fn.instructions for fn in functions], chunk_count)
-    files: dict[str, str] = {HEADER_NAME: render_funcs_header(sha256, entries, thunks)}
+    files: dict[str, str] = {
+        HEADER_NAME: render_funcs_header(sha256, entries, thunks, overrides.originals)}
     chunk_info = []
     chunk_files = []
     for index, (start, end) in enumerate(plan):
@@ -208,7 +229,11 @@ def write_output(out_dir: Path, sha256: str, functions: Sequence[FunctionRecord]
                            "bytes": len(text.encode("utf-8"))})
     files[IMPORTS_NAME] = render_source(sha256, thunk_texts)
     files[TABLES_NAME] = render_tables(sha256, entries, thunks)
-    files[SOURCES_NAME] = render_sources(sha256, chunk_files + [IMPORTS_NAME, TABLES_NAME])
+    files[OVERRIDES_NAME] = overrides.source
+    files[OVERRIDE_HANDLERS_NAME] = overrides.handlers
+    files[OVERRIDE_STUBS_NAME] = overrides.stubs
+    files[SOURCES_NAME] = render_sources(
+        sha256, chunk_files + [IMPORTS_NAME, TABLES_NAME, OVERRIDES_NAME], [OVERRIDE_STUBS_NAME])
 
     remove_stale_chunks(out_dir, chunk_files)
     total = 0
@@ -247,7 +272,7 @@ def edges_section(edges: Counter) -> dict:
 
 def build_report(*, sha256: str, db_sha256: str, stats: EmitStats,
                  functions: Sequence[FunctionRecord], thunks: Sequence[DbThunk],
-                 without_toc_save: Sequence[int], summary: OutputSummary,
+                 without_toc_save: Sequence[int], summary: OutputSummary, overrides: dict,
                  elapsed: float) -> dict:
     largest = sorted(functions, key=lambda fn: (-fn.instructions, fn.entry))[:LARGEST_FUNCTIONS]
     return {
@@ -267,6 +292,7 @@ def build_report(*, sha256: str, db_sha256: str, stats: EmitStats,
                             for site, target, kind in stats.dynamic_targets],
         "labels": stats.labels,
         "loop_hooks": stats.loop_hooks,
+        "overrides": overrides,
         "output_bytes": summary.output_bytes,
         "elapsed_s": round(elapsed, 3),
     }
@@ -276,7 +302,7 @@ def report_lines(report: dict, out_dir: str) -> list[str]:
     unhandled = report["unhandled"]
     edges = report["edges"]
     top = ", ".join("%s %d" % kv for kv in list(unhandled["by_mnemonic"].items())[:UNHANDLED_TOP])
-    return [
+    lines = [
         "emit: %d functions (%d insns) in %d chunks, %d import trampolines (%d without TOC save)"
         % (report["functions"], report["instructions"], len(report["chunks"]),
            report["import_trampolines"], len(report["thunks_without_toc_save"])),
@@ -288,6 +314,23 @@ def report_lines(report: dict, out_dir: str) -> list[str]:
            edges["calls_dynamic_const"], edges["tails_direct"], edges["tails_import"],
            edges["tails_dynamic"], edges["fallthrough_tails"], edges["switches"],
            edges["switch_cases"]),
-        "output: %d bytes in %s" % (report["output_bytes"], out_dir),
-        "elapsed: %.1f s" % report["elapsed_s"],
     ]
+    lines += override_lines(report["overrides"])
+    lines += ["output: %d bytes in %s" % (report["output_bytes"], out_dir),
+              "elapsed: %.1f s" % report["elapsed_s"]]
+    return lines
+
+
+def override_lines(section: dict) -> list[str]:
+    """Stdout lines for the `overrides` report section; none when there is nothing to say."""
+    if not section["enabled"]:
+        return ["overrides: disabled by --no-overrides"]
+    entries = section["entries"]
+    if not entries:
+        return []
+    hooks = sum(1 for e in entries if e["kind"] == "hook")
+    lines = ["overrides: %d entries (override %d, hook %d)"
+             % (len(entries), len(entries) - hooks, hooks)]
+    lines += ["overrides: %s branches to its own entry; that loop does not run the %s handler again"
+              % (e["address"], e["kind"]) for e in entries if e["self_entry_loop"]]
+    return lines

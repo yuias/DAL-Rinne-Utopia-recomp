@@ -274,6 +274,12 @@ class LoadOverridesTest(unittest.TestCase):
     def test_default_path_is_config_overrides_json(self):
         self.assertEqual(DEFAULT_OVERRIDES, REPO_ROOT / "config" / "overrides.json")
 
+    def test_committed_file_has_no_entries_and_the_pinned_sha(self):
+        config = load_overrides(DEFAULT_OVERRIDES, required=True)
+        functions = json.loads((REPO_ROOT / "config" / "functions.json").read_text("utf-8"))
+        self.assertEqual(config.entries, ())
+        self.assertEqual(config.sha256, functions["input"]["executable_sha256"])
+
 
 class CheckOverridesTest(unittest.TestCase):
     def config(self, *addresses, sha=SHA):
