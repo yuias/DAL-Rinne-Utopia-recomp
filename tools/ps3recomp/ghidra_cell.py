@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -11,7 +13,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,8 @@ SLASPEC_NAME = "ppc_cell.slaspec"
 SLA_NAME = "ppc_cell.sla"
 LDEFS_NAME = "cell.ldefs"
 VERSION_PLACEHOLDER = "@extversion@"
+JAVA_OPTIONS_ENV = "GHIDRA_HEADLESS_JAVA_OPTIONS"
+EXTERNAL_MODULES_PROPERTY = "ghidra.external.modules"
 
 _COMPILE_TIMEOUT = 600
 _MAX_ERROR_LINES = 10
@@ -238,6 +242,62 @@ def _install_info(ghidra_dir: Path) -> tuple[str, str]:
     if not version or not release:
         raise CliError(ghidra.EXIT_TOOL, "not a Ghidra install: %s" % ghidra_dir)
     return version, release
+
+
+def settings_dir_candidates(version: str, release: str, environ: Mapping[str, str],
+                            system: str, home: Path, username: str) -> list[Path]:
+    """User settings directories Ghidra may use for this version; the environment part only."""
+    leaf = "ghidra_%s_%s" % (version, release)
+    xdg = environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        base = Path(xdg)
+        # Ghidra swaps the directory name for "<user>-ghidra" when the base is outside the home
+        # directory; which one applies depends on Java's view of the home, so offer both.
+        return [base / "ghidra" / leaf, base / ("%s-ghidra" % username) / leaf]
+    if system == "Windows":
+        appdata = environ.get("APPDATA")
+        return [(Path(appdata) if appdata else home / "AppData" / "Roaming") / "ghidra" / leaf]
+    if system == "Darwin":
+        return [home / "Library" / "ghidra" / leaf]
+    return [home / ".config" / "ghidra" / leaf]
+
+
+def external_module_env(stage_dir: Path, ghidra_dir: Path,
+                        environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Environment for a headless run that loads the staged module as an external module.
+
+    Ghidra aborts at startup when a module name appears twice, so an installed CellPPU is
+    detected here (read-only) instead of being left to fail inside Ghidra.
+    """
+    env = dict(os.environ if environ is None else environ)
+    stage_dir = stage_dir.resolve()
+    lang_dir = stage_dir / "data" / "languages"
+    if not (stage_dir / "Module.manifest").is_file() or not (lang_dir / SLA_NAME).is_file():
+        raise CliError(ghidra.EXIT_TOOL, "staged module not found or not built: %s; run "
+                       "python tools/ps3tool.py ghidra-cell-lang build" % stage_dir)
+    # The launcher splits the Java options on spaces.
+    if re.search(r"\s", str(stage_dir)):
+        raise CliError(ghidra.EXIT_TOOL, "staged module path must not contain spaces: %s; use "
+                       "--out under a path without spaces" % stage_dir)
+    existing = env.get(JAVA_OPTIONS_ENV, "")
+    if EXTERNAL_MODULES_PROPERTY in existing:
+        raise CliError(ghidra.EXIT_TOOL, "%s already sets %s; unset it"
+                       % (JAVA_OPTIONS_ENV, EXTERNAL_MODULES_PROPERTY))
+
+    version, release = _install_info(ghidra_dir)
+    places = [ghidra_dir / "Ghidra" / "Processors", ghidra_dir / "Ghidra" / "Extensions"]
+    places += [d / "Extensions" for d in settings_dir_candidates(
+        version, release, env, platform.system(), Path.home(), getpass.getuser())]
+    for place in places:
+        installed = place / MODULE_NAME
+        if installed.exists():
+            raise CliError(ghidra.EXIT_TOOL, "%s is already installed at %s; Ghidra cannot load "
+                           "a second copy. Use --language %s (the installed language) or "
+                           "uninstall it first" % (MODULE_NAME, installed, CELL_LANGUAGE))
+
+    option = "-D%s=%s" % (EXTERNAL_MODULES_PROPERTY, stage_dir)
+    env[JAVA_OPTIONS_ENV] = "%s %s" % (existing, option) if existing.strip() else option
+    return env
 
 
 def build(ghidra_dir: Path, src_dir: Path, out_dir: Path, make_zip: bool = True,

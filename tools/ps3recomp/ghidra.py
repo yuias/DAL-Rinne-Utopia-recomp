@@ -278,14 +278,17 @@ def _print_summary(export: dict, elapsed: float | None) -> None:
         print("elapsed: %d s" % round(elapsed))
 
 
-def _run_headless(cmd: list[str], log_dir: Path, timeout: int) -> float:
+def _run_headless(cmd: list[str], log_dir: Path, timeout: int,
+                  env: Mapping[str, str] | None = None) -> float:
     console_log = log_dir / "console.log"
     started = time.monotonic()
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(console_log, "wb") as log:
+            # env=None inherits the environment; a mapping replaces it entirely.
             proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=log,
-                                  stderr=subprocess.STDOUT, timeout=timeout + _TIMEOUT_SLACK)
+                                  stderr=subprocess.STDOUT, timeout=timeout + _TIMEOUT_SLACK,
+                                  env=env)
     except subprocess.TimeoutExpired:
         raise CliError(EXIT_TOOL, "Ghidra timed out after %d s; see logs in %s"
                        % (timeout + _TIMEOUT_SLACK, log_dir))

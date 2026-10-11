@@ -1,7 +1,9 @@
 import contextlib
+import getpass
 import io
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -310,6 +312,133 @@ class CellBuildTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(ghidra_cell.main(["frobnicate"]), 2)
             self.assertEqual(ghidra_cell.main([]), 2)
+
+
+class SettingsDirCandidatesTest(unittest.TestCase):
+    def candidates(self, environ, system, home="/home/u"):
+        return ghidra_cell.settings_dir_candidates("9.8.7", "TEST", environ, system,
+                                                   Path(home), "alice")
+
+    def test_windows_uses_appdata(self):
+        self.assertEqual(self.candidates({"APPDATA": "/roaming"}, "Windows"),
+                         [Path("/roaming/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_windows_without_appdata_falls_back_to_home(self):
+        self.assertEqual(self.candidates({}, "Windows", "/h"),
+                         [Path("/h/AppData/Roaming/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_linux(self):
+        self.assertEqual(self.candidates({}, "Linux"),
+                         [Path("/home/u/.config/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_macos(self):
+        self.assertEqual(self.candidates({}, "Darwin", "/Users/u"),
+                         [Path("/Users/u/Library/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_xdg_config_home_gives_both_names_on_any_system(self):
+        for system in ("Windows", "Linux", "Darwin"):
+            with self.subTest(system=system):
+                self.assertEqual(
+                    self.candidates({"XDG_CONFIG_HOME": "/cfg", "APPDATA": "/roaming"}, system),
+                    [Path("/cfg/ghidra/ghidra_9.8.7_TEST"),
+                     Path("/cfg/alice-ghidra/ghidra_9.8.7_TEST")])
+
+    def test_empty_xdg_config_home_is_ignored(self):
+        self.assertEqual(self.candidates({"XDG_CONFIG_HOME": ""}, "Linux"),
+                         [Path("/home/u/.config/ghidra/ghidra_9.8.7_TEST")])
+
+
+class ExternalModuleEnvTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.ghidra_dir = _make_install(self.root)
+        self.stage = self.root / "out" / "CellPPU"
+        (self.stage / "data" / "languages").mkdir(parents=True)
+        (self.stage / "Module.manifest").write_bytes(b"")
+        (self.stage / "data" / "languages" / "ppc_cell.sla").write_bytes(b"sla")
+        # XDG_CONFIG_HOME keeps every settings-directory lookup inside the temporary tree.
+        self.settings = self.root / "cfg" / "ghidra" / "ghidra_9.8.7_TEST"
+        self.environ = {"XDG_CONFIG_HOME": str(self.root / "cfg")}
+
+    def env(self, environ=None, stage=None):
+        return ghidra_cell.external_module_env(stage or self.stage, self.ghidra_dir,
+                                               self.environ if environ is None else environ)
+
+    def option(self) -> str:
+        return "-Dghidra.external.modules=%s" % self.stage.resolve()
+
+    def assertFails(self, text, **kwargs):
+        with self.assertRaises(CliError) as caught:
+            self.env(**kwargs)
+        self.assertEqual(caught.exception.code, ghidra.EXIT_TOOL)
+        self.assertIn(text, str(caught.exception))
+
+    def test_sets_the_option_when_absent(self):
+        env = self.env()
+        self.assertEqual(env["GHIDRA_HEADLESS_JAVA_OPTIONS"], self.option())
+        self.assertEqual(env["XDG_CONFIG_HOME"], self.environ["XDG_CONFIG_HOME"])
+
+    def test_appends_to_existing_options(self):
+        self.environ["GHIDRA_HEADLESS_JAVA_OPTIONS"] = "-Xmx2g"
+        self.assertEqual(self.env()["GHIDRA_HEADLESS_JAVA_OPTIONS"], "-Xmx2g " + self.option())
+
+    def test_input_mapping_is_unchanged(self):
+        self.environ["GHIDRA_HEADLESS_JAVA_OPTIONS"] = "-Xmx2g"
+        before = dict(self.environ)
+        env = self.env()
+        self.assertEqual(self.environ, before)
+        self.assertIsNot(env, self.environ)
+
+    def test_stage_without_manifest(self):
+        (self.stage / "Module.manifest").unlink()
+        self.assertFails("staged module not found or not built: ")
+        self.assertFails("run python tools/ps3tool.py ghidra-cell-lang build")
+
+    def test_stage_without_sla(self):
+        (self.stage / "data" / "languages" / "ppc_cell.sla").unlink()
+        self.assertFails("staged module not found or not built: ")
+
+    def test_stage_dir_missing(self):
+        self.assertFails("staged module not found or not built: ",
+                         stage=self.root / "nowhere")
+
+    def test_path_with_space(self):
+        spaced = self.root / "with space" / "CellPPU"
+        shutil.copytree(self.stage, spaced)
+        self.assertFails("staged module path must not contain spaces: ", stage=spaced)
+
+    def test_existing_external_modules_option(self):
+        self.environ["GHIDRA_HEADLESS_JAVA_OPTIONS"] = "-Dghidra.external.modules=/x"
+        self.assertFails("already sets ghidra.external.modules; unset it")
+
+    def test_installed_in_processors(self):
+        self.assertDuplicate(self.ghidra_dir / "Ghidra" / "Processors" / "CellPPU")
+
+    def test_installed_in_install_extensions(self):
+        self.assertDuplicate(self.ghidra_dir / "Ghidra" / "Extensions" / "CellPPU")
+
+    def test_installed_in_user_settings(self):
+        self.assertDuplicate(self.settings / "Extensions" / "CellPPU")
+
+    def test_installed_in_user_prefixed_settings(self):
+        self.assertDuplicate(self.root / "cfg" / ("%s-ghidra" % getpass.getuser())
+                             / "ghidra_9.8.7_TEST" / "Extensions" / "CellPPU")
+
+    def assertDuplicate(self, installed: Path):
+        installed.mkdir(parents=True)
+        self.assertFails("CellPPU is already installed at %s" % installed)
+        self.assertFails("Use --language PowerPC:BE:64:CellPPU-32addr")
+
+    def test_nothing_is_created(self):
+        self.env()
+        self.assertFalse((self.root / "cfg").exists())
+        self.assertEqual(sorted(p.name for p in self.ghidra_dir.rglob("CellPPU")), [])
+
+    def test_missing_application_properties(self):
+        (self.ghidra_dir / "Ghidra" / "application.properties").unlink()
+        self.assertFails("not a Ghidra install: ")
 
 
 @unittest.skipUnless(os.environ.get("DAL_GHIDRA_LIVE") == "1"

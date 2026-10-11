@@ -432,6 +432,22 @@ class RunTest(GhidraTestBase):
         self.assertEqual(len(err.strip().splitlines()), 1)
 
 
+class RunHeadlessEnvTest(GhidraTestBase):
+    def run_headless(self, *args):
+        with mock.patch.object(ghidra.subprocess, "run",
+                               side_effect=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0)
+                               ) as m:
+            ghidra._run_headless(["ghidra"], self.tmp / "logs", 10, *args)
+        return m.call_args.kwargs
+
+    def test_env_defaults_to_inherited(self):
+        self.assertIsNone(self.run_headless()["env"])
+
+    def test_env_is_passed_through(self):
+        env = {"GHIDRA_HEADLESS_JAVA_OPTIONS": "-Dx=1"}
+        self.assertIs(self.run_headless(env)["env"], env)
+
+
 @unittest.skipUnless(os.environ.get("DAL_EBOOT_ELF"), "DAL_EBOOT_ELF is not set")
 class RealEbootSeedsTest(unittest.TestCase):
     def test_seeds(self):
