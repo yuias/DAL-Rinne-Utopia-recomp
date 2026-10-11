@@ -430,8 +430,11 @@ Ghidra's loader has no opinion for the new language: in the GUI, import the ELF 
 of this repository (`Ps3Prepare.java`, `ExportAnalysis.java`) work with it unchanged, because the
 processor name and the registers are those of PowerPC.
 
-`config/ghidra_summary.json` and `config/functions.json` were not regenerated from a Cell export; their
-use is unchanged. The comparison commands (`ghidra-diff`, `ghidra-summary`, `recover`) work on a Cell
+`config/ghidra_summary.json` is made from the base Cell export with the installed language, and
+`config/functions.json` from that summary (see
+[Committed files and regeneration](function-recovery.md#committed-files-and-regeneration)). Compared
+with the earlier stock summary, every function extent in `config/functions.json` is unchanged; 98
+functions add `ghidra` to their `sources`. The comparison commands (`ghidra-diff`, `ghidra-summary`, `recover`) work on a Cell
 export as on a stock one; see [Function recovery](function-recovery.md#report) for the report.
 
 ### Measured on the game executable

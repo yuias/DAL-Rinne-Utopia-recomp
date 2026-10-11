@@ -5,14 +5,14 @@ repository's own decoder for function extents. Ghidra truncates some functions a
 Cell-only vector load/store instructions (`lvlx`, `lvrx`, `stvlx`, `stvrx` and their `l`
 variants) that it cannot decode, so `recover` re-derives every function body itself from the
 seeds. The [Cell PPU Ghidra language](ghidra-cell-language.md) (`ghidra-export --cell`) removes this
-truncation in Ghidra itself. `recover` also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
+truncation in Ghidra itself, and the committed summary is made with it. `recover` also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
 numbers over the recovered control-flow graph and reports coverage.
 
 ## Commands
 
 ```sh
-python tools/ps3tool.py ghidra-export  <elf>
-python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra.json -o config/ghidra_summary.json
+python tools/ps3tool.py ghidra-export  <elf> --cell
+python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra_cell.json -o config/ghidra_summary.json
 python tools/ps3tool.py recover        <elf> -o config/functions.json
 ```
 
@@ -69,7 +69,7 @@ holds one hex address per line; blank lines and `#` comments are ignored. The se
 needs its own project directory and output file so that the base export is left alone:
 
 ```sh
-python tools/ps3tool.py ghidra-export  <elf> --seeds-file generated/analysis/ghidra_seeds.txt --project-dir generated/ghidra/project_seeded -o generated/ghidra/eboot_ghidra_seeded.json
+python tools/ps3tool.py ghidra-export  <elf> --cell --seeds-file generated/analysis/ghidra_seeds.txt --project-dir generated/ghidra/project_seeded -o generated/ghidra/eboot_ghidra_seeded.json
 python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra_seeded.json -o generated/ghidra/summary_seeded.json
 python tools/ps3tool.py recover        <elf> --ghidra-summary generated/ghidra/summary_seeded.json -o generated/analysis/functions_seeded.json --report generated/analysis/recovery_report_seeded.json
 ```
@@ -83,7 +83,7 @@ the only seeds), so it does not depend on an earlier recovery run.
 
 | File | Produced by | Notes |
 | --- | --- | --- |
-| `config/ghidra_summary.json` | `ghidra-summary` on the base `ghidra-export` | Needs Ghidra and the ELF; regenerate when the Ghidra version, language setting or base seeding changes |
+| `config/ghidra_summary.json` | `ghidra-summary` on the base `ghidra-export --cell` | Needs Ghidra with the [Cell PPU language](ghidra-cell-language.md#installing) installed, and the ELF; regenerate when the Ghidra version, language or base seeding changes |
 | `config/extra_seeds.json` | by hand, or from the feedback run | Small and reviewable; edit it directly |
 | `config/functions.json` | `recover -o config/functions.json` | Input for later stages; needs only the ELF and the files above |
 
@@ -96,8 +96,8 @@ files, so `git diff config/` shows exactly what the change affected. To rebuild 
 from scratch:
 
 ```sh
-python tools/ps3tool.py ghidra-export  <elf>
-python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra.json -o config/ghidra_summary.json
+python tools/ps3tool.py ghidra-export  <elf> --cell
+python tools/ps3tool.py ghidra-summary <elf> --ghidra generated/ghidra/eboot_ghidra_cell.json -o config/ghidra_summary.json
 python tools/ps3tool.py recover        <elf> -o config/functions.json
 ```
 

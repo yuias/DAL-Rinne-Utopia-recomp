@@ -97,7 +97,7 @@ Other audio code is covered by `runtime_core` (`testEventQueueIpcKeys`,
 
 Python unit tests use synthetic ELF files built in memory. Tests that need the real
 executable are skipped unless `DAL_EBOOT_ELF` points at it. The Ghidra comparison tests
-additionally need `DAL_GHIDRA_JSON`, the path of an export written by `ghidra-export`, and
+additionally need `DAL_GHIDRA_JSON`, the path of an export written by `ghidra-export --cell`, and
 are skipped without it. The tests never run Ghidra themselves, apart from the opt-in live tests below. The tests of `recover` and
 `emit` that use the real executable also need `DAL_EBOOT_ELF`; the `emit` tests assert the
 counts above and that no word is unhandled.
@@ -121,5 +121,5 @@ They write only to temporary directories.
 ```sh
 python -m unittest discover -s tools/tests -t tools -v
 DAL_EBOOT_ELF=game/EBOOT.elf python -m unittest discover -s tools/tests -t tools -v
-DAL_EBOOT_ELF=game/EBOOT.elf DAL_GHIDRA_JSON=generated/ghidra/eboot_ghidra.json python -m unittest discover -s tools/tests -t tools -v
+DAL_EBOOT_ELF=game/EBOOT.elf DAL_GHIDRA_JSON=generated/ghidra/eboot_ghidra_cell.json python -m unittest discover -s tools/tests -t tools -v
 ```

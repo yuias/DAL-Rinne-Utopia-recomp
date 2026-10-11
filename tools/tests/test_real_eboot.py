@@ -268,21 +268,21 @@ class RealGhidraSummaryTest(unittest.TestCase):
         self.assertEqual(self.exit_code, 0)
 
     def test_function_count(self):
-        self.assertEqual(len(self.summary.functions), 2549)
+        self.assertEqual(len(self.summary.functions), 2649)
 
     def test_word_kinds(self):
         start, end = self.summary.text
         words = (end - start) // 4
         code = sum(b - a for a, b in self.summary.code_ranges) // 4
         data = sum(b - a for a, b in self.summary.data_ranges) // 4
-        self.assertEqual((code, data, words - code - data), (175301, 891, 33535))
+        self.assertEqual((code, data, words - code - data), (196865, 1137, 11725))
 
     def test_entries_are_in_or_next_to_text(self):
         # Ghidra also starts functions in the executable sections around .text
         # (the section below it and the import stubs); everything else is in .text.
         start, end = self.summary.text
         outside = [f.entry for f in self.summary.functions if not start <= f.entry < end]
-        self.assertEqual(len(self.summary.functions) - len(outside), 2388)
+        self.assertEqual(len(self.summary.functions) - len(outside), 2486)
         stray = [hex(a) for a in outside if not (a < start and a >= 0x10200
                                                  or end <= a < 0xDE410)]
         self.assertEqual(stray, [])
@@ -308,8 +308,8 @@ class RealSeedsTest(unittest.TestCase):
         # Counted over the code range: the descriptors of .init/.fini and the calls from
         # them add 2 OPD functions and 5 `bl` targets to the .text-only counts (854, 1697).
         expected = {"opd": 856, "opd_not_ghidra": 0, "bl_targets_in_text": 1702,
-                    "bl_targets_not_ghidra": 139, "bl_targets_thunk": 161, "thunks": 166,
-                    "union_ghidra_bl_opd": 2688}
+                    "bl_targets_not_ghidra": 41, "bl_targets_thunk": 161, "thunks": 166,
+                    "union_ghidra_bl_opd": 2690}
         self.assertEqual({k: counts[k] for k in expected}, expected)
 
     def test_thunks_load_their_slots(self):
@@ -470,11 +470,11 @@ class RealCoverageTest(unittest.TestCase):
         self.assertEqual((by_class["jump_table"]["words"], by_class["jump_table"]["runs"]),
                          (732, 14))
 
-    def test_cell_truncated_ghidra_functions_are_extended(self):
+    def test_no_ghidra_functions_are_cell_truncated(self):
+        # The committed summary comes from a Cell PPU language export, which decodes the
+        # Cell-only vector words, so Ghidra no longer ends functions at them.
         cell_info = self.ghidra["cell_truncated"]
-        self.assertEqual(cell_info["count"], 76)
-        # Observed: every truncated function is owned past its Cell-only word by the same entry.
-        self.assertEqual(cell_info["extended"], 76)
+        self.assertEqual((cell_info["count"], cell_info["extended"]), (0, 0))
         self.assertEqual(cell_info["not_extended"], [])
 
     def test_ghidra_functions_are_never_smaller_in_our_partition(self):
