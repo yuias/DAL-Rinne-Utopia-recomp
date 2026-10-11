@@ -69,6 +69,8 @@ class CellSleighSourcesTest(unittest.TestCase):
         self.assertEqual(len(languages), 1)
         language = languages[0]
         self.assertEqual(language.get("id"), "PowerPC:BE:64:CellPPU-32addr")
+        self.assertEqual(language.get("id"), ghidra.CELL_LANGUAGE)
+        self.assertEqual(language.get("id"), ghidra_cell.CELL_LANGUAGE)
         self.assertEqual(language.get("processor"), "PowerPC")
         self.assertEqual(language.get("endian"), "big")
         self.assertEqual(language.get("size"), "32")

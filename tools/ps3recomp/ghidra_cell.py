@@ -20,7 +20,7 @@ from pathlib import Path
 from . import ghidra
 from .info import EXIT_IO, REPO_ROOT, CliError
 
-CELL_LANGUAGE = "PowerPC:BE:64:CellPPU-32addr"
+CELL_LANGUAGE = ghidra.CELL_LANGUAGE
 BASE_LANGUAGE = "PowerPC:BE:64:A2ALT-32addr"
 
 MODULE_NAME = "CellPPU"
