@@ -36,6 +36,9 @@ DEFAULT_OUTPUT = GHIDRA_DIR / "eboot_ghidra.json"
 CELL_PROJECT_DIR = GHIDRA_DIR / "project_cell"
 CELL_LOG_DIR = GHIDRA_DIR / "logs_cell"
 CELL_OUTPUT = GHIDRA_DIR / "eboot_ghidra_cell.json"
+# Where `ghidra-cell-lang build` stages the module; kept here so ghidra_cell is only imported
+# when --staged needs it (it imports this module).
+CELL_STAGE_DIR = GHIDRA_DIR / "cell" / "CellPPU"
 SCRIPT_DIR = REPO_ROOT / "tools" / "ghidra"
 
 SCHEMA = 1
@@ -348,9 +351,13 @@ def _run(args: argparse.Namespace) -> int:
     if args.seeds_file and not Path(args.seeds_file).is_file():
         raise CliError(EXIT_IO, "seeds file not found: %s" % args.seeds_file)
     launcher = None
+    env = None
     if not args.check_only:
         ghidra_dir = resolve_ghidra_dir(args.ghidra_dir, os.environ)
         launcher = headless_launcher(ghidra_dir)
+        if args.staged is not None:
+            from . import ghidra_cell  # imports this module, so it cannot be a top-level import
+            env = ghidra_cell.external_module_env(Path(args.staged), ghidra_dir)
 
     data = read_input(args.elf)
     sha256 = hashlib.sha256(data).hexdigest()
@@ -385,9 +392,11 @@ def _run(args: argparse.Namespace) -> int:
             toc=toc, seeds=seeds, text_range=text_range, timeout=args.timeout,
             seeds_file=seeds_file)
         hint = ""
-        if language == CELL_LANGUAGE:
+        if args.staged is not None:
+            hint = "; is the staged module current? run ghidra-cell-lang build"
+        elif language == CELL_LANGUAGE:
             hint = "; is the Cell PPU language installed? see docs/ghidra-cell-language.md"
-        elapsed = _run_headless(cmd, log_dir, args.timeout, failure_hint=hint)
+        elapsed = _run_headless(cmd, log_dir, args.timeout, env=env, failure_hint=hint)
         if not out_path.is_file():
             raise CliError(EXIT_TOOL, "Ghidra finished without writing %s; see logs in %s"
                            % (out_path, log_dir))
@@ -424,8 +433,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--language", metavar="ID",
                         help="Ghidra language id (default: %s)" % DEFAULT_LANGUAGE)
     parser.add_argument("--cell", action="store_true",
-                        help="use the installed Cell PPU language (%s) with its own project, "
-                             "output and log directories" % CELL_LANGUAGE)
+                        help="use the Cell PPU language (%s; installed, or see --staged) with "
+                             "its own project, output and log directories" % CELL_LANGUAGE)
+    parser.add_argument("--staged", nargs="?", const=str(CELL_STAGE_DIR), metavar="DIR",
+                        help="with --cell: load the module staged by ghidra-cell-lang build as "
+                             "an external module instead of an installed one "
+                             "(default DIR: generated/ghidra/cell/CellPPU)")
     parser.add_argument("--cspec", default=DEFAULT_CSPEC, metavar="ID",
                         help="compiler spec id (default: %(default)s)")
     parser.add_argument("--project-dir", metavar="DIR",
@@ -452,6 +465,8 @@ def _parser() -> argparse.ArgumentParser:
 def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.cell and args.language is not None:
         parser.error("--cell and --language cannot be combined")
+    if args.staged is not None and not args.cell:
+        parser.error("--staged requires --cell")
     if (args.start is None) != (args.end is None):
         parser.error("--start and --end must be given together")
     for name in ("start", "end"):

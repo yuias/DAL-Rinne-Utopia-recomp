@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import subprocess
 import tempfile
 import unittest
@@ -474,8 +475,8 @@ class RunTest(GhidraTestBase):
         self.assertEqual(len(err.strip().splitlines()), 1)
 
 
-class CellRunTest(GhidraTestBase):
-    """`--cell` defaults and hints, with a stubbed `subprocess.run`."""
+class CellRunBase(GhidraTestBase):
+    """Fake install and patched `--cell` paths for runs with a stubbed `subprocess.run`."""
 
     def setUp(self):
         super().setUp()
@@ -516,6 +517,10 @@ class CellRunTest(GhidraTestBase):
     @staticmethod
     def failing_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1)
+
+
+class CellRunTest(CellRunBase):
+    """`--cell` defaults and hints."""
 
     def test_default_paths(self):
         self.assertEqual(REAL_CELL_PATHS, (ghidra.GHIDRA_DIR / "project_cell",
@@ -579,6 +584,92 @@ class CellRunTest(GhidraTestBase):
         self.assertEqual(code, 6)
         self.assertIn(str(self.stock_logs), err)
         self.assertNotIn("Cell PPU", err)
+
+
+class CellStagedRunTest(CellRunBase):
+    """`--cell --staged` with a fake staged module, a fake install and a stubbed runner."""
+
+    def setUp(self):
+        super().setUp()
+        props = self.ghidra_dir / "Ghidra" / "application.properties"
+        props.parent.mkdir(parents=True)
+        props.write_text("application.version=1.2.3\napplication.release.name=TEST\n",
+                         encoding="utf-8")
+        self.stage = self.tmp / "stage" / "CellPPU"
+        (self.stage / "data" / "languages").mkdir(parents=True)
+        (self.stage / "Module.manifest").write_text("", encoding="utf-8")
+        (self.stage / "data" / "languages" / "ppc_cell.sla").write_bytes(b"sla")
+        # platform.system() shells out on Windows; cache it before subprocess.run is stubbed.
+        platform.system()
+        # Keep the duplicate-module check away from the real user settings directory.
+        patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.tmp / "xdg")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("GHIDRA_HEADLESS_JAVA_OPTIONS", None)
+
+    def test_default_stage_dir_is_where_build_writes(self):
+        from ps3recomp import ghidra_cell
+        self.assertEqual(ghidra.CELL_STAGE_DIR, ghidra_cell.DEFAULT_OUT / "CellPPU")
+        self.assertEqual(ghidra.CELL_STAGE_DIR,
+                         ghidra.GHIDRA_DIR / "cell" / "CellPPU")
+
+    def test_staged_command_and_environment(self):
+        writer = self.export_writer(self.cell_out, language=ghidra.CELL_LANGUAGE)
+        with mock.patch.object(ghidra, "CELL_STAGE_DIR", self.stage):
+            (code, out, err), run = self.run_ghidra(writer, "--cell", "--staged")
+        self.assertEqual((code, err), (0, ""))
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("-processor") + 1], ghidra.CELL_LANGUAGE)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["GHIDRA_HEADLESS_JAVA_OPTIONS"],
+                         "-Dghidra.external.modules=%s" % self.stage.resolve())
+        self.assertIn("language check: lvlx at 0x00010014 -> ghidra 'lvlx': ok", out)
+
+    def test_explicit_stage_dir_is_honoured(self):
+        writer = self.export_writer(self.cell_out, language=ghidra.CELL_LANGUAGE)
+        missing_default = self.tmp / "not_built"
+        with mock.patch.object(ghidra, "CELL_STAGE_DIR", missing_default):
+            (code, _, err), run = self.run_ghidra(writer, "--cell", "--staged", str(self.stage))
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(str(self.stage.resolve()),
+                      run.call_args.kwargs["env"]["GHIDRA_HEADLESS_JAVA_OPTIONS"])
+
+    def test_staged_without_cell_is_a_usage_error(self):
+        (code, _, _), run = self.run_ghidra(self.failing_run, "--staged")
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+
+    def test_unbuilt_stage_is_exit_6_with_the_build_hint(self):
+        (code, _, err), run = self.run_ghidra(self.failing_run, "--cell", "--staged",
+                                              str(self.tmp / "not_built"))
+        self.assertEqual(code, 6)
+        self.assertIn("ghidra-cell-lang build", err)
+        run.assert_not_called()
+
+    def test_cell_without_staged_passes_no_environment(self):
+        writer = self.export_writer(self.cell_out, language=ghidra.CELL_LANGUAGE)
+        (code, _, _), run = self.run_ghidra(writer, "--cell")
+        self.assertEqual(code, 0)
+        self.assertIsNone(run.call_args.kwargs["env"])
+
+    def test_check_only_ignores_staged(self):
+        export = make_export(self.data, language=ghidra.CELL_LANGUAGE)
+        self.cell_out.parent.mkdir(parents=True)
+        self.cell_out.write_text(json.dumps(export), encoding="utf-8")
+        (code, out, _), run = self.run_ghidra(self.failing_run, "--check-only", "--cell",
+                                              "--staged", str(self.tmp / "not_built"))
+        self.assertEqual(code, 0)
+        self.assertIn("lvlx at 0x00010014 -> ghidra 'lvlx': ok", out)
+        run.assert_not_called()
+
+    def test_staged_failure_points_at_the_staged_module(self):
+        (code, _, err), _ = self.run_ghidra(self.failing_run, "--cell", "--staged",
+                                            str(self.stage))
+        self.assertEqual(code, 6)
+        self.assertIn(str(self.cell_logs), err)
+        self.assertIn("is the staged module current? run ghidra-cell-lang build", err)
+        self.assertNotIn("installed", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
 
 
 class RunHeadlessEnvTest(GhidraTestBase):
