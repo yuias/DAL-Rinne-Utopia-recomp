@@ -315,9 +315,9 @@ class CellBuildTest(unittest.TestCase):
 
 
 class SettingsDirCandidatesTest(unittest.TestCase):
-    def candidates(self, environ, system, home="/home/u"):
+    def candidates(self, environ, system, home="/home/u", username="alice"):
         return ghidra_cell.settings_dir_candidates("9.8.7", "TEST", environ, system,
-                                                   Path(home), "alice")
+                                                   Path(home), username)
 
     def test_windows_uses_appdata(self):
         self.assertEqual(self.candidates({"APPDATA": "/roaming"}, "Windows"),
@@ -346,6 +346,29 @@ class SettingsDirCandidatesTest(unittest.TestCase):
     def test_empty_xdg_config_home_is_ignored(self):
         self.assertEqual(self.candidates({"XDG_CONFIG_HOME": ""}, "Linux"),
                          [Path("/home/u/.config/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_blank_xdg_config_home_is_ignored(self):
+        for blank in (" ", "\t  "):
+            with self.subTest(blank=blank):
+                self.assertEqual(self.candidates({"XDG_CONFIG_HOME": blank}, "Linux"),
+                                 [Path("/home/u/.config/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_xdg_config_home_is_trimmed(self):
+        self.assertEqual(self.candidates({"XDG_CONFIG_HOME": "  /cfg "}, "Linux")[0],
+                         Path("/cfg/ghidra/ghidra_9.8.7_TEST"))
+
+    def test_blank_appdata_falls_back_to_home(self):
+        self.assertEqual(self.candidates({"APPDATA": "  "}, "Windows", "/h"),
+                         [Path("/h/AppData/Roaming/ghidra/ghidra_9.8.7_TEST")])
+
+    def test_user_name_is_cleaned_like_ghidra(self):
+        for raw, clean in (("Alice Smith", "AliceSmith"), ("CORP\\alice", "alice"),
+                           ("/home/alice", "alice"), ("CORP\\Alice Smith", "AliceSmith")):
+            with self.subTest(raw=raw):
+                self.assertEqual(ghidra_cell.clean_user_name(raw), clean)
+                self.assertEqual(
+                    self.candidates({"XDG_CONFIG_HOME": "/cfg"}, "Linux", username=raw)[1],
+                    Path("/cfg/%s-ghidra/ghidra_9.8.7_TEST" % clean))
 
 
 class ExternalModuleEnvTest(unittest.TestCase):

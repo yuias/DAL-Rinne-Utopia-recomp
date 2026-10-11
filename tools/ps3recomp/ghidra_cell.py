@@ -244,18 +244,24 @@ def _install_info(ghidra_dir: Path) -> tuple[str, str]:
     return version, release
 
 
+def clean_user_name(name: str) -> str:
+    """Ghidra's SystemUtilities.getCleanUserName: no spaces, no leading domain or path part."""
+    return re.sub(r"^.*[\\/]", "", name.replace(" ", ""))
+
+
 def settings_dir_candidates(version: str, release: str, environ: Mapping[str, str],
                             system: str, home: Path, username: str) -> list[Path]:
     """User settings directories Ghidra may use for this version; the environment part only."""
     leaf = "ghidra_%s_%s" % (version, release)
-    xdg = environ.get("XDG_CONFIG_HOME")
+    # Ghidra trims these values, so a blank one counts as unset.
+    xdg = environ.get("XDG_CONFIG_HOME", "").strip()
     if xdg:
         base = Path(xdg)
         # Ghidra swaps the directory name for "<user>-ghidra" when the base is outside the home
         # directory; which one applies depends on Java's view of the home, so offer both.
-        return [base / "ghidra" / leaf, base / ("%s-ghidra" % username) / leaf]
+        return [base / "ghidra" / leaf, base / ("%s-ghidra" % clean_user_name(username)) / leaf]
     if system == "Windows":
-        appdata = environ.get("APPDATA")
+        appdata = environ.get("APPDATA", "").strip()
         return [(Path(appdata) if appdata else home / "AppData" / "Roaming") / "ghidra" / leaf]
     if system == "Darwin":
         return [home / "Library" / "ghidra" / leaf]
