@@ -1,0 +1,5 @@
+# The stock Power ISA 3.0 + AltiVec 32-bit-address PowerPC language plus the Cell PPU vector
+# load/store left/right instructions. Compiled only inside the module staged by ghidra-cell-lang,
+# where the stock files sit next to this one.
+@include "ppc_64_isa_altivec_be.slaspec"
+@include "cell_vmx.sinc"

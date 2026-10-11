@@ -1,0 +1,77 @@
+# Cell Broadband Engine PPU vector load/store left/right (not in Power ISA; RPCS3 LVLX..STVRXL).
+# sh = EA & 15. The p-code reads the aligned block even where the hardware touches no byte
+# (lvrx/stvrx with sh == 0) and stores rewrite the whole block with the untouched bytes unchanged;
+# both only matter for memory-mapped I/O, which user-mode PS3 code does not reach this way.
+# A shift by 128 bits yields 0 in p-code, which gives the sh == 0 cases without a branch.
+# Every constructor requires $(NOTVLE) (context vle=0, always 0 in this language): stock stvepx
+# (XO 807) and stvepxl (XO 775) occupy the lvrxl/lvlxl patterns, and an identical pattern is a
+# SLEIGH error. The extra constraint makes ours more specific, so ours win; the embedded stvepx and
+# stvepxl therefore do not decode in this language.
+
+macro cellLoadLeft(vr, ea) {      # bytes ea .. block end, left-justified, rest zero
+    blk_ea:$(REGISTER_SIZE) = ea & 0xfffffffffffffff0;
+    blk:16 = *[ram]:16 blk_ea;
+    vr = blk << ((ea & 0xf) * 8);
+}
+macro cellLoadRight(vr, ea) {     # bytes block start .. ea-1, right-justified, rest zero
+    blk_ea:$(REGISTER_SIZE) = ea & 0xfffffffffffffff0;
+    blk:16 = *[ram]:16 blk_ea;
+    vr = blk >> (128 - (ea & 0xf) * 8);
+}
+macro cellStoreLeft(vr, ea) {     # register bytes 0 .. 15-sh to ea .. block end
+    blk_ea:$(REGISTER_SIZE) = ea & 0xfffffffffffffff0;
+    old:16 = *[ram]:16 blk_ea;
+    keep:$(REGISTER_SIZE) = 128 - (ea & 0xf) * 8;
+    *[ram]:16 blk_ea = ((old >> keep) << keep) | (vr >> ((ea & 0xf) * 8));
+}
+macro cellStoreRight(vr, ea) {    # register bytes 16-sh .. 15 to block start .. ea-1
+    blk_ea:$(REGISTER_SIZE) = ea & 0xfffffffffffffff0;
+    old:16 = *[ram]:16 blk_ea;
+    sh8:$(REGISTER_SIZE) = (ea & 0xf) * 8;
+    *[ram]:16 blk_ea = (vr << (128 - sh8)) | ((old << sh8) >> sh8);
+}
+
+:lvlx vrD,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrD & RA_OR_ZERO & B & XOP_1_10=519 & Rc=0
+{
+    build RA_OR_ZERO;
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellLoadLeft(vrD, ea);
+}
+:lvlxl vrD,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrD & RA_OR_ZERO & B & XOP_1_10=775 & Rc=0
+{
+    build RA_OR_ZERO;
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellLoadLeft(vrD, ea);
+}
+:lvrx vrD,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrD & RA_OR_ZERO & B & XOP_1_10=551 & Rc=0
+{
+    build RA_OR_ZERO;
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellLoadRight(vrD, ea);
+}
+:lvrxl vrD,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrD & RA_OR_ZERO & B & XOP_1_10=807 & Rc=0
+{
+    build RA_OR_ZERO;
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellLoadRight(vrD, ea);
+}
+:stvlx vrS,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrS & RA_OR_ZERO & B & XOP_1_10=647 & Rc=0
+{
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellStoreLeft(vrS, ea);
+}
+:stvlxl vrS,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrS & RA_OR_ZERO & B & XOP_1_10=903 & Rc=0
+{
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellStoreLeft(vrS, ea);
+}
+:stvrx vrS,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrS & RA_OR_ZERO & B & XOP_1_10=679 & Rc=0
+{
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellStoreRight(vrS, ea);
+}
+:stvrxl vrS,RA_OR_ZERO,B is $(NOTVLE) & OP=31 & vrS & RA_OR_ZERO & B & XOP_1_10=935 & Rc=0
+{
+    ea:$(REGISTER_SIZE) = RA_OR_ZERO + B;
+    cellStoreRight(vrS, ea);
+}
