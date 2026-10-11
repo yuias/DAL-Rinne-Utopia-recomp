@@ -4,7 +4,8 @@ Function recovery uses Ghidra for function starts and data references, and this
 repository's own decoder for function extents. Ghidra truncates some functions at the
 Cell-only vector load/store instructions (`lvlx`, `lvrx`, `stvlx`, `stvrx` and their `l`
 variants) that it cannot decode, so `recover` re-derives every function body itself from the
-seeds. It also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
+seeds. The [Cell PPU Ghidra language](ghidra-cell-language.md) (`ghidra-export --cell`) removes this
+truncation in Ghidra itself. `recover` also resolves `bctr` jump tables, recognises import thunks, resolves lv2 syscall
 numbers over the recovered control-flow graph and reports coverage.
 
 ## Commands

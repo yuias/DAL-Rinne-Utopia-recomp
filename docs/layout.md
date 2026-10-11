@@ -28,7 +28,9 @@
 | `tools/build.ps1` | Windows build wrapper |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
 | `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |
-| `tools/ghidra/` | Java `GhidraScript`s run by `ghidra-export` |
+| `tools/ghidra/` | Java `GhidraScript`s run by `ghidra-export`, and `CellLangCheck.java`, the script behind `ghidra-cell-lang verify` |
+| `tools/ghidra/CellPPU/` | Sources of the `CellPPU` Ghidra language module; `ghidra-cell-lang build` stages and compiles them, see [Files](ghidra-cell-language.md#files) |
+| `tools/install-ghidra-cell.ps1` | Optional installer of the built module into a Ghidra settings or install directory; see [The install script](ghidra-cell-language.md#the-install-script) |
 | `tools/ps3recomp/emit*.py` | The `emit` command: function DB loader and census, per-instruction handlers by group, output writer and report |
 | `tools/tests/` | Unit tests |
 | `tools/tests/ppu_semantics/` | Semantics harness cases and the C generator; see [Semantics harness](emitter.md#semantics-harness) |

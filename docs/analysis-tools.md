@@ -1,13 +1,15 @@
 # Analysis tools
 
-`tools/ps3tool.py` has nine subcommands. Each takes the path to the decrypted ELF, except
+`tools/ps3tool.py` has ten subcommands. Each takes the path to the decrypted ELF, except
 `nidgen`, which reads an RPCS3 checkout.
 
 ```sh
 python tools/ps3tool.py info   <elf> [-o OUTPUT] [--target-config FILE] [--nids FILE] [--no-verify]
 python tools/ps3tool.py probe  <elf> [-o OUTPUT] [--syscalls FILE]
 python tools/ps3tool.py disasm <elf> (--start ADDR (--count N | --end ADDR) | --entry [--count N] | --stats [--start ADDR --end ADDR] [--json OUT]) [--raw] [--strict]
-python tools/ps3tool.py ghidra-export <elf> [--ghidra-dir DIR] [--language ID] [--cspec ID] [--project-dir DIR] [-o OUT] [--start ADDR] [--end ADDR] [--timeout SEC] [--seeds-file PATH] [--check-only]
+python tools/ps3tool.py ghidra-export <elf> [--ghidra-dir DIR] [--language ID] [--cspec ID] [--project-dir DIR] [-o OUT] [--start ADDR] [--end ADDR] [--timeout SEC] [--seeds-file PATH] [--check-only] [--cell [--staged [DIR]]]
+python tools/ps3tool.py ghidra-cell-lang build [--ghidra-dir DIR] [--src DIR] [--out DIR] [--no-zip]
+python tools/ps3tool.py ghidra-cell-lang verify [--ghidra-dir DIR] [--staged [DIR] | --language ID] [--out DIR] [--timeout SEC]
 python tools/ps3tool.py ghidra-diff   <elf> --ghidra JSON [--start ADDR] [--end ADDR] [--strict] [-o OUT] [--top N] [--examples K]
 python tools/ps3tool.py ghidra-summary <elf> --ghidra JSON [-o OUT]
 python tools/ps3tool.py recover <elf> [--ghidra-summary PATH | --no-ghidra] [--extra-seeds PATH] [--nids FILE] [--syscalls FILE] [-o OUT] [--report PATH] [--seeds-out PATH] [--prologue-seeds] [--max-rounds N]
@@ -36,6 +38,8 @@ python tools/ps3tool.py nidgen --rpcs3 DIR [--source-commit COMMIT] [--nids-out 
   checking and which mnemonics are rejected most often. `--json OUT` also writes the
   statistics as JSON.
 - `ghidra-export` and `ghidra-diff` cross-check the decoder against Ghidra; see below.
+- `ghidra-cell-lang` builds and verifies a Ghidra language that decodes the Cell-only vector
+  instructions; see [Ghidra language for the Cell PPU](ghidra-cell-language.md).
 - `ghidra-summary` and `recover` find and delimit functions; see [Function recovery](function-recovery.md#function-recovery).
 - `emit` writes C source for the recovered functions; see [Emitting C](emitter.md#emitting-c).
 - `nidgen` builds the name tables from RPCS3 sources; see below.
@@ -69,6 +73,15 @@ python tools/ps3tool.py ghidra-diff   <elf> --ghidra generated/ghidra/eboot_ghid
   The tool then checks that Ghidra decodes a few probe instructions (including AltiVec
   ones) as expected, so a wrong language setting is reported. `--check-only` skips Ghidra
   and only validates and language-checks an existing export.
+- `--cell` selects the Cell PPU language `PowerPC:BE:64:CellPPU-32addr` instead (see
+  [Using the language](ghidra-cell-language.md#using-the-language)); it cannot be combined with
+  `--language` and has its own project, export and log files under `generated/ghidra/`
+  (`project_cell/`, `eboot_ghidra_cell.json`, `logs_cell/`). The language must be installed
+  ([Installing](ghidra-cell-language.md#installing)), or `--staged [DIR]` loads the module built by
+  `ghidra-cell-lang build` for this run only ([Building](ghidra-cell-language.md#building)).
+  With this language the language check also requires `lvlx` and `lvrx` to decode like this
+  repository's decoder, and the run exits with 7 if they do not; with other languages those two
+  probes are informational.
 - Output goes under `generated/ghidra/`: the export JSON (`eboot_ghidra.json`), the Ghidra
   project (`project/`) and the Ghidra logs (`logs/`). All of it is git-ignored.
 - `ghidra-diff` classifies every word of the range into one category and prints the

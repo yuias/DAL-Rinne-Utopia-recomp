@@ -98,9 +98,25 @@ Other audio code is covered by `runtime_core` (`testEventQueueIpcKeys`,
 Python unit tests use synthetic ELF files built in memory. Tests that need the real
 executable are skipped unless `DAL_EBOOT_ELF` points at it. The Ghidra comparison tests
 additionally need `DAL_GHIDRA_JSON`, the path of an export written by `ghidra-export`, and
-are skipped without it. The tests never run Ghidra themselves. The tests of `recover` and
+are skipped without it. The tests never run Ghidra themselves, apart from the opt-in live tests below. The tests of `recover` and
 `emit` that use the real executable also need `DAL_EBOOT_ELF`; the `emit` tests assert the
 counts above and that no word is unhandled.
+
+The tests of the Cell PPU Ghidra language (see [Ghidra language for the Cell PPU](ghidra-cell-language.md))
+run without Ghidra, on fake Ghidra trees in temporary directories:
+
+- `test_ghidra_cell.py`: the module sources in `tools/ghidra/CellPPU/` against the decoder
+  (encodings and the language definition), `ghidra-cell-lang build` with a fake SLEIGH compiler,
+  the settings-directory candidates and the external-module environment used by `--staged`.
+- `test_ghidra_cell_verify.py`: the request, the result evaluation and the exit codes of
+  `ghidra-cell-lang verify` with a fake headless run.
+- `test_install_ghidra_cell.py`: `tools/install-ghidra-cell.ps1` against fake trees. It needs `pwsh`
+  (PowerShell 7) on `PATH` and is skipped without it.
+
+One live test in each of `test_ghidra_cell.py` and `test_ghidra_cell_verify.py` runs the real
+`ghidra-cell-lang build` and `verify` (staged module, then the stock baseline). They run only with
+`DAL_GHIDRA_LIVE=1` and `GHIDRA_INSTALL_DIR` set to a Ghidra 12.x install, and are skipped otherwise.
+They write only to temporary directories.
 
 ```sh
 python -m unittest discover -s tools/tests -t tools -v
