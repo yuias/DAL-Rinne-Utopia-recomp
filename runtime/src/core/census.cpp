@@ -34,6 +34,7 @@ struct CensusState {
     CensusWriterFn rsx_stop_writer = nullptr;
     SailCensusFn sail_fn = nullptr;
     AudioCensusFn audio_fn = nullptr;
+    OverrideCensusFn override_fn = nullptr;
 };
 
 // Leaked on purpose: the census is printed from stop paths that end in _Exit and may be updated
@@ -166,6 +167,12 @@ void setAudioCensusProvider(AudioCensusFn fn) {
     s.audio_fn = fn;
 }
 
+void setOverrideCensusProvider(OverrideCensusFn fn) {
+    CensusState& s = state();
+    std::lock_guard lock(s.mutex);
+    s.override_fn = fn;
+}
+
 void setRsxUnimplementedProvider(RsxUnimplementedFn fn, CensusResetFn reset) {
     CensusState& s = state();
     std::lock_guard lock(s.mutex);
@@ -187,6 +194,7 @@ std::string formatCensus() {
     RsxUnimplementedFn unimplemented_fn = nullptr;
     SailCensusFn sail_fn = nullptr;
     AudioCensusFn audio_fn = nullptr;
+    OverrideCensusFn override_fn = nullptr;
     {
         std::lock_guard lock(s.mutex);
 
@@ -230,6 +238,7 @@ std::string formatCensus() {
         unimplemented_fn = s.unimplemented_fn;
         sail_fn = s.sail_fn;
         audio_fn = s.audio_fn;
+        override_fn = s.override_fn;
     }
 
     if (rsx_fn != nullptr) {
@@ -284,6 +293,12 @@ std::string formatCensus() {
         }
     }
 
+    if (override_fn != nullptr) {
+        for (const std::string& line : override_fn()) {
+            out += "\n" + line;
+        }
+    }
+
     // The provider takes its own locks, so it runs outside ours.
     std::vector<ThreadCensusEntry> threads;
     if (thread_fn != nullptr) {
@@ -334,6 +349,7 @@ void resetCensus() {
         s.unimplemented_fn = nullptr;
         s.sail_fn = nullptr;
         s.audio_fn = nullptr;
+        s.override_fn = nullptr;
         unimplemented_reset = s.unimplemented_reset;
         s.unimplemented_reset = nullptr;
     }

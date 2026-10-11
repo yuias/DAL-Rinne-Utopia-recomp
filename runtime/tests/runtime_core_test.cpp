@@ -34,9 +34,11 @@
 #include "core/json_read.h"
 #include "core/log.h"
 #include "core/param_sfo.h"
+#include "core/overrides.h"
 #include "core/threads.h"
 #include "core/timer_resolution.h"
 #include "dal/ppu_context.h"
+#include "dal/ppu_override.h"
 #include "hle/hle.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_buttons.h"
@@ -587,6 +589,98 @@ void testCensus() {
     CHECK(lines.size() == 11);
     CHECK(!lines.empty() && lines[0].find("census: syscalls 123 calls") != std::string::npos);
 
+    dal::setLogSink({});
+    dal::resetCensus();
+}
+
+// Stand-ins for a generated wrapper and its original body.
+DAL_PPU_FUNC(overrideWrapperA) { ctx->gpr[3] = 100; }
+DAL_PPU_FUNC(overrideWrapperB) { ctx->gpr[3] = 200; }
+DAL_PPU_FUNC(overrideOriginalB) { ctx->gpr[3] = 42; }
+
+std::uint64_t g_override_calls[2];
+
+const DalPpuOverride kTestOverrides[2] = {
+        {0x10100, kDalOverrideKindHook, overrideOriginalB, &g_override_calls[0], "dalHookNop", nullptr},
+        {0x10200, kDalOverrideKindOverride, overrideOriginalB, &g_override_calls[1], "dalOverrideOriginal", "quoted"},
+};
+
+void testOverrides() {
+    std::vector<std::string> lines;
+    dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+    dal::resetCensus();
+
+    const DalFuncMapping mappings[] = {{0x10100, overrideWrapperA}, {0x10200, overrideWrapperB}};
+    dalRegisterFuncs(mappings, 2);
+
+    lines.clear();
+    dal::installOverrides(kTestOverrides, 2);
+    CHECK(lines.size() == 3);
+    CHECK(countContaining(lines, "dal: overrides: 2 entries (override 1, hook 1)") == 1);
+    CHECK(countContaining(lines, "dal: overrides: hook 0x00010100 dalHookNop") == 1);
+    CHECK(countContaining(lines, "dal: overrides: override 0x00010200 dalOverrideOriginal \"quoted\"") == 1);
+
+    // The entry that was never reached is listed after the one that was.
+    g_override_calls[0] = 0;
+    g_override_calls[1] = 5;
+    const std::vector<std::string> census_lines = dal::overrideCensusLines();
+    const std::vector<std::string> expected_lines = {
+            "census: overrides 2 entries, 5 calls",
+            "  0x00010200 override dalOverrideOriginal \"quoted\": 5",
+            "  0x00010100 hook dalHookNop: 0",
+    };
+    CHECK(census_lines == expected_lines);
+    const std::string census = dal::formatCensus();
+    CHECK(census.find("\ncensus: overrides 2 entries, 5 calls\n"
+                      "  0x00010200 override dalOverrideOriginal \"quoted\": 5\n"
+                      "  0x00010100 hook dalHookNop: 0\n"
+                      "census: threads") != std::string::npos);
+
+    // Equal counts keep the address order.
+    g_override_calls[0] = 5;
+    CHECK(dal::overrideCensusLines().at(1) == "  0x00010100 hook dalHookNop: 5");
+
+    // Generic handlers. The hook handlers must not touch the context.
+    auto ctx = std::make_unique<DalPpuContext>();
+    auto before = std::make_unique<DalPpuContext>();
+    ctx->gpr[3] = 7;
+    ctx->gpr[4] = 0x1234;
+    ctx->lr = 0x10300;
+    std::memcpy(before.get(), ctx.get(), sizeof(DalPpuContext));
+    dalHookNop(ctx.get(), nullptr, &kTestOverrides[0]);
+    CHECK(std::memcmp(before.get(), ctx.get(), sizeof(DalPpuContext)) == 0);
+
+    lines.clear();
+    g_override_calls[0] = 1;
+    dalHookLogCall(ctx.get(), nullptr, &kTestOverrides[0]);
+    CHECK(std::memcmp(before.get(), ctx.get(), sizeof(DalPpuContext)) == 0);
+    CHECK(lines.size() == 1);
+    CHECK(countContaining(lines, "dal: hook 0x00010100 call 1: r3=0x7 r4=0x1234 r5=0x0 r6=0x0 lr=0x10300") == 1);
+    g_override_calls[1] = 2;
+    dalHookLogCall(ctx.get(), nullptr, &kTestOverrides[1]);
+    CHECK(countContaining(lines, "dal: hook 0x00010200 \"quoted\" call 2:") == 1);
+    // Only the first calls are logged.
+    lines.clear();
+    g_override_calls[0] = 9;
+    dalHookLogCall(ctx.get(), nullptr, &kTestOverrides[0]);
+    g_override_calls[0] = 0;
+    dalHookLogCall(ctx.get(), nullptr, &kTestOverrides[0]);
+    CHECK(lines.empty());
+
+    dalOverrideReturn0(ctx.get(), nullptr, &kTestOverrides[1]);
+    CHECK(ctx->gpr[3] == 0);
+    CHECK(ctx->gpr[4] == 0x1234);
+    dalOverrideOriginal(ctx.get(), nullptr, &kTestOverrides[1]);
+    CHECK(ctx->gpr[3] == 42);
+
+    // A second install replaces the first; zero entries leave no section.
+    lines.clear();
+    dal::installOverrides(nullptr, 0);
+    CHECK(countContaining(lines, "dal: overrides: none") == 1);
+    CHECK(dal::overrideCensusLines().empty());
+    CHECK(dal::formatCensus().find("census: overrides") == std::string::npos);
+
+    dalRegisterFuncs(nullptr, 0);
     dal::setLogSink({});
     dal::resetCensus();
 }
@@ -8266,6 +8360,7 @@ int main(int argc, char** argv) {
     testDispatch();
     testCensus();
     testCensusRenderSuffix();
+    testOverrides();
     testDisableFrameBuilder();
     testSyscalls();
     testHle();

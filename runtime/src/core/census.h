@@ -96,6 +96,12 @@ void setSailCensusProvider(SailCensusFn fn);
 using AudioCensusFn = std::vector<std::string> (*)();
 void setAudioCensusProvider(AudioCensusFn fn);
 
+// Lines of the override and hook statistics, header line included. The section is printed only while
+// a provider is set and it returns lines. The provider runs without the census lock and may be called
+// from any thread.
+using OverrideCensusFn = std::vector<std::string> (*)();
+void setOverrideCensusProvider(OverrideCensusFn fn);
+
 // Called once by printCensus() after the text census, on the stop path; the RSX consumer uses it to
 // log the frame-builder totals and write its argument census (--rsx-census). Runs without the census
 // lock.

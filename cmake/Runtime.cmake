@@ -117,6 +117,8 @@ function(dal_runtime_add_core)
     runtime/src/core/guest_memory.cpp
     runtime/src/core/json_read.cpp
     runtime/src/core/log.cpp
+    runtime/src/core/override_handlers.cpp
+    runtime/src/core/overrides.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
     runtime/src/core/timer_resolution.cpp
