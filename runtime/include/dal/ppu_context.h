@@ -8,8 +8,8 @@
 //
 // Naming: functions camelCase, types PascalCase, constants kPascalCase (as enumerators), macros
 // DAL_*. The generated code adds address-derived identifiers that deliberately do not follow the
-// table: fn_%08x (functions), imp_%08x (import trampolines), L_%08x (labels), and the semantics
-// harness uses case_<name>.
+// table: fn_%08x (functions), fn_%08x_orig (the original body of an overridden or hooked function),
+// imp_%08x (import trampolines), L_%08x (labels), and the semantics harness uses case_<name>.
 //
 // Guest memory: `base` points at a flat, big-endian guest address space. The runtime must reserve
 // 4 GiB + kDalGuestGuardSize bytes so that an unaligned access at the top of the 32-bit space

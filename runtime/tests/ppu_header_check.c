@@ -137,6 +137,85 @@ static void checkDcbz(DalPpuContext* ctx, uint8_t* base) {
     }
 }
 
+// The wrappers below have the shape the emitter generates for an override table.
+static uint64_t g_override_calls[2];
+
+DAL_PPU_FUNC(overrideCheckOrig) {
+    (void)base;
+    ctx->gpr[3] += 1;
+}
+
+DAL_OVERRIDE_HANDLER(overrideCheckHook) {
+    (void)base;
+    (void)site;
+    ctx->gpr[4] = 0x55;
+}
+
+DAL_OVERRIDE_HANDLER(overrideCheckOverride) {
+    ctx->gpr[3] = 0x77;
+    site->original(ctx, base);
+}
+
+extern const DalPpuOverride kCheckOverrides[2];
+
+DAL_PPU_FUNC(overrideCheckHookWrapper) {
+    DAL_ENTER(0x3000u);
+    dalCountCall(&g_override_calls[0]);
+    overrideCheckHook(ctx, base, &kCheckOverrides[0]);
+    DAL_TAIL(overrideCheckOrig);
+}
+
+DAL_PPU_FUNC(overrideCheckOverrideWrapper) {
+    DAL_ENTER(0x3100u);
+    dalCountCall(&g_override_calls[1]);
+    overrideCheckOverride(ctx, base, &kCheckOverrides[1]);
+}
+
+const DalPpuOverride kCheckOverrides[2] = {
+        {0x3000u, kDalOverrideKindHook, overrideCheckOrig, &g_override_calls[0], "overrideCheckHook", "check hook"},
+        {0x3100u, kDalOverrideKindOverride, overrideCheckOrig, &g_override_calls[1], "overrideCheckOverride", nullptr},
+};
+static const DalPpuOverride kCheckEmptyOverrides[1] = {};
+
+static void checkOverrides(DalPpuContext* ctx, uint8_t* base) {
+    ctx->preempt_budget = 1 << 20;
+
+    ctx->gpr[3] = 10;
+    ctx->gpr[4] = 0;
+    overrideCheckHookWrapper(ctx, base);
+    CHECK(ctx->gpr[3] == 11);
+    CHECK(ctx->gpr[4] == 0x55);
+    CHECK(g_override_calls[0] == 1);
+
+    DalFuncMapping mappings[] = {{0x3000u, overrideCheckHookWrapper}, {0x3100u, overrideCheckOverrideWrapper}};
+    dalRegisterFuncs(mappings, 2);
+    ctx->gpr[3] = 20;
+    ctx->gpr[4] = 0;
+    ctx->jump_target = 0x3000u;
+    ctx->jump_site = 0x1000;
+    dalDispatch(ctx, base);
+    CHECK(ctx->gpr[3] == 21);
+    CHECK(ctx->gpr[4] == 0x55);
+    CHECK(g_override_calls[0] == 2);
+
+    ctx->gpr[3] = 5;
+    overrideCheckOverrideWrapper(ctx, base);
+    CHECK(ctx->gpr[3] == 0x78);
+    CHECK(g_override_calls[1] == 1);
+
+    uint64_t fresh = 0;
+    dalCountCall(&fresh);
+    dalCountCall(&fresh);
+    CHECK(fresh == 2);
+
+    CHECK(kCheckOverrides[0].guest == 0x3000u && kCheckOverrides[0].kind == kDalOverrideKindHook);
+    CHECK(kCheckOverrides[1].label == nullptr);
+
+    const DalPpuOverride* empty = &kCheckEmptyOverrides[0];
+    CHECK(empty->guest == 0 && empty->kind == 0 && empty->original == nullptr && empty->calls == nullptr);
+    CHECK(empty->handler_name == nullptr && empty->label == nullptr);
+}
+
 int main(void) {
     checkMemory(g_mem);
     checkVectors(g_mem);
@@ -145,6 +224,7 @@ int main(void) {
     checkDispatch(&g_ctx, g_mem);
     checkAtomics(&g_ctx, g_mem);
     checkDcbz(&g_ctx, g_mem);
+    checkOverrides(&g_ctx, g_mem);
 
     if (g_failures != 0) {
         fprintf(stderr, "ppu header check: %d failure(s)\n", g_failures);
