@@ -12,6 +12,7 @@ parameter and describe how the project works:
 | [ghidra-cell-language.md](ghidra-cell-language.md) | The Ghidra language for the Cell PPU: the eight vector load/store instructions, building, loading and installing the module, the install script, `verify`, `ghidra-export --cell` and the licence |
 | [function-recovery.md](function-recovery.md) | Recovering function starts and extents, the function database and its report |
 | [emitter.md](emitter.md) | Turning the recovered functions into C, the contract header and the semantics harness |
+| [overrides.md](overrides.md) | Replacing or hooking guest functions with native handlers: `config/overrides.json`, the `emit` options, the handler interface, the generic handlers, log lines, census and limits |
 | [runtime.md](runtime.md) | Runtime internals: logging, census, memory map, dispatch, threads, system calls, HLE imports, headless policy, PNG decoding, default handlers |
 | [virtual-file-system.md](virtual-file-system.md) | Guest path mapping and the VFS configuration file |
 | [sdat.md](sdat.md) | Decrypting the game's `.sdat` files: where the keys come from, the build step and `dal_sdat` |
