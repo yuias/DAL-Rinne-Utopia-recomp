@@ -203,6 +203,20 @@ function(dal_runtime_add_core)
   set_tests_properties(media_core PROPERTIES
     PASS_REGULAR_EXPRESSION "media core tests: [0-9]+ passed, 0 failed")
 
+  # Option parsing of dal_game. CLI11 stays PRIVATE so its headers never reach game_main.cpp.
+  add_library(dal_game_options STATIC runtime/src/app/game_options.cpp)
+  target_compile_options(dal_game_options PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_game_options PUBLIC dal_runtime_core)
+  target_link_libraries(dal_game_options PRIVATE CLI11)
+
+  add_executable(dal_game_options_tests runtime/tests/game_options_test.cpp)
+  target_compile_options(dal_game_options_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_link_libraries(dal_game_options_tests PRIVATE dal_game_options)
+
+  add_test(NAME game_options COMMAND dal_game_options_tests)
+  set_tests_properties(game_options PROPERTIES
+    PASS_REGULAR_EXPRESSION "game options tests: [0-9]+ passed, 0 failed")
+
   dal_sdat_add_tool()
 endfunction()
 
