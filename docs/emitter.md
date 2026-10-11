@@ -17,7 +17,9 @@ function named `fn_<address>`. Branches inside a function become labels `L_<addr
 edges carry a hook (`DAL_LOOP`) that counts a preemption budget. Import stubs become
 trampolines `imp_<address>` that call the runtime hook `dalHleCall` with an index into the
 generated import table. The output is deterministic: two runs on the same inputs write
-byte-identical files, and a file is only rewritten when its content changes.
+byte-identical files, and a file is only rewritten when its content changes. A function can be
+replaced or hooked by a native handler without editing generated code; see
+[Overrides and hooks](#overrides-and-hooks).
 
 ## Output
 
@@ -28,8 +30,11 @@ Everything goes to `--out` (default `generated/ppu`; git-ignored):
 | `ppu_chunk_NNN.c` | The function bodies, split into `--chunks` files (default 16) of similar instruction counts, so that they compile in parallel |
 | `ppu_imports.c` | The import trampolines |
 | `ppu_tables.c` | `kDalPpuFuncMappings` (guest address to host function, one row per function and per trampoline), `kDalPpuImports` (stub address, FNID, module, name) and the executable's SHA-256 |
-| `ppu_funcs.h` | Declarations of the functions and trampolines |
-| `sources.cmake` | The list of sources that `DAL_PPU_GENERATED_DIR` includes |
+| `ppu_funcs.h` | Declarations of the functions and trampolines, and with overrides `fn_<address>_orig` for each entry |
+| `ppu_overrides.c` | The table `kDalPpuOverrides` with its count, the call counters and the wrappers of the entries in the overrides file (always written; without entries the table is empty) |
+| `ppu_override_handlers.h` | `DAL_OVERRIDE_HANDLER` declarations of the handlers the overrides file names |
+| `ppu_override_stubs.c` | Stand-ins for those handlers, for the `ppu_link` test only |
+| `sources.cmake` | The list of sources that `DAL_PPU_GENERATED_DIR` includes (`DAL_PPU_GENERATED_SOURCES`, which has `ppu_overrides.c`) and `DAL_PPU_OVERRIDE_STUB_SOURCES`, the stand-in file |
 
 Chunk files that a smaller `--chunks` makes unnecessary are removed. `--comments` annotates
 the code with the guest disassembly; it is off by default because it makes the files larger.
@@ -45,6 +50,7 @@ The report (`--report`, default `generated/analysis/emit_report.json`) is JSON, 
 | `unhandled` | Words emitted as a call to `dalUnhandled`: total, per mnemonic, per group, with example addresses |
 | `edges` | Calls, tail calls, switches, syscalls and traps by kind, for example `calls_direct` and `calls_indirect` |
 | `dynamic_targets` | Transfers whose constant target is not a recovered function or stub, with site and target |
+| `overrides` | `enabled`, `file_sha256` and the entries with `self_entry_loop`; see [Overrides and hooks](#overrides-and-hooks) |
 | `labels`, `loop_hooks`, `elapsed_s` | Emitted labels, loop hooks, run time |
 
 `--census` only counts the owned instructions by mnemonic and exits, without writing C.
@@ -53,6 +59,49 @@ mnemonic with its count and handler group. `--max-unhandled N` makes `emit` exit
 more than `N` words are emitted as unhandled. For the committed function database and the
 pinned ELF, the code range holds 206065 words of 168 distinct mnemonics in 2531 functions,
 `emit` writes 16 chunks and 166 import trampolines, and `--max-unhandled 0` exits with 0.
+
+## Overrides and hooks
+
+`emit` reads `config/overrides.json` (the file format, the handler interface and the run-time
+behaviour are in [Function overrides and hooks](overrides.md)) and generates a wrapper for each
+entry. It exits with 0 or 9 as above; the other exit codes are 1 (a file cannot be read or
+written), 2 (usage), 3 (not a PPU ELF), 4 (the database or the overrides file was made for another
+ELF) and 10 (invalid overrides file).
+
+| Option | Effect |
+| --- | --- |
+| `--overrides PATH` | Overrides file (default `config/overrides.json`). A missing default file means no entries; a missing file given here is an error |
+| `--no-overrides` | Ignore the file and emit every function unchanged. Excludes `--overrides` |
+
+The file is checked after the function database and before anything is written, so an invalid
+file (exit 10, or 4 for a wrong ELF) leaves the output directory untouched. For an entry, the
+function body is emitted under the name `fn_<address>_orig` and without the `DAL_ENTER` line
+(`emit_function` takes the name and an `enter` flag), and the wrapper in `ppu_overrides.c` takes
+the name `fn_<address>`. Call sites are emitted as before and name the wrapper, as does the
+dispatch table. The wrapper does `DAL_ENTER`, so the call trace and the preemption budget see one
+entry per call. Chunk planning does not change.
+
+With no entries, or with `--no-overrides`, every `ppu_chunk_*.c`, `ppu_imports.c`, `ppu_tables.c`
+and `ppu_funcs.h` is byte-identical to the output without this feature. The other files are
+always written (`ppu_overrides.c` with an empty table), and the report has the key `overrides`:
+
+```json
+"overrides": {
+  "enabled": true,
+  "file_sha256": "<SHA-256 of the file, null when no file was read>",
+  "entries": [
+    { "address": "0x0001a2b0", "kind": "hook", "handler": "dalHookLogCall", "label": "frameStep",
+      "self_entry_loop": false }
+  ]
+}
+```
+
+`enabled` is false with `--no-overrides`. `self_entry_loop` is true when the original body
+branches to its own entry (the emitted body contains the label `L_<address>:`); that loop is a
+`goto` and does not run the handler again. The stdout lines `overrides: <n> entries (override <o>,
+hook <h>)`, one `overrides: 0x... branches to its own entry; ...` line per such entry and
+`overrides: disabled by --no-overrides` follow the `calls:` line; without entries and without
+`--no-overrides` nothing is printed.
 
 ## Contract header and stub runtime
 
@@ -66,6 +115,10 @@ all of them). `ppu_context.h` is the contract between generated code and a runti
 - the hooks the runtime implements: `dalDispatch`, `dalHleCall`, `dalSyscall`, `dalYield`,
   `dalUnhandled`, `dalTrap`, the reservation and cache operations, `dalMftb` and the FPSCR
   moves.
+
+`ppu_override.h` holds the handler interface of overrides and hooks (`DalPpuOverride`,
+`DAL_OVERRIDE_HANDLER`, `dalCountCall` and the generic handlers; see
+[Function overrides and hooks](overrides.md#handlers)).
 
 `ppu_int.h`, `ppu_fp.h` and `ppu_vmx.h` hold the inline helpers that emitted code calls.
 Vector registers are stored byte-reversed relative to guest memory; the `DAL_VR_*`
@@ -103,6 +156,28 @@ architecture rule the expected value comes from), the instruction words (built w
 extra callee functions and switch targets. Expected values are derived by hand, not by
 running the emitter.
 
+`cases_overrides.py` holds the override and hook cases. A case lists `overrides`, a mapping from
+a function address (`CODE_BASE`, or the entry of a callee) to `(kind, handler)`, and
+`expect_calls`, a mapping from the same addresses to the expected number of wrapper calls; both
+must name the same addresses. The generator emits those functions as `<name>_orig` bodies without
+`DAL_ENTER`, adds the wrappers and a per-case table through the same rendering functions as
+`emit`, and checks the counters together with the registers. The handlers are C functions in
+`runtime/tests/ppu_semantics_handlers.c`, defined with `DAL_OVERRIDE_HANDLER` after including the
+generated header, which declares every handler the cases name. To add a case, append to `CASES`
+in `cases_overrides.py` (its `case` helper fills in the reference; `A` is a callee address, `at(i)`
+the address of instruction `i` and `INC_R3` the callee `addi r3,r3,1`); to add a handler, define it
+in the handlers file:
+
+```python
+case("override_direct_call", [asm.bl(at(0), A)], {"r3": 5}, {"r3": 105},
+     callees={A: INC_R3}, overrides={A: ("override", "testOverrideAdd100")}, expect_calls={A: 1})
+```
+
+The cases cover every way into a function (`bl`, `b`, a `bctrl` dispatch, a switch case outside
+the function, and the case function itself), an override that runs the original, hooks that read
+the call and rewrite an argument, a hook in a tail-call cycle of a million rounds (the host stack
+must not grow), and a hook on a function that loops to its own entry (the hook runs once).
+
 ## What is and is not implemented
 
 Every instruction word in the code range of the pinned ELF has an emitter handler, so
@@ -128,5 +203,7 @@ Every instruction word in the code range of the pinned ELF has an emitter handle
 - `fres`, `frsqrte` and the vector estimate instructions return exactly computed results,
   which lie within the architected estimate error, not the hardware estimate values.
 - The stub runtime does not implement import calls, lv2 syscalls, threads or memory
-  allocation: it exits on import calls and returns 0 from syscalls. The runtime in `dal_game`
+  allocation: it exits on import calls and returns 0 from syscalls. It also defines
+`dalStubOverrideHandler`, which the generated stand-in handlers call: it prints `dal: override
+handler <name> for 0x<address> called in the stub runtime` and exits with status 3. The runtime in `dal_game`
   implements a subset; see [Runtime internals](runtime.md).

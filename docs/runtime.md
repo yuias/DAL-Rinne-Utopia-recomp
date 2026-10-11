@@ -42,7 +42,15 @@ the `, rendered ... draws, skipped ...` part appears when the renderer runs, and
 After a run that played movies, a `census: sail <n> movies` section repeats the per-movie
 summary lines (see [Movies](movies.md#log-lines-and-census)). After a run in which the game
 initialised `cellAudio`, a `census: audio` section gives the audio engine, mixer input and
-`cellAtrac` counters (see [Audio](audio.md#census)).
+`cellAtrac` counters (see [Audio](audio.md#census)). When the generated code has override or hook
+entries, a `census: overrides <n> entries, <total> calls` section follows, with one line per entry
+sorted by call count and then address (see [Function overrides and hooks](overrides.md#log-lines-and-census)):
+
+```
+census: overrides 2 entries, 5 calls
+  0x0001c000 override skipSpuWait: 5
+  0x0001a2b0 hook dalHookLogCall "frameStep": 0
+```
 Thread states are `running`, `blocked in <what>` or `exited`. The first call of each syscall and
 each import also logs `dal: first sc <number> <name>` or `dal: first hle <module>::<name>` while
 the game runs; these lines are the progress markers that `game_boot` checks.
@@ -81,6 +89,16 @@ table is an unknown target: the first occurrence of each (target, call site) pai
 the call trace and counted in the census. With `--strict` it is a fatal stop. Without it the
 dispatch returns, which acts like a callee that returned immediately, so the run goes on and the
 census lists every such target.
+
+A function that the overrides file names has a wrapper in the table under the function's own
+address, so computed jumps, indirect calls, callbacks and thread entries reach the handler; the
+original body is not in the table. Right after registering the functions, `dal_game` checks the
+generated override table against the dispatch table (a wrong table is a fatal stop) and logs
+`dal: overrides: none`, or `dal: overrides: <n> entries (override <o>, hook <h>)` followed by one
+`dal: overrides: <kind> 0x<address> <handler>[ "<label>"]` line per entry. The hook handler
+`dalHookLogCall` logs its first 8 calls per entry as
+`dal: hook 0x<address>[ "<label>"] call <n>: r3=... r4=... r5=... r6=... lr=...`. See
+[Function overrides and hooks](overrides.md).
 
 ## Threads
 

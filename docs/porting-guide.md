@@ -58,6 +58,10 @@ Run the analysis tools first (see [Analysis tools](analysis-tools.md)); this tak
 - Pin progress with the first call that the main thread makes after each new milestone (see
   [The `game_boot` test](tests.md#the-game_boot-test)); lines from other threads depend on
   scheduling.
+- To replace or observe a game function without editing generated code, list its address in
+  `config/overrides.json` and write a native handler for it in `runtime/src/game/overrides/`; the
+  generic handlers log or stub a function without any game code (see
+  [Function overrides and hooks](overrides.md)).
 - Never let the runtime abort into a modal dialog; unattended runs must end with an exit code.
 
 ## 6. Graphics, files and media

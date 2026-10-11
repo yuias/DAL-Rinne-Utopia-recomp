@@ -9,9 +9,9 @@ files are registered only when those are configured, and configuration prints wh
 | --- | --- | --- |
 | `runtime_version`, `runtime_musttail` | The runtime stub starts, and the compiler supports `musttail` | - |
 | `tools_unittest` | The Python unit tests (below) | - |
-| `ppu_header_check`, `ppu_semantics` | Contract header and the semantics harness (see [Emitting C](emitter.md)) | - |
-| `ppu_link` | The generated code links | `-GeneratedDir` |
-| `runtime_core` | Runtime core unit tests (memory, threads, lv2, HLE, VFS, fake RSX) | - |
+| `ppu_header_check`, `ppu_semantics` | Contract header and the semantics harness (see [Emitting C](emitter.md)). The header check includes hand-written wrappers in the shape `emit` generates for a hook and an override, with `dalCountCall` and an empty table. The harness has the override and hook cases (see [Semantics harness](emitter.md#semantics-harness)): every way into an overridden function reaches its wrapper, an override can run the original, a hook runs first and can rewrite an argument, a hook does not grow the host stack in a tail-call cycle, and the call counters are exact | - |
+| `ppu_link` | The generated code links with the stub runtime. It also checks the generated override table: addresses strictly ascending, dispatch reaches the wrapper and not the original body, and every entry has a counter and a handler name. Its ok line gives the number of overrides | `-GeneratedDir` |
+| `runtime_core` | Runtime core unit tests (memory, threads, lv2, HLE, VFS, fake RSX). `testOverrides` covers the start-up check of the override table, its log lines, the `census: overrides` section and the four generic handlers | - |
 | `game_options` | The `dal_game` option parser (`runtime/src/app`), with no game files: derived values, every validation message, last-wins and CLI11 errors, `--name=value` and `--flag=false`, UTF-8 paths, the configuration file reader (every kind, paths, every error text, unknown keys), the lookup (working directory, executable directory, `--config`, `--no-config`), precedence, error notes and the `dal: config:` log line, and that `config/dal_game.example.json` parses without errors or warnings. The tests run in scratch working directories, so a `config.json` of yours does not affect them | - |
 | `sdat_tests` | SDAT decryption and decompression on synthetic data | - |
 | `render_core`, `vp_translator`, `fp_translator` | Renderer and shader translators (see [Rendering](rendering.md)) | a Vulkan 1.3 device for the rendering parts |
@@ -102,7 +102,10 @@ Other audio code is covered by `runtime_core` (`testEventQueueIpcKeys`,
 ## Python unit tests
 
 Python unit tests use synthetic ELF files built in memory. Tests that need the real
-executable are skipped unless `DAL_EBOOT_ELF` points at it. The Ghidra comparison tests
+executable are skipped unless `DAL_EBOOT_ELF` points at it. The overrides file has its own tests
+(`test_emit_overrides.py`): every validation message and exit code, and the rendered texts; the
+`emit` command with `--overrides` and `--no-overrides` on a synthetic ELF is in
+`test_emit_output.py`. The Ghidra comparison tests
 additionally need `DAL_GHIDRA_JSON`, the path of an export written by `ghidra-export --cell`, and
 are skipped without it. The tests never run Ghidra themselves, apart from the opt-in live tests below. The tests of `recover` and
 `emit` that use the real executable also need `DAL_EBOOT_ELF`; the `emit` tests assert the
