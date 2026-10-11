@@ -41,7 +41,8 @@ dal_render_add()
 if(TARGET dal_game)
   # dal_media supplies the FFmpeg codec factory that game_main installs for the cellSail movies; the
   # FFmpeg DLLs it loads at run time are copied next to the executable by dal_ffmpeg_runtime.
-  target_link_libraries(dal_game PRIVATE dal_render dal_media)
+  # shell32: CommandLineToArgvW, for the UTF-8 arguments.
+  target_link_libraries(dal_game PRIVATE dal_render dal_media dal_game_options shell32)
   add_dependencies(dal_game dal_ffmpeg_runtime)
 endif()
 

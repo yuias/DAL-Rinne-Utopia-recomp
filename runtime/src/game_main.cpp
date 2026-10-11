@@ -1,10 +1,8 @@
 // dal_game: loads the decrypted EBOOT.elf and runs it through the generated PPU code.
 
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -17,10 +15,15 @@
 #include <string_view>
 #include <vector>
 
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <shellapi.h>
+
+#include "app/game_options.h"
 #include "audio/audio_engine.h"
 #include "audio/audio_output.h"
 #include "audio/wasapi_output.h"
-#include "audio/wav_file.h"
 #include "core/boot.h"
 #include "core/census.h"
 #include "core/elf_loader.h"
@@ -48,41 +51,6 @@
 #include "rsx/rsx_thread.h"
 
 namespace {
-
-struct Options {
-    std::string game_dir;
-    std::string elf;
-    std::string hdd_dir;
-    std::string sdata_cache;
-    std::string vfs_config;
-    std::string png_dump;
-    std::string rsx_census;
-    std::string log_file;
-    std::string dialog_answer;
-    std::string pad;  // --pad as given; empty until the defaults are settled after all arguments
-    std::string pad_script;
-    std::string audio;  // --audio as given; empty until the defaults are settled after all arguments
-    std::string audio_dump;
-    std::vector<dal::PadScriptEvent> pad_script_events;
-    // The host pad state, set for every --pad that reads host input (keyboard, gamepad, both). The
-    // window thread, the script thread and the gamepad thread each write their own source of it.
-    std::shared_ptr<dal::KeyboardPadState> keyboard;
-    unsigned seconds = 0;
-    bool strict = false;
-    bool quiet_hle = false;
-    bool load_only = false;
-    bool render_vulkan = false;
-    std::optional<bool> render_flag;  // --render as given; the final mode is settled after all arguments
-    bool dump_every_given = false;
-    bool vk_validation = false;
-    bool no_window = false;
-    bool window = false;  // settled after all arguments
-    bool pad_probe = false;
-    std::string dump_frames;
-    std::uint32_t dump_frames_every = 1;
-    std::string shader_cache;
-    std::vector<std::uint32_t> rsx_capture_frames;
-};
 
 bool padUsesKeyboard(std::string_view pad) { return pad == "keyboard" || pad == "keyboard+gamepad"; }
 bool padUsesGamepad(std::string_view pad) { return pad == "gamepad" || pad == "keyboard+gamepad"; }
@@ -153,7 +121,9 @@ private:
 };
 
 // Runs on the RSX thread; a null result makes the consumer continue without rendering.
-std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::string& error) {
+std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const dal::GameOptions& opt,
+                                                       const std::shared_ptr<dal::KeyboardPadState>& keyboard,
+                                                       std::string& error) {
     const auto start = std::chrono::steady_clock::now();
     dal::VkContextOptions context_options;
     context_options.validation = opt.vk_validation;
@@ -171,17 +141,17 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
     dal::RenderOptions render_options;
     render_options.dump_dir = opt.dump_frames;
     render_options.dump_every = opt.dump_frames_every;
-    render_options.shader_cache = opt.shader_cache.empty() ? std::filesystem::path("generated") / "shader_cache"
-                                                           : std::filesystem::path(opt.shader_cache);
+    render_options.shader_cache =
+            opt.shader_cache.empty() ? std::filesystem::path("generated") / "shader_cache" : opt.shader_cache;
     std::unique_ptr<dal::Presenter> presenter;
     if (opt.window) {
         dal::PresenterOptions presenter_options;
         presenter_options.frame_slots = dal::RsxRenderer::kFramesInFlight;
         presenter_options.on_close = [] { dal::stopProcess(dal::ExitCode::ProcessExit, "dal: stop: window closed"); };
-        if (opt.keyboard && padUsesKeyboard(opt.pad)) {
+        if (keyboard && padUsesKeyboard(opt.pad)) {
             // These run on the window thread; the state is lock-free, so the guest never waits on it.
             // Focus loss releases the keyboard source only: the gamepad thread is the sole writer of its own.
-            presenter_options.on_key = [keyboard = opt.keyboard](const dal::KeyMessage& key) {
+            presenter_options.on_key = [keyboard](const dal::KeyMessage& key) {
                 keyboard->keyEvent(key.scan_code, key.down, key.repeat, dal::KeyboardPadState::Clock::now());
                 if (key.repeat) return;
                 if (const std::optional<dal::PadButton> button = dal::padButtonForScanCode(key.scan_code)) {
@@ -189,9 +159,7 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
                                   dal::padButtonName(*button));
                 }
             };
-            presenter_options.on_focus_lost = [keyboard = opt.keyboard] {
-                keyboard->releaseAll(dal::InputSource::Keyboard);
-            };
+            presenter_options.on_focus_lost = [keyboard] { keyboard->releaseAll(dal::InputSource::Keyboard); };
         }
         presenter = dal::Presenter::create(*context, std::move(presenter_options), error);
         if (!presenter) {
@@ -212,219 +180,6 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const Options& opt, std::
                      render_options.dump_dir.generic_string());
     }
     return executor;
-}
-
-bool parseFrameList(std::string_view list, std::vector<std::uint32_t>& frames) {
-    while (!list.empty()) {
-        const std::size_t comma = list.find(',');
-        const std::string_view item = list.substr(0, comma);
-        std::uint32_t frame = 0;
-        const auto [end, ec] = std::from_chars(item.data(), item.data() + item.size(), frame);
-        if (item.empty() || ec != std::errc{} || end != item.data() + item.size() || frame == 0) return false;
-        frames.push_back(frame);
-        if (comma == std::string_view::npos) break;
-        list.remove_prefix(comma + 1);
-        if (list.empty()) return false;  // trailing comma
-    }
-    return !frames.empty();
-}
-
-void printUsage() {
-    std::fputs(
-            "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
-            "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
-            "                [--log-level trace|debug|info|warn|error]\n"
-            "                [--quiet-hle] [--load-only] [--png-dump DIR]\n"
-            "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
-            "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
-            "                [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]\n"
-            "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
-            "                [--vk-validation] [--no-window]\n",
-            stderr);
-}
-
-std::optional<dal::LogLevel> parseLogLevel(std::string_view name) {
-    if (name == "trace") return dal::LogLevel::Trace;
-    if (name == "debug") return dal::LogLevel::Debug;
-    if (name == "info") return dal::LogLevel::Info;
-    if (name == "warn") return dal::LogLevel::Warn;
-    if (name == "error") return dal::LogLevel::Error;
-    return std::nullopt;
-}
-
-bool parseArgs(int argc, char** argv, Options& opt) {
-    for (int i = 1; i < argc; i++) {
-        const std::string_view arg = argv[i];
-        auto value = [&](std::string& out) {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "error: %s needs a value\n", argv[i]);
-                return false;
-            }
-            out = argv[++i];
-            return true;
-        };
-        if (arg == "--game-dir") {
-            if (!value(opt.game_dir)) return false;
-        } else if (arg == "--elf") {
-            if (!value(opt.elf)) return false;
-        } else if (arg == "--hdd-dir") {
-            if (!value(opt.hdd_dir)) return false;
-        } else if (arg == "--sdata-cache") {
-            if (!value(opt.sdata_cache)) return false;
-        } else if (arg == "--vfs-config") {
-            if (!value(opt.vfs_config)) return false;
-        } else if (arg == "--png-dump") {
-            if (!value(opt.png_dump)) return false;
-        } else if (arg == "--rsx-census") {
-            if (!value(opt.rsx_census)) return false;
-        } else if (arg == "--rsx-capture") {
-            std::string list;
-            if (!value(list) || !parseFrameList(list, opt.rsx_capture_frames)) {
-                std::fprintf(stderr, "error: --rsx-capture needs frame numbers (1-based), e.g. 300,600\n");
-                return false;
-            }
-        } else if (arg == "--log") {
-            if (!value(opt.log_file)) return false;
-        } else if (arg == "--log-level") {
-            std::string name;
-            if (!value(name)) return false;
-            const std::optional<dal::LogLevel> level = parseLogLevel(name);
-            if (!level) {
-                std::fprintf(stderr, "error: --log-level needs trace, debug, info, warn or error\n");
-                return false;
-            }
-            // Applied here so that nothing later in startup logs at the wrong level.
-            dal::setLogLevel(*level);
-        } else if (arg == "--dialog-answer") {
-            if (!value(opt.dialog_answer)) return false;
-            if (!dal::setDialogAnswer(opt.dialog_answer)) {
-                std::fprintf(stderr, "error: --dialog-answer needs yes, no or ok\n");
-                return false;
-            }
-        } else if (arg == "--pad") {
-            std::string name;
-            if (!value(name)) return false;
-            if (name != "none" && name != "neutral" && name != "keyboard" && name != "gamepad" &&
-                name != "keyboard+gamepad") {
-                std::fprintf(stderr, "error: --pad needs none, neutral, keyboard, gamepad or keyboard+gamepad\n");
-                return false;
-            }
-            opt.pad = name;
-        } else if (arg == "--pad-script") {
-            if (!value(opt.pad_script)) return false;
-            auto events = dal::loadPadScript(std::filesystem::path(opt.pad_script));
-            if (!events) {
-                std::fprintf(stderr, "error: --pad-script %s: %s\n", opt.pad_script.c_str(), events.error().c_str());
-                return false;
-            }
-            opt.pad_script_events = std::move(*events);
-        } else if (arg == "--pad-probe") {
-            opt.pad_probe = true;
-        } else if (arg == "--audio") {
-            std::string name;
-            if (!value(name)) return false;
-            if (name != "none" && name != "wasapi") {
-                std::fprintf(stderr, "error: --audio needs none or wasapi\n");
-                return false;
-            }
-            opt.audio = name;
-        } else if (arg == "--audio-dump") {
-            if (!value(opt.audio_dump)) return false;
-        } else if (arg == "--render") {
-            std::string name;
-            if (!value(name)) return false;
-            if (name != "none" && name != "vulkan") {
-                std::fprintf(stderr, "error: --render needs none or vulkan\n");
-                return false;
-            }
-            opt.render_flag = name == "vulkan";
-        } else if (arg == "--dump-frames") {
-            if (!value(opt.dump_frames)) return false;
-        } else if (arg == "--dump-frames-every") {
-            std::string text;
-            if (!value(text)) return false;
-            const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), opt.dump_frames_every);
-            if (ec != std::errc{} || end != text.data() + text.size() || opt.dump_frames_every == 0) {
-                std::fprintf(stderr, "error: --dump-frames-every needs a positive integer\n");
-                return false;
-            }
-            opt.dump_every_given = true;
-        } else if (arg == "--shader-cache") {
-            if (!value(opt.shader_cache)) return false;
-        } else if (arg == "--vk-validation") {
-            opt.vk_validation = true;
-        } else if (arg == "--no-window") {
-            opt.no_window = true;
-        } else if (arg == "--seconds") {
-            std::string text;
-            if (!value(text)) return false;
-            const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), opt.seconds);
-            if (ec != std::errc{} || end != text.data() + text.size()) {
-                std::fprintf(stderr, "error: --seconds needs a non-negative integer\n");
-                return false;
-            }
-        } else if (arg == "--strict") {
-            opt.strict = true;
-        } else if (arg == "--quiet-hle") {
-            opt.quiet_hle = true;
-        } else if (arg == "--load-only") {
-            opt.load_only = true;
-        } else {
-            std::fprintf(stderr, "error: unknown argument %s\n", argv[i]);
-            return false;
-        }
-    }
-    if (opt.game_dir.empty() && opt.vfs_config.empty()) {
-        std::fputs("error: --game-dir or --vfs-config is required\n", stderr);
-        return false;
-    }
-    // Playing is the default, so the window is on unless the run asks for none: --no-window for
-    // unattended runs, or an explicit "--render none", which leaves nothing to show.
-    opt.window = !opt.no_window && opt.render_flag.value_or(true);
-    // --dump-frames and the window imply vulkan; an explicit "--render none" (anywhere on the line)
-    // overrides that and then conflicts with it. The other options have no effect without a renderer.
-    opt.render_vulkan = opt.render_flag.value_or(!opt.dump_frames.empty() || opt.window);
-    const bool render_option =
-            !opt.dump_frames.empty() || opt.dump_every_given || !opt.shader_cache.empty() || opt.vk_validation;
-    if (render_option && !opt.render_vulkan) {
-        std::fputs(
-                "error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need --render vulkan\n",
-                stderr);
-        return false;
-    }
-    // GameInput delivers readings to the foreground window only, so unattended runs have nothing to probe.
-    if (opt.pad_probe && !opt.window) {
-        std::fputs("error: --pad-probe needs the window\n", stderr);
-        return false;
-    }
-    // A window or a script is what makes a keyboard pad useful, so either one selects it by default.
-    const bool pad_input = opt.window || !opt.pad_script.empty();
-    if (opt.pad.empty()) opt.pad = opt.window ? "keyboard+gamepad" : pad_input ? "keyboard" : "neutral";
-    if (opt.pad == "keyboard" && !pad_input) {
-        std::fputs("error: --pad keyboard needs the window or --pad-script\n", stderr);
-        return false;
-    }
-    // GameInput delivers readings to the foreground window only.
-    if (padUsesGamepad(opt.pad) && !opt.window) {
-        std::fprintf(stderr, "error: --pad %s needs the window\n", opt.pad.c_str());
-        return false;
-    }
-    if (!opt.pad_script.empty() && !padUsesKeyboard(opt.pad)) {
-        std::fputs("error: --pad-script needs --pad keyboard or keyboard+gamepad\n", stderr);
-        return false;
-    }
-    // A window means somebody is listening; unattended runs must not need a sound device.
-    if (opt.audio.empty()) opt.audio = opt.window ? "wasapi" : "none";
-    if (!opt.audio_dump.empty()) {
-        // The engine creates the file again on its own thread; creating it here makes a bad path a
-        // usage error instead of a warning in the middle of a run.
-        const auto probe = dal::WavWriter::create(opt.audio_dump, dal::kAudioSampleRate, dal::kAudioOutputChannels);
-        if (!probe) {
-            std::fprintf(stderr, "error: --audio-dump %s: %s\n", opt.audio_dump.c_str(), probe.error().c_str());
-            return false;
-        }
-    }
-    return true;
 }
 
 // The movies decode through FFmpeg DLLs loaded at run time. Without them the factory stays unset
@@ -508,7 +263,7 @@ std::vector<std::string> audioCensusLines() {
     return lines;
 }
 
-void configureAudio(const Options& opt) {
+void configureAudio(const dal::GameOptions& opt) {
     dal::AudioEngineConfig config;
     // Only the wasapi choice builds a device output, so a run without it never touches COM.
     if (opt.audio == "wasapi") config.make_output = [] { return dal::makeWasapiOutput(); };
@@ -543,44 +298,62 @@ void applyBuildDirDefaults(dal::VfsLayout& layout) {
     }
 }
 
+// The arguments after the program name as UTF-8, so option paths do not depend on the ANSI code page.
+std::vector<std::string> utf8Arguments() {
+    std::vector<std::string> args;
+    int argc = 0;
+    wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!wide) return args;
+    for (int i = 1; i < argc; ++i) {
+        const int size = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string arg(size > 1 ? static_cast<std::size_t>(size - 1) : 0, '\0');
+        if (size > 1) WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, arg.data(), size, nullptr, nullptr);
+        args.push_back(std::move(arg));
+    }
+    LocalFree(wide);
+    return args;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
+int main() {
     dal::installProcessSettings();
     dal::installCensus();
 
-    Options opt;
-    if (!parseArgs(argc, argv, opt)) {
-        printUsage();
-        return static_cast<int>(dal::ExitCode::Usage);
+    const std::vector<std::string> args = utf8Arguments();
+    auto parsed = dal::parseGameOptions(args);
+    if (!parsed) {
+        const dal::OptionsExit& stop = parsed.error();
+        std::fputs(stop.message.c_str(), stderr);
+        if (stop.print_usage) {
+            const std::string_view usage = dal::gameOptionsUsage();
+            std::fwrite(usage.data(), 1, usage.size(), stop.exit_code == 0 ? stdout : stderr);
+        }
+        return stop.exit_code;
     }
+    const dal::GameOptions opt = std::move(*parsed);
 
     std::error_code ec;
     dal::VfsCliOptions cli;
     if (!opt.game_dir.empty()) {
-        const std::filesystem::path game_dir(opt.game_dir);
-        if (!std::filesystem::is_directory(game_dir, ec)) {
-            std::fprintf(stderr, "error: game directory %s does not exist\n", opt.game_dir.c_str());
+        if (!std::filesystem::is_directory(opt.game_dir, ec)) {
+            std::fprintf(stderr, "error: game directory %s does not exist\n", opt.game_dir.string().c_str());
             return static_cast<int>(dal::ExitCode::Usage);
         }
-        cli.game_dir = game_dir;
+        cli.game_dir = opt.game_dir;
     }
-    if (!opt.hdd_dir.empty()) {
-        cli.hdd_dir = std::filesystem::path(opt.hdd_dir);
-    }
-    if (!opt.sdata_cache.empty()) {
-        cli.sdata_cache = std::filesystem::path(opt.sdata_cache);
-    }
+    if (!opt.hdd_dir.empty()) cli.hdd_dir = opt.hdd_dir;
+    if (!opt.sdata_cache.empty()) cli.sdata_cache = opt.sdata_cache;
 
-    if (!opt.log_file.empty() && !dal::setLogFile(opt.log_file)) {
-        std::fprintf(stderr, "error: cannot open log file %s\n", opt.log_file.c_str());
+    if (const auto applied = dal::applyGameOptions(opt); !applied) {
+        std::fprintf(stderr, "error: %s\n", applied.error().c_str());
         return static_cast<int>(dal::ExitCode::Usage);
     }
 
     // Precedence: command-line options, then the configuration file, then the defaults.
     std::optional<dal::VfsConfigFile> vfs_file;
     if (!opt.vfs_config.empty()) {
-        auto loaded = dal::loadVfsConfig(std::filesystem::path(opt.vfs_config));
+        auto loaded = dal::loadVfsConfig(opt.vfs_config);
         if (!loaded) {
             dal::logError("vfs config: {}", loaded.error());
             return static_cast<int>(dal::ExitCode::LoadError);
@@ -598,7 +371,7 @@ int main(int argc, char** argv) {
     applyBuildDirDefaults(*layout);
     dal::configureVfs(std::move(*layout));
 
-    std::filesystem::path elf_path(opt.elf);
+    std::filesystem::path elf_path = opt.elf;
     if (opt.elf.empty()) {
         bool read_only = false;
         const auto default_elf = dal::resolveGuestPath("/dev_bdvd/PS3_GAME/USRDIR/EBOOT.elf", read_only);
@@ -611,11 +384,11 @@ int main(int argc, char** argv) {
 
     if (!opt.png_dump.empty()) {
         std::filesystem::create_directories(opt.png_dump, ec);
-        dal::setPngDumpDirectory(std::filesystem::path(opt.png_dump));
+        dal::setPngDumpDirectory(opt.png_dump);
     }
 
     loadGameParamSfo();
-    if (!opt.rsx_census.empty()) dal::setRsxArgCensusFile(opt.rsx_census);
+    if (!opt.rsx_census.empty()) dal::setRsxArgCensusFile(opt.rsx_census.string());
     if (!opt.rsx_capture_frames.empty()) {
         dal::setRsxCaptureFrames(opt.rsx_capture_frames, std::filesystem::path("generated") / "rsx" / "captures");
     }
@@ -671,16 +444,18 @@ int main(int argc, char** argv) {
         dal::logWarn("dal: timer: the 1 ms resolution request was refused; timed waits use the default tick");
     }
 
-    // The window, script and gamepad threads share `opt.keyboard`; the executor factory below copies
-    // the options, so it is created first.
+    // The host pad state, set for every --pad that reads host input (keyboard, gamepad, both). The
+    // window thread, the script thread and the gamepad thread each write their own source of it. The
+    // executor factory below copies it, so it is created first.
+    std::shared_ptr<dal::KeyboardPadState> keyboard;
     if (padUsesKeyboard(opt.pad) || padUsesGamepad(opt.pad)) {
-        opt.keyboard = std::make_shared<dal::KeyboardPadState>();
+        keyboard = std::make_shared<dal::KeyboardPadState>();
         // With the keyboard in the pad, port 0 is always there; a gamepad-only pad follows the hardware.
-        dal::setPadProvider(dal::makeKeyboardPadProvider(opt.keyboard, {}, {.always_connected = opt.pad != "gamepad"}));
+        dal::setPadProvider(dal::makeKeyboardPadProvider(keyboard, {}, {.always_connected = opt.pad != "gamepad"}));
         std::string where;
         if (opt.window) where += " (window)";
         if (!opt.pad_script.empty()) {
-            where += std::format(" (script {}, {} events)", std::filesystem::path(opt.pad_script).filename().string(),
+            where += std::format(" (script {}, {} events)", opt.pad_script.filename().string(),
                                  opt.pad_script_events.size());
         }
         dal::logInfo("dal: pad: {}{}", opt.pad, where);
@@ -692,12 +467,13 @@ int main(int argc, char** argv) {
 
     // The device is created on the RSX thread when it starts, so it belongs to that thread.
     if (opt.render_vulkan) {
-        dal::setRsxExecutorFactory([opt](std::string& error) { return createVulkanExecutor(opt, error); });
+        dal::setRsxExecutorFactory(
+                [opt, keyboard](std::string& error) { return createVulkanExecutor(opt, keyboard, error); });
     }
 
     // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").
     // The script clock starts here so that it matches --seconds within a few milliseconds.
-    if (opt.keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, opt.keyboard);
+    if (keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, keyboard);
     // GameInput takes about a second to initialise, so the gamepad thread creates the backend itself.
     // The probe alone (no gamepad in the pad) runs the thread without a state to write.
     if (padUsesGamepad(opt.pad) || opt.pad_probe) {
@@ -705,7 +481,7 @@ int main(int argc, char** argv) {
                 []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
                     return dal::makeGameInputBackend({});
                 },
-                padUsesGamepad(opt.pad) ? opt.keyboard : nullptr,
+                padUsesGamepad(opt.pad) ? keyboard : nullptr,
                 {.is_foreground = dal::processOwnsForegroundWindow,
                  .detect_steam = dal::detectSteamContext,
                  .probe = opt.pad_probe});
