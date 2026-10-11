@@ -73,6 +73,17 @@ try {
     "build: {0:N1} s" -f $buildTimer.Elapsed.TotalSeconds
     if ($buildExit -ne 0) { exit $buildExit }
 
+    # Lets dal_game start from its own folder without options. Only with the generated tree, which
+    # is what produces dal_game.exe.
+    $binDir = Join-Path (Get-Location) "build/$Preset/bin"
+    if ($GameDir -and (Test-Path -LiteralPath (Join-Path $binDir 'dal_game.exe'))) {
+        $writeArgs = @{ BinDir = $binDir; GameDir = $GameDir }
+        if ($EbootElf) {
+            $writeArgs['EbootElf'] = (Resolve-Path -LiteralPath $EbootElf).Path
+        }
+        & (Join-Path $PSScriptRoot 'write-game-config.ps1') @writeArgs
+    }
+
     if ($Test) {
         & ctest --preset $Preset
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
