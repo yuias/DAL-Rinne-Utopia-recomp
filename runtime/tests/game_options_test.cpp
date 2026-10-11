@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -659,6 +660,23 @@ void testConfigFileAcceptsEveryKey() {
     }
 }
 
+// The tracked example must stay a valid file, so users can copy it.
+void testConfigFileExample() {
+    const std::filesystem::path file = std::filesystem::path(DAL_SOURCE_DIR) / "config" / "dal_game.example.json";
+    std::ifstream in(file, std::ios::binary);
+    CHECK(in.good());
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(!text.empty());
+    const auto result = dal::parseConfigFile(text, file.parent_path(), dal::gameOptionSpecs());
+    CHECK(result.has_value());
+    if (!result) {
+        std::fprintf(stderr, "example file error: %s\n", result.error().c_str());
+        return;
+    }
+    CHECK(result->warnings.empty());
+    CHECK(!result->values.empty());
+}
+
 void testApplyGameOptions() {
     CHECK(!dal::logEnabled(dal::LogLevel::Debug));
     {
@@ -1010,6 +1028,7 @@ int main() {
     testConfigFileUnknownKeys();
     testConfigFileFrameList();
     testConfigFileAcceptsEveryKey();
+    testConfigFileExample();
     testApplyGameOptions();
     testConfigLookupNoFile();
     testConfigLookupWorkingDirectory();

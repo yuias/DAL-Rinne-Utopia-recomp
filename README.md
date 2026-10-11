@@ -88,6 +88,15 @@ build/release/bin/dal_game.exe --game-dir <game-dir>
 Closing the window ends the run. Game data and saves are written to `build/release/hdd`;
 `tools/build.ps1 -Clean` deletes them together with the rest of `build/release`.
 
+The build with `-GameDir` also writes `build/release/bin/config.json` (with `game_dir`, and `elf` if
+you gave `-EbootElf`) when that file does not exist yet. `dal_game.exe` reads a `config.json` from
+the working directory or, when there is none, from its own folder. So `dal_game.exe` needs no
+options when you start it from `build/release/bin` (for example by double-click, or from a shortcut
+whose "Start in" is that folder). To use a file elsewhere, pass `--config <file>`; `--no-config`
+reads none. The command line wins over the file. The file format is described in
+[`dal_game` options](docs/runtime-options.md#configuration-file), and `config/dal_game.example.json`
+is an example.
+
 Every option of `dal_game` is described in [`dal_game` options](docs/runtime-options.md).
 
 ### Keyboard

@@ -1,0 +1,9 @@
+{
+  "game_dir": "/path/to/BLJM61048",
+  "elf": "/path/to/EBOOT.elf",
+  "hdd_dir": "saves",
+  "log_level": "info",
+  "pad": "keyboard+gamepad",
+  "audio": "wasapi",
+  "no_window": false
+}

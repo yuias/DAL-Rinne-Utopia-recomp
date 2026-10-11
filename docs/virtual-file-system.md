@@ -8,8 +8,9 @@ Guest paths map to host directories (`runtime/src/lv2/vfs.cpp`, following RPCS3'
 | `/dev_hdd0` | `<--hdd-dir>/dev_hdd0` | read and write |
 | `/dev_hdd1` | `<--hdd-dir>/dev_hdd1` | read and write |
 
-The table is the layout the command-line options produce. A VFS configuration file can change it
-(other host directories, more devices, single-file overrides).
+The table is the layout the command-line options produce; the same options set in `config.json` (see
+[Configuration file](runtime-options.md#configuration-file)) produce it too. A VFS configuration file
+can change it (other host directories, more devices, single-file overrides).
 
 When neither an option nor the configuration file sets them, `dal_game` uses defaults relative to
 its own build directory (`build/<preset>`, the parent of the `bin` directory that holds the
@@ -76,9 +77,14 @@ Rules:
 - Overrides are not added to directory listings: `cellFsOpendir` lists what the host directory
   holds.
 
-Precedence is command-line option, then configuration file, then default. `--game-dir` replaces
-the `/dev_bdvd` and `/app_home` mounts of the file (not other mounts), `--hdd-dir` replaces
-`/dev_hdd0` and `/dev_hdd1`, and `--sdata-cache` replaces `sdata_cache`. `files` have no
-command-line form. Without `--elf`, the executable and `PARAM.SFO` are looked up through the VFS
+The VFS configuration file is named by `--vfs-config`, or by the `vfs_config` key of `config.json`.
+These are two different files: `config.json` holds the options of `dal_game`, the VFS file holds
+the layout (`version`, `mounts`, `files`).
+
+Precedence is command-line option, then VFS configuration file, then default. A `config.json` value of
+`game_dir`, `hdd_dir` or `sdata_cache` counts as the option: `--game-dir` (or `game_dir` in `config.json`)
+replaces the `/dev_bdvd` and `/app_home` mounts of the VFS file (not other mounts), `--hdd-dir` (`hdd_dir`)
+replaces `/dev_hdd0` and `/dev_hdd1`, and `--sdata-cache` (`sdata_cache`) replaces `sdata_cache`. The
+command line wins over `config.json`. `files` have no command-line form. Without `--elf`, the executable and `PARAM.SFO` are looked up through the VFS
 (`/dev_bdvd/PS3_GAME/...`), so the `/dev_bdvd` mount of the file, and a `files` override of those
 paths, applies.

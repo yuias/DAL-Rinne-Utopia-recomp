@@ -213,6 +213,7 @@ function(dal_runtime_add_core)
 
   add_executable(dal_game_options_tests runtime/tests/game_options_test.cpp)
   target_compile_options(dal_game_options_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_definitions(dal_game_options_tests PRIVATE DAL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(dal_game_options_tests PRIVATE dal_game_options)
 
   add_test(NAME game_options COMMAND dal_game_options_tests)

@@ -1,7 +1,8 @@
 # `dal_game` options
 
 The [top-level README](../README.md) shows the command for playing. This page lists every option of
-`dal_game`, its exit codes, and the options for unattended and diagnostic runs.
+`dal_game`, the [configuration file](#configuration-file) that can set them, its exit codes, and the
+options for unattended and diagnostic runs.
 
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
@@ -12,7 +13,13 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
          [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]
          [--dump-frames DIR] [--dump-frames-every K]
          [--shader-cache DIR] [--vk-validation] [--no-window]
+         [--config FILE | --no-config] [-h|--help]
 ```
+
+A value is given as `--name value` or `--name=value`. Flags take no value; `--flag=false` switches a
+flag off (see [precedence](#precedence)). Arguments are read as UTF-8, so paths with characters
+outside the ANSI code page work. When an option is repeated, the last one wins, except
+`--rsx-capture`, whose values add up.
 
 `dal_game` loads the decrypted `EBOOT.elf` into a 4 GiB guest address space, sets up the main PPU
 thread the way RPCS3 does and calls the entry function through the generated code.
@@ -23,7 +30,7 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 
 | Option | Meaning |
 | --- | --- |
-| `--game-dir DIR` | The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home` (`DIR/PS3_GAME/USRDIR`), `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. Required unless `--vfs-config` mounts `/dev_bdvd` (the executable can also come from `--elf`). `DIR/PS3_GAME/USRDIR` need not exist. |
+| `--game-dir DIR` | The game directory, the one that contains `PS3_GAME`. It must exist. It is mounted read-only as `/dev_bdvd` and `/app_home` (`DIR/PS3_GAME/USRDIR`), `PS3_GAME/PARAM.SFO` is read from it, and it holds the default ELF location. Required (on the command line or in the configuration file) unless `--vfs-config` mounts `/dev_bdvd` (the executable can also come from `--elf`). `DIR/PS3_GAME/USRDIR` need not exist. |
 | `--elf PATH` | The decrypted executable. Default: `PS3_GAME/USRDIR/EBOOT.elf` on `/dev_bdvd` (`DIR/PS3_GAME/USRDIR/EBOOT.elf`, or where the configuration puts it). |
 | `--hdd-dir DIR` | Host directory behind `/dev_hdd0` and `/dev_hdd1` (`DIR/dev_hdd0`, `DIR/dev_hdd1`; created on demand), where the game keeps its game data and saves. Default: `build/<preset>/hdd`, next to the `bin` directory of the executable. |
 | `--sdata-cache DIR` | Directory of decrypted `.sdat` files, each at its path relative to the game directory, as written by `dal_sdat`. Default: `build/<preset>/sdata_cache` if it exists, which is where the build writes it. Without a cache `cellFsSdataOpen` fails. See [SDAT files](sdat.md). |
@@ -82,6 +89,123 @@ the window cannot be created, the RSX thread logs the reason and the game goes o
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
 
+### Help and configuration file
+
+| Option | Meaning |
+| --- | --- |
+| `-h`, `--help` | Print the usage text on stdout and exit with 0. It works even when `config.json` is broken. |
+| `--config FILE` | Read `FILE` instead of looking for `config.json`. A relative name is relative to the working directory. The file must exist and be readable, and the name must not be empty. See [Configuration file](#configuration-file). |
+| `--no-config` | Read no configuration file. Cannot be combined with `--config` (`error: --no-config excludes --config`). The game tests pass it. |
+
+These three have no key in the configuration file.
+
+## Configuration file
+
+Every option above can also be set in a JSON file, so that `dal_game.exe` starts without arguments
+(double-click, or a shortcut with "Start in" set to the `bin` folder).
+
+### Lookup
+
+1. `config.json` in the working directory, if it exists.
+2. Otherwise `config.json` in the directory of `dal_game.exe`.
+
+Only one file is read; they are not merged. A missing file is not an error. `--config FILE` reads
+`FILE` instead (the last `--config` counts), and then a missing or unreadable file is an error.
+`--no-config` reads none. `tools/build.ps1 -GameDir <game-dir>` writes `build/<preset>/bin/config.json`
+when there is none (see [Building](building.md#toolsbuildps1)); `/config.json` at the repository root is
+git-ignored, for a file of your own.
+
+The log tells which file was read, as `dal: config: <file>`.
+
+### Format
+
+Strict JSON, with an optional UTF-8 byte-order mark: no comments, no trailing commas. The top level is
+an object, and each key may appear once. A key is the option name without the leading `--` and with `-`
+replaced by `_` (`--game-dir` is `game_dir`). `null` is not a value; remove the key to get the default.
+
+| Kind | Keys | JSON value |
+| --- | --- | --- |
+| Path | `game_dir`, `vfs_config`, `elf`, `log`, `hdd_dir`, `sdata_cache`, `png_dump`, `pad_script`, `audio_dump`, `rsx_census`, `dump_frames`, `shader_cache` | A non-empty string. A relative path is relative to the directory of the file, not to the working directory. |
+| String | `log_level`, `dialog_answer`, `pad`, `audio`, `render` | A string with one of the values of the option. |
+| Unsigned integer | `seconds`, `dump_frames_every` | A non-negative integer, with the range of the option (`dump_frames_every` must be positive). |
+| Flag | `strict`, `quiet_hle`, `load_only`, `pad_probe`, `vk_validation`, `no_window` | `true` or `false`. |
+| Frame list | `rsx_capture` | An array of positive integers (`[300, 600]`), or a string in the command-line form (`"300,600"`). |
+
+A key that is not in the table (including `config`, `no_config` and `help`) is ignored with a warning,
+`dal: config: <file>: unknown key "<key>" ignored`, so a newer file still starts an older build.
+Values are checked like their command-line forms, so the derived defaults, the conflict checks and
+the exit codes are the same.
+
+`config/dal_game.example.json` is a tracked example with placeholder paths:
+
+```json
+{
+  "game_dir": "/path/to/BLJM61048",
+  "elf": "/path/to/EBOOT.elf",
+  "hdd_dir": "saves",
+  "log_level": "info",
+  "pad": "keyboard+gamepad",
+  "audio": "wasapi",
+  "no_window": false
+}
+```
+
+Here `hdd_dir` is `saves` next to the file.
+
+### Precedence
+
+1. The command line.
+2. `config.json`.
+3. The VFS configuration named by `--vfs-config` (or `vfs_config`); the merged `game_dir`, `hdd_dir`
+   and `sdata_cache` replace the matching parts of it (see [Virtual file system](virtual-file-system.md#vfs-configuration-file)).
+4. The built-in defaults.
+
+A value on the command line always wins over the same option in the file, including flags:
+`"no_window": true` in the file is switched off with `--no-window=false`. Relative paths from the
+command line stay relative to the working directory; those from the file are relative to the file.
+
+### Errors
+
+A configuration file error exits with code 2 and prints one line, **without** the usage text, because
+the command line is not the mistake. The file is named by its full path:
+
+| Message (after `error: <file>: `) | Cause |
+| --- | --- |
+| `cannot open the file` | `--config FILE` names a file that is missing or cannot be read. |
+| `invalid JSON: <message> at line L, column C (byte B)` | A syntax error. |
+| `duplicate key "k" in an object` | A key given twice. |
+| `the top level must be an object` | The file is valid JSON but not an object. |
+| `"k": expected a path string, got <type>`, `"k": the path is empty`, `"k": the path is not valid UTF-8` | A bad Path value. |
+| `"k": expected a string, got <type>` | A bad String value. |
+| `"k": expected a non-negative integer, got <type>` | A bad integer value. |
+| `"k": expected true or false, got <type>` | A bad flag value. |
+| `"k": expected a string or an array of positive integers, got <type>` | A bad `rsx_capture` value. |
+| `"k": null is not a value; remove the key to use the default` | A `null`. |
+
+`<type>` is `null`, `object`, `array`, `string`, `boolean` or `number`. A broken file is reported before
+an unknown command-line argument.
+
+A value that parses but is not valid is reported like its command-line form, with the file and key in
+place of the option: `error: <file>: seconds needs a non-negative integer`, `error: <file>: pad needs
+none, neutral, keyboard, gamepad or keyboard+gamepad`, `error: <file>: pad_script: <reason>`. A conflict between
+options keeps its usual text (for example `--pad-probe needs the window`) and gets the line
+`note: settings were also read from <file>`. When neither `--game-dir` nor `--vfs-config` is given,
+the message is `error: --game-dir or --vfs-config is required (or "game_dir" or "vfs_config" in
+config.json)`. These print the usage text as before.
+
+### Differences from earlier versions
+
+- `-h` and `--help` print the usage text and exit with 0 (before, they were unknown arguments).
+- `--name=value` works for every option, and `--flag=false` and `--flag=true` for flags. `--name=`
+  with an empty value takes the next argument as the value.
+- Unknown arguments and missing values use the wording of the command-line library after `error: `, for
+  example `error: The following argument was not expected: --bogus` and `error: --log: 1 required TEXT
+  missing`.
+- When several options are wrong, the first one in the usage order is reported, not the first one on the
+  command line.
+- Arguments are UTF-8.
+- `--rsx-capture` can be repeated; the frames of all occurrences are recorded.
+
 ## Exit codes and stop lines
 
 Every run ends with one stop line on stderr and a census (see [Census](runtime.md#census)), then
@@ -90,7 +214,7 @@ exits:
 | Code | Meaning | Stop line |
 | --- | --- | --- |
 | 0 | The guest called `sys_process_exit` or `_sys_process_exit`, the window was closed, or `--load-only` finished loading | `dal: stop: process exit status N`, `dal: stop: window closed` |
-| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable | `error: ...` (usage text) |
+| 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable, configuration file missing (`--config`) or invalid | `error: ...` (usage text; none for a configuration file error) |
 | 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved; also the stops the game itself asks for (`cellGameContentErrorDialog`, a failed trophy registration) | `dal: stop: fatal <kind>: ...`, or a `dal: stop: ...` line naming the call |
 | 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
 | 5 | The `--seconds` watchdog elapsed | `dal: stop: watchdog N s` |
@@ -121,6 +245,13 @@ is the one the `game_input` test uses):
 
 ```sh
 dal_game --game-dir <game-dir> --no-window --hdd-dir <empty-dir> --seconds 40 --pad-script tools/pad_scripts/leave_title.txt
+```
+
+Playing with the settings of a file of your own (the file's `no_window` is switched off for this
+run):
+
+```sh
+dal_game --config <settings-file> --no-window=false
 ```
 
 Recording the game's sound to a file without playing it:
