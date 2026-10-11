@@ -98,7 +98,7 @@ function(dal_ppu_add_generated_tree)
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/game_hdd_input")
       set_tests_properties(game_input_hdd_clean PROPERTIES FIXTURES_SETUP game_input_hdd)
       add_test(NAME game_input
-        COMMAND dal_game --no-window --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
+        COMMAND dal_game --no-config --no-window --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
           --sdata-cache "${sdata_cache}" --hdd-dir "${CMAKE_BINARY_DIR}/game_hdd_input"
           --pad-script "${CMAKE_SOURCE_DIR}/tools/pad_scripts/leave_title.txt"
           --seconds ${DAL_GAME_INPUT_SECONDS})
@@ -114,7 +114,7 @@ function(dal_ppu_add_generated_tree)
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/game_hdd_audio")
       set_tests_properties(game_audio_hdd_clean PROPERTIES FIXTURES_SETUP game_audio_hdd)
       add_test(NAME game_audio
-        COMMAND dal_game --no-window --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
+        COMMAND dal_game --no-config --no-window --game-dir "${DAL_GAME_DIR}" --elf "${DAL_EBOOT_ELF}"
           --sdata-cache "${sdata_cache}" --hdd-dir "${CMAKE_BINARY_DIR}/game_hdd_audio"
           --pad-script "${CMAKE_SOURCE_DIR}/tools/pad_scripts/leave_title.txt"
           --audio none --audio-dump "${CMAKE_BINARY_DIR}/game_audio.wav"
