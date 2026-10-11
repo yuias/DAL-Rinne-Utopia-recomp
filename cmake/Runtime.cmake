@@ -70,12 +70,39 @@ function(dal_runtime_add_yyjson)
   set_target_properties(yyjson PROPERTIES SYSTEM ON)
 endfunction()
 
+# CLI11 is header-only here (precompiled mode off), so nothing is built from it; the CLI11 target
+# only carries the include directory. Tests, examples, docs and install rules stay off. SYSTEM keeps
+# its headers out of the warnings of the translation units that include them.
+function(dal_runtime_add_cli11)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/CLI11/CMakeLists.txt)
+    message(FATAL_ERROR
+      "DAL: externals/CLI11 is missing or empty. Run: git submodule update --init")
+  endif()
+  set(CLI11_PRECOMPILED OFF CACHE BOOL "" FORCE)
+  set(CLI11_SINGLE_FILE OFF CACHE BOOL "" FORCE)
+  set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(CLI11_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(CLI11_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/externals/CLI11
+    ${CMAKE_BINARY_DIR}/externals/CLI11 EXCLUDE_FROM_ALL)
+  set_target_properties(CLI11 PROPERTIES SYSTEM ON)
+
+  # project() inside the subdirectory does not set CLI11_VERSION here, so read the header it uses.
+  file(STRINGS ${CMAKE_SOURCE_DIR}/externals/CLI11/include/CLI/Version.hpp cli11_version_line
+    REGEX "#define CLI11_VERSION[ \t]+\"")
+  string(REGEX REPLACE ".*CLI11_VERSION[ \t]+\"([^\"]+)\".*" "\\1" cli11_version
+    "${cli11_version_line}")
+  message(STATUS "DAL: CLI11 ${cli11_version}")
+endfunction()
+
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
   dal_runtime_add_yyjson()
+  dal_runtime_add_cli11()
 
   add_library(dal_runtime_core STATIC
     runtime/src/audio/audio_engine.cpp

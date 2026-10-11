@@ -19,3 +19,6 @@
 [submodule "externals/VulkanMemoryAllocator"]
 	path = externals/VulkanMemoryAllocator
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+[submodule "externals/CLI11"]
+	path = externals/CLI11
+	url = https://github.com/CLIUtils/CLI11

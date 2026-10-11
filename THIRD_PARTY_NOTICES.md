@@ -1,5 +1,48 @@
 # Third-party notices
 
+## CLI11
+
+`dal_game` parses its command line and its `config.json` file with CLI11
+(<https://github.com/CLIUtils/CLI11>), a header-only C++ library. It is a git submodule in
+`externals/CLI11`, compiled into `dal_game`; nothing is copied into the build output.
+
+| | |
+| --- | --- |
+| Version | CLI11 2.7.2 (tag `v2.7.2`, commit `cbd58a3696887b34c70949aef21a71735a0c2ad5`) |
+| Source | <https://github.com/CLIUtils/CLI11/tree/v2.7.2> |
+| Licence | BSD 3-Clause (below) |
+
+BSD 3-Clause requires this notice to accompany binary redistributions. The licence text of
+`externals/CLI11/LICENSE`:
+
+```text
+CLI11 2.7.2 Copyright (c) 2017-2026 University of Cincinnati, developed by Henry
+Schreiner under NSF AWARD 1414736. All rights reserved.
+
+Redistribution and use in source and binary forms of CLI11, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ## RPCS3 `key_vault.h`
 
 To decrypt the game's `.sdat` files, the build downloads `rpcs3/Crypto/key_vault.h` from the RPCS3
