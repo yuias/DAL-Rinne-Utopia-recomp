@@ -1,4 +1,4 @@
-"""`ghidra-cell-lang` command: build the Cell PPU Ghidra language module from the user's Ghidra."""
+"""`ghidra-cell-lang` command: build and verify the Cell PPU Ghidra language module."""
 
 from __future__ import annotations
 
@@ -339,14 +339,18 @@ def _run(args: argparse.Namespace) -> int:
         ghidra_dir = ghidra.resolve_ghidra_dir(args.ghidra_dir, os.environ)
         return build(ghidra_dir, Path(args.src).resolve(), Path(args.out).resolve(),
                      make_zip=not args.no_zip)
+    if args.command == "verify":
+        # Imported here: the verify module imports this one.
+        from . import ghidra_cell_verify
+        return ghidra_cell_verify.run(args)
     raise AssertionError("unhandled subcommand %r" % args.command)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ps3tool.py ghidra-cell-lang",
-        description="Build the Cell PPU language module for Ghidra.")
-    sub = parser.add_subparsers(dest="command", required=True, metavar="{build}")
+        description="Build and verify the Cell PPU language module for Ghidra.")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{build,verify}")
     build_parser = sub.add_parser(
         "build", help="stage the module with the stock PowerPC files and compile it",
         description="Stage a self-contained CellPPU module from the tracked sources and the "
@@ -361,6 +365,15 @@ def _parser() -> argparse.ArgumentParser:
                               help="output directory (default: generated/ghidra/cell)")
     build_parser.add_argument("--no-zip", action="store_true",
                               help="do not write the extension zip")
+
+    from . import ghidra_cell_verify
+    verify_parser = sub.add_parser(
+        "verify", help="check a Ghidra language against our decoder, semantics and decompiler",
+        description="Disassemble every row of the decoder's opcode table, run the Cell vector "
+                    "load/store semantics in Ghidra's emulator and decompile a sample, all on a "
+                    "generated test image. By default the staged module is loaded as an external "
+                    "module for the run; nothing is installed.")
+    ghidra_cell_verify.add_arguments(verify_parser)
     return parser
 
 
