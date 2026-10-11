@@ -116,7 +116,10 @@ typedef struct DalImportInfo {
     const char* name;
 } DalImportInfo;
 
-#define DAL_PPU_FUNC(name) DAL_NOINLINE void name(DalPpuContext* __restrict ctx, uint8_t* __restrict base)
+// The parameters are [[maybe_unused]] because an overridden body has no DAL_ENTER, so a leaf body
+// can leave ctx or base untouched.
+#define DAL_PPU_FUNC(name) \
+    DAL_NOINLINE void name([[maybe_unused]] DalPpuContext* __restrict ctx, [[maybe_unused]] uint8_t* __restrict base)
 
 // Runtime hooks, implemented by the runtime.
 void dalDispatch(DalPpuContext* __restrict ctx, uint8_t* __restrict base);  // target = jump_target
