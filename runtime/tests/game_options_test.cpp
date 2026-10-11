@@ -31,8 +31,17 @@ int g_failed;
 
 constexpr int kUsageExit = static_cast<int>(dal::ExitCode::Usage);
 
+std::string utf8Of(const std::filesystem::path& path) {
+    const std::u8string text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
+
+// A directory that does not exist, so the executable-directory lookup finds nothing in the plain tests.
+// The working directory is an empty scratch directory for the whole run (see main), for the same reason.
+const std::filesystem::path kNoExecutableDir = std::filesystem::temp_directory_path() / "dal_game_options_noexe";
+
 std::expected<dal::GameOptions, dal::OptionsExit> parse(const std::vector<std::string>& args) {
-    return dal::parseGameOptions(args);
+    return dal::parseGameOptions(args, kNoExecutableDir);
 }
 
 // Checks one failing command line: exit code 2, the exact stderr text and the usage text.
@@ -57,7 +66,8 @@ bool expectUsageError(const std::vector<std::string>& args, std::string_view mes
 // A scratch directory for pad scripts and the audio-dump probe.
 class TempDir {
 public:
-    TempDir() : path_(std::filesystem::temp_directory_path() / "dal_game_options_test") {
+    explicit TempDir(const char* name = "dal_game_options_test")
+        : path_(std::filesystem::temp_directory_path() / name) {
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
         std::filesystem::create_directories(path_, ec);
@@ -81,6 +91,27 @@ private:
     std::filesystem::path path_;
 };
 
+// Changes the working directory for a scope; declare it after the TempDir it points into, so the
+// directory is left before it is removed.
+class ScopedCwd {
+public:
+    explicit ScopedCwd(const std::filesystem::path& dir) : previous_(std::filesystem::current_path()) {
+        std::filesystem::current_path(dir);
+    }
+    ~ScopedCwd() {
+        std::error_code ec;
+        std::filesystem::current_path(previous_, ec);
+    }
+    ScopedCwd(const ScopedCwd&) = delete;
+    ScopedCwd& operator=(const ScopedCwd&) = delete;
+
+private:
+    std::filesystem::path previous_;
+};
+
+const std::string kRequired =
+        "error: --game-dir or --vfs-config is required (or \"game_dir\" or \"vfs_config\" in config.json)\n";
+
 void testGameOptionSpecs() {
     const std::span<const dal::OptionSpec> specs = dal::gameOptionSpecs();
     CHECK(specs.size() == 26);
@@ -92,6 +123,7 @@ void testGameOptionSpecs() {
     CHECK(usage.starts_with("usage: dal_game "));
     CHECK(usage.ends_with("\n"));
     CHECK(usage.find("[-h|--help]") != std::string_view::npos);
+    CHECK(usage.find("[--config FILE | --no-config]") != std::string_view::npos);
     for (const dal::OptionSpec& spec : specs) {
         CHECK(usage.find("--" + std::string(spec.name)) != std::string_view::npos);
     }
@@ -224,8 +256,8 @@ void testValidationMessages() {
     const std::string bad_script = dir.write("bad.txt", "0.1 tap cross\n0.2 frobnicate cross\n");
     const std::filesystem::path missing_wav = dir.path() / "missing" / "x.wav";
 
-    CHECK(expectUsageError({}, "error: --game-dir or --vfs-config is required\n"));
-    CHECK(expectUsageError({"--seconds", "10"}, "error: --game-dir or --vfs-config is required\n"));
+    CHECK(expectUsageError({}, kRequired));
+    CHECK(expectUsageError({"--seconds", "10"}, kRequired));
 
     CHECK(expectUsageError({"--game-dir", "g", "--log-level", "loud"},
                            "error: --log-level needs trace, debug, info, warn or error\n"));
@@ -660,9 +692,310 @@ void testApplyGameOptions() {
     CHECK(dal::logEnabled(dal::LogLevel::Info) && !dal::logEnabled(dal::LogLevel::Debug));
 }
 
+// ---- config.json lookup and merging ----
+
+// Checks one failing parse that is not a command-line mistake: exit code 2, the exact text, no usage.
+bool expectConfigFailure(const std::expected<dal::GameOptions, dal::OptionsExit>& result, std::string_view message) {
+    if (result) {
+        std::fprintf(stderr, "expected a config error\n");
+        return false;
+    }
+    const bool ok =
+            result.error().exit_code == kUsageExit && result.error().message == message && !result.error().print_usage;
+    if (!ok) {
+        std::fprintf(stderr, "unexpected result: code %d, usage %d, message \"%s\"\n  expected \"%.*s\"\n",
+                     result.error().exit_code, result.error().print_usage ? 1 : 0, result.error().message.c_str(),
+                     static_cast<int>(message.size()), message.data());
+    }
+    return ok;
+}
+
+std::filesystem::path normal(const std::filesystem::path& path) { return path.lexically_normal(); }
+
+void testConfigLookupNoFile() {
+    const TempDir dir("dal_game_options_cfg");
+    const ScopedCwd cwd(dir.path());
+    const auto result = parse({"--game-dir", "g"});
+    CHECK(result.has_value());
+    if (result) CHECK(result->config_file.empty() && result->warnings.empty() && result->seconds == 0);
+    // A directory named config.json is not a file and is skipped.
+    std::filesystem::create_directories(dir.path() / "config.json");
+    CHECK(parse({"--game-dir", "g"}).has_value());
+}
+
+void testConfigLookupWorkingDirectory() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write("config.json", R"({"game_dir": "gd", "seconds": 10, "log_level": "debug"})");
+    const ScopedCwd cwd(dir.path());
+    const auto result = parse({});
+    CHECK(result.has_value());
+    if (!result) return;
+    CHECK(normal(result->config_file) == normal(std::filesystem::absolute("config.json")));
+    CHECK(normal(result->game_dir) == normal(std::filesystem::current_path() / "gd"));
+    CHECK(result->seconds == 10 && result->log_level && *result->log_level == dal::LogLevel::Debug);
+    CHECK(result->warnings.empty());
+}
+
+void testConfigLookupExecutableDirectory() {
+    const TempDir dir("dal_game_options_cfg");
+    const std::filesystem::path work = dir.path() / "work";
+    const std::filesystem::path exe = dir.path() / "exe";
+    std::filesystem::create_directories(work);
+    std::filesystem::create_directories(exe);
+    dir.write("exe/config.json", R"({"game_dir": "from_exe", "seconds": 2})");
+    const ScopedCwd cwd(work);
+    {
+        // No file in the working directory: the one next to the executable is used.
+        const auto result = dal::parseGameOptions({}, exe);
+        CHECK(result.has_value());
+        if (result) {
+            CHECK(normal(result->config_file) == normal(exe / "config.json"));
+            CHECK(normal(result->game_dir) == normal(exe / "from_exe") && result->seconds == 2);
+        }
+    }
+    dir.write("work/config.json", R"({"game_dir": "from_cwd"})");
+    {
+        // Both exist: only the working directory's is read, nothing is merged.
+        const auto result = dal::parseGameOptions({}, exe);
+        CHECK(result.has_value());
+        if (result) {
+            CHECK(normal(result->game_dir) == normal(std::filesystem::current_path() / "from_cwd"));
+            CHECK(result->seconds == 0);
+        }
+    }
+    {
+        // An explicit --config replaces both lookups.
+        const std::vector<std::string> args{"--config", dir.write("other.json", R"({"game_dir": "from_other"})")};
+        const auto result = dal::parseGameOptions(args, exe);
+        CHECK(result.has_value());
+        if (result) CHECK(normal(result->game_dir) == normal(dir.path() / "from_other") && result->seconds == 0);
+    }
+}
+
+void testConfigExplicitFile() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write("config.json", R"({"game_dir": "default_file", "seconds": 1})");
+    dir.write("other.json", R"({"game_dir": "other_file", "hdd_dir": "saves"})");
+    const ScopedCwd cwd(dir.path());
+    for (const char* arg : {"--config=other.json"}) {
+        const auto result = parse({arg});
+        CHECK(result.has_value());
+        if (!result) continue;
+        CHECK(normal(result->config_file) == normal(std::filesystem::absolute("other.json")));
+        CHECK(normal(result->game_dir) == normal(std::filesystem::current_path() / "other_file"));
+        CHECK(result->seconds == 0);  // the default file is not read as well
+    }
+    // The last --config wins.
+    const auto last = parse({"--config", "config.json", "--config", "other.json"});
+    CHECK(last.has_value() && last->seconds == 0 && last->hdd_dir.filename() == "saves");
+
+    CHECK(expectConfigFailure(parse({"--game-dir", "g", "--config", "nope.json"}),
+                              "error: " + utf8Of(std::filesystem::absolute("nope.json")) + ": cannot open the file\n"));
+    // A directory is not a readable file either.
+    std::filesystem::create_directories(dir.path() / "subdir");
+    CHECK(expectConfigFailure(parse({"--game-dir", "g", "--config", "subdir"}),
+                              "error: " + utf8Of(std::filesystem::absolute("subdir")) + ": cannot open the file\n"));
+    CHECK(expectUsageError({"--game-dir", "g", "--config", ""}, "error: --config needs a file name\n"));
+}
+
+void testConfigNoConfig() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write("config.json", "{");
+    dir.write("other.json", R"({"game_dir": "o"})");
+    const ScopedCwd cwd(dir.path());
+    // --no-config reads nothing, so a broken file does not matter.
+    const auto skipped = parse({"--game-dir", "g", "--no-config"});
+    CHECK(skipped.has_value() && skipped->config_file.empty());
+    // --no-config=false is the same as leaving it out.
+    const auto read = parse({"--game-dir", "g", "--no-config=false"});
+    CHECK(!read.has_value());
+    if (!read)
+        CHECK(read.error().message.starts_with("error: " + utf8Of(std::filesystem::absolute("config.json")) +
+                                               ": invalid JSON: "));
+
+    const std::string excludes = "error: --no-config excludes --config\n";
+    CHECK(expectUsageError({"--game-dir", "g", "--config", "other.json", "--no-config"}, excludes));
+    CHECK(expectUsageError({"--game-dir", "g", "--no-config", "--config", "other.json"}, excludes));
+    // The conflict is reported even when the explicit file is missing.
+    CHECK(expectUsageError({"--game-dir", "g", "--no-config", "--config", "nope.json"}, excludes));
+}
+
+void testConfigPrecedence() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write(
+            "config.json",
+            R"({"game_dir": "g", "seconds": 10, "no_window": true, "strict": true, "rsx_capture": [7], "pad": "none"})");
+    const ScopedCwd cwd(dir.path());
+    {
+        const auto result = parse({});
+        CHECK(result.has_value());
+        if (result) {
+            // The file beats the defaults.
+            CHECK(result->seconds == 10 && result->no_window && !result->window && result->strict);
+            CHECK(result->pad == "none" && result->rsx_capture_frames == (std::vector<std::uint32_t>{7}));
+        }
+    }
+    {
+        // The command line beats the file, for a value, a flag and a list.
+        const auto result = parse({"--seconds", "5", "--no-window=false", "--strict=false", "--rsx-capture", "1,2"});
+        CHECK(result.has_value());
+        if (result) {
+            CHECK(result->seconds == 5 && !result->no_window && result->window && !result->strict);
+            CHECK(result->rsx_capture_frames == (std::vector<std::uint32_t>{1, 2}));
+            CHECK(result->pad == "none");  // untouched keys still come from the file
+        }
+    }
+    {
+        const auto result = parse({"--game-dir", "cli_game"});
+        CHECK(result.has_value() && result->game_dir == std::filesystem::path("cli_game"));
+    }
+}
+
+void testConfigRelativePaths() {
+    const TempDir dir("dal_game_options_cfg");
+    std::filesystem::create_directories(dir.path() / "sub");
+    dir.write("sub/c.json", R"({"game_dir": "../game", "hdd_dir": "saves"})");
+    const ScopedCwd cwd(dir.path());
+    const auto result = parse({"--config", "sub/c.json"});
+    CHECK(result.has_value());
+    if (!result) return;
+    // Relative to the file's directory, not to the working directory.
+    CHECK(normal(result->hdd_dir) == normal(std::filesystem::current_path() / "sub" / "saves"));
+    CHECK(normal(result->game_dir) == normal(std::filesystem::current_path() / "game"));
+}
+
+void testConfigValueErrors() {
+    const TempDir dir("dal_game_options_cfg");
+    const ScopedCwd cwd(dir.path());
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    const std::string prefix = "error: " + file + ": ";
+
+    // A bad value from the file names the file and the key; it is a validation error, so usage follows.
+    dir.write("config.json", R"({"game_dir": "g", "pad": "bogus"})");
+    CHECK(expectUsageError({}, prefix + "pad needs none, neutral, keyboard, gamepad or keyboard+gamepad\n"));
+    dir.write("config.json", R"({"game_dir": "g", "seconds": 99999999999})");
+    CHECK(expectUsageError({}, prefix + "seconds needs a non-negative integer\n"));
+    dir.write("config.json", R"({"game_dir": "g", "dump_frames_every": 0})");
+    CHECK(expectUsageError({}, prefix + "dump_frames_every needs a positive integer\n"));
+    dir.write("config.json", R"({"game_dir": "g", "rsx_capture": "1,,2"})");
+    CHECK(expectUsageError({}, prefix + "rsx_capture needs frame numbers (1-based), e.g. 300,600\n"));
+    dir.write("config.json", R"({"game_dir": "g", "pad_script": "missing_script.txt"})");
+    {
+        const auto result = parse({});
+        CHECK(!result.has_value());
+        if (!result) {
+            CHECK(result.error().exit_code == kUsageExit && result.error().print_usage);
+            CHECK(result.error().message.starts_with(prefix + "pad_script: "));
+            CHECK(result.error().message.find("note:") == std::string::npos);
+        }
+    }
+    // The same mistake on the command line keeps today's text, plus the note that a file was read too.
+    dir.write("config.json", R"({"game_dir": "g"})");
+    CHECK(expectUsageError({"--pad", "bogus"},
+                           "error: --pad needs none, neutral, keyboard, gamepad or keyboard+gamepad\n"
+                           "note: settings were also read from " +
+                                   file + "\n"));
+}
+
+void testConfigConflictNote() {
+    const TempDir dir("dal_game_options_cfg");
+    const ScopedCwd cwd(dir.path());
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    dir.write("config.json", R"({"game_dir": "g", "render": "none"})");
+    CHECK(expectUsageError({"--dump-frames", "d"},
+                           "error: --dump-frames, --dump-frames-every, --shader-cache and --vk-validation need "
+                           "--render vulkan\nnote: settings were also read from " +
+                                   file + "\n"));
+    // Without a game directory in the file, the required-option message mentions the keys.
+    dir.write("config.json", R"({"seconds": 1})");
+    CHECK(expectUsageError({}, kRequired + "note: settings were also read from " + file + "\n"));
+    // "vfs_config" alone satisfies the check.
+    dir.write("config.json", R"({"vfs_config": "v.json"})");
+    const auto result = parse({});
+    CHECK(result.has_value());
+    if (result) CHECK(normal(result->vfs_config) == normal(std::filesystem::current_path() / "v.json"));
+}
+
+void testConfigFileFailures() {
+    const TempDir dir("dal_game_options_cfg");
+    const ScopedCwd cwd(dir.path());
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    dir.write("config.json", "{\r\n  \"seconds\": 1,\r\n  \"pad\": ]\r\n}");
+    {
+        const auto result = parse({"--game-dir", "g"});
+        CHECK(!result.has_value());
+        if (!result) {
+            CHECK(result.error().exit_code == kUsageExit && !result.error().print_usage);
+            CHECK(result.error().message.starts_with("error: " + file + ": invalid JSON: "));
+            // The offset counts the CRLF bytes of the file.
+            CHECK(result.error().message.ends_with(" at line 3, column 10 (byte 29)\n"));
+        }
+    }
+    dir.write("config.json", R"({"seconds": "5"})");
+    CHECK(expectConfigFailure(parse({"--game-dir", "g"}),
+                              "error: " + file + ": \"seconds\": expected a non-negative integer, got string\n"));
+    // A file that is broken wins over an unknown argument, which CLI11 would report later.
+    dir.write("config.json", "{");
+    {
+        const auto result = parse({"--game-dir", "g", "--bogus"});
+        CHECK(!result.has_value());
+        if (!result) {
+            CHECK(result.error().exit_code == kUsageExit && !result.error().print_usage);
+            CHECK(result.error().message.starts_with("error: " + file + ": invalid JSON: "));
+        }
+    }
+    // --help is handled before the file is read.
+    const auto help = parse({"--help"});
+    CHECK(!help.has_value() && help.error().exit_code == 0 && help.error().print_usage);
+    // A missing value is reported before the file is read, too.
+    CHECK(expectUsageError({"--game-dir"}, "error: --game-dir: 1 required TEXT missing\n"));
+}
+
+void testConfigUnknownKeyWarning() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write("config.json", R"({"game_dir": "g", "future_option": 1, "config": "x.json"})");
+    const ScopedCwd cwd(dir.path());
+    const auto result = parse({});
+    CHECK(result.has_value());
+    if (result) {
+        CHECK(result->warnings ==
+              (std::vector<std::string>{"unknown key \"future_option\" ignored", "unknown key \"config\" ignored"}));
+    }
+}
+
+void testApplyGameOptionsConfigLog() {
+    const TempDir dir("dal_game_options_cfg");
+    dir.write("config.json", R"({"game_dir": "g", "future_option": 1})");
+    const ScopedCwd cwd(dir.path());
+    const auto parsed = parse({});
+    CHECK(parsed.has_value());
+    if (!parsed) return;
+    std::vector<std::string> lines;
+    dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+    const auto applied = dal::applyGameOptions(*parsed);
+    dal::setLogSink({});
+    CHECK(applied.has_value());
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    CHECK(lines.size() == 2);
+    if (lines.size() == 2) {
+        CHECK(lines[0].ends_with("dal: config: " + file) && lines[0].find("warn") == std::string::npos);
+        CHECK(lines[1].find("warn: dal: config: " + file + ": unknown key \"future_option\" ignored") !=
+              std::string::npos);
+    }
+    // Without a file nothing is logged.
+    lines.clear();
+    dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+    CHECK(dal::applyGameOptions(dal::GameOptions{}).has_value());
+    dal::setLogSink({});
+    CHECK(lines.empty());
+}
+
 }  // namespace
 
 int main() {
+    // An empty working directory for the plain tests; the config tests make their own.
+    const TempDir isolated("dal_game_options_cwd");
+    const ScopedCwd cwd(isolated.path());
     testGameOptionSpecs();
     testDerivedValues();
     testValidationMessages();
@@ -678,6 +1011,18 @@ int main() {
     testConfigFileFrameList();
     testConfigFileAcceptsEveryKey();
     testApplyGameOptions();
+    testConfigLookupNoFile();
+    testConfigLookupWorkingDirectory();
+    testConfigLookupExecutableDirectory();
+    testConfigExplicitFile();
+    testConfigNoConfig();
+    testConfigPrecedence();
+    testConfigRelativePaths();
+    testConfigValueErrors();
+    testConfigConflictNote();
+    testConfigFileFailures();
+    testConfigUnknownKeyWarning();
+    testApplyGameOptionsConfigLog();
     std::printf("game options tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed != 0 ? 1 : 0;
 }

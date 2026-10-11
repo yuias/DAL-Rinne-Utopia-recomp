@@ -26,7 +26,7 @@ struct OptionSpec {
 };
 
 // The 26 options in usage-text order; the single source for the CLI11 registration and the file
-// schema. Excludes --help, which has no file key.
+// schema. Excludes --config, --no-config and --help, which have no file key.
 std::span<const OptionSpec> gameOptionSpecs();
 std::string configKeyFor(std::string_view option_name);  // "game-dir" -> "game_dir"
 
@@ -45,7 +45,7 @@ struct GameOptions {
     bool strict = false, quiet_hle = false, load_only = false, pad_probe = false, vk_validation = false,
          no_window = false;
     bool window = false, render_vulkan = false;  // derived
-    std::filesystem::path config_file;           // the file that was applied; empty: none
+    std::filesystem::path config_file;           // the file that was applied (absolute); empty: none
     std::vector<std::string> warnings;           // config file warnings, logged by applyGameOptions
 };
 
@@ -57,13 +57,18 @@ struct OptionsExit {
 };
 
 // `args` excludes the program name and is UTF-8. Never prints, never changes global state. Reads
-// the pad script and creates the --audio-dump file (as before, both are usage errors).
-std::expected<GameOptions, OptionsExit> parseGameOptions(std::span<const std::string> args);
+// the pad script and creates the --audio-dump file (as before, both are usage errors), and the
+// config file: `config.json` in the working directory, else next to the executable, unless
+// --config or --no-config says otherwise. `executable_dir` is that second location; empty means the
+// directory of the running executable (tests pass their own).
+std::expected<GameOptions, OptionsExit> parseGameOptions(std::span<const std::string> args,
+                                                         const std::filesystem::path& executable_dir = {});
 
 std::string_view gameOptionsUsage();  // the usage text, ends with '\n'
 
 // Global side effects, in this order: setLogLevel (first, so nothing later logs at the wrong level),
-// setLogFile (error -> "cannot open log file <path>"), setDialogAnswer.
+// setLogFile (error -> "cannot open log file <path>"), setDialogAnswer, then the
+// `dal: config: <file>` Info line and one Warn line per config file warning.
 std::expected<void, std::string> applyGameOptions(const GameOptions& options);
 
 }  // namespace dal
