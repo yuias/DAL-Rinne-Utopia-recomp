@@ -146,6 +146,14 @@ class GeneratorTest(TempDirTestCase):
             "switch site is no bcctr": simple(switch_targets={CODE_BASE: (CODE_BASE,)}),
             "unaligned switch target": simple(words=(asm.bctr(),),
                                               switch_targets={CODE_BASE: (CODE_BASE + 2,)}),
+            "override of a non-function": simple(overrides={0x18000: ("hook", "h")},
+                                                 expect_calls={0x18000: 0}),
+            "unknown override kind": simple(overrides={CODE_BASE: ("after", "h")},
+                                            expect_calls={CODE_BASE: 0}),
+            "reserved handler name": simple(overrides={CODE_BASE: ("hook", "fn_1")},
+                                            expect_calls={CODE_BASE: 0}),
+            "override without expected calls": simple(overrides={CODE_BASE: ("hook", "h")}),
+            "expected calls without override": simple(expect_calls={CODE_BASE: 1}),
         }
         for label, case in reject.items():
             with self.subTest(label), self.assertRaises(gen.CaseError) as ctx:
@@ -195,6 +203,25 @@ class GeneratorTest(TempDirTestCase):
         self.assertIn("DAL_SYSCALL(0x00010000u);\n    return;\n}", sc_text)
         b_text = run_case(simple(words=(asm.b(CODE_BASE, CODE_BASE + 8), asm.blr(), asm.blr())))
         self.assertIn("goto L_00010008;", b_text)
+
+    def test_override_wrapper_replaces_the_name_of_the_body(self):
+        words = (asm.bl(CODE_BASE, 0x18000), asm.blr())
+        case = simple(words=words, callees={0x18000: (asm.blr(),)},
+                      overrides={0x18000: ("hook", "someHandler")}, expect_calls={0x18000: 3})
+        header, text = gen.render([case])
+        self.assertIn("DAL_OVERRIDE_HANDLER(someHandler);", header)
+        self.assertIn("DAL_PPU_FUNC(case_x_00018000_orig);", header)
+        self.assertIn("DAL_CALL(case_x_00018000, 0x00010004u);", text)
+        self.assertIn("DAL_PPU_FUNC(case_x_00018000_orig) {\n    return;", text)
+        self.assertIn("DAL_TAIL(case_x_00018000_orig);", text)
+        self.assertIn("{ 0x00018000u, case_x_00018000 },", text)
+        self.assertIn("override_calls_x[0] = 0;", text)
+        self.assertIn('"calls[0x00018000]", 16, override_calls_x[0], 0x0000000000000003ull', text)
+
+    def test_cases_without_overrides_add_nothing(self):
+        header, text = gen.render([simple()])
+        self.assertNotIn("DAL_OVERRIDE_HANDLER", header)
+        self.assertNotIn("override", text)
 
     def test_callees_and_switch_targets_reach_the_emitter(self):
         words = (asm.bctr(), asm.bl(CODE_BASE + 4, 0x18000), asm.blr())

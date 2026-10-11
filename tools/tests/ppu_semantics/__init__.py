@@ -28,3 +28,7 @@ class Case:
     # Extra functions, address in [CALLEE_BASE, DATA_START).
     callees: Mapping[int, tuple[int, ...]] = field(default_factory=dict)
     switch_targets: Mapping[int, tuple[int, ...]] = field(default_factory=dict)
+    # Function address (CODE_BASE or a callee entry) -> (kind, handler); see gen.py.
+    overrides: Mapping[int, tuple[str, str]] = field(default_factory=dict)
+    # Function address -> expected wrapper call count; every overridden address needs one.
+    expect_calls: Mapping[int, int] = field(default_factory=dict)

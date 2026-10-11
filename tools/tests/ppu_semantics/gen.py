@@ -20,6 +20,9 @@ from pathlib import Path
 from ps3recomp.emit_core import EmitEnv, EmitStats, _comment_text, emit_function, u32, u64
 from ps3recomp.emit_db import GROUPS
 from ps3recomp.emit_output import write_if_changed
+from ps3recomp.emit_overrides import (_C23_KEYWORDS, _HANDLER, _RESERVED_PREFIXES, KINDS,
+                                      OverrideEntry, OverrideSymbols, handler_declarations,
+                                      orig_name, render_table, render_wrapper)
 from ps3recomp.info import CliError
 from ps3recomp.ppu import decode
 from ps3recomp.ppu_flow import CodeImage, flow_of
@@ -45,10 +48,11 @@ class CaseError(Exception):
 
 
 def load_cases() -> list[Case]:
-    """`CASES` of every `cases_<group>` module that exists, in group order."""
+    """`CASES` of every `cases_<group>` module that exists, in group order, then the override cases."""
     package = __package__ or "tests.ppu_semantics"
     cases: list[Case] = []
-    for group in GROUPS:
+    # `overrides` is not an instruction group, so it is not in GROUPS.
+    for group in (*GROUPS, "overrides"):
         module_name = "%s.cases_%s" % (package, group)
         if importlib.util.find_spec(module_name) is None:
             continue
@@ -211,22 +215,60 @@ def _switch_targets(case: Case, functions: Mapping[int, tuple[int, ...]]) -> dic
     return out
 
 
-def _render_case(case: Case) -> tuple[list[str], str, list[tuple[int, str]]]:
-    """(prototype lines, function/init/check/mapping text, mappings) of one case."""
+def _overrides(case: Case, functions: Mapping[int, tuple[int, ...]]) -> list[OverrideEntry]:
+    """The case's overrides as table entries sorted by address (the order of the table rows)."""
+    entries = []
+    for addr in sorted(case.overrides):
+        spec = case.overrides[addr]
+        if addr not in functions:
+            raise CaseError("case %s: override at 0x%x is not a function of the case"
+                            % (case.name, addr))
+        if not (isinstance(spec, tuple) and len(spec) == 2 and all(isinstance(x, str) for x in spec)):
+            raise CaseError("case %s: override at 0x%x must be a (kind, handler) pair"
+                            % (case.name, addr))
+        kind, handler = spec
+        if kind not in KINDS:
+            raise CaseError("case %s: override at 0x%x has unknown kind %r" % (case.name, addr, kind))
+        if (not _HANDLER.fullmatch(handler) or handler.startswith(_RESERVED_PREFIXES)
+                or handler in _C23_KEYWORDS):
+            raise CaseError("case %s: override at 0x%x has invalid handler %r"
+                            % (case.name, addr, handler))
+        entries.append(OverrideEntry(addr, kind, handler))
+    # Every wrapper counts calls, so a case that overrides must say what it expects.
+    if set(case.expect_calls) != set(case.overrides):
+        raise CaseError("case %s: expect_calls and overrides must name the same addresses"
+                        % case.name)
+    for addr, count in case.expect_calls.items():
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise CaseError("case %s: expect_calls[0x%x]=%r is not a count" % (case.name, addr, count))
+    return entries
+
+
+def _render_case(case: Case) -> tuple[list[str], str, list[tuple[int, str]], list[OverrideEntry]]:
+    """(prototype lines, function/init/check/mapping text, mappings, override entries) of one case."""
     if not _NAME_RE.fullmatch(case.name):
         raise CaseError("invalid case name %r (need [a-z0-9_]+)" % (case.name,))
     if not isinstance(case.ref, str) or not case.ref.strip():
         raise CaseError("case %s: missing ref" % case.name)
     functions = _functions(case)
+    entries = _overrides(case, functions)
     names = {entry: "case_%s" % case.name if entry == CODE_BASE
              else "case_%s_%08x" % (case.name, entry) for entry in functions}
+    # Call sites keep naming `names`, which is the wrapper for an overridden function.
     env = EmitEnv(names, {}, _switch_targets(case, functions))
     stats = EmitStats()
+    # The table and its counters are file-scope statics named after the case, like the functions.
+    symbols = OverrideSymbols(table="overrides_%s" % case.name, count=None,
+                              calls="override_calls_%s" % case.name, static_table=True)
     texts = []
+    if entries:
+        texts.append(render_table(entries, names, symbols))
     for entry, words in functions.items():
         image = CodeImage.from_words(entry, words)
+        name = orig_name(names[entry]) if entry in case.overrides else names[entry]
         texts.append(emit_function(image, entry, [entry + 4 * i for i in range(len(words))], env,
-                                   stats, name=names[entry]))
+                                   stats, name=name, enter=entry not in case.overrides))
+    texts += [render_wrapper(e, i, names[e.address], symbols) for i, e in enumerate(entries)]
     if stats.unhandled:
         keys = ", ".join("%s x%d" % (key, count) for key, count in sorted(stats.unhandled.items()))
         raise CaseError("case %s: unhandled words (%s)" % (case.name, keys))
@@ -234,6 +276,8 @@ def _render_case(case: Case) -> tuple[list[str], str, list[tuple[int, str]]]:
     init_lines = ["(void)ctx;", "(void)base;"]
     for key, kind, index, value in _state(case, case.init):
         init_lines.append(_init_stmt(key, kind, index, value))
+    # The counters are statics that live across cases, so each case starts them at zero.
+    init_lines += ["%s[%d] = 0;" % (symbols.calls, i) for i in range(len(entries))]
     for addr, data in sorted(_blob(case, "mem_init", a, d) for a, d in case.mem_init.items()):
         init_lines.append("__builtin_memcpy(base + %s, %s, %du);"
                           % (u32(addr), _byte_array(data), len(data)))
@@ -243,6 +287,9 @@ def _render_case(case: Case) -> tuple[list[str], str, list[tuple[int, str]]]:
     for addr, data in sorted(_blob(case, "mem_expect", a, d) for a, d in case.mem_expect.items()):
         check_lines.append("n += checkMem(msg, msg_size, n, base, %s, %s, %du);"
                            % (u32(addr), _byte_array(data), len(data)))
+    for i, e in enumerate(entries):
+        check_lines.append('n += checkU64(msg, msg_size, n, "calls[%s]", 16, %s[%d], %s);'
+                           % (u32(e.address)[:-1], symbols.calls, i, u64(case.expect_calls[e.address])))
     check_lines.append("return n;")
 
     mappings = sorted((entry, names[entry]) for entry in functions)
@@ -256,7 +303,9 @@ def _render_case(case: Case) -> tuple[list[str], str, list[tuple[int, str]]]:
     body += ["    " + line for line in check_lines] + ["}", ""]
     body.append("static const DalFuncMapping mappings_%s[] = {" % case.name)
     body += ["    { %s, %s }," % (u32(guest), name) for guest, name in mappings] + ["};", ""]
-    return ["DAL_PPU_FUNC(%s);" % names[e] for e in sorted(names)], "\n".join(body), mappings
+    protos = ["DAL_PPU_FUNC(%s);" % names[e] for e in sorted(names)]
+    protos += ["DAL_PPU_FUNC(%s);" % orig_name(names[e.address]) for e in entries]
+    return protos, "\n".join(body), mappings, entries
 
 
 # --- files ------------------------------------------------------------------------------------
@@ -366,19 +415,25 @@ def render(cases: Sequence[Case]) -> tuple[str, str]:
     prototypes: list[str] = []
     bodies: list[str] = []
     rows: list[str] = []
+    entries: list[OverrideEntry] = []
     for case in cases:
         if case.name in seen_cases:
             raise CaseError("duplicate case name %r" % case.name)
         seen_cases.add(case.name)
-        protos, body, mappings = _render_case(case)
+        protos, body, mappings, case_entries = _render_case(case)
         prototypes.extend(protos)
+        entries.extend(case_entries)
         bodies.append(body)
         rows.append('    { .name = "%s", .entry = case_%s, .init = init_%s, .check = check_%s,\n'
                     "      .mappings = mappings_%s, .mapping_count = %d },"
                     % (case.name, case.name, case.name, case.name, case.name, len(mappings)))
     _check_unique(prototypes)
 
-    header = "\n".join([BANNER, _HEADER_HEAD.rstrip("\n"), ""] + prototypes + [
+    # Handler definitions (runtime/tests/ppu_semantics_handlers.c) include this header, so a
+    # definition with a different signature does not compile.
+    decls = handler_declarations(entries)
+    header = "\n".join([BANNER, _HEADER_HEAD.rstrip("\n"), ""] + prototypes
+                       + ([""] + decls if decls else []) + [
         "",
         "extern const DalSemanticsCase kDalSemanticsCases[];",
         "extern const uint32_t kDalSemanticsCaseCount;",

@@ -164,6 +164,7 @@ function(dal_ppu_add_semantics_harness)
 
   add_executable(dal_ppu_semantics
     runtime/tests/ppu_semantics_main.c
+    runtime/tests/ppu_semantics_handlers.c
     "${gen_dir}/ppu_semantics_cases.c")
   set_source_files_properties("${gen_dir}/ppu_semantics_cases.c" PROPERTIES GENERATED TRUE)
   add_dependencies(dal_ppu_semantics dal_ppu_semantics_gen)
