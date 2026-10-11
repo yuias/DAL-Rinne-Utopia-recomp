@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -452,6 +453,32 @@ class RunTest(unittest.TestCase):
 
 def ghidra_cell_default_stage() -> Path:
     return (ghidra_cell.DEFAULT_OUT / "CellPPU").resolve()
+
+
+@unittest.skipUnless(os.environ.get("DAL_GHIDRA_LIVE") == "1"
+                     and os.environ.get(ghidra.GHIDRA_DIR_ENV),
+                     "set DAL_GHIDRA_LIVE=1 and GHIDRA_INSTALL_DIR to run against Ghidra")
+class VerifyLiveTest(unittest.TestCase):
+    def test_staged_and_stock_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(ghidra_cell.main(["build", "--out", str(root / "cell")]), 0)
+                code = ghidra_cell.main(["verify", "--staged", str(root / "cell" / "CellPPU"),
+                                         "--out", str(root / "verify")])
+            self.assertEqual(code, 0, stdout.getvalue())
+            report = json.loads((root / "verify" / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual((report["language"], report["ok"]), (CELL, True))
+            self.assertEqual(report["decompile"]["status"], "ok")
+
+            with contextlib.redirect_stdout(stdout):
+                code = ghidra_cell.main(["verify", "--language", STOCK,
+                                         "--out", str(root / "verify_stock")])
+            self.assertEqual(code, 0, stdout.getvalue())
+            report = json.loads((root / "verify_stock" / "report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual((report["language"], report["ok"]), (STOCK, True))
 
 
 if __name__ == "__main__":
