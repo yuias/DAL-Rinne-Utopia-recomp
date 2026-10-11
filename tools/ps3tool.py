@@ -9,6 +9,7 @@ COMMANDS = {
     "probe": "probe",
     "disasm": "disasm",
     "ghidra-export": "ghidra",
+    "ghidra-cell-lang": "ghidra_cell",
     "ghidra-diff": "ghidra_diff",
     "ghidra-summary": "ghidra_summary",
     "recover": "recover",
