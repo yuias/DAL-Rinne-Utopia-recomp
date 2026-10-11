@@ -42,14 +42,22 @@ function(dal_ppu_add_generated_tree)
   endif()
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${sources_file}")
   include("${sources_file}")
+  if(NOT DEFINED DAL_PPU_OVERRIDE_STUB_SOURCES)
+    message(FATAL_ERROR
+      "DAL: ${sources_file} was written by an older emitter; re-run: "
+      "python tools/ps3tool.py emit <EBOOT.elf> --out ${DAL_PPU_GENERATED_DIR}")
+  endif()
   message(STATUS "DAL: generated PPU code from ${generated_dir}")
 
   add_library(dal_ppu_generated STATIC ${DAL_PPU_GENERATED_SOURCES})
   dal_ppu_codegen_options(dal_ppu_generated)
   target_include_directories(dal_ppu_generated PUBLIC "${generated_dir}")
 
-  add_executable(dal_ppu_link_test runtime/tests/ppu_link_test.cpp)
+  # The stand-in handlers exist only here: dal_game must fail to link when a handler named in the
+  # overrides file is missing, while this test links with the stub runtime whatever the file names.
+  add_executable(dal_ppu_link_test runtime/tests/ppu_link_test.cpp ${DAL_PPU_OVERRIDE_STUB_SOURCES})
   target_compile_options(dal_ppu_link_test PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_include_directories(dal_ppu_link_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)
   target_link_libraries(dal_ppu_link_test PRIVATE dal_ppu_generated dal_ppu_stub)
 
   add_test(NAME ppu_link COMMAND dal_ppu_link_test)
@@ -60,6 +68,12 @@ function(dal_ppu_add_generated_tree)
   add_executable(dal_game runtime/src/game_main.cpp)
   target_compile_options(dal_game PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core dal_audio_wasapi dal_input_gameinput)
+
+  # Per-game override handlers. A glob rather than a source list: the directory is the drop-in point
+  # for a port, which adds handler files without editing CMake.
+  file(GLOB DAL_GAME_OVERRIDE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/runtime/src/game/overrides/*.cpp")
+  target_sources(dal_game PRIVATE ${DAL_GAME_OVERRIDE_SOURCES})
 
   # Pins how far the game gets; updated by whoever moves the milestone.
   include("${CMAKE_SOURCE_DIR}/cmake/game_boot.cmake")

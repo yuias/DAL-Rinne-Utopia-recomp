@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "dal/ppu_context.h"
+#include "dal/ppu.h"
 
 namespace {
 
@@ -37,11 +37,22 @@ int main() {
         CHECK(host != nullptr);
     }
 
+    // The wrapper must be what dispatch reaches; the original body is only reachable through it.
+    for (uint32_t i = 0; i < kDalPpuOverrideCount; i++) {
+        const DalPpuOverride& o = kDalPpuOverrides[i];
+        CHECK(i == 0 || kDalPpuOverrides[i - 1].guest < o.guest);
+        CHECK(dalLookup(o.guest) != nullptr);
+        CHECK(dalLookup(o.guest) != o.original);
+        CHECK(o.original != nullptr);
+        CHECK(o.calls != nullptr);
+        CHECK(o.handler_name != nullptr);
+    }
+
     if (g_failures != 0) {
         std::fprintf(stderr, "ppu link: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::printf("ppu link ok: %u mappings, %u imports, executable %.16s\n", count, kDalPpuImportCount,
-                kDalPpuExecutableSha256);
+    std::printf("ppu link ok: %u mappings, %u imports, %u overrides, executable %.16s\n", count, kDalPpuImportCount,
+                kDalPpuOverrideCount, kDalPpuExecutableSha256);
     return 0;
 }

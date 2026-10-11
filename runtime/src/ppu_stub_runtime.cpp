@@ -47,6 +47,12 @@ void dalStubResetFuncs(void) { funcTable().clear(); }
 
 void dalStubSetLabel(const char* label) { g_label = label; }
 
+void dalStubOverrideHandler(const DalPpuOverride* site) {
+    std::fprintf(stderr, "dal: override handler %s for 0x%08x called in the stub runtime\n", site->handler_name,
+                 site->guest);
+    fatalExit();
+}
+
 void dalRegisterFuncs(const DalFuncMapping* mappings, uint32_t count) {
     std::vector<DalFuncMapping>& table = funcTable();
     table.insert(table.end(), mappings, mappings + count);

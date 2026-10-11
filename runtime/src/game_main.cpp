@@ -30,6 +30,7 @@
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
+#include "core/overrides.h"
 #include "core/param_sfo.h"
 #include "core/threads.h"
 #include "core/timer_resolution.h"
@@ -415,6 +416,7 @@ int main() {
     }
 
     dalRegisterFuncs(kDalPpuFuncMappings, kDalPpuFuncMappingCount);
+    dal::installOverrides(kDalPpuOverrides, kDalPpuOverrideCount);
     dal::setQuietHle(opt.quiet_hle);
     dal::installImports(kDalPpuImports, kDalPpuImportCount);
 
