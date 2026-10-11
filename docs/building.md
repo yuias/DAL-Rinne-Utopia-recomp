@@ -20,12 +20,33 @@ then configures, builds, and optionally runs CTest.
 | `-Clean` | Delete `build/<preset>/` before configuring. This also deletes the `.sdat` cache and the default hdd directory `build/<preset>/hdd` (game data and saves). |
 | `-Test` | Run CTest after the build. Which tests run depends on the other parameters; see [Tests](tests.md). |
 | `-GeneratedDir <dir>` | The directory written by `ps3tool.py emit --out <dir>`. Compiles it into `dal_ppu_generated` and builds `dal_game` and the link test. Without it only the runtime libraries, tools and unit tests are built. If the directory has no `sources.cmake`, configuration fails and prints the `emit` command to run. CMake variable `DAL_PPU_GENERATED_DIR`. |
-| `-GameDir <dir>` | The game directory (the one that contains `PS3_GAME`). The build decrypts its `.sdat` files into `build/<preset>/sdata_cache` (see [SDAT files](sdat.md)), and the game tests run against it. CMake variable `DAL_GAME_DIR`. |
+| `-GameDir <dir>` | The game directory (the one that contains `PS3_GAME`). The build decrypts its `.sdat` files into `build/<preset>/sdata_cache` (see [SDAT files](sdat.md)), and the game tests run against it. With the generated tree it also writes `build/<preset>/bin/config.json` when there is none (see [below](#configjson-for-dal_game)). CMake variable `DAL_GAME_DIR`. |
 | `-EbootElf <path>` | The decrypted executable for the Python tests that read the real ELF and for the game tests. Not needed to build or play. CMake variable `DAL_EBOOT_ELF`. |
 | `-LlvmBin <dir>` | Put this LLVM `bin` directory first on `PATH`. Defaults to the `DAL_LLVM_BIN` environment variable. Use it when the clang bundled with Visual Studio is too old or clang is not on `PATH`. |
 
 Relative paths are resolved against the current directory. The parameters set CMake cache
 variables, so a later build of the same preset keeps them until they are given again.
+
+### `config.json` for `dal_game`
+
+With `-GameDir`, after a successful build that produced `build/<preset>/bin/dal_game.exe` (so with
+`-GeneratedDir`), `tools/write-game-config.ps1` writes `build/<preset>/bin/config.json`, which
+`dal_game.exe` reads when it is started from that folder (see
+[Configuration file](runtime-options.md#configuration-file)). The rules:
+
+- The file is written only when the directory holds the game data (`<game-dir>/PS3_GAME/PARAM.SFO`
+  exists). Otherwise the build prints `config.json not written: <game-dir> has no PS3_GAME/PARAM.SFO`.
+- It holds `game_dir` (the full path of `-GameDir`) and, if `-EbootElf` is given, `elf`. The build prints
+  `wrote <path>`.
+- An existing `config.json` is never modified, so your own edits survive later builds. The build
+  prints `config.json left unchanged: ...` when the file cannot be parsed or its `game_dir` is another
+  directory than `-GameDir`.
+- `sdata_cache` and `hdd_dir` are not written: `dal_game` finds `build/<preset>/sdata_cache` and
+  `build/<preset>/hdd` next to `bin` on its own, and a written path would point at a directory that
+  `-Clean` deletes.
+
+The script can also be run alone: `pwsh -NoProfile -File tools/write-game-config.ps1 -BinDir <dir>
+-GameDir <dir> [-EbootElf <path>]`.
 
 ## CMake variables
 
@@ -41,8 +62,9 @@ These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<
 | `DAL_GAMEINPUT_DIR` | empty | An extracted `Microsoft.GameInput` package to use instead of `generated/deps/gameinput/<pinned version>` (see [Input](input.md#the-gameinput-package)). Configure needs the package from `tools/fetch-gameinput.ps1`. |
 | `DAL_PPU_WERROR` | `ON` | Add `-Werror` for generated code and the code that mirrors it (header check, semantics harness, link test). Every such target is compiled with `-O1 -march=x86-64-v3 -ffp-contract=off -fpatchable-function-entry=8 -Wall -Wextra`, whatever the preset's optimization level. |
 
-No tracked file contains a game path: they are command-line arguments, CMake cache variables, or a
-user-local VFS configuration (`config/vfs.example.json` shows the format with placeholders).
+No tracked file contains a game path: they are command-line arguments, CMake cache variables, a
+user-local `config.json` (`config/dal_game.example.json` shows the format with placeholders), or a
+user-local VFS configuration (`config/vfs.example.json` does the same).
 
 ## What gets built
 

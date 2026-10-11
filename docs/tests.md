@@ -12,6 +12,7 @@ files are registered only when those are configured, and configuration prints wh
 | `ppu_header_check`, `ppu_semantics` | Contract header and the semantics harness (see [Emitting C](emitter.md)) | - |
 | `ppu_link` | The generated code links | `-GeneratedDir` |
 | `runtime_core` | Runtime core unit tests (memory, threads, lv2, HLE, VFS, fake RSX) | - |
+| `game_options` | The `dal_game` option parser (`runtime/src/app`), with no game files: derived values, every validation message, last-wins and CLI11 errors, `--name=value` and `--flag=false`, UTF-8 paths, the configuration file reader (every kind, paths, every error text, unknown keys), the lookup (working directory, executable directory, `--config`, `--no-config`), precedence, error notes and the `dal: config:` log line, and that `config/dal_game.example.json` parses without errors or warnings. The tests run in scratch working directories, so a `config.json` of yours does not affect them | - |
 | `sdat_tests` | SDAT decryption and decompression on synthetic data | - |
 | `render_core`, `vp_translator`, `fp_translator` | Renderer and shader translators (see [Rendering](rendering.md)) | a Vulkan 1.3 device for the rendering parts |
 | `rsx_replay` | Replays a local capture and compares it with a reference image | a local capture (see [Capture and replay](rendering.md#capture-and-replay)) |
@@ -45,7 +46,7 @@ stop before the milestone leaves the pattern unmatched.
 The pin file `cmake/game_boot.cmake` holds the arguments and two milestones:
 
 ```cmake
-set(DAL_GAME_BOOT_ARGS "--no-window --seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
+set(DAL_GAME_BOOT_ARGS "--no-config --no-window --seconds 20 --hdd-dir \"${CMAKE_BINARY_DIR}/game_hdd\"")
 set(DAL_GAME_BOOT_MILESTONE "\\[t 01000000\\] dal: first hle sceNpTrophy::sceNpTrophyGetTrophyUnlockState")
 set(DAL_GAME_BOOT_MILESTONE_NO_SDATA "\\[t 01000000\\] dal: first hle cellSysutil::cellMsgDialogOpen2")
 ```
@@ -54,9 +55,14 @@ A milestone is a `dal: first ...` line written by the main thread (thread id `01
 a line from another thread can appear or not depending on scheduling. The first one applies when
 the build has the `.sdat` keys (the test also passes `--sdata-cache`), the second when it has not and
 the game stops at its error dialog for the missing `.sdat` file. When a change lets the game get
-further, run `dal_game --game-dir <dir> --no-window --seconds 20 --hdd-dir <empty-dir>` three times, take the
+further, run `dal_game --no-config --game-dir <dir> --no-window --seconds 20 --hdd-dir <empty-dir>` three times, take the
 last main-thread `dal: first ...` line that appears in every run, and set the matching milestone.
 Update only that file; the test then guards against regressions.
+
+All three game tests (`game_boot`, `game_input`, `game_audio`) pass `--no-config`. CTest runs them in
+`build/<preset>/`, so without it a `config.json` there, or one next to `dal_game.exe`, would change
+their options, and a broken one would fail them with exit code 2. (The `config.json` that
+`tools/build.ps1 -GameDir` writes sits in `build/<preset>/bin/`.)
 
 ## The `game_input` test
 

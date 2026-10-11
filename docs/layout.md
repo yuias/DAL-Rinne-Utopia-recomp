@@ -5,7 +5,8 @@
 | Path | Contents |
 | --- | --- |
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
-| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `media`, `audio`, `game_main.cpp`; see [Runtime internals](runtime.md) and [`dal_game` options](runtime-options.md)) and runtime-side tests |
+| `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `media`, `audio`, `app`, `game_main.cpp`; see [Runtime internals](runtime.md) and [`dal_game` options](runtime-options.md)) and runtime-side tests |
+| `runtime/src/app/` | `dal_game` option handling (`dal_game_options`): the option table, command-line parsing with CLI11, the `config.json` reader, validation and derived values, and the usage text; see [`dal_game` options](runtime-options.md) |
 | `tools/dal_sdat/`, `cmake/sdat_keys.cmake` | `dal_sdat`, the SDAT decryption tool, and its tests, and the pin of the downloaded key file; see [SDAT files](sdat.md) |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
@@ -27,6 +28,7 @@
 | `cmake/Audio.cmake`, `cmake/atrac_decode.cmake`, `cmake/game_audio.cmake` | Audio targets and tests (`audio_core`, `audio_wasapi`), and the pin files of the `atrac_decode` and `game_audio` tests |
 | `tools/pad_scripts/`, `cmake/game_input.cmake` | Pad scripts (`leave_title.txt` is used by the `game_input` test) and the pin file of that test; see [Pad script](runtime.md#pad-script) |
 | `tools/build.ps1` | Windows build wrapper |
+| `tools/write-game-config.ps1` | Writes `build/<preset>/bin/config.json` for `dal_game` after a build with `-GameDir`; see [`config.json` for `dal_game`](building.md#configjson-for-dal_game) |
 | `tools/ps3tool.py` | Command-line entry point for the analysis tools |
 | `tools/ps3recomp/` | ELF/PRX parsing, PPU decoder and formatter, probe, Ghidra export, diff and summary, function recovery (seeds, partition, jump tables, coverage, syscall resolution), name table generator |
 | `tools/ghidra/` | Java `GhidraScript`s run by `ghidra-export`, and `CellLangCheck.java`, the script behind `ghidra-cell-lang verify` |
@@ -38,10 +40,11 @@
 | `runtime/include/dal/` | Contract header and inline helpers for generated code |
 | `config/target.json` | Pinned size and hashes of the target executable |
 | `config/vfs.example.json` | Example VFS configuration for `dal_game --vfs-config`, placeholder paths only; see [VFS configuration file](virtual-file-system.md#vfs-configuration-file) |
+| `config/dal_game.example.json` | Example `config.json` for `dal_game`, placeholder paths only; see [Configuration file](runtime-options.md#configuration-file) |
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |
 | `config/ghidra_summary.json`, `config/extra_seeds.json`, `config/functions.json` | Ghidra summary, extra function starts and the recovered function database; see [Function recovery](function-recovery.md#function-recovery) |
 | `docs/` | Development documentation |
-| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput) |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput, CLI11) |
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |
 | `build/` | Build output (git-ignored) |
 | `game/` | Suggested place for your own `EBOOT.elf` (git-ignored) |
