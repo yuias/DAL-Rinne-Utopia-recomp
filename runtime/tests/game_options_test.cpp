@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "app/config_file.h"
 #include "app/game_options.h"
 #include "core/fatal.h"
 #include "core/log.h"
@@ -419,6 +420,213 @@ void testUtf8Path() {
     }
 }
 
+// Config file reader. `base` stands in for the directory of the file.
+const std::filesystem::path kConfigBase = std::filesystem::temp_directory_path() / "dal_config_base";
+
+std::filesystem::path pathOfInput(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+
+// Checks that `text` fails with exactly `message`.
+bool expectConfigError(std::string_view text, std::string_view message) {
+    const auto result = dal::parseConfigFile(text, kConfigBase, dal::gameOptionSpecs());
+    if (result) {
+        std::fprintf(stderr, "expected a config error for: %.*s\n", static_cast<int>(text.size()), text.data());
+        return false;
+    }
+    if (result.error() != message) {
+        std::fprintf(stderr, "unexpected config error: \"%s\"\n  expected \"%.*s\"\n", result.error().c_str(),
+                     static_cast<int>(message.size()), message.data());
+        return false;
+    }
+    return true;
+}
+
+void testConfigFileKinds() {
+    const auto result = dal::parseConfigFile(R"({
+  "game_dir": "game",
+  "log_level": "debug",
+  "seconds": 12,
+  "no_window": false,
+  "strict": true,
+  "rsx_capture": [300, 600]
+})",
+                                             kConfigBase, dal::gameOptionSpecs());
+    CHECK(result.has_value());
+    if (!result) return;
+    CHECK(result->warnings.empty());
+    CHECK(result->values.size() == 6);
+    if (result->values.size() != 6) return;
+    // Document order, one input each, option name and key spelled as designed.
+    const auto& values = result->values;
+    CHECK(values[0].option == "game-dir" && values[0].key == "game_dir" && values[0].inputs.size() == 1);
+    CHECK(pathOfInput(values[0].inputs[0]) == kConfigBase / "game");
+    CHECK(values[1].option == "log-level" && values[1].inputs == std::vector<std::string>{"debug"});
+    CHECK(values[2].option == "seconds" && values[2].inputs == std::vector<std::string>{"12"});
+    CHECK(values[3].option == "no-window" && values[3].key == "no_window");
+    CHECK(values[3].inputs == std::vector<std::string>{"false"});
+    CHECK(values[4].inputs == std::vector<std::string>{"true"});
+    CHECK(values[5].option == "rsx-capture" && values[5].inputs == std::vector<std::string>{"300,600"});
+
+    const auto empty = dal::parseConfigFile("{}", kConfigBase, dal::gameOptionSpecs());
+    CHECK(empty.has_value() && empty->values.empty() && empty->warnings.empty());
+    const auto bom = dal::parseConfigFile("\xEF\xBB\xBF{\"seconds\": 1}", kConfigBase, dal::gameOptionSpecs());
+    CHECK(bom.has_value() && bom->values.size() == 1);
+    const auto big = dal::parseConfigFile("{\"seconds\": 18446744073709551615}", kConfigBase, dal::gameOptionSpecs());
+    CHECK(big.has_value() && big->values.size() == 1 && big->values[0].inputs[0] == "18446744073709551615");
+}
+
+void testConfigFilePaths() {
+    const std::filesystem::path absolute = std::filesystem::temp_directory_path() / "abs" / "dir";
+    // Backslashes of a Windows path are JSON escapes, so the text is built from the generic form.
+    const std::u8string generic = absolute.generic_u8string();
+    const std::string text = "{\"game_dir\": \"" + std::string(generic.begin(), generic.end()) +
+                             "\", \"hdd_dir\": \"saves/sub\", \"elf\": \"../x/./y.elf\", \"log\": \"a/../b\"}";
+    const auto result = dal::parseConfigFile(text, kConfigBase, dal::gameOptionSpecs());
+    CHECK(result.has_value());
+    if (!result || result->values.size() != 4) return;
+    CHECK(pathOfInput(result->values[0].inputs[0]) == absolute.lexically_normal());
+    CHECK(pathOfInput(result->values[1].inputs[0]) == kConfigBase / "saves" / "sub");
+    CHECK(pathOfInput(result->values[2].inputs[0]) == kConfigBase.parent_path() / "x" / "y.elf");
+    CHECK(pathOfInput(result->values[3].inputs[0]) == kConfigBase / "b");
+
+    // A path with code points outside the ANSI code page survives the conversion both ways.
+    const std::u8string name = u8"日本語_éü";
+    const auto utf8 = dal::parseConfigFile("{\"hdd_dir\": \"" + std::string(name.begin(), name.end()) + "\"}",
+                                           kConfigBase, dal::gameOptionSpecs());
+    CHECK(utf8.has_value());
+    if (utf8 && utf8->values.size() == 1) {
+        const std::filesystem::path expected = kConfigBase / std::filesystem::path(name);
+        CHECK(pathOfInput(utf8->values[0].inputs[0]) == expected);
+        const std::u8string expected_utf8 = expected.lexically_normal().u8string();
+        CHECK(utf8->values[0].inputs[0] == std::string(expected_utf8.begin(), expected_utf8.end()));
+    }
+}
+
+void testConfigFileErrors() {
+    CHECK(expectConfigError("{\"a\":1,\"a\":2}", "duplicate key \"a\" in an object"));
+    CHECK(expectConfigError("{\"x\": {\"b\": 1, \"b\": 2}}", "duplicate key \"b\" in an object"));
+    CHECK(expectConfigError("{\"seconds\": 1, \"seconds\": 2}", "duplicate key \"seconds\" in an object"));
+    CHECK(expectConfigError("[1, 2]", "the top level must be an object"));
+    CHECK(expectConfigError("\"game_dir\"", "the top level must be an object"));
+    CHECK(expectConfigError("null", "the top level must be an object"));
+
+    CHECK(expectConfigError("{\"game_dir\": 5}", "\"game_dir\": expected a path string, got number"));
+    CHECK(expectConfigError("{\"game_dir\": [\"a\"]}", "\"game_dir\": expected a path string, got array"));
+    CHECK(expectConfigError("{\"elf\": \"\"}", "\"elf\": the path is empty"));
+    CHECK(expectConfigError("{\"pad\": 1}", "\"pad\": expected a string, got number"));
+    CHECK(expectConfigError("{\"pad\": true}", "\"pad\": expected a string, got boolean"));
+    CHECK(expectConfigError("{\"seconds\": \"5\"}", "\"seconds\": expected a non-negative integer, got string"));
+    CHECK(expectConfigError("{\"seconds\": -1}", "\"seconds\": expected a non-negative integer, got number"));
+    CHECK(expectConfigError("{\"seconds\": 1.5}", "\"seconds\": expected a non-negative integer, got number"));
+    CHECK(expectConfigError("{\"dump_frames_every\": {}}",
+                            "\"dump_frames_every\": expected a non-negative integer, got object"));
+    CHECK(expectConfigError("{\"strict\": \"true\"}", "\"strict\": expected true or false, got string"));
+    CHECK(expectConfigError("{\"no_window\": 1}", "\"no_window\": expected true or false, got number"));
+    CHECK(expectConfigError("{\"rsx_capture\": 300}",
+                            "\"rsx_capture\": expected a string or an array of positive integers, got number"));
+    CHECK(expectConfigError("{\"rsx_capture\": [1, \"2\"]}",
+                            "\"rsx_capture\": expected a string or an array of positive integers, got string"));
+    CHECK(expectConfigError("{\"rsx_capture\": [1, -2]}",
+                            "\"rsx_capture\": expected a string or an array of positive integers, got number"));
+    CHECK(expectConfigError("{\"rsx_capture\": []}",
+                            "\"rsx_capture\": expected a string or an array of positive integers, got array"));
+
+    // null is refused for every kind of option.
+    for (const char* key : {"game_dir", "pad", "seconds", "strict", "rsx_capture"}) {
+        CHECK(expectConfigError(
+                std::string("{\"") + key + "\": null}",
+                std::string("\"") + key + "\": null is not a value; remove the key to use the default"));
+    }
+
+    // The first bad value in document order is the one reported.
+    CHECK(expectConfigError("{\"strict\": 1, \"pad\": 2}", "\"strict\": expected true or false, got number"));
+
+    // yyjson reports positions for syntax errors only; the line is counted over CRLF text too.
+    {
+        const auto result = dal::parseConfigFile("{\r\n  \"seconds\": 1,\r\n  \"pad\": ]\r\n}", kConfigBase,
+                                                 dal::gameOptionSpecs());
+        CHECK(!result.has_value());
+        if (!result) {
+            CHECK(result.error().starts_with("invalid JSON: "));
+            CHECK(result.error().ends_with(" at line 3, column 10 (byte 29)"));
+        }
+    }
+    {
+        // No comments and no trailing commas.
+        const auto comment = dal::parseConfigFile("{\n// c\n}", kConfigBase, dal::gameOptionSpecs());
+        CHECK(!comment && comment.error().starts_with("invalid JSON: ") &&
+              comment.error().find("at line 2, column 1 (byte 2)") != std::string::npos);
+        const auto comma = dal::parseConfigFile("{\"seconds\": 1,}", kConfigBase, dal::gameOptionSpecs());
+        CHECK(!comma && comma.error().starts_with("invalid JSON: "));
+        const auto truncated = dal::parseConfigFile("{", kConfigBase, dal::gameOptionSpecs());
+        CHECK(!truncated && truncated.error().starts_with("invalid JSON: "));
+        const auto none = dal::parseConfigFile("", kConfigBase, dal::gameOptionSpecs());
+        CHECK(!none && none.error().starts_with("invalid JSON: "));
+        // yyjson rejects invalid UTF-8 itself, so a path never reaches the path conversion with it.
+        const auto invalid = dal::parseConfigFile("{\"elf\": \"\xFF\"}", kConfigBase, dal::gameOptionSpecs());
+        CHECK(!invalid && invalid.error().starts_with("invalid JSON: "));
+    }
+}
+
+void testConfigFileUnknownKeys() {
+    const auto result = dal::parseConfigFile(
+            R"({"config": "x.json", "seconds": 3, "no_config": true, "help": true, "future": null, "game-dir": "g"})",
+            kConfigBase, dal::gameOptionSpecs());
+    CHECK(result.has_value());
+    if (!result) return;
+    // Unknown keys are not checked, so a null or a wrong type does not fail the file.
+    CHECK(result->values.size() == 1 && result->values[0].option == "seconds");
+    CHECK(result->warnings ==
+          (std::vector<std::string>{"unknown key \"config\" ignored", "unknown key \"no_config\" ignored",
+                                    "unknown key \"help\" ignored", "unknown key \"future\" ignored",
+                                    "unknown key \"game-dir\" ignored"}));
+}
+
+void testConfigFileFrameList() {
+    const auto array = dal::parseConfigFile(R"({"rsx_capture": [5]})", kConfigBase, dal::gameOptionSpecs());
+    CHECK(array.has_value() && array->values.size() == 1 && array->values[0].inputs == std::vector<std::string>{"5"});
+    const auto many = dal::parseConfigFile(R"({"rsx_capture": [1, 20, 300]})", kConfigBase, dal::gameOptionSpecs());
+    CHECK(many.has_value() && many->values.size() == 1 &&
+          many->values[0].inputs == std::vector<std::string>{"1,20,300"});
+    // The string form is the command-line form and is checked later, like the command line.
+    const auto text = dal::parseConfigFile(R"({"rsx_capture": "300,600"})", kConfigBase, dal::gameOptionSpecs());
+    CHECK(text.has_value() && text->values.size() == 1 &&
+          text->values[0].inputs == std::vector<std::string>{"300,600"});
+    const auto bad_text = dal::parseConfigFile(R"({"rsx_capture": "1,,x"})", kConfigBase, dal::gameOptionSpecs());
+    CHECK(bad_text.has_value() && bad_text->values[0].inputs == std::vector<std::string>{"1,,x"});
+    // Zero is an unsigned integer here; the frame number check (1-based) is the validation phase's.
+    const auto zero = dal::parseConfigFile(R"({"rsx_capture": [0]})", kConfigBase, dal::gameOptionSpecs());
+    CHECK(zero.has_value() && zero->values[0].inputs == std::vector<std::string>{"0"});
+}
+
+void testConfigFileAcceptsEveryKey() {
+    std::string text = "{";
+    for (const dal::OptionSpec& spec : dal::gameOptionSpecs()) {
+        const char* value = "\"v\"";
+        switch (spec.kind) {
+            case dal::OptionKind::Path:
+            case dal::OptionKind::String: value = "\"v\""; break;
+            case dal::OptionKind::Unsigned: value = "7"; break;
+            case dal::OptionKind::Flag: value = "true"; break;
+            case dal::OptionKind::FrameList: value = "[2]"; break;
+        }
+        if (text.size() > 1) text += ", ";
+        text += "\"" + dal::configKeyFor(spec.name) + "\": " + value;
+    }
+    text += "}";
+    const auto result = dal::parseConfigFile(text, kConfigBase, dal::gameOptionSpecs());
+    CHECK(result.has_value());
+    if (!result) return;
+    CHECK(result->warnings.empty());
+    CHECK(result->values.size() == dal::gameOptionSpecs().size());
+    for (std::size_t i = 0; i < result->values.size() && i < dal::gameOptionSpecs().size(); ++i) {
+        CHECK(result->values[i].option == dal::gameOptionSpecs()[i].name);
+        CHECK(result->values[i].key == dal::configKeyFor(result->values[i].option));
+        CHECK(result->values[i].inputs.size() == 1);
+    }
+}
+
 void testApplyGameOptions() {
     CHECK(!dal::logEnabled(dal::LogLevel::Debug));
     {
@@ -463,6 +671,12 @@ int main() {
     testValuesStartingWithDash();
     testFlagsAndEqualsForm();
     testUtf8Path();
+    testConfigFileKinds();
+    testConfigFilePaths();
+    testConfigFileErrors();
+    testConfigFileUnknownKeys();
+    testConfigFileFrameList();
+    testConfigFileAcceptsEveryKey();
     testApplyGameOptions();
     std::printf("game options tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed != 0 ? 1 : 0;
