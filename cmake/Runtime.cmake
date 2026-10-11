@@ -115,6 +115,7 @@ function(dal_runtime_add_core)
     runtime/src/core/elf_loader.cpp
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_memory.cpp
+    runtime/src/core/json_read.cpp
     runtime/src/core/log.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
@@ -181,13 +182,13 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
   target_link_libraries(dal_runtime_core PRIVATE png_static)
-  # PRIVATE as well: JSON types stay inside vfs_config.cpp and rsx_census.cpp.
+  # PRIVATE as well: JSON types stay inside json_read.*, vfs_config.cpp and rsx_census.cpp.
   target_link_libraries(dal_runtime_core PRIVATE yyjson)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
   target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  # The tests build their PNG inputs with libpng's writer.
-  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core png_static)
+  # The tests build their PNG inputs with libpng's writer and test the json_read.h helpers.
+  target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core png_static yyjson)
 
   add_test(NAME runtime_core COMMAND dal_runtime_tests)
   set_tests_properties(runtime_core PROPERTIES

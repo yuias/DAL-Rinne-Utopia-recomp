@@ -31,6 +31,7 @@
 #include "core/fatal.h"
 #include "core/guest_memory.h"
 #include "core/host_functions.h"
+#include "core/json_read.h"
 #include "core/log.h"
 #include "core/param_sfo.h"
 #include "core/threads.h"
@@ -2233,6 +2234,82 @@ void testCellFs() {
     dal::resetLogOnce();
     stdfs::remove_all(root, ec);
     dal::configureVfs({}, std::nullopt);
+}
+
+// The yyjson helpers shared by the VFS configuration parser and the dal_game config file reader.
+void testJsonRead() {
+    // Line and column count from the last line feed, so CRLF files report the editor's position;
+    // the byte offset is the offset in the file.
+    const std::string crlf = "{\r\n  \"a\": 1,\r\n  bad\r\n}\r\n";
+    const auto broken = dal::json::readDocument(crlf);
+    CHECK(!broken.has_value());
+    if (!broken) {
+        CHECK(broken.error().starts_with("invalid JSON: "));
+        CHECK(broken.error().ends_with(" at line 3, column 3 (byte 16)"));
+    }
+
+    // Empty input is a syntax error on line 1.
+    const auto empty = dal::json::readDocument("");
+    CHECK(!empty.has_value());
+    if (!empty) {
+        CHECK(empty.error().find(" at line 1, column 1 (byte 0)") != std::string::npos);
+    }
+
+    const auto bom = dal::json::readDocument("\xEF\xBB\xBF{\"a\": 1}");
+    CHECK(bom.has_value());
+    if (bom) {
+        const dal::json::Value root = yyjson_doc_get_root(bom->get());
+        CHECK(yyjson_is_obj(root));
+        CHECK(yyjson_get_int(yyjson_obj_get(const_cast<yyjson_val*>(root), "a")) == 1);
+    }
+
+    const auto duplicate = dal::json::readDocument(R"({"a":1,"a":2})");
+    CHECK(!duplicate.has_value());
+    if (!duplicate) {
+        CHECK(duplicate.error() == "duplicate key \"a\" in an object");
+    }
+    const auto nested = dal::json::readDocument(R"({"o":{"x":1,"x":2}})");
+    CHECK(!nested.has_value());
+    if (!nested) {
+        CHECK(nested.error() == "duplicate key \"x\" in an object");
+    }
+    const auto in_array = dal::json::readDocument(R"({"l":[1,{"k":1,"k":2}]})");
+    CHECK(!in_array.has_value());
+    if (!in_array) {
+        CHECK(in_array.error() == "duplicate key \"k\" in an object");
+    }
+    // The same key in different objects is fine.
+    CHECK(dal::json::readDocument(R"({"a":{"k":1},"b":{"k":2},"l":[{"k":1},{"k":2}]})").has_value());
+
+    // A syntax error is reported before the duplicate-key check runs.
+    const auto syntax_first = dal::json::readDocument(R"({"a":1,"a":2,)");
+    CHECK(!syntax_first.has_value());
+    if (!syntax_first) {
+        CHECK(syntax_first.error().starts_with("invalid JSON: "));
+    }
+
+    const auto all = dal::json::readDocument(R"({"n":null,"o":{},"a":[],"s":"x","b":true,"u":1,"i":-1,"d":1.5})");
+    CHECK(all.has_value());
+    if (all) {
+        const dal::json::Value root = yyjson_doc_get_root(all->get());
+        std::vector<std::pair<std::string, std::string>> seen;
+        dal::json::forEachMember(root, [&](std::string_view key, dal::json::Value value) {
+            seen.emplace_back(std::string(key), dal::json::typeName(value));
+            return true;
+        });
+        const std::vector<std::pair<std::string, std::string>> expected = {
+                {"n", "null"},    {"o", "object"}, {"a", "array"},  {"s", "string"},
+                {"b", "boolean"}, {"u", "number"}, {"i", "number"}, {"d", "number"}};
+        CHECK(seen == expected);
+
+        // fn returning false stops the iteration.
+        int visited = 0;
+        dal::json::forEachMember(root, [&](std::string_view, dal::json::Value) { return ++visited < 3; });
+        CHECK(visited == 3);
+
+        const dal::json::Value s = yyjson_obj_get(const_cast<yyjson_val*>(root), "s");
+        CHECK(dal::json::stringOf(s) == "x");
+    }
 }
 
 // Parsing, composition and installation of the VFS configuration file, and file overrides through
@@ -8206,6 +8283,7 @@ int main(int argc, char** argv) {
     testParamSfo();
     testCellGame();
     testCellFs();
+    testJsonRead();
     testVfsConfig();
     testSceNpAndTrophy();
     testCellSysutil();
