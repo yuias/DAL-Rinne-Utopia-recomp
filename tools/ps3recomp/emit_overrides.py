@@ -6,11 +6,13 @@ import bisect
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .emit_core import _comment_text, u32
 from .emit_db import FunctionDb
+from .emit_output import banner, c_string
 from .info import EXIT_IO, EXIT_PIN_MISMATCH, REPO_ROOT, CliError
 
 EXIT_BAD_OVERRIDES = 10
@@ -193,3 +195,95 @@ def check_overrides(config: OverrideConfig, *, elf_sha256: str, db: FunctionDb) 
             where = "outside every function"
         raise CliError(EXIT_BAD_OVERRIDES,
                        "overrides entry 0x%08x is not a function entry (%s)" % (addr, where))
+
+
+_KIND_ENUMERATOR = {"override": "kDalOverrideKindOverride", "hook": "kDalOverrideKindHook"}
+
+
+def orig_name(name: str) -> str:
+    return name + "_orig"
+
+
+@dataclass(frozen=True)
+class OverrideSymbols:
+    """Names of the generated table, its count and the counters (scoped per case in the harness)."""
+    table: str = "kDalPpuOverrides"
+    count: str | None = "kDalPpuOverrideCount"   # None: not emitted
+    calls: str = "override_calls"
+    static_table: bool = False                   # True: `static const` table
+
+
+def render_wrapper(entry: OverrideEntry, index: int, name: str, symbols: OverrideSymbols) -> str:
+    """The function `name` that runs the handler of `entry`; `index` is its table row."""
+    title = "// %s %s" % (entry.kind, _comment_text(entry.handler))
+    if entry.label:
+        title += ": " + _comment_text(entry.label)
+    site = "&%s[%d]" % (symbols.table, index)
+    lines = [title,
+             "DAL_PPU_FUNC(%s) {" % name,
+             "    DAL_ENTER(%s);" % u32(entry.address),
+             "    dalCountCall(&%s[%d]);" % (symbols.calls, index),
+             "    %s(ctx, base, %s);" % (entry.handler, site)]
+    # Only the transfer into the body is a tail call, so a hook leaves no frame behind.
+    if entry.kind == "hook":
+        lines.append("    DAL_TAIL(%s);" % orig_name(name))
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_table(entries: Sequence[OverrideEntry], names: Mapping[int, str],
+                 symbols: OverrideSymbols) -> str:
+    """Counters (when there are entries), the `DalPpuOverride` table and optionally its count."""
+    prefix = "static " if symbols.static_table else ""
+    lines: list[str] = []
+    if not entries:
+        # C has no zero-length arrays; the single slot stays zero.
+        lines.append("%sconst DalPpuOverride %s[1] = {};" % (prefix, symbols.table))
+    else:
+        lines += ["static uint64_t %s[%d];" % (symbols.calls, len(entries)), "",
+                  "%sconst DalPpuOverride %s[%d] = {" % (prefix, symbols.table, len(entries))]
+        for i, e in enumerate(entries):
+            lines.append("    { %s, %s, %s, &%s[%d], %s, %s }," % (
+                u32(e.address), _KIND_ENUMERATOR[e.kind], orig_name(names[e.address]),
+                symbols.calls, i, c_string(e.handler), c_string(e.label)))
+        lines.append("};")
+    if symbols.count is not None:
+        lines.append("const uint32_t %s = %d;" % (symbols.count, len(entries)))
+    return "\n".join(lines) + "\n"
+
+
+def handler_declarations(entries: Sequence[OverrideEntry]) -> list[str]:
+    return ["DAL_OVERRIDE_HANDLER(%s);" % h for h in sorted({e.handler for e in entries})]
+
+
+def render_overrides_source(sha256: str, entries: Sequence[OverrideEntry],
+                            names: Mapping[int, str]) -> str:
+    """ppu_overrides.c: the table, the counters and the wrappers."""
+    symbols = OverrideSymbols()
+    text = (banner(sha256) + '\n#include "ppu_funcs.h"\n#include "ppu_override_handlers.h"\n\n'
+            + render_table(entries, names, symbols))
+    for i, e in enumerate(entries):
+        text += "\n" + render_wrapper(e, i, names[e.address], symbols)
+    return text
+
+
+def render_handler_header(sha256: str, entries: Sequence[OverrideEntry]) -> str:
+    decls = handler_declarations(entries)
+    lines = [banner(sha256).rstrip("\n"), "#pragma once", "", '#include "dal/ppu_override.h"', "",
+             "#ifdef __cplusplus", 'extern "C" {', "#endif", ""]
+    if decls:
+        lines += decls + [""]
+    lines += ["#ifdef __cplusplus", '}  // extern "C"', "#endif"]
+    return "\n".join(lines) + "\n"
+
+
+def render_handler_stubs(sha256: str, entries: Sequence[OverrideEntry]) -> str:
+    """ppu_override_stubs.c: handler stand-ins for the stub-runtime link test."""
+    text = (banner(sha256)
+            + "// Stand-ins for the override handlers, linked only into the stub-runtime link "
+              "test.\n"
+            + '\n#include "ppu_override_handlers.h"\n#include "dal/ppu_stub.h"\n')
+    for h in sorted({e.handler for e in entries}):
+        text += ("\nDAL_OVERRIDE_HANDLER(%s) {\n    (void)ctx;\n    (void)base;\n"
+                 "    dalStubOverrideHandler(site);\n}\n" % h)
+    return text

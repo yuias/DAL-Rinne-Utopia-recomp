@@ -397,7 +397,7 @@ def _comment_text(text: str) -> str:
 
 def emit_function(image: CodeImage, entry: int, addrs: Iterable[int], env: EmitEnv,
                   stats: EmitStats, *, name: str, title: str | None = None,
-                  handlers: Mapping[str, Handler] | None = None) -> str:
+                  handlers: Mapping[str, Handler] | None = None, enter: bool = True) -> str:
     addr_list = sorted(addrs)
     em = _FunctionEmitter(image, addr_list, env, stats,
                           _default_handlers() if handlers is None else handlers)
@@ -409,7 +409,9 @@ def emit_function(image: CodeImage, entry: int, addrs: Iterable[int], env: EmitE
     if title:
         out.append("// %s" % _comment_text(title))
     out.append("DAL_PPU_FUNC(%s) {" % name)
-    out.append(_INDENT + "DAL_ENTER(%s);" % u32(entry))
+    # An overridden body is entered through its wrapper, which records the entry itself.
+    if enter:
+        out.append(_INDENT + "DAL_ENTER(%s);" % u32(entry))
     for addr, lines in blocks:
         if addr in em.targeted:
             out.append("L_%08x:" % addr)

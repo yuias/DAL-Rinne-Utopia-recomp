@@ -96,6 +96,22 @@ class FunctionShapeTest(unittest.TestCase):
         text, _ = emit([asm.blr()], title="foo\\\nbar\u00e9")
         self.assertEqual(text.splitlines()[0], "// foo??bar?")
 
+    def test_enter_false_only_drops_the_enter_line(self):
+        image = CodeImage.from_words(BASE, [asm.li(3, 5), asm.b(BASE + 4, BASE), asm.blr()])
+        addrs = [BASE + 4 * i for i in range(3)]
+
+        def render(**extra):
+            return emit_function(image, BASE, addrs, make_env(comments=True), EmitStats(),
+                                 name="fn_00010000_orig", title="t", handlers=HANDLERS, **extra)
+
+        default = render()
+        self.assertEqual(default, render(enter=True))
+        without = render(enter=False)
+        self.assertNotIn("DAL_ENTER", without)
+        self.assertEqual(without.splitlines(),
+                         [line for line in default.splitlines() if "DAL_ENTER" not in line])
+        self.assertIn("DAL_PPU_FUNC(fn_00010000_orig) {", without)
+
     def test_comments_option(self):
         text, _ = emit([asm.li(3, 5), asm.blr()], env=make_env(comments=True))
         self.assertIn("    // 0x00010000: 38600005  li r3,0x5\n", text)
