@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "core/sleeper.h"
@@ -624,9 +625,16 @@ void writeCaptures(const std::vector<RsxConsumer::FinishedCapture>& captures) {
     }
 }
 
+}  // namespace
+
+std::chrono::nanoseconds rsxVBlankPeriod() {
+    return std::chrono::nanoseconds(std::chrono::microseconds(kRsxVBlankPeriodUs)) / guestSpeed();
+}
+
+namespace {
+
 void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
     using Clock = std::chrono::steady_clock;
-    constexpr auto kPeriod = std::chrono::microseconds(kRsxVBlankPeriodUs);
     constexpr auto kPollInterval = std::chrono::milliseconds(1);
     Sleeper sleeper;
 
@@ -648,12 +656,14 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
     // delays work until the next pass.
     std::atomic_ref<std::uint32_t> put_word(*reinterpret_cast<std::uint32_t*>(base + kRsxControlAddr + kControlPut));
 
-    auto next_tick = Clock::now() + kPeriod;
-    // True once per elapsed period; the deadline moves on only when it fires.
+    auto next_tick = Clock::now() + rsxVBlankPeriod();
+    // True once per elapsed period; the deadline moves on only when it fires. The period is read each
+    // time so a speed change takes effect within one old period.
     auto tickDue = [&](Clock::time_point now) {
         if (now < next_tick) return false;
-        next_tick += kPeriod;
-        if (next_tick <= now) next_tick = now + kPeriod;  // no burst after a long pause
+        const auto period = rsxVBlankPeriod();
+        next_tick += period;
+        if (next_tick <= now) next_tick = now + period;  // no burst after a long pause
         return true;
     };
     for (;;) {

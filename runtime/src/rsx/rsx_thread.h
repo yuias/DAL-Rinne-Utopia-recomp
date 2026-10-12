@@ -38,6 +38,10 @@ void setRsxInterruptHook(void (*hook)(RsxInterrupt kind, std::uint32_t arg));
 // One VBlank every 1/60 s (RPCS3's default VBlank rate).
 inline constexpr std::uint32_t kRsxVBlankPeriodUs = 16667;
 
+// The host time between two VBlanks: kRsxVBlankPeriodUs of guest time, so 1/guestSpeed() of it while
+// fast-forwarding. Any thread.
+std::chrono::nanoseconds rsxVBlankPeriod();
+
 // Register state and effects behind the parser. All members are used under the guest lock except
 // census(), which only touches atomics, and takeCommands()/takeCaptures(), which only touch state the
 // RSX thread owns.

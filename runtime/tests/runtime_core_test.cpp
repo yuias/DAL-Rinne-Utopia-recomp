@@ -7031,6 +7031,13 @@ void testRsxSyntheticCaptures() {
 
 void testRsxConsumer() {
     using dal::FifoStatus;
+    CHECK(dal::rsxVBlankPeriod() == std::chrono::microseconds(16667));
+    dal::setFastForwardSpeed(4);
+    dal::setFastForwardToggled(true);
+    CHECK(dal::rsxVBlankPeriod() == std::chrono::nanoseconds(16667000) / 4);
+    dal::setFastForwardToggled(false);
+    dal::setFastForwardSpeed(dal::kDefaultFastForwardSpeed);
+    CHECK(dal::rsxVBlankPeriod() == std::chrono::microseconds(16667));
     using Interrupts = std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>>;
     std::vector<std::string> lines;
     dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
