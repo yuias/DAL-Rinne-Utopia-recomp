@@ -29,6 +29,7 @@
 #include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/host_functions.h"
 #include "core/json_read.h"
@@ -8411,6 +8412,133 @@ void testTimebase() {
     CHECK(dal::systemTimeUs() >= us0 + 15000);
 }
 
+void testGuestClock() {
+    using dal::GuestClockSegment;
+
+    // (a) The pure mapping.
+    const GuestClockSegment normal{100, 1000, 1};
+    CHECK(normal.guestAt(100) == 1000);
+    CHECK(normal.guestAt(150) == 1050);
+    const GuestClockSegment fast{100, 1000, 4};
+    CHECK(fast.guestAt(150) == 1200);
+    CHECK(fast.guestAt(50) == 1000);
+
+    const GuestClockSegment second = fast.rebased(200, 2);
+    CHECK(second.host_origin == 200);
+    CHECK(second.speed == 2);
+    CHECK(second.rebased(200, 8).guestAt(200) == second.guestAt(200));
+    CHECK(second.guestAt(200) == fast.guestAt(200));
+    CHECK(second.guestAt(250) == fast.guestAt(200) + 100);
+    const GuestClockSegment third = second.rebased(300, 8);
+    CHECK(third.guestAt(300) == second.guestAt(300));
+    std::uint64_t previous = 0;
+    bool monotonic = true;
+    for (std::uint64_t host = 0; host <= 400; host++) {
+        const GuestClockSegment& segment = host < 200 ? fast : (host < 300 ? second : third);
+        const std::uint64_t guest = segment.guestAt(host);
+        monotonic = monotonic && guest >= previous;
+        previous = guest;
+    }
+    CHECK(monotonic);
+
+    // (b) The switches. Nothing else in this binary turns fast-forward on.
+    dal::FastForwardState state = dal::fastForwardState();
+    CHECK(!state.toggled);
+    CHECK(!state.held);
+    CHECK(state.speed == 4);
+    CHECK(!state.active());
+    CHECK(dal::guestSpeed() == 1);
+
+    dal::setFastForwardSpeed(1);
+    CHECK(dal::fastForwardState().speed == dal::kMinFastForwardSpeed);
+    dal::setFastForwardSpeed(9);
+    CHECK(dal::fastForwardState().speed == dal::kMaxFastForwardSpeed);
+    CHECK(dal::guestSpeed() == 1);
+    dal::setFastForwardSpeed(dal::kDefaultFastForwardSpeed);
+
+    dal::setFastForwardToggled(true);
+    CHECK(dal::guestSpeed() == 4);
+    dal::setFastForwardSpeed(2);
+    CHECK(dal::guestSpeed() == 2);
+    dal::setFastForwardHeld(true);
+    dal::setFastForwardToggled(false);
+    CHECK(dal::guestSpeed() == 2);
+    dal::setFastForwardSpeed(dal::kDefaultFastForwardSpeed);
+    CHECK(dal::guestSpeed() == 4);
+    dal::setFastForwardHeld(false);
+    CHECK(dal::guestSpeed() == 1);
+
+    // (c) Guest time against the host clock, with the interval measured by QueryPerformanceCounter so
+    // Sleep jitter cancels.
+    auto ctx = std::make_unique<DalPpuContext>();
+    LARGE_INTEGER frequency, t0, t1;
+    QueryPerformanceFrequency(&frequency);
+    dal::setFastForwardToggled(true);
+    const std::uint64_t us0 = dal::systemTimeUs();
+    const std::uint64_t tb0 = dalMftb(ctx.get());
+    QueryPerformanceCounter(&t0);
+    Sleep(100);
+    const std::uint64_t us1 = dal::systemTimeUs();
+    const std::uint64_t tb1 = dalMftb(ctx.get());
+    QueryPerformanceCounter(&t1);
+    const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / frequency.QuadPart;
+    const std::uint64_t elapsed_us = us1 - us0;
+    CHECK(elapsed_us >= 350000 && elapsed_us <= 700000);
+    const double time_ratio = static_cast<double>(elapsed_us) / 1e6 / seconds;
+    const double timebase_ratio = static_cast<double>(tb1 - tb0) / seconds / dal::kTimebaseFrequency;
+    const bool ratios_ok = time_ratio > 3.4 && time_ratio < 4.6 && timebase_ratio > 3.4 && timebase_ratio < 4.6;
+    CHECK(ratios_ok);
+    if (!ratios_ok)
+        std::fprintf(stderr, "guest clock ratios %.2f (time) %.2f (timebase)\n", time_ratio, timebase_ratio);
+
+    // Guest time never steps back across speed changes, on the switching thread or on a reader.
+    std::atomic<bool> stop{false};
+    std::atomic<bool> reader_monotonic{true};
+    std::thread reader([&] {
+        std::uint64_t last = 0;
+        while (!stop.load()) {
+            const std::uint64_t now = dal::guestClockTicks();
+            if (now < last) reader_monotonic = false;
+            last = now;
+        }
+    });
+    std::uint64_t last_us = dal::systemTimeUs();
+    bool switcher_monotonic = true;
+    // Each change logs a line; 200 of them would bury the rest of the test output.
+    dal::setLogSink([](std::string_view) {});
+    for (int i = 0; i < 200; i++) {
+        dal::setFastForwardSpeed(i % 2 == 0 ? dal::kMaxFastForwardSpeed : dal::kMinFastForwardSpeed);
+        dal::setFastForwardToggled(i % 3 != 0);
+        for (int j = 0; j < 20; j++) {
+            const std::uint64_t now_us = dal::systemTimeUs();
+            switcher_monotonic = switcher_monotonic && now_us >= last_us;
+            last_us = now_us;
+        }
+        if (i % 20 == 0) Sleep(1);
+    }
+    dal::setLogSink({});
+    stop = true;
+    reader.join();
+    CHECK(switcher_monotonic);
+    CHECK(reader_monotonic.load());
+
+    // (d) Waits the guest asked for, in host time.
+    dal::setFastForwardSpeed(dal::kDefaultFastForwardSpeed);
+    dal::setFastForwardToggled(true);
+    CHECK(dal::guestSpeed() == 4);
+    CHECK(dal::hostDuration(std::chrono::microseconds(400000)) == std::chrono::microseconds(100000));
+    CHECK(dal::hostDuration(std::chrono::microseconds(1)) == std::chrono::microseconds(1));
+    CHECK(dal::hostDuration(std::chrono::microseconds(5)) == std::chrono::microseconds(2));
+    CHECK(dal::hostDuration(std::chrono::microseconds(0)) == std::chrono::microseconds(0));
+    dal::setFastForwardToggled(false);
+    CHECK(dal::guestSpeed() == 1);
+    CHECK(dal::hostDuration(std::chrono::microseconds(400000)) == std::chrono::microseconds(400000));
+
+    dal::setFastForwardToggled(false);
+    dal::setFastForwardHeld(false);
+    dal::setFastForwardSpeed(dal::kDefaultFastForwardSpeed);
+}
+
 void testTimerResolution() {
     const dal::TimerResolution resolution;
     CHECK(resolution.active());
@@ -8782,6 +8910,7 @@ int main(int argc, char** argv) {
     testGcmInterruptThread();
     testJudgeThreads();
     testTimebase();
+    testGuestClock();
     testTimerResolution();
     testGuestLockFifo();
     testReservationAndDcbz();

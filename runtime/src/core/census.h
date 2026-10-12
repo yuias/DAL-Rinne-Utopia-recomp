@@ -10,7 +10,8 @@ namespace dal {
 // PS3 timebase frequency; dalMftb and sys_time_get_timebase_frequency report it.
 inline constexpr std::uint64_t kTimebaseFrequency = 79800000;
 
-// Microseconds since the runtime started (a monotonic host clock).
+// Guest microseconds since the runtime started: a monotonic clock that runs guestSpeed() times as
+// fast as the host while fast-forward is active.
 std::uint64_t systemTimeUs();
 
 // Run statistics printed on every stop path. Counters are updated under the guest lock; the

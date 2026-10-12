@@ -7,50 +7,24 @@
 
 #include "core/census.h"
 #include "core/fatal.h"
+#include "core/guest_clock.h"
 #include "core/log.h"
 #include "dal/ppu_context.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-
 namespace {
-
-std::int64_t queryCounter() {
-    LARGE_INTEGER value;
-    QueryPerformanceCounter(&value);
-    return value.QuadPart;
-}
-
-std::int64_t counterFrequency() {
-    static const std::int64_t frequency = [] {
-        LARGE_INTEGER value;
-        QueryPerformanceFrequency(&value);
-        return value.QuadPart;
-    }();
-    return frequency;
-}
-
-// Initialised during static initialisation, so it is the process start for all practical purposes.
-const std::int64_t g_start_counter = queryCounter();
 
 // delta * mul / frequency without a 128-bit division (needs compiler-rt, which is not linked).
 // The remainder term stays below frequency * mul, far under 2^64 for a QPC frequency in the MHz.
 std::uint64_t scaleCounter(std::uint64_t delta, std::uint64_t mul) {
-    const auto frequency = static_cast<std::uint64_t>(counterFrequency());
+    const std::uint64_t frequency = dal::guestClockFrequency();
     return (delta / frequency) * mul + (delta % frequency) * mul / frequency;
-}
-
-std::uint64_t elapsedCounter() {
-    const std::int64_t now = queryCounter();
-    return now > g_start_counter ? static_cast<std::uint64_t>(now - g_start_counter) : 0;
 }
 
 }  // namespace
 
 namespace dal {
 
-std::uint64_t systemTimeUs() { return scaleCounter(elapsedCounter(), 1000000u); }
+std::uint64_t systemTimeUs() { return scaleCounter(guestClockTicks(), 1000000u); }
 
 }  // namespace dal
 
@@ -114,7 +88,7 @@ void dalSync(DalPpuContext* ctx, uint32_t kind) {
 
 uint64_t dalMftb(DalPpuContext* ctx) {
     (void)ctx;
-    return scaleCounter(elapsedCounter(), dal::kTimebaseFrequency);
+    return scaleCounter(dal::guestClockTicks(), dal::kTimebaseFrequency);
 }
 
 uint64_t dalMffs(DalPpuContext* ctx) { return ctx->fpscr; }
