@@ -24,7 +24,7 @@ endfunction()
 set(DAL_PPU_GENERATED_DIR "" CACHE PATH "Output directory of 'ps3tool emit' (empty: no generated code)")
 set(DAL_GAME_DIR "" CACHE PATH "Game directory whose .sdat files the build decrypts, also used by the game tests (empty: neither)")
 
-include("${CMAKE_SOURCE_DIR}/cmake/sdat_keys.cmake")
+include("${CMAKE_SOURCE_DIR}/cmake/rpcs3_keys.cmake")
 
 function(dal_ppu_add_generated_tree)
   if(DAL_PPU_GENERATED_DIR STREQUAL "")
@@ -82,14 +82,16 @@ function(dal_ppu_add_generated_tree)
 
   # Decrypt the game's .sdat files during the build into the directory dal_game uses by default.
   set(sdata_cache "${CMAKE_BINARY_DIR}/sdata_cache")
-  set(DAL_SDAT_KEYS "")
+  # A missing key file is not fatal here: the build then skips the .sdat cache, and the game stops at
+  # its error dialog for the missing file.
+  set(DAL_RPCS3_KEYS_DIR "")
   if(NOT DAL_GAME_DIR STREQUAL "")
-    dal_resolve_sdat_keys()
+    dal_resolve_rpcs3_keys()
   endif()
-  if(NOT DAL_SDAT_KEYS STREQUAL "")
+  if(NOT DAL_RPCS3_KEYS_DIR STREQUAL "")
     set(sdata_stamp "${sdata_cache}/.stamp")
     add_custom_command(OUTPUT "${sdata_stamp}"
-      COMMAND dal_sdat --keys "${DAL_SDAT_KEYS}" --game-dir "${DAL_GAME_DIR}" --out "${sdata_cache}"
+      COMMAND dal_sdat --keys "${DAL_RPCS3_KEYS_DIR}" --game-dir "${DAL_GAME_DIR}" --out "${sdata_cache}"
       COMMAND ${CMAKE_COMMAND} -E touch "${sdata_stamp}"
       DEPENDS dal_sdat
       COMMENT "Decrypting sdat files into ${sdata_cache}"
