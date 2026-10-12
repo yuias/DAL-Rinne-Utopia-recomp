@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <variant>
 #include <vector>
 
 #include "render/fp_translator.h"
@@ -27,6 +28,7 @@
 #include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame_builder.h"
 #include "rsx/rsx_registers.h"
+#include "rsx/rsx_texture_cache.h"
 #include "rsx/rsx_unimplemented.h"
 #include "rsx_synthetic.h"
 
@@ -1273,6 +1275,7 @@ void testRendererTextures(dal::VkContext& ctx) {
     {
         std::vector<dal::RsxCommand> commands = replaySynthetic(makeChangedTextureCapture());
         dal::rsxUnimplementedReset();
+        const std::uint64_t uploads_before = renderer.stats().texture_uploads;
         renderer.execute(commands);
         CHECK(renderer.valid());
         CHECK(renderer.readDisplay(bgra, width, height));
@@ -1280,6 +1283,36 @@ void testRendererTextures(dal::VkContext& ctx) {
         CHECK(pixelArgb(bgra, width, 10, 24) == 0xFFFF0000 && pixelArgb(bgra, width, 22, 40) == 0x80FFFFFF);
         CHECK(pixelArgb(bgra, width, 42, 24) == 0xFFFFFF00 && pixelArgb(bgra, width, 54, 40) == 0xFF808080);
         CHECK(renderer.stats().draws_skipped == 0);
+        // The two draws carry different content ids, so the one image is uploaded for each of them.
+        CHECK(renderer.stats().texture_uploads == uploads_before + 2);
+        expectNoNotes();
+    }
+
+    // An image is uploaded from a blob once: the same commands again carry the same content ids and upload
+    // nothing, and a new content id (the guest bytes changed) uploads again. A blob with no id is always new.
+    {
+        std::vector<dal::RsxCommand> commands = replaySynthetic(makeTexturedCapture({}));
+        dal::rsxUnimplementedReset();
+        const auto texture = [&]() -> dal::RsxTextureDesc& {
+            for (dal::RsxCommand& command : commands) {
+                if (auto* draw = std::get_if<dal::RsxDraw>(&command)) return draw->textures.at(0);
+            }
+            std::abort();
+        };
+        CHECK(texture().data != nullptr && texture().content_id != 0);
+        const std::uint64_t uploads_before = renderer.stats().texture_uploads;
+        renderer.execute(commands);
+        CHECK(renderer.stats().texture_uploads == uploads_before + 1);
+        renderer.execute(commands);
+        CHECK(renderer.stats().texture_uploads == uploads_before + 1);
+        texture().content_id = dal::RsxTextureCache::nextContentId();
+        renderer.execute(commands);
+        CHECK(renderer.stats().texture_uploads == uploads_before + 2);
+        texture().content_id = 0;
+        renderer.execute(commands);
+        renderer.execute(commands);
+        CHECK(renderer.stats().texture_uploads == uploads_before + 4);
+        CHECK(renderer.valid() && renderer.stats().draws_skipped == 0);
         expectNoNotes();
     }
 

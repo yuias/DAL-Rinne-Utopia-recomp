@@ -60,6 +60,9 @@ struct TextureImage {
     // Layout at the end of the commands recorded so far (the frame's command buffer is submitted in order).
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::uint64_t last_used = 0;
+    // RsxTextureDesc::content_id of the blob the image was last uploaded from; 0 = never. A re-created image
+    // starts at 0, so it is uploaded again even when its content id matches the one of the dropped image.
+    std::uint64_t content_id = 0;
     std::map<std::uint32_t, VkImageView> views;  // by remap word (low 16 bits)
 
     TextureImage() = default;

@@ -606,8 +606,9 @@ bool RsxRenderer::vertexFormatSupported(VkFormat format) {
 
 // Fills the image info and coordinate scale of every texture unit the draw's fragment program samples.
 // A unit without a usable texture keeps the placeholder, and every such case is counted with
-// rsxNoteUnimplemented, so a census without texture kinds means no placeholder was sampled. Texture memory is uploaded
-// again for every draw, as the guest may have changed it between draws.
+// rsxNoteUnimplemented, so a census without texture kinds means no placeholder was sampled. A texture image is
+// uploaded only when the content id of the blob differs from the one it received last: the frame builder gives
+// an unchanged guest texture the same blob and id in every draw, and a new id once the guest bytes changed.
 //
 // A texture at a known render target samples that target's image. When the target is the one the draw
 // renders to (a cyclic reference), the draw would read and write the same image: it samples a copy
@@ -739,7 +740,12 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
                 continue;
             }
             reference(image);
-            if (std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
+            // An id of 0 names no content, so such a blob is always uploaded. A second unit that names the same
+            // image within one draw is left alone, whatever its id says, so the first unit's texels stay.
+            // An image that is not uploaded keeps SHADER_READ_ONLY from its last upload, and the barrier of a
+            // later upload waits for every earlier use, so earlier draws still sample the old texels.
+            const bool current = texture->content_id != 0 && image->content_id == texture->content_id;
+            if (!current && std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
                 UploadRef staging;
                 if (!allocUpload(bytes.size(), staging)) return false;
                 const std::uint8_t* source = bytes.data();
@@ -760,6 +766,7 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
                         compressed ? static_cast<std::uint32_t>(row_bytes / rsxTextureBlockBytes(texture->format)) * 4
                                    : texture->pitch / 4;
                 textures_->recordUpload(cmd, *image, staging.buffer, staging.offset, row_length);
+                image->content_id = texture->content_id;
                 uploaded.push_back(image.get());
                 stats_.texture_uploads++;
             }
