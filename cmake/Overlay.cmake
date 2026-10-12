@@ -29,15 +29,16 @@ function(dal_overlay_add_imgui)
 endfunction()
 
 # The overlay libraries. Call after dal_render_add(), which defines volk and dal_render and enables
-# testing. dal_render stays free of ImGui; only this library will link it.
+# testing. dal_render stays free of ImGui; only this library links it.
 function(dal_overlay_add)
   dal_overlay_add_imgui()
 
   add_library(dal_overlay STATIC
-    runtime/src/overlay/overlay_model.cpp)
+    runtime/src/overlay/overlay_model.cpp
+    runtime/src/overlay/overlay_panels.cpp)
   target_compile_options(dal_overlay PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_overlay PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
-  target_link_libraries(dal_overlay PUBLIC dal_render)
+  target_link_libraries(dal_overlay PUBLIC imgui dal_render)
 
   # Needs no GPU for the model tests; the Vulkan parts skip without a device.
   add_executable(dal_overlay_tests runtime/tests/overlay_test.cpp)
