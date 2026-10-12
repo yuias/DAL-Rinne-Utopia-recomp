@@ -84,6 +84,12 @@ public:
         std::uint64_t clears = 0, draws = 0, flips = 0;
     };
     CommandCounts commandCounts() const;
+    // Texture cache counters as of the last takeCommands(); any thread.
+    struct TextureCacheCounts {
+        RsxTextureCache::Stats stats;
+        std::uint64_t entries = 0, bytes = 0;
+    };
+    TextureCacheCounts textureCacheCounts() const;
 
     // Records the listed frames (1 = the writes up to and including the first flip command, N = those
     // after flip N-1 up to flip N) for rsx/rsx_capture.h. Enables the frame builder; call before the
@@ -149,6 +155,9 @@ private:
     std::unique_ptr<GuestRsxMemoryView> memory_view_;
     std::unique_ptr<RsxFrameBuilder> builder_;
     std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0};
+    // Copy of the builder's texture cache counters, published by takeCommands() for the stop path.
+    std::atomic<std::uint64_t> tex_epochs_{0}, tex_hits_{0}, tex_checks_{0}, tex_checked_bytes_{0}, tex_stores_{0},
+            tex_stored_bytes_{0}, tex_entries_{0}, tex_bytes_{0};
 
     void startCapture(std::uint32_t frame);
     void finishCapture(std::uint32_t buffer);

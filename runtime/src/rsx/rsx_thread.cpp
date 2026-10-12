@@ -207,7 +207,19 @@ std::vector<RsxConsumer::FinishedCapture> RsxConsumer::takeCaptures() { return s
 std::vector<RsxCommand> RsxConsumer::takeCommands() {
     if (builder_ == nullptr) return {};
     finishPendingDraw();
-    return builder_->takeCommands();
+    std::vector<RsxCommand> commands = builder_->takeCommands();
+    // The cache belongs to this thread; the stop path reads only these copies.
+    const RsxTextureCache& cache = builder_->textureCache();
+    const RsxTextureCache::Stats& s = cache.stats();
+    tex_epochs_.store(s.epochs, std::memory_order_relaxed);
+    tex_hits_.store(s.hits, std::memory_order_relaxed);
+    tex_checks_.store(s.checks, std::memory_order_relaxed);
+    tex_checked_bytes_.store(s.checked_bytes, std::memory_order_relaxed);
+    tex_stores_.store(s.stores, std::memory_order_relaxed);
+    tex_stored_bytes_.store(s.stored_bytes, std::memory_order_relaxed);
+    tex_entries_.store(cache.entryCount(), std::memory_order_relaxed);
+    tex_bytes_.store(cache.byteCount(), std::memory_order_relaxed);
+    return commands;
 }
 
 void RsxConsumer::countCommands(const std::vector<RsxCommand>& commands) {
@@ -225,6 +237,19 @@ void RsxConsumer::countCommands(const std::vector<RsxCommand>& commands) {
 RsxConsumer::CommandCounts RsxConsumer::commandCounts() const {
     return {clears_.load(std::memory_order_relaxed), draws_.load(std::memory_order_relaxed),
             built_flips_.load(std::memory_order_relaxed)};
+}
+
+RsxConsumer::TextureCacheCounts RsxConsumer::textureCacheCounts() const {
+    TextureCacheCounts counts;
+    counts.stats.epochs = tex_epochs_.load(std::memory_order_relaxed);
+    counts.stats.hits = tex_hits_.load(std::memory_order_relaxed);
+    counts.stats.checks = tex_checks_.load(std::memory_order_relaxed);
+    counts.stats.checked_bytes = tex_checked_bytes_.load(std::memory_order_relaxed);
+    counts.stats.stores = tex_stores_.load(std::memory_order_relaxed);
+    counts.stats.stored_bytes = tex_stored_bytes_.load(std::memory_order_relaxed);
+    counts.entries = tex_entries_.load(std::memory_order_relaxed);
+    counts.bytes = tex_bytes_.load(std::memory_order_relaxed);
+    return counts;
 }
 
 void RsxConsumer::enableArgCensus(std::filesystem::path json_path, std::filesystem::path dump_dir) {
@@ -545,6 +570,13 @@ void onStop() {
     if (g_consumer->frameBuilderEnabled()) {
         const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
         logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
+        const RsxConsumer::TextureCacheCounts tex = g_consumer->textureCacheCounts();
+        constexpr double kMiB = 1024.0 * 1024.0;
+        logInfo("dal: rsx: texture cache: {} epochs, {} hits, {} checks ({:.1f} MiB), {} new blobs ({:.1f} MiB), "
+                "{} entries ({:.1f} MiB)",
+                tex.stats.epochs, tex.stats.hits, tex.stats.checks, static_cast<double>(tex.stats.checked_bytes) / kMiB,
+                tex.stats.stores, static_cast<double>(tex.stats.stored_bytes) / kMiB, tex.entries,
+                static_cast<double>(tex.bytes) / kMiB);
     }
     if (RsxExecutor* executor = g_executor.load(std::memory_order_acquire)) {
         // The process ends without destructors, so the dump worker's queue is written here. The bound keeps a
