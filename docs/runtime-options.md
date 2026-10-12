@@ -12,7 +12,7 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
          [--load-only] [--png-dump DIR]
          [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]
          [--dump-frames DIR] [--dump-frames-every K]
-         [--shader-cache DIR] [--vk-validation] [--no-window]
+         [--shader-cache DIR] [--fast-forward N] [--vk-validation] [--no-window]
          [--config FILE | --no-config] [-h|--help]
 ```
 
@@ -85,6 +85,7 @@ the window cannot be created, the RSX thread logs the reason and the game goes o
 | `--log FILE` | Also write every log line to `FILE`, which is truncated. |
 | `--log-level trace\|debug\|info\|warn\|error` | Lowest level that is logged (default `info`). `debug` adds diagnostics such as the 10 s window statistics; `trace` is the most verbose. Debug and trace lines carry a `debug: ` / `trace: ` tag. |
 | `--quiet-hle` | Do not log the first calls of default-handled imports. The counts in the census are unaffected. |
+| `--fast-forward N` | Debug option: run the guest `N` times faster than real time. `N` is 1 (off, the default) or a speed from 2 to 8; anything else is a usage error (`--fast-forward needs 1 (off) or a speed from 2 to 8`). The game's clock, timed waits, vblank and movie clock follow the speed, and the sound to the audio device is muted unless the overlay's `Sound while fast-forwarding` is on (`--audio-dump` always receives it). `--seconds`, pad scripts and the stall detector stay in host time. The run logs `dal: clock: guest speed Nx`. This is the way to fast-forward without the window; with the window, holding `Tab` or the overlay's Settings do the same interactively (the option ticks the overlay's `Fast-forward` checkbox). See [Guest time and fast-forward](runtime.md#guest-time-and-fast-forward). |
 | `--strict` | Treat a jump to an address that is not a recovered function as a fatal error (see [Dispatch](runtime.md#dispatch)). |
 | `--load-only` | Load and verify the executable, print the load summary and exit with 0 without running any guest code. |
 | `--png-dump DIR` | Write every image `cellPngDec` decodes to `DIR/png_<n>.png` (8-bit RGBA, at most 64), to check what the guest was given. `DIR` is created. |
@@ -127,7 +128,7 @@ replaced by `_` (`--game-dir` is `game_dir`). `null` is not a value; remove the 
 | --- | --- | --- |
 | Path | `game_dir`, `vfs_config`, `elf`, `log`, `hdd_dir`, `sdata_cache`, `png_dump`, `pad_script`, `audio_dump`, `rsx_census`, `dump_frames`, `shader_cache` | A non-empty string. A relative path is relative to the directory of the file, not to the working directory. |
 | String | `log_level`, `dialog_answer`, `pad`, `audio`, `render` | A string with one of the values of the option. |
-| Unsigned integer | `seconds`, `dump_frames_every` | A non-negative integer, with the range of the option (`dump_frames_every` must be positive). |
+| Unsigned integer | `seconds`, `dump_frames_every`, `fast_forward` | A non-negative integer, with the range of the option (`dump_frames_every` must be positive; `fast_forward` is 1 or from 2 to 8). |
 | Flag | `strict`, `quiet_hle`, `load_only`, `pad_probe`, `vk_validation`, `no_window` | `true` or `false`. |
 | Frame list | `rsx_capture` | An array of positive integers (`[300, 600]`), or a string in the command-line form (`"300,600"`). |
 

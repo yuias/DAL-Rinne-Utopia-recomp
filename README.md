@@ -131,6 +131,9 @@ place on AZERTY and QWERTZ keyboards:
 The game confirms with Circle (the `X` key), which also skips the notice screen and the intro
 movies. If keys do nothing, click the window to give it keyboard focus.
 
+Two keys are not pad buttons: `F1` shows or hides the debug overlay, and holding `Tab` runs the game
+faster (see [Debug overlay](docs/runtime.md#debug-overlay)).
+
 ### Gamepad
 
 A connected Xbox-family gamepad or DualShock 4 (second model) works in the window together with the

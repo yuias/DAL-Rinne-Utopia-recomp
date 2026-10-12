@@ -15,12 +15,14 @@
 | `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used to parse the VFS configuration and `config.json` |
 | `externals/CLI11` | CLI11 submodule (2.7.2, header-only), used by `dal_game` option parsing |
 | `externals/Vulkan-Headers`, `externals/volk`, `externals/VulkanMemoryAllocator` | Vulkan headers, the run-time loader and the memory allocator of the renderer |
-| `runtime/src/render/` | The renderer (`dal_render`): Vulkan context, render targets, textures, pipelines, window and swapchain, vertex program and fragment program translators, shader compiler and cache, PNG output; see [Rendering](rendering.md#rendering) |
+| `externals/imgui` | Dear ImGui submodule (v1.91.9b, built as a static library from the core files and the Win32 and Vulkan backends, no demo window), used only by the debug overlay |
+| `runtime/src/render/` | The renderer (`dal_render`): Vulkan context, render targets, textures, pipelines, window and swapchain, the hook that lets the overlay draw into the swapchain image, vertex program and fragment program translators, shader compiler and cache, PNG output; see [Rendering](rendering.md#rendering) |
 | `runtime/src/media/` | Movie and ATRAC3plus support: the PAMF header parser and MPEG-PS demuxer, the host movie player, the AT3 file parser and the ATRAC frame-decoder interface (all in the runtime core), and the FFmpeg loader with the movie and ATRAC3plus decoders (`dal_media`); see [Movies](movies.md) and [Audio](audio.md#cellatrac) |
 | `tools/dal_moviedump/` | `dal_moviedump`, which decodes a `.pam` file without the game; see [Movies](movies.md#dal_moviedump) |
 | `tools/fetch-ffmpeg.ps1`, `cmake/ffmpeg.cmake`, `cmake/Media.cmake`, `cmake/movie_decode.cmake` | FFmpeg fetch script and pin, the media targets, and the pin file of the `movie_decode` test |
 | `tools/dal_rsxreplay/` | `dal_rsxreplay`, which replays an RSX capture without the game; see [Capture and replay](rendering.md#capture-and-replay) |
 | `cmake/Render.cmake`, `cmake/rsx_replay.cmake` | Renderer targets and tests, and the pin file of the `rsx_replay` test |
+| `runtime/src/overlay/`, `cmake/Overlay.cmake` | The debug overlay (`dal_overlay`): the numbers it shows (no ImGui), the panels, the connections to the runtime and the ImGui backends that draw it over the presented image, plus the `imgui` and `dal_overlay_tests` targets and the `overlay_core` test; see [Debug overlay](runtime.md#debug-overlay) |
 | `cmake/game_boot.cmake` | Pin file of the `game_boot` test: arguments and milestones |
 | `runtime/src/input/` | Pad buttons, the host pad state and provider, the pad script player, and the gamepad code (backend interface, GameInput backend `dal_input_gameinput`, mapping, selection, hub, probe); see [Input](runtime.md#input) and [Gamepads](input.md) |
 | `tools/dal_padtool/` | `dal_padtool`: GameInput devices, live readings and rumble; see [`dal_padtool`](input.md#dal_padtool) |
@@ -48,7 +50,7 @@
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |
 | `config/ghidra_summary.json`, `config/extra_seeds.json`, `config/functions.json` | Ghidra summary, extra function starts and the recovered function database; see [Function recovery](function-recovery.md#function-recovery) |
 | `docs/` | Development documentation |
-| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput, CLI11) |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput, CLI11, Dear ImGui) |
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |
 | `generated/inputs/` | The decrypted `EBOOT.elf` written by the build with `-EbootBin` (git-ignored) |
 | `generated/deps/rpcs3/` | The downloaded RPCS3 key files `key_vault.h` and `key_vault.cpp`, one directory per commit (git-ignored) |

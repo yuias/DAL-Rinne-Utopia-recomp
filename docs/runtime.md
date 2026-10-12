@@ -243,9 +243,11 @@ selection, Steam, the GameInput runtime, log lines and tools) are described in [
 | Script | `runtime/src/input/pad_script.*` | The script parser and the player thread |
 | Gamepad | `runtime/src/input/gamepad_*`, `gameinput_backend.*` | Backend interface, GameInput backend, mapping, selection, the gamepad thread and `--pad-probe`; see [Input](input.md#design) |
 | Window | `runtime/src/render/vk_window.*` | Key and focus messages from the window thread; turns the IME off for the window |
+| Overlay | `runtime/src/overlay/debug_overlay.*` | The `F1` toggle, the `Tab` fast-forward hold and the message hook that decides which key presses the [debug overlay](#debug-overlay) withholds from the pad |
 
-The renderer library does not depend on `input/`: the window reports raw scan codes through
-callbacks, and `game_main.cpp` connects them to the state.
+The renderer library does not depend on `input/` or on the overlay: the window reports raw scan codes
+and, through `PresenterOptions::on_message`, raw window messages through callbacks, and `game_main.cpp`
+connects them to the state and to the overlay.
 
 ### Threading
 
@@ -275,6 +277,16 @@ nothing joins them, because the process ends with `std::_Exit`.
   without focus). Script buttons are a separate source and stay; the gamepad thread releases its own
   source when the process loses the foreground window. `Alt` combinations still reach the
   default window procedure, so `Alt+F4` closes the window.
+- `F1` (scan code `0x3B`) is not in the pad map: it toggles the [debug overlay](#debug-overlay) and
+  never reaches the pad, with any `--pad` value. While the overlay is shown and ImGui wants the
+  keyboard (a text box is active), key presses (`WM_KEYDOWN`, `WM_SYSKEYDOWN`) are withheld from the
+  pad. Key-ups are always delivered, so a key that went down before the overlay took the keyboard is
+  still released.
+- `Tab` (scan code `0x0F`) is not in the pad map either: holding it fast-forwards the game (see
+  [Debug overlay](#debug-overlay)). The first key-down starts the hold, repeats are ignored, and the
+  key-up ends it. It works with the overlay hidden, is withheld from the pad and from ImGui (so Tab
+  does not move between the overlay's controls), and `WM_KILLFOCUS` ends the hold too, because the
+  key-up does not arrive in a window without focus.
 - The press mode that the game sets with `cellPadSetPortSetting` decides whether `cellPad` copies
   the pressure words to the game; the game under test turns it on (`dal: pad: port 0 setting 0x2`).
 
@@ -360,6 +372,119 @@ the rest of the gamepad code by `input_core` and `input_gameinput` (see [Tests](
 key message conversion by `render_core` (`testKeyMessages`).
 
 Scripts live in `tools/pad_scripts/`.
+
+## Debug overlay
+
+With the window open, `F1` shows or hides a [Dear ImGui](https://github.com/ocornut/imgui) window
+titled `dal` over the presented image, at the top left. It has four collapsible sections:
+
+| Section | Contents |
+| --- | --- |
+| Stats | The flip number (the `frame_<N>.png` and `--rsx-capture N` numbering), flips per second over the last second, draws and skipped draws of the last flip, the total of skipped draws and a graph of the last 240 flip intervals. Below, the audio counters of the engine and `cellAudio`: the output, the longest producer time against the 5.333 ms block period and its margin, blocks, periods, failed notifies, skipped periods (with a rate), underrun frames (with a rate), dropped blocks, the clock correction in ppm and the mean output fill against its target. Before `cellAudioInit` the audio part says `n/a (audio not started)` |
+| Settings | `Fast-forward` (checkbox), `Speed` (slider, 2x to 8x, default 4x), `Sound while fast-forwarding` (checkbox, off by default), the line `Hold Tab to fast-forward. Guest speed Nx` (N is 1 while fast-forward is off) and `Log level` (the lowest level that is logged; the same filter as `--log-level`) |
+| Capture | `Capture next flip` and `Dump next flip as PNG`, each with the state of its last request, and the dump counts (written, failed, skipped) |
+| RSX unimplemented | The live `rsx unimplemented` counts (see [Rendering](rendering.md#rendering)) as a table of count and kind, with a text filter, and the number of kinds dropped because the table was full |
+
+Fast-forward makes the guest run `Speed` times as fast as real time while `Fast-forward` is ticked or
+`Tab` is held in the window. It is the same state as the `--fast-forward N` option, which is the only
+way to use it without a window. The device output is muted while it is active unless `Sound while
+fast-forwarding` is on; `--audio-dump` always receives the real sound. A control whose connection to
+the runtime is missing is shown disabled.
+
+`Capture next flip` records the first whole frame that starts after the click, which is typically
+flip N+2 when the click happens while flip N is displayed, and writes it as
+`generated/rsx/captures/frame_<N>.dalcap` like `--rsx-capture`. The button is disabled while a
+request is pending or recording, and when no frame builder runs. The panel shows `pending`,
+`recording frame N`, then `frame N -> <path>` or `frame N failed: <reason>`.
+`Dump next flip as PNG` writes the next completed flip as `frame_<N>.png` into the `--dump-frames`
+directory, or `generated/frames` without that option; a flip that `--dump-frames-every` dumps anyway
+is written once.
+
+The overlay is drawn on the swapchain image after the letterboxed blit, so it is never part of
+`--dump-frames` files, requested dumps, `readDisplay` or captures (see
+[Rendering](rendering.md#rendering)). It redraws only when the game flips: during a stall without
+flips (a load, for example) it freezes and takes no input. Without the window (`--no-window`,
+`--render none`) there is no overlay, and `F1` and `Tab` do nothing.
+
+Design notes:
+
+- The code is the `dal_overlay` library in `runtime/src/overlay/`; `dal_render` does not depend on
+  it. `overlay_model.*` holds the numbers (no ImGui), `overlay_panels.*` the ImGui window,
+  `overlay_sources.*` the connections to the runtime (audio engine and `cellAudio` counters, the
+  `rsx unimplemented` snapshot, the fast-forward state and its switches, the sound switch, the capture
+  request and status, the log level) and `debug_overlay.*` the Vulkan and Win32 backends and the keys.
+  The overlay only calls thread-safe providers and never touches guest memory.
+- The ImGui backends start at the first draw after the first show, not at start-up, on the RSX thread:
+  the log gets `dal: overlay: ready (imgui 1.91.9b, scale N)` (info) and the font upload costs a
+  one-time hitch. `scale` is the DPI scale of the window at that moment and is not updated later. If
+  the setup fails, one `dal: overlay: ... failed, overlay disabled` warning is logged and the game
+  goes on without the overlay: nothing is drawn, `F1` is still withheld from the pad and `Tab` still
+  fast-forwards. A change of the swapchain's surface format
+  after start-up skips the overlay for that image and logs `dal: overlay: surface format changed,
+  overlay skipped for that image` once.
+- One global ImGui context is guarded by a mutex. The window thread feeds it the mouse and key
+  messages (the Win32 backend calls `SetCapture` and `GetKeyState`, which only work on the thread that
+  owns the window); the RSX thread holds the mutex while it builds and records a frame, and never
+  across a swapchain call. `ImGui_ImplWin32_NewFrame` is not used, because its key workaround reads
+  `GetKeyState` on the calling thread. Hiding the overlay sends ImGui a focus-lost event so that held
+  keys and buttons are dropped, and showing it again sends a focus-gained event: ImGui 1.91.9b keeps
+  clearing its input while it believes the application has no focus.
+- The overlay window has no `imgui.ini`, no docking, no gamepad navigation and does not change the
+  mouse cursor.
+
+## Guest time and fast-forward
+
+Fast-forward is a debug feature: the guest runs N times faster than real time, N from 2 to 8. It is
+switched on by `--fast-forward N` (the only way without a window), by the `Fast-forward` checkbox and
+`Speed` slider of the [debug overlay](#debug-overlay), and by holding `Tab` in the window (losing the
+window focus ends the hold). The state is `toggled` (option or checkbox), `held` (the key) and the
+speed (default 4); the guest speed is the speed while either is set and 1 otherwise. Each change logs
+`dal: clock: guest speed Nx` (`1x` when the guest returns to real time). With fast-forward off every
+path below is the same as without the feature.
+
+Turning off only the vblank would not be enough: the game also measures time itself, movies end by
+their clock, timed waits are host waits, and with a window the swapchain's `FIFO` present holds the RSX
+thread at the display rate. So the guest speed applies to everything the game can observe
+(`runtime/src/core/guest_clock.*`):
+
+| What | Behaviour at speed N |
+| --- | --- |
+| Guest time: `systemTimeUs()` and the timebase counter (`dalMftb`, the `mftb` reads; the timebase frequency is unchanged), so `sys_time_get_system_time`, the RSX report and last-flip timestamps, the `cellAudio` period timestamps and the `cellSail` log times | Advance N times as fast as the host clock. The clock is continuous and never goes back when the speed changes; it is lock-free and readable from any thread (a sequence-locked segment of host start, guest start and speed) |
+| Timed guest waits: `sys_timer_usleep` and `sys_timer_sleep`, and the timeouts of mutexes, lightweight mutexes, condition variables, event flags and event queues | The host wait is the guest duration divided by N, rounded up and at least 1 us for a nonzero duration. A wait already in progress is not shortened by a speed change |
+| `cellMsgDialogClose` delay | Divided by N like a timed wait |
+| VBlank | The period is 16667 us of guest time, so 16667 us / N on the host. The game's frame loop waits on the vblank handler, so it speeds up with it |
+| Movie clock | 90 kHz ticks of guest time, so movies advance and end at N times real time (see [Movies](movies.md#hle-boundary)) |
+| Window presentation | While N > 1 the swapchain uses the `MAILBOX` present mode (else `IMMEDIATE`, else `FIFO`), which does not wait for the display's refresh, and the renderer does not wait for a free swapchain image: a flip with no image free is rendered and submitted without a present and counted as `skipped` in the `dal: render: window:` line. At speed 1 it is `FIFO` again. Each switch recreates the swapchain once and logs `dal: render: window: present mode <mode>`. The overlay is drawn only on presented flips |
+| Audio engine | Stays on host time (below) |
+
+Stay on host time: the `--seconds` watchdog, pad scripts, the stall detector, the auto-answer delay of
+message dialogs, the `cellPad` sensor interval, the keyboard's 60 ms minimum press time, the bounds the
+runtime sets itself (the `cellSail` preroll, the 5 s stops of its service threads) and the audio
+engine's block clock.
+
+The audio engine keeps producing one `cellAudio` period every 5.333 ms of host time, so the game's
+mixer and sound thread run at real time. The device output gets silence while the guest speed is above
+1, unless `Sound while fast-forwarding` is on (then it plays at normal pitch and is out of step with
+the picture); the `--audio-dump` file and the engine's block counts always see the mixed sound. The
+`cellAudio` timestamps are guest time, so they advance N times per period. See
+[Audio](audio.md#engine-and-block-clock).
+
+Consequences:
+
+- The census rates (`--rsx-census` per-second arrays) and the `cellSail` `movie window` lines are per
+  guest second, because they are computed from guest time. A run of `--seconds S` lasts S host seconds,
+  which is N times S guest seconds.
+- The real speed-up can be below N. Periodic host waits use a timer that sleeps in steps of about
+  1 ms, and a short guest sleep takes at least about 1 ms of host time. The log line `dal: gcm: the
+  vblank handler is behind, ticks are being coalesced` is logged once per run and also appears at 1x
+  during boot, so it does not mark that limit by itself.
+- Measured over 60 s with `--no-window`: 60.0 vblanks per second at 1x, 239.9 at 4x and 478.8 at 8x
+  (4.00x and 7.98x). In the window over 40 s: 59 per second at 1x and about 470 at 8x. Before the
+  window switched to `MAILBOX`, the `FIFO` swapchain held the RSX thread at the display refresh
+  through the frame-slot fence wait, and windowed 8x reached only 280 per second; the `fence wait`
+  figures in the `dal: render: window:` debug line show such a wait.
+- Movie frames are dropped when the frame loop falls behind the movie clock: at 8x without a window
+  about 6% of `op.pam`'s frames.
 
 ## PNG decoding
 

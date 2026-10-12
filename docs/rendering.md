@@ -71,7 +71,17 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   the displayed buffer is also blitted, letterboxed to 16:9, to a swapchain with the FIFO present
   mode, so the display's refresh is what paces the RSX thread; presenting runs outside the guest
   lock. Without a window nothing waits for a vertical blank in the renderer, and the game's own
-  waits on the 60 Hz vblank handler set its frame rate.
+  waits on the 60 Hz vblank handler set its frame rate. While the game is fast-forwarded (see
+  [Guest time and fast-forward](runtime.md#guest-time-and-fast-forward)) the vblank period is divided
+  by the guest speed, and the swapchain is recreated with the `MAILBOX` present mode (else
+  `IMMEDIATE`), so the window no longer paces the RSX thread: a flip with no swapchain image free
+  without waiting is rendered and submitted without a present and counted as `skipped` in the
+  `dal: render: window:` debug line. That line also reports the time the renderer waited for a frame
+  slot's fence (`fence wait avg ... max ... ms`), which is where a `FIFO` swapchain holds the thread.
+  The [debug overlay](runtime.md#debug-overlay) is drawn on the swapchain image after that blit, in a
+  separate pass before the image is presented. It is not drawn into the render target, so it never
+  appears in `--dump-frames` files, requested PNG dumps, the display readback or captures, and it only
+  redraws when a flip completes (while fast-forwarding, when a flip is presented).
 - **`rsx unimplemented` census.** The decoders, the frame builder and the renderer count what they
   meet but cannot handle yet (surface, depth and texture formats, texture layouts, vertex types,
   primitives, vertex and fragment opcodes, blend modes, other state and unknown methods) under

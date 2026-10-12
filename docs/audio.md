@@ -48,6 +48,15 @@ does not call the producer and does not advance the read index, tags or timestam
 block still goes to the dump and the output, so the dump stays aligned with wall time and the
 device does not underrun because of it. `kMaxCatchUpBlocks` is 0.
 
+**Fast-forward.** The engine stays on the host clock when the guest runs faster than real time (see
+[Guest time and fast-forward](runtime.md#guest-time-and-fast-forward)), so the game's mixer and
+sound thread keep running at real time and the sound would be out of step with the picture. While the
+guest speed is above 1 the output therefore receives silent blocks instead of the mix, unless `Sound
+while fast-forwarding` in the [debug overlay](runtime.md#debug-overlay) is on (`setFastForwardSound`;
+off by default). The speed is read for every block, so a change takes effect within one period. The
+dump file and the block counts (including the non-silent count) are not affected. The `cellAudio`
+period timestamps are guest time and advance N times per period at speed N.
+
 ### Guest lock
 
 Guest memory and lv2 objects are touched only under the guest lock, which is a FIFO ticket lock
@@ -117,7 +126,8 @@ then every 2 seconds. A successful reopen logs `dal: audio: wasapi: reopened <de
 The dump is a WAV file with 32-bit float samples, 48 kHz, 2 channels. Only the engine thread writes
 it. The header is patched (and flushed) after every 48000 frames and by the census provider on
 every stop path, because the process ends with `std::_Exit` and runs no destructors; a file cut
-short is valid up to its last full second. `dal_audiotool wavstat` reads it.
+short is valid up to its last full second. `dal_audiotool wavstat` reads it. The dump always gets the
+mixed blocks, also while the output is muted for fast-forward.
 
 ## cellAudio
 
