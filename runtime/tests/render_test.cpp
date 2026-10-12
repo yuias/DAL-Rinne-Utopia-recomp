@@ -491,6 +491,104 @@ void testRendererReadbackGate(dal::VkContext& ctx) {
     dal::rsxUnimplementedReset();
 }
 
+// A requested dump needs no dump_dir: only the asked flip is read back and written, into
+// requested_dump_dir.
+void testRendererRequestedDump(dal::VkContext& ctx) {
+    dal::rsxUnimplementedReset();
+    std::error_code ec;
+    const std::filesystem::path dir =
+            std::filesystem::temp_directory_path() /
+            std::format("dal_render_test_requested_{}",
+                        std::chrono::steady_clock::now().time_since_epoch().count());  // unique under parallel runs
+    std::filesystem::remove_all(dir, ec);
+
+    dal::RenderOptions options;
+    options.requested_dump_dir = dir;
+    dal::RsxRenderer renderer(ctx, options);
+    CHECK(renderer.valid());
+    std::vector<std::uint8_t> bgra;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    for (std::uint32_t flip = 1; flip <= 3; flip++) {
+        if (flip == 2) renderer.requestDisplayDump();
+        std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(0xFF102030));
+        renderer.execute(commands);
+        CHECK(renderer.valid());
+        CHECK(renderer.readDisplay(bgra, width, height) == (flip == 2));
+    }
+    CHECK(renderer.flushDumps(std::chrono::seconds(10)) == 0);
+    const dal::DumpCounts dumps = renderer.dumpCounts();
+    CHECK(dumps.written == 1 && dumps.failed == 0 && dumps.skipped == 0);
+    CHECK(std::filesystem::exists(dir / "frame_000002.png"));
+    CHECK(!std::filesystem::exists(dir / "frame_000001.png") && !std::filesystem::exists(dir / "frame_000003.png"));
+    dal::RgbImage image;
+    std::string error;
+    CHECK(dal::readPngRgb(dir / "frame_000002.png", image, error) && image.width == width && image.height == height);
+    CHECK(image.rgb.size() >= 3 && image.rgb[0] == 0x10 && image.rgb[1] == 0x20 && image.rgb[2] == 0x30);
+    std::filesystem::remove_all(dir, ec);
+    dal::rsxUnimplementedReset();
+}
+
+// A flip that dump_dir writes anyway is not written again into requested_dump_dir.
+void testRendererRequestedDumpSharesDumpDir(dal::VkContext& ctx) {
+    dal::rsxUnimplementedReset();
+    std::error_code ec;
+    const std::filesystem::path base =
+            std::filesystem::temp_directory_path() /
+            std::format("dal_render_test_shared_{}", std::chrono::steady_clock::now().time_since_epoch().count());
+    std::filesystem::remove_all(base, ec);
+
+    dal::RenderOptions options;
+    options.dump_dir = base / "dumped";
+    options.dump_every = 2;
+    options.requested_dump_dir = base / "requested";
+    dal::RsxRenderer renderer(ctx, options);
+    CHECK(renderer.valid());
+    for (std::uint32_t flip = 1; flip <= 3; flip++) {
+        if (flip == 2 || flip == 3) renderer.requestDisplayDump();
+        std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(0xFF102030));
+        renderer.execute(commands);
+        CHECK(renderer.valid());
+    }
+    CHECK(renderer.flushDumps(std::chrono::seconds(10)) == 0);
+    CHECK(renderer.dumpCounts().written == 2);
+    CHECK(std::filesystem::exists(base / "dumped" / "frame_000002.png"));
+    CHECK(!std::filesystem::exists(base / "requested" / "frame_000002.png"));
+    CHECK(std::filesystem::exists(base / "requested" / "frame_000003.png"));
+    std::filesystem::remove_all(base, ec);
+    dal::rsxUnimplementedReset();
+}
+
+class CountingOverlay final : public dal::PresentOverlay {
+public:
+    dal::PresentOverlayRequests onFlip(const dal::PresentFrameInfo&) override {
+        on_flip++;
+        return {};
+    }
+    bool wantsDraw() const override { return true; }
+    void record(VkCommandBuffer, const dal::Presenter::Target&) override { records++; }
+
+    int on_flip = 0;
+    int records = 0;
+};
+
+// The overlay hook belongs to the present path: a renderer without a presenter never calls it.
+void testPresentOverlayNeedsPresenter(dal::VkContext& ctx) {
+    dal::rsxUnimplementedReset();
+    CountingOverlay overlay;
+    dal::RsxRenderer renderer(ctx, readbackAllOptions());
+    CHECK(renderer.valid());
+    renderer.setPresentOverlay(&overlay);
+    for (int flip = 0; flip < 3; flip++) {
+        std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(0xFF102030));
+        renderer.execute(commands);
+        CHECK(renderer.valid());
+    }
+    CHECK(renderer.stats().flips == 3);
+    CHECK(overlay.on_flip == 0 && overlay.records == 0);
+    dal::rsxUnimplementedReset();
+}
+
 std::uint32_t pixelArgb(const std::vector<std::uint8_t>& bgra, std::uint32_t width, std::uint32_t x, std::uint32_t y) {
     const std::uint8_t* p = bgra.data() + (static_cast<std::size_t>(y) * width + x) * 4;
     return (static_cast<std::uint32_t>(p[3]) << 24) | (static_cast<std::uint32_t>(p[2]) << 16) |
@@ -1539,6 +1637,9 @@ int main() {
     testClearAndReadback(*ctx);
     testRendererClear(*ctx);
     testRendererReadbackGate(*ctx);
+    testRendererRequestedDump(*ctx);
+    testRendererRequestedDumpSharesDumpDir(*ctx);
+    testPresentOverlayNeedsPresenter(*ctx);
     testRendererScissorAndMask(*ctx);
     testRendererQuad(*ctx);
     testRendererTextures(*ctx);
