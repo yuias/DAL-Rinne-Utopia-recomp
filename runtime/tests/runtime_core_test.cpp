@@ -7322,6 +7322,40 @@ void testRsxConsumer() {
         CHECK(capturing.takeCaptures().empty());
     }
 
+    // A capture requested at run time records the first whole frame that starts after the request, with no
+    // frame listed. The request before flip command 1 therefore yields frame 2 (flip 1 is already reached when
+    // the frame builder sees the write).
+    {
+        dalWrite32(base, kControl + 4, at);
+        dal::RsxConsumer plain(base);
+        CHECK(!plain.requestCapture() && !plain.captureRequestPending() && !plain.frameBuilderLive());
+
+        dal::RsxConsumer requesting(base);
+        requesting.enableFrameBuilder();
+        CHECK(requesting.frameBuilderLive() && !requesting.captureRequestPending());
+        CHECK(requesting.requestCapture() && requesting.captureRequestPending());
+        emit(dal::kMethodGcmFlipCommand, {1});
+        emit(dal::kMethodGcmFlipCommand, {1});
+        dalWrite32(base, kControl, at);
+        CHECK(requesting.pump(100) == FifoStatus::Idle && requesting.census().flips == 2);
+        std::vector<dal::RsxConsumer::FinishedCapture> done = requesting.takeCaptures();
+        CHECK(done.size() == 1 && done[0].frame == 2 && done[0].requested);
+        CHECK(!requesting.captureRequestPending() && requesting.requestedRecording() == 2);
+        requesting.finishRequestedRecording(7);  // another frame's: ignored
+        CHECK(requesting.requestedRecording() == 2);
+        requesting.finishRequestedRecording(2);
+        CHECK(requesting.requestedRecording() == 0);
+
+        // Nothing more is recorded for later flips.
+        emit(dal::kMethodGcmFlipCommand, {1});
+        dalWrite32(base, kControl, at);
+        CHECK(requesting.pump(100) == FifoStatus::Idle && requesting.census().flips == 3);
+        CHECK(requesting.takeCaptures().empty() && !requesting.captureRequestPending());
+    }
+
+    // The process-wide request is refused without a running RSX thread.
+    CHECK(!dal::requestRsxCapture() && !dal::rsxCaptureStatus().available);
+
     // The census section is printed only while a provider is registered.
     CHECK(dal::formatCensus().find("census: rsx") == std::string::npos);
     dal::setRsxCensusProvider(&fakeRsxCensus);

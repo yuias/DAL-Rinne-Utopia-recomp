@@ -77,6 +77,8 @@ public:
     // write.
     void enableFrameBuilder();
     bool frameBuilderEnabled() const { return builder_ != nullptr; }
+    // True while a frame builder exists, so a capture can be requested. Any thread.
+    bool frameBuilderLive() const { return builder_live_.load(std::memory_order_acquire); }
     // Drops the frame builder again. Only while nothing was written yet and no capture is enabled.
     void disableFrameBuilder();
     // Commands built since the last call, after building a pending draw. Needs no guest lock (only the
@@ -102,10 +104,25 @@ public:
     struct FinishedCapture {
         std::uint32_t frame = 0;
         std::uint64_t writes = 0, ranges = 0;
+        bool requested = false;  // started by requestCapture()
         RsxCaptureFile file;
     };
     // Captures completed since the last call; same thread rules as takeCommands().
     std::vector<FinishedCapture> takeCaptures();
+
+    // Records the first whole frame that starts after this call, independent of the listed frames: the
+    // consumer is usually past the flip command of the frame being presented, so that is typically the
+    // frame after the next one. False, with nothing queued, without a frame builder. A request made while
+    // another capture is recording starts at the next flip command. Any thread.
+    bool requestCapture();
+    // A request that has not started recording yet. Any thread.
+    bool captureRequestPending() const { return capture_requested_.load(std::memory_order_acquire); }
+    // The requested frame being recorded or waiting to be written, 0 when none. Read it after
+    // captureRequestPending() so that a request is never seen as neither. Any thread.
+    std::uint32_t requestedRecording() const { return requested_recording_.load(std::memory_order_acquire); }
+    // Ends the requestedRecording() state of `frame` once its file result is published. The thread that
+    // takes the captures calls it, so the state does not vanish while the file is still being written.
+    void finishRequestedRecording(std::uint32_t frame);
 
     bool faulted() const { return faulted_; }
     std::uint32_t parserGet() const { return get_; }
@@ -163,13 +180,19 @@ private:
     std::atomic<std::uint64_t> tex_epochs_{0}, tex_hits_{0}, tex_checks_{0}, tex_checked_bytes_{0}, tex_stores_{0},
             tex_stored_bytes_{0}, tex_entries_{0}, tex_bytes_{0};
 
-    void startCapture(std::uint32_t frame);
+    void startCapture(std::uint32_t frame, bool requested = false);
     void finishCapture(std::uint32_t buffer);
     bool captureWanted(std::uint32_t frame) const;
     std::unique_ptr<RsxRecordingMemoryView> recording_view_;  // between the builder and memory_view_
     std::vector<std::uint32_t> capture_frames_;
     std::unique_ptr<RsxCaptureWriter> capture_;  // the frame being recorded
     std::uint32_t capture_frame_ = 0;
+    bool capture_is_requested_ = false;
+    // Release/acquire: the request flag is cleared after the recording frame is published, so a reader that sees
+    // no pending request also sees the recording.
+    std::atomic<bool> capture_requested_{false};
+    std::atomic<std::uint32_t> requested_recording_{0};
+    std::atomic<bool> builder_live_{false};
     std::uint64_t flips_reached_ = 0;  // flip commands the parser has reached (the builder's flip index)
     std::vector<FinishedCapture> finished_captures_;
     // The write that left the draw pending (method, value): the capture records it after the draw's memory reads.
@@ -224,7 +247,24 @@ void setRsxFrameBuilderEnabled(bool enabled);
 
 // Captures the listed frames (see RsxConsumer::enableCapture) into `<dir>/frame_<N>.dalcap`, written on
 // the RSX thread after the guest lock is released. Implies the frame builder. Call before startRsxThread.
+// The directory defaults to generated/rsx/captures, which also receives the captures requested at run time.
 void setRsxCaptureFrames(std::vector<std::uint32_t> frames, std::filesystem::path dir);
+
+// Where a capture requested at run time stands; see requestRsxCapture().
+struct RsxCaptureStatus {
+    bool available = false;        // a frame builder runs, so a capture can be requested
+    bool pending = false;          // requested; the frame has not started yet
+    std::uint32_t recording = 0;   // requested frame being recorded or written, 0 when none
+    std::uint32_t last_frame = 0;  // last requested capture written (or failed)
+    std::string last_path;         // generic_string() of its file; empty on failure
+    std::string last_error;        // why the last requested capture failed; empty on success
+};
+
+// Records the first whole frame that starts after the call into `<capture dir>/frame_<N>.dalcap`, like a
+// listed frame. False when no frame builder runs (before startRsxThread, or after the renderer failed to
+// start). Any thread.
+bool requestRsxCapture();
+RsxCaptureStatus rsxCaptureStatus();  // any thread
 
 // Turns the argument census on for the consumer startRsxThread creates; written to `json_path` (the
 // program dumps go to generated/rsx) when the process stops. Call before startRsxThread.
