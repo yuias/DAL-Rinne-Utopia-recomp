@@ -36,7 +36,8 @@ function(dal_overlay_add)
   add_library(dal_overlay STATIC
     runtime/src/overlay/debug_overlay.cpp
     runtime/src/overlay/overlay_model.cpp
-    runtime/src/overlay/overlay_panels.cpp)
+    runtime/src/overlay/overlay_panels.cpp
+    runtime/src/overlay/overlay_sources.cpp)
   target_compile_options(dal_overlay PRIVATE -march=x86-64-v3 -Wall -Wextra)
   target_include_directories(dal_overlay PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_link_libraries(dal_overlay PUBLIC imgui dal_render)

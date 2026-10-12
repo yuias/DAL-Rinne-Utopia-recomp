@@ -23,6 +23,8 @@
 #include "overlay/debug_overlay.h"
 #include "overlay/overlay_model.h"
 #include "overlay/overlay_panels.h"
+#include "overlay/overlay_sources.h"
+#include "rsx/rsx_unimplemented.h"
 
 namespace {
 
@@ -273,6 +275,59 @@ void testPanels() {
     // No providers at all: every section falls back to its placeholder.
     dal::OverlayState empty_state;
     CHECK(drawFrames(empty_state, dal::OverlaySources{}));
+}
+
+void testRuntimeSources() {
+    const dal::OverlaySources sources = dal::makeRuntimeOverlaySources();
+    const bool all_set = sources.audio && sources.unimplemented && sources.unimplemented_dropped &&
+                         sources.fast_forward && sources.set_fast_forward && sources.set_fast_forward_held &&
+                         sources.set_fast_forward_speed && sources.fast_forward_sound &&
+                         sources.set_fast_forward_sound && sources.log_level && sources.set_log_level &&
+                         sources.request_capture && sources.capture_status;
+    CHECK(all_set);
+    if (!all_set) return;
+
+    // Toggle, hold and speed go through the guest clock; leave it as found.
+    const dal::FastForwardState before = sources.fast_forward();
+    CHECK(!before.active());
+    sources.set_fast_forward_speed(6);
+    sources.set_fast_forward(true);
+    dal::FastForwardState now = sources.fast_forward();
+    CHECK(now.toggled && !now.held && now.speed == 6);
+    sources.set_fast_forward(false);
+    sources.set_fast_forward_held(true);
+    now = sources.fast_forward();
+    CHECK(!now.toggled && now.held && now.speed == 6);
+    sources.set_fast_forward_held(false);
+    sources.set_fast_forward_speed(before.speed);
+    now = sources.fast_forward();
+    CHECK(!now.toggled && !now.held && now.speed == before.speed);
+
+    const bool sound = sources.fast_forward_sound();
+    sources.set_fast_forward_sound(!sound);
+    CHECK(sources.fast_forward_sound() == !sound);
+    sources.set_fast_forward_sound(sound);
+    CHECK(sources.fast_forward_sound() == sound);
+
+    dal::rsxUnimplementedReset();
+    dal::rsxNoteUnimplemented("state", "overlay test");
+    const auto counts = sources.unimplemented();
+    CHECK(counts.size() == 1 && counts[0].first == "state overlay test" && counts[0].second == 1);
+    CHECK(sources.unimplemented_dropped() == 0);
+    dal::rsxUnimplementedReset();
+
+    // No audio engine and no RSX thread run in this process.
+    CHECK(sources.audio().output.empty());
+    CHECK(!sources.capture_status().available);
+    CHECK(!sources.request_capture());
+
+    const dal::LogLevel level = sources.log_level();
+    sources.set_log_level(dal::LogLevel::Warn);
+    CHECK(sources.log_level() == dal::LogLevel::Warn);
+    sources.set_log_level(dal::LogLevel::Debug);
+    CHECK(sources.log_level() == dal::LogLevel::Debug);
+    sources.set_log_level(level);
+    CHECK(sources.log_level() == level);
 }
 
 // Raw Win32 key message values, so the test needs no windows.h.
@@ -629,6 +684,7 @@ int main() {
     testDrawDeltas();
     testRefresh();
     testPanels();
+    testRuntimeSources();
 
     dal::VkContextOptions options;
     options.validation = true;
