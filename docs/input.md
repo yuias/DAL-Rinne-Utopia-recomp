@@ -112,9 +112,12 @@ log shows `dal: pad: gameinput v3 from gameoverlayrenderer64.dll`. To set it up:
 2. In the shortcut's properties set Target to `<repository>\build\release\bin\dal_game.exe` and Start
    In to `<repository>`, the repository root. The game resolves `generated/shader_cache` and relative
    option paths against the start directory.
-3. Put the options into Launch Options with full paths, for example `--game-dir "<game-dir>"`. Steam
-   does not expand environment variables there. Add `--log <repository>\build\release\pad\steam.log
-   --log-level debug` to keep a log.
+3. Put the options into a [configuration file](runtime-options.md#configuration-file) and leave
+   Launch Options empty. With Start In at the repository root, `dal_game` reads `config.json` there
+   if it exists, and otherwise `build\release\bin\config.json`, which `tools/build.ps1 -GameDir`
+   writes. Paths in the file are relative to the file. To keep a log, add `"log": "steam.log"` and
+   `"log_level": "debug"`. Options in Launch Options still work and override the file; Steam does
+   not expand environment variables there.
 4. Leave "Enable the Steam Overlay while in-game" on.
 5. Under Properties > Controller, the per-game setting turns Steam Input on or off for this game.
 
