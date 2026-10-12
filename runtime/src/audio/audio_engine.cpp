@@ -123,6 +123,7 @@ public:
         stats.skipped_blocks = skipped_blocks_.load(std::memory_order_relaxed);
         stats.max_producer_time = std::chrono::microseconds(max_producer_us_.load(std::memory_order_relaxed));
         stats.clock_ppm = clock_ppm_.load(std::memory_order_relaxed);
+        stats.mean_fill_frames = mean_fill_frames_.load(std::memory_order_relaxed);
         return stats;
     }
 
@@ -225,6 +226,7 @@ private:
             const BlockClockPlan plan = clock.due(now);
             if (plan.produce + plan.skipped != 0 && rate_.observe(now, output_->fillFrames())) {
                 clock.setCorrectionPpm(rate_.ppm());
+                mean_fill_frames_.store(rate_.lastMeanFill(), std::memory_order_relaxed);
                 clock_ppm_.store(rate_.ppm(), std::memory_order_relaxed);
                 if (++updates % kClockLogEvery == 0) {
                     const AudioOutputStats output_stats = output_->stats();
@@ -280,6 +282,7 @@ private:
     std::atomic<std::uint64_t> skipped_blocks_{0};
     std::atomic<std::int64_t> max_producer_us_{0};
     std::atomic<double> clock_ppm_{0.0};
+    std::atomic<double> mean_fill_frames_{0.0};
 };
 
 std::mutex g_mutex;

@@ -1227,6 +1227,7 @@ void testEngineFollowsReportedFill() {
         CHECK(waitFor([&] { return dal::audioEngineStats().clock_ppm != 0.0; }, 5s));
         const double ppm = dal::audioEngineStats().clock_ppm;
         CHECK(ppm < 0.0 && ppm >= -dal::kClockMaxPpm);
+        CHECK(dal::audioEngineStats().mean_fill_frames == 3000.0);
         CHECK(dal::stopAudioEngineForTest());
     }
     // An output without a fill level keeps the plain clock.
@@ -1237,6 +1238,7 @@ void testEngineFollowsReportedFill() {
         dal::startAudioEngine(makeProducer(state));
         CHECK(waitFor([&] { return state->calls.load() >= 250; }));
         CHECK(dal::audioEngineStats().clock_ppm == 0.0);
+        CHECK(dal::audioEngineStats().mean_fill_frames == 0.0);
         CHECK(dal::stopAudioEngineForTest());
     }
 }
