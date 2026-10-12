@@ -6266,7 +6266,7 @@ void testRsxFrameBuilderTextureCache() {
          {dal::kMethodNv406eSemaphoreAcquire, dal::kMethodNv406eSemaphoreRelease, dal::kMethodNv406eSetReference,
           dal::kMethodNv4097GetReport, dal::kMethodNv4097BackEndWriteSemaphoreRelease,
           dal::kMethodNv4097TextureReadSemaphoreRelease, dal::kMethodGcmSetUserCommand,
-          dal::kMethodGcmSetUserCommand + 4}) {
+          dal::kMethodGcmSetUserCommand + 4, dal::kMethodNv3089ImageIn, dal::kMethodNv0039BufferNotify}) {
         fill(kTex, 64, seed++);
         write(method, 1);
         const dal::RsxDraw after = draw();
@@ -6331,6 +6331,66 @@ void testRsxFrameBuilderTextureCache() {
     CHECK(size(variants.textures[4]) == 32 + 32);
     CHECK(unimplementedCount("state unreadable texture memory") == 0);
 
+    // An inline blit word is an RSX write of its 4 destination bytes: only a texture that contains them is
+    // read again, within the epoch. The words at both ends of the color register range count, one past the
+    // end and one past the width do not.
+    for (std::uint32_t unit = 0; unit < 6; unit++) write(0x1A0C + unit * 0x20, 0);
+    constexpr std::uint32_t kBlit = 0x4000;  // texture range [0x4000, 0x4040)
+    constexpr std::uint32_t kLastWord = 0x6FF, kWordWidth = 0x700;
+    fill(kBlit, 64, 21);
+    setTexture(0, kBlit, 0xA5, 4, 4, 16);
+    const std::uint64_t blit_id = draw().textures[0].content_id;
+    int blit_reads = 1;
+    CHECK(memory.readsAt(0, kBlit) == blit_reads);
+    // Writes the color word `index` and draws; true when the draw read the texture again.
+    const auto blit = [&](std::uint32_t index) {
+        write(dal::kMethodNv308aColor + index * 4, 0x11223344);
+        const dal::RsxDraw after = draw();
+        CHECK(after.textures[0].content_id == blit_id);  // the guest bytes did not change
+        const int reads = memory.readsAt(0, kBlit);
+        CHECK(reads == blit_reads || reads == blit_reads + 1);
+        const bool read_again = reads == blit_reads + 1;
+        blit_reads = reads;
+        return read_again;
+    };
+    write(dal::kMethodNv3062SetContextDmaImageDestin, dal::kRsxContextDmaLocal);
+    write(dal::kMethodNv3062SetPitch, 0x100u << 16);
+    write(dal::kMethodNv308aPoint, 0);
+    write(dal::kMethodNv308aSizeOut, kWordWidth | (1u << 16));
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit);  // word 0 at kBlit; the last word is far above
+    CHECK(blit(0));
+    CHECK(!blit(kLastWord));
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit + 0x3C - kLastWord * 4);  // the last word on the last texel
+    CHECK(blit(kLastWord));
+    CHECK(!blit(0));
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit - 4);  // word 0 ends where the texture starts
+    CHECK(!blit(0));
+    CHECK(blit(1));
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit + 0x3C);  // word 0 on the last texel
+    CHECK(blit(0));
+    CHECK(!blit(1));  // starts where the texture ends
+    // The offset also moves with the point (x in words, y in rows of the destination pitch).
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit - 0x500 + 8);
+    CHECK(!blit(0));
+    write(dal::kMethodNv308aPoint, 0x80 | (3u << 16));  // 0x80 words = 0x200 bytes, 3 rows of 0x100 = 0x300
+    CHECK(blit(0));
+    write(dal::kMethodNv308aPoint, 0);
+    // The word past the color registers is another register, and a word past the blit width is not written.
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit - kWordWidth * 4);  // that word would be on the first texel
+    CHECK(!blit(kWordWidth));
+    write(dal::kMethodNv3062SetOffsetDestin, kBlit);
+    write(dal::kMethodNv308aSizeOut, 1u | (1u << 16));
+    CHECK(blit(0));
+    CHECK(!blit(1));
+    // Main memory is another location, and an unknown DMA object is not written at all.
+    write(dal::kMethodNv3062SetContextDmaImageDestin, dal::kRsxContextDmaMain);
+    CHECK(!blit(0));
+    write(dal::kMethodNv3062SetContextDmaImageDestin, 0x66604200);
+    CHECK(!blit(0));
+    write(dal::kMethodNv3062SetContextDmaImageDestin, dal::kRsxContextDmaLocal);
+    CHECK(blit(0));
+    CHECK(unimplementedCount("state unreadable texture memory") == 0);
+
     // An unreadable range is counted on every draw and leaves no entry.
     for (std::uint32_t unit = 0; unit < 6; unit++) write(0x1A0C + unit * 0x20, 0);
     setTexture(6, 0xFFF0, 0xA5, 16, 16, 64);
@@ -6340,7 +6400,24 @@ void testRsxFrameBuilderTextureCache() {
     CHECK(unimplementedCount("state unreadable texture memory") == 1);
     draw();
     CHECK(unimplementedCount("state unreadable texture memory") == 2);
-    CHECK(builder.textureCache().entryCount() == entries_before + 5);
+    CHECK(builder.textureCache().entryCount() == entries_before + 6);  // the blit texture stays
+
+    // A stored entry whose range has become unreadable is dropped when the next epoch finds it so.
+    write(0x1A0C + 6 * 0x20, 0);
+    constexpr std::uint32_t kStale = 0xE000;
+    fill(kStale, 64, 9);
+    setTexture(0, kStale, 0xA5, 4, 4, 16);
+    const dal::RsxDraw stored = draw();
+    CHECK(size(stored.textures[0]) == 64);
+    CHECK(builder.textureCache().entryCount() == entries_before + 7);
+    flip();
+    setSurface(0x100000, 64, 4);
+    setTexture(0, kStale, 0xA5, 4, 4, 16);
+    memory.local.resize(0xD000);  // the fragment program at 0x2000 stays readable
+    const dal::RsxDraw stale = draw();
+    CHECK(stale.textures.size() == 1 && stale.textures[0].data == nullptr && stale.textures[0].content_id == 0);
+    CHECK(builder.textureCache().entryCount() == entries_before + 6);
+    CHECK(unimplementedCount("state unreadable texture memory") == 3);
     dal::rsxUnimplementedReset();
 }
 

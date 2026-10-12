@@ -141,9 +141,21 @@ void RsxFrameBuilder::onWrite(const RsxRegisters& regs, std::uint32_t method, st
         case kMethodNv0039BufferNotify:
         case kMethodNv3089ImageIn: textures_.beginEpoch(); break;
         default:
-            // The RSX thread writes the inline blit words into guest memory.
+            // The RSX thread writes the inline blit words into guest memory, 4 bytes each; noting just those
+            // bytes keeps the textures elsewhere trusted. The destination is decoded as the consumer does.
             if (method >= kMethodNv308aColor && method < kMethodNv308aColor + kBlitColorRegisters * 4) {
-                textures_.beginEpoch();
+                const std::uint32_t index = (method - kMethodNv308aColor) >> 2;
+                const std::uint32_t dma = regs.reg(kMethodNv3062SetContextDmaImageDestin);
+                if (index < (regs.reg(kMethodNv308aSizeOut) & 0xFFFF) &&
+                    (dma == kRsxContextDmaLocal || dma == kRsxContextDmaMain)) {
+                    const std::uint32_t point = regs.reg(kMethodNv308aPoint);
+                    const std::uint64_t offset = rsxInlineBlitOffset(regs.reg(kMethodNv3062SetOffsetDestin),
+                                                                     regs.reg(kMethodNv3062SetPitch) >> 16,
+                                                                     point & 0xFFFF, point >> 16, index);
+                    if (offset + 4 <= 0x100000000ull) {
+                        textures_.noteWrite(dma == kRsxContextDmaMain ? 1 : 0, offset, offset + 4);
+                    }
+                }
                 break;
             }
             if (in_draw_ && have_range_ && isDrawParameter(method)) noteState("draw parameter change inside a clause");

@@ -32,6 +32,14 @@ inline constexpr std::uint32_t kRsxSurfaceDepthZ24S8 = 2;
 inline constexpr std::uint32_t kRsxContextDmaLocal = 0xFEED0000;
 inline constexpr std::uint32_t kRsxContextDmaMain = 0xFEED0001;
 
+// Byte offset inside the destination DMA object of word `index` of an NV308A inline blit. 64-bit so a
+// hostile offset cannot wrap into a valid range.
+constexpr std::uint64_t rsxInlineBlitOffset(std::uint32_t offset, std::uint32_t pitch, std::uint32_t point_x,
+                                            std::uint32_t point_y, std::uint32_t index) {
+    return static_cast<std::uint64_t>(offset) + (static_cast<std::uint64_t>(point_x) + index) * 4 +
+           static_cast<std::uint64_t>(pitch) * point_y;
+}
+
 // 8-bit texture format field of SET_TEXTURE_FORMAT: base format, layout flag, normalization flag.
 inline constexpr std::uint32_t kRsxTextureBaseMask = 0x9F;
 inline constexpr std::uint32_t kRsxTextureLinearFlag = 0x20;  // CELL_GCM_TEXTURE_LN; clear = swizzled

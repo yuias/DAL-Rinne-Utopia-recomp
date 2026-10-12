@@ -22,6 +22,7 @@
 #include "rsx/fifo_parser.h"
 #include "rsx/rsx_capture.h"
 #include "rsx/rsx_census.h"
+#include "rsx/rsx_decode.h"
 #include "rsx/rsx_frame.h"
 #include "rsx/rsx_frame_builder.h"
 #include "rsx/rsx_registers.h"
@@ -29,14 +30,6 @@
 namespace dal {
 
 enum class RsxInterrupt { VBlank, Flip, User };
-
-// Byte offset inside the destination DMA object of word `index` of an NV308A inline blit. 64-bit so a
-// hostile offset cannot wrap into a valid range.
-constexpr std::uint64_t rsxInlineBlitOffset(std::uint32_t offset, std::uint32_t pitch, std::uint32_t point_x,
-                                            std::uint32_t point_y, std::uint32_t index) {
-    return static_cast<std::uint64_t>(offset) + (static_cast<std::uint64_t>(point_x) + index) * 4 +
-           static_cast<std::uint64_t>(pitch) * point_y;
-}
 
 // Called by the RSX thread with the guest lock held. `arg` is the head (1) for VBlank and Flip and
 // the cause for User. No-op while unset.
