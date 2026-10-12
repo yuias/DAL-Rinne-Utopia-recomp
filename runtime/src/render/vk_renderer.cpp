@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -254,7 +255,9 @@ void RsxRenderer::fail(std::string message) {
 
 bool RsxRenderer::waitSlot(FrameSlot& slot) {
     if (!slot.pending) return true;
+    const auto start = std::chrono::steady_clock::now();
     const VkResult result = vkWaitForFences(context_.device(), 1, &slot.fence, VK_TRUE, kFenceTimeoutNs);
+    if (presenter_ != nullptr) presenter_->noteFenceWait(std::chrono::steady_clock::now() - start);
     if (result != VK_SUCCESS) {
         fail(std::format("waiting for the GPU failed ({})", static_cast<int>(result)));
         return false;
@@ -1383,8 +1386,10 @@ void RsxRenderer::recordFlip(const RsxFlip& flip) {
 void RsxRenderer::recordPresentBlit(FrameSlot& slot, RenderTarget* source) {
     // While fast-forwarding the guest outruns the display. Waiting for a swapchain image here would hold
     // the RSX thread, and with it the vblanks, at the display rate, so a flip with no free image is
-    // submitted without a present and the surplus flips are not shown.
-    if (!presenter_->acquire(current_slot_, present_target_, guestSpeed() == 1)) return;
+    // submitted without a present and the surplus flips are not shown. The presenter also leaves FIFO
+    // then: with vsync the acquire semaphore's wait moves into the submit, and the slot fence the next
+    // beginFrame waits on signals at the display rate.
+    if (!presenter_->acquire(current_slot_, present_target_, guestSpeed() > 1)) return;
     present_pending_ = true;
     const Presenter::Target& dst = present_target_;
     const VkCommandBuffer cmd = slot.cmd;

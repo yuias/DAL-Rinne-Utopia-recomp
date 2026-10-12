@@ -1603,6 +1603,26 @@ void testPresenterTypes() {
     CHECK(target.view != VK_NULL_HANDLE && target.format == VK_FORMAT_B8G8R8A8_UNORM);
 }
 
+void testPresentModeChoice() {
+    constexpr VkPresentModeKHR kFifo = VK_PRESENT_MODE_FIFO_KHR;
+    constexpr VkPresentModeKHR kMailbox = VK_PRESENT_MODE_MAILBOX_KHR;
+    constexpr VkPresentModeKHR kImmediate = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    const std::array<VkPresentModeKHR, 3> all = {kImmediate, kMailbox, kFifo};
+    const std::array<VkPresentModeKHR, 2> no_mailbox = {kImmediate, kFifo};
+    const std::array<VkPresentModeKHR, 1> fifo_only = {kFifo};
+
+    // At normal speed the choice is always vsync, whatever the surface offers.
+    CHECK(dal::choosePresentMode(all, false) == kFifo);
+    CHECK(dal::choosePresentMode(no_mailbox, false) == kFifo);
+    CHECK(dal::choosePresentMode(fifo_only, false) == kFifo);
+    CHECK(dal::choosePresentMode({}, false) == kFifo);
+
+    CHECK(dal::choosePresentMode(all, true) == kMailbox);
+    CHECK(dal::choosePresentMode(no_mailbox, true) == kImmediate);
+    CHECK(dal::choosePresentMode(fifo_only, true) == kFifo);
+    CHECK(dal::choosePresentMode({}, true) == kFifo);
+}
+
 }  // namespace
 
 int main() {
@@ -1611,6 +1631,7 @@ int main() {
     testLetterbox();
     testKeyMessages();
     testPresenterTypes();
+    testPresentModeChoice();
     testShaderCompiler();
     testTextureMapping();
     testFrameDump();

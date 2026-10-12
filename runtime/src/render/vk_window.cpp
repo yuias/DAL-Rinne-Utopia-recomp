@@ -233,6 +233,29 @@ private:
     std::atomic<std::uint32_t> height_{0};
 };
 
+VkPresentModeKHR choosePresentMode(std::span<const VkPresentModeKHR> supported, bool fast) {
+    if (fast) {
+        for (VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
+            if (std::find(supported.begin(), supported.end(), wanted) != supported.end()) return wanted;
+        }
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+namespace {
+
+const char* presentModeName(VkPresentModeKHR mode) {
+    switch (mode) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+        case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+        case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+        default: return "other";
+    }
+}
+
+}  // namespace
+
 Presenter::Presenter(VkContext& context) : context_(context) {}
 
 std::unique_ptr<Presenter> Presenter::create(VkContext& context, PresenterOptions options, std::string& error) {
@@ -267,6 +290,13 @@ std::unique_ptr<Presenter> Presenter::create(VkContext& context, PresenterOption
         error = "the graphics queue family cannot present to the window";
         return nullptr;
     }
+
+    std::uint32_t mode_count = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(context.physicalDevice(), presenter->surface_, &mode_count, nullptr);
+    presenter->present_modes_.resize(mode_count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(context.physicalDevice(), presenter->surface_, &mode_count,
+                                              presenter->present_modes_.data());
+    presenter->present_modes_.resize(mode_count);
 
     VkSemaphoreCreateInfo semaphore_info{};
     semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -397,7 +427,8 @@ bool Presenter::createSwapchain(const VkSurfaceCapabilitiesKHR& caps, VkExtent2D
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = alpha;
-    info.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // vsync; always available
+    const VkPresentModeKHR present_mode = choosePresentMode(present_modes_, fast_);
+    info.presentMode = present_mode;
     info.clipped = VK_TRUE;
     info.oldSwapchain = swapchain_;
     VkSwapchainKHR created = VK_NULL_HANDLE;
@@ -461,10 +492,15 @@ bool Presenter::createSwapchain(const VkSurfaceCapabilitiesKHR& caps, VkExtent2D
     extent_ = extent;
     needs_recreate_ = false;
     stats_.recreations++;
+    if (present_mode_ != present_mode) {
+        logInfo("dal: render: window: present mode {}{}", presentModeName(present_mode),
+                present_mode_ ? std::format(" (was {})", presentModeName(*present_mode_)) : std::string());
+        present_mode_ = present_mode;
+    }
     return true;
 }
 
-bool Presenter::acquire(std::size_t frame_slot, Target& target, bool wait) {
+bool Presenter::acquire(std::size_t frame_slot, Target& target, bool fast) {
     if (frame_slot >= acquire_semaphores_.size()) {
         logOnce(LogLevel::Warn, "window-frame-slot",
                 "dal: render: window: frame slot {} but the presenter has {} acquire semaphores", frame_slot,
@@ -472,6 +508,12 @@ bool Presenter::acquire(std::size_t frame_slot, Target& target, bool wait) {
         return false;
     }
     if (report_start_ == std::chrono::steady_clock::time_point{}) report_start_ = std::chrono::steady_clock::now();
+    fast_ = fast;
+    // One rebuild (with a device wait) per toggle; the mode must not change while images are in flight.
+    if (swapchain_ != VK_NULL_HANDLE && present_mode_ != choosePresentMode(present_modes_, fast)) {
+        needs_recreate_ = true;
+    }
+    const bool wait = !fast;
     for (int attempt = 0; attempt < 2; attempt++) {
         if (!ensureSwapchain()) {
             stats_.skipped++;
@@ -519,6 +561,12 @@ bool Presenter::acquire(std::size_t frame_slot, Target& target, bool wait) {
     return false;
 }
 
+void Presenter::noteFenceWait(std::chrono::nanoseconds waited) {
+    stats_.fence_waits++;
+    stats_.fence_total += waited;
+    stats_.fence_max = std::max<std::chrono::nanoseconds>(stats_.fence_max, waited);
+}
+
 void Presenter::present(const Target& target) {
     VkPresentInfoKHR info{};
     info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -552,12 +600,14 @@ void Presenter::reportStats() {
     const double seconds = std::chrono::duration<double>(elapsed).count();
     const double acquires = static_cast<double>(std::max<std::uint64_t>(stats_.acquires, 1));
     const double presents = static_cast<double>(std::max<std::uint64_t>(stats_.presents, 1));
+    const double fence_waits = static_cast<double>(std::max<std::uint64_t>(stats_.fence_waits, 1));
     logDebug(
             "dal: render: window: {} presents in {:.1f} s ({:.1f}/s), acquire avg {:.2f} max {:.2f} ms, present avg {:.2f} max {:.2f} ms, "
-            "{} skipped, {} swapchain creations",
+            "fence wait avg {:.2f} max {:.2f} ms, {} skipped, {} swapchain creations",
             stats_.presents, seconds, static_cast<double>(stats_.presents) / seconds,
             toMs(stats_.acquire_total) / acquires, toMs(stats_.acquire_max), toMs(stats_.present_total) / presents,
-            toMs(stats_.present_max), stats_.skipped, stats_.recreations);
+            toMs(stats_.present_max), toMs(stats_.fence_total) / fence_waits, toMs(stats_.fence_max), stats_.skipped,
+            stats_.recreations);
     const std::uint64_t recreations = stats_.recreations;
     stats_ = Stats{};
     stats_.recreations = recreations;

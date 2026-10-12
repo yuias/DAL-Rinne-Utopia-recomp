@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,10 @@ struct PresenterOptions {
     std::size_t frame_slots = 2;
 };
 
+// The present mode for the swapchain: FIFO (vsync) unless `fast`, then MAILBOX, else IMMEDIATE, else FIFO,
+// whichever `supported` offers first. FIFO is the only mode the spec guarantees, so it is the fallback.
+VkPresentModeKHR choosePresentMode(std::span<const VkPresentModeKHR> supported, bool fast);
+
 class Presenter {
 public:
     // An acquired swapchain image. The submit that writes it waits on `acquire_semaphore` and signals
@@ -99,9 +104,14 @@ public:
     // Acquires the next swapchain image, recreating the swapchain after a resize. False when there is
     // nothing to present to this time (minimised window, no image within the timeout, a failure): the
     // frame is then submitted without a swapchain image. The image is in an undefined layout; the caller
-    // leaves it in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR. With `wait` false no image being free right now is
-    // counted as skipped and returns false at once, without marking the presenter as stalled.
-    bool acquire(std::size_t frame_slot, Target& target, bool wait = true);
+    // leaves it in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR. With `fast` set the caller wants presentation that
+    // does not hold it back (fast-forward): no image being free right now is counted as skipped and
+    // returns false at once, without marking the presenter as stalled, and the swapchain is rebuilt with
+    // MAILBOX or IMMEDIATE presentation when the surface offers one. Without it, FIFO.
+    bool acquire(std::size_t frame_slot, Target& target, bool fast = false);
+
+    // Adds one wait of the renderer on a frame slot's fence to the statistics of the periodic report.
+    void noteFenceWait(std::chrono::nanoseconds waited);
 
     // Number of frame slots acquire accepts (one acquire semaphore each).
     std::size_t frameSlots() const { return acquire_semaphores_.size(); }
@@ -123,6 +133,9 @@ private:
         std::chrono::nanoseconds acquire_max{0};
         std::chrono::nanoseconds present_total{0};
         std::chrono::nanoseconds present_max{0};
+        std::uint64_t fence_waits = 0;
+        std::chrono::nanoseconds fence_total{0};
+        std::chrono::nanoseconds fence_max{0};
     };
 
     explicit Presenter(VkContext& context);
@@ -138,6 +151,9 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR color_space_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D extent_{};
+    std::vector<VkPresentModeKHR> present_modes_;   // what the surface supports, queried once
+    std::optional<VkPresentModeKHR> present_mode_;  // of the latest swapchain; empty before the first
+    bool fast_ = false;                             // what the last acquire asked for
     bool needs_recreate_ = false;
     bool acquire_stalled_ = false;  // the last acquire timed out; acquire without waiting until one succeeds
     int swapchain_failures_ = 0;    // consecutive failed swapchain creations
