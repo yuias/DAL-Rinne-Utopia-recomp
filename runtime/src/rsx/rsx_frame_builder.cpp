@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -307,17 +308,13 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
             }
             if (t.pitch < row) {
                 rsxNoteUnimplemented("texture layout", "pitch below row size");
-            } else if (draw.texture_data.size() + size > kRsxMaxTextureBytes) {
+            } else if (size > kRsxMaxTextureBytes) {
                 rsxNoteUnimplemented("texture layout", "too large");
             } else {
-                draw.texture_data.resize((draw.texture_data.size() + 3) & ~std::size_t{3});
-                t.data_offset = static_cast<std::uint32_t>(draw.texture_data.size());
-                t.data_size = static_cast<std::uint32_t>(size);
-                draw.texture_data.resize(draw.texture_data.size() + size);
-                if (!memory_.read(t.location, t.offset,
-                                  std::span<std::uint8_t>(draw.texture_data.data() + t.data_offset, size))) {
-                    draw.texture_data.resize(t.data_offset);
-                    t.data_offset = t.data_size = 0;
+                auto bytes = std::make_shared<std::vector<std::uint8_t>>(size);
+                if (memory_.read(t.location, t.offset, *bytes)) {
+                    t.data = std::move(bytes);
+                } else {
                     noteState("unreadable texture memory");
                 }
             }

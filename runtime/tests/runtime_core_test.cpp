@@ -6320,12 +6320,12 @@ void testRsxFrameBuilder() {
     CHECK(commands.size() == 1);
     const dal::RsxDraw& textured = std::get<dal::RsxDraw>(commands[0]);
     CHECK(textured.textures.size() == 3);
-    CHECK(textured.textures[0].unit == 0 && textured.textures[0].rt_alias == 0 && textured.textures[0].data_size == 0);
-    CHECK(textured.textures[1].unit == 1 && textured.textures[1].rt_alias == -1 &&
-          textured.textures[1].data_size == 64 * 3 + 64);
-    CHECK(textured.texture_data.size() == 256 && textured.texture_data[0] == (0 ^ 0x5A) &&
-          textured.texture_data[255] == (255 ^ 0x5A));
-    CHECK(textured.textures[2].unit == 2 && textured.textures[2].data_size == 0);
+    CHECK(textured.textures[0].unit == 0 && textured.textures[0].rt_alias == 0 && textured.textures[0].data == nullptr);
+    CHECK(textured.textures[1].unit == 1 && textured.textures[1].rt_alias == -1 && textured.textures[1].data &&
+          textured.textures[1].data->size() == 64 * 3 + 64);
+    const std::vector<std::uint8_t>& textured_bytes = *textured.textures[1].data;
+    CHECK(textured_bytes[0] == (0 ^ 0x5A) && textured_bytes[255] == (255 ^ 0x5A));
+    CHECK(textured.textures[2].unit == 2 && textured.textures[2].data == nullptr);
     CHECK(unimplementedCount("texture layout swizzled") == 1);
     CHECK(unimplementedCount("state texture location 0x0") == 0);
 
@@ -6353,15 +6353,15 @@ void testRsxFrameBuilder() {
     CHECK(commands.size() == 1);
     const dal::RsxDraw& compressed = std::get<dal::RsxDraw>(commands[0]);
     CHECK(compressed.textures.size() == 3);
-    CHECK(compressed.textures[0].unit == 3 && compressed.textures[0].data_size == 64 &&
-          compressed.textures[0].pitch == 32);
-    CHECK(compressed.textures[1].unit == 4 && compressed.textures[1].data_size == 16 &&
-          compressed.textures[1].pitch == 16);
-    CHECK(compressed.textures[2].unit == 5 && compressed.textures[2].data_size == 0);
-    CHECK(compressed.texture_data.size() == 64 + 16);
-    CHECK(compressed.texture_data[0] == (0 ^ 0x5A) && compressed.texture_data[63] == (63 ^ 0x5A));
-    CHECK(compressed.texture_data[compressed.textures[1].data_offset] == (0 ^ 0x5A) &&
-          compressed.texture_data[compressed.textures[1].data_offset + 15] == (15 ^ 0x5A));
+    CHECK(compressed.textures[0].unit == 3 && compressed.textures[0].data &&
+          compressed.textures[0].data->size() == 64 && compressed.textures[0].pitch == 32);
+    CHECK(compressed.textures[1].unit == 4 && compressed.textures[1].data &&
+          compressed.textures[1].data->size() == 16 && compressed.textures[1].pitch == 16);
+    CHECK(compressed.textures[2].unit == 5 && compressed.textures[2].data == nullptr);
+    const std::vector<std::uint8_t>& dxt45_bytes = *compressed.textures[0].data;
+    const std::vector<std::uint8_t>& dxt1_bytes = *compressed.textures[1].data;
+    CHECK(dxt45_bytes[0] == (0 ^ 0x5A) && dxt45_bytes[63] == (63 ^ 0x5A));
+    CHECK(dxt1_bytes[0] == (0 ^ 0x5A) && dxt1_bytes[15] == (15 ^ 0x5A));
     CHECK(unimplementedCount("texture layout swizzled") == 1);  // compressed formats are never counted as swizzled
     CHECK(unimplementedCount("texture layout mips 2") == 1);
     CHECK(unimplementedCount("texture format DXT45_SZ_NR") == 0);
@@ -6439,10 +6439,10 @@ bool sameCommand(const dal::RsxCommand& left, const dal::RsxCommand& right) {
     if (!sameSurfaceState(a.surfaces, b.surfaces) || a.primitive != b.primitive || a.indexed != b.indexed ||
         a.index_type != b.index_type || a.first != b.first || a.count != b.count || a.min_index != b.min_index ||
         a.attribs.size() != b.attribs.size() || a.textures.size() != b.textures.size() ||
-        a.vertex_data != b.vertex_data || a.index_data != b.index_data || a.texture_data != b.texture_data ||
-        a.vp_hash != b.vp_hash || a.vp_ucode != b.vp_ucode || a.vp_constants != b.vp_constants ||
-        a.fp_hash != b.fp_hash || a.fp_ucode != b.fp_ucode || a.fp_constants != b.fp_constants ||
-        a.fp_control != b.fp_control || a.texcoord_control != b.texcoord_control || a.raster.cull != b.raster.cull ||
+        a.vertex_data != b.vertex_data || a.index_data != b.index_data || a.vp_hash != b.vp_hash ||
+        a.vp_ucode != b.vp_ucode || a.vp_constants != b.vp_constants || a.fp_hash != b.fp_hash ||
+        a.fp_ucode != b.fp_ucode || a.fp_constants != b.fp_constants || a.fp_control != b.fp_control ||
+        a.texcoord_control != b.texcoord_control || a.raster.cull != b.raster.cull ||
         a.default_attribs != b.default_attribs) {
         return false;
     }
@@ -6450,10 +6450,11 @@ bool sameCommand(const dal::RsxCommand& left, const dal::RsxCommand& right) {
         const auto& x = a.textures[i];
         const auto& y = b.textures[i];
         if (x.unit != y.unit || x.rt_alias != y.rt_alias || x.offset != y.offset || x.pitch != y.pitch ||
-            x.width != y.width || x.height != y.height || x.data_offset != y.data_offset ||
-            x.data_size != y.data_size) {
+            x.width != y.width || x.height != y.height) {
             return false;
         }
+        // content_id differs between builders, so the blobs are compared by content.
+        if ((x.data == nullptr) != (y.data == nullptr) || (x.data && *x.data != *y.data)) return false;
     }
     for (std::size_t i = 0; i < a.attribs.size(); i++) {
         const auto& x = a.attribs[i];
@@ -6542,7 +6543,7 @@ void testRsxCapture() {
           std::holds_alternative<dal::RsxDraw>(live[1]));
     CHECK(std::get<dal::RsxDraw>(live[2]).textures.size() == 2 &&
           std::get<dal::RsxDraw>(live[2]).textures[0].rt_alias == 0);
-    CHECK(!std::get<dal::RsxDraw>(live[2]).texture_data.empty());
+    CHECK(std::get<dal::RsxDraw>(live[2]).textures[1].data != nullptr);
 
     // The flip, as the consumer runs it: the builder and the writer see it, the context registers are
     // reset, and only then does the flip method write itself land.
@@ -6737,8 +6738,9 @@ void testRsxSyntheticCaptures() {
     CHECK(commands.size() == 3 && std::holds_alternative<dal::RsxDraw>(commands[1]));
     const dal::RsxDraw& textured = std::get<dal::RsxDraw>(commands[1]);
     CHECK(textured.textures.size() == 1 && textured.textures[0].rt_alias == -1 && textured.textures[0].width == 2);
-    CHECK(textured.textures[0].data_size == 16 && textured.texture_data.size() == 16);
-    CHECK(textured.texture_data[0] == 0xFF && textured.texture_data[1] == 0xFF && textured.texture_data[2] == 0x00);
+    CHECK(textured.textures[0].data && textured.textures[0].data->size() == 16);
+    const std::vector<std::uint8_t>& texel_bytes = *textured.textures[0].data;
+    CHECK(texel_bytes[0] == 0xFF && texel_bytes[1] == 0xFF && texel_bytes[2] == 0x00);
     CHECK(unimplementedCount("capture missing range") == 0);
     dal::rsxUnimplementedReset();
 }

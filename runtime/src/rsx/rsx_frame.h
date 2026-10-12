@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <variant>
 #include <vector>
 
@@ -54,8 +55,12 @@ struct RsxTextureDesc {
     // remap/filter/address/border are the raw SET_TEXTURE_CONTROL1/FILTER/ADDRESS/BORDER_COLOR words.
     std::uint32_t location = 0, offset = 0, pitch = 0, width = 0, height = 0, remap = 0, filter = 0, address = 0,
                   border = 0;
-    std::int32_t rt_alias = -1;  // index into the builder's known surfaces, -1 = bytes in texture_data
-    std::uint32_t data_offset = 0, data_size = 0;
+    std::int32_t rt_alias = -1;  // index into the builder's known surfaces, -1 = bytes in `data`
+    // Guest bytes of the texture, exactly the range the builder read (rows at `pitch`, the last row without
+    // padding; DXT: whole block rows). Null means no bytes were copied. `content_id` names the content: 0 is
+    // "unnamed" (hand-made descriptors), and such a blob is always treated as new.
+    std::shared_ptr<const std::vector<std::uint8_t>> data;
+    std::uint64_t content_id = 0;
 };
 
 struct RsxRasterState {
@@ -101,7 +106,6 @@ struct RsxDraw {
     std::array<float, 16 * 4> default_attribs{};
     std::uint32_t default_written = 0;
     std::vector<RsxTextureDesc> textures;
-    std::vector<std::uint8_t> texture_data;
     std::uint64_t vp_hash = 0;
     std::vector<std::uint32_t> vp_ucode;
     std::uint32_t vp_input_mask = 0, vp_output_mask = 0;

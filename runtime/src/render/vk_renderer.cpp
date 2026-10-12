@@ -711,13 +711,10 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
                     if (view == VK_NULL_HANDLE) target->sampled_views.erase(remap);
                 }
             }
-        } else if (texture->data_size != 0) {
+        } else if (texture->data != nullptr) {
+            const std::vector<std::uint8_t>& bytes = *texture->data;
             if (texture->pitch % 4 != 0) {
                 rsxNoteUnimplemented("texture layout", "pitch is not a multiple of 4");
-                continue;
-            }
-            if (static_cast<std::uint64_t>(texture->data_offset) + texture->data_size > draw.texture_data.size()) {
-                rsxNoteUnimplemented("state", "texture data short");
                 continue;
             }
             // The copy reads pitch * (height - 1) + width * 4 bytes from the staging buffer, or whole block rows
@@ -728,7 +725,7 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
             const std::uint64_t needed =
                     compressed ? rsxCompressedSize(texture->format, texture->width, texture->height)
                                : static_cast<std::uint64_t>(texture->pitch) * (texture->height - 1) + row_bytes;
-            if (texture->pitch < row_bytes || texture->data_size < needed) {
+            if (texture->pitch < row_bytes || bytes.size() < needed) {
                 rsxNoteUnimplemented("state", "texture data short");
                 continue;
             }
@@ -744,14 +741,14 @@ bool RsxRenderer::prepareTextures(const RsxDraw& draw, const DrawShaders& shader
             reference(image);
             if (std::find(uploaded.begin(), uploaded.end(), image.get()) == uploaded.end()) {
                 UploadRef staging;
-                if (!allocUpload(texture->data_size, staging)) return false;
-                const std::uint8_t* source = draw.texture_data.data() + texture->data_offset;
+                if (!allocUpload(bytes.size(), staging)) return false;
+                const std::uint8_t* source = bytes.data();
                 if (compressed) {
                     // Blocks are stored the way Vulkan expects them.
-                    std::memcpy(staging.data, source, texture->data_size);
+                    std::memcpy(staging.data, source, bytes.size());
                 } else {
                     // Guest texels are big-endian words A, R, G, B in memory; byte swapped they are B8G8R8A8 texels.
-                    for (std::size_t i = 0; i + 4 <= texture->data_size; i += 4) {
+                    for (std::size_t i = 0; i + 4 <= bytes.size(); i += 4) {
                         std::uint32_t word;
                         std::memcpy(&word, source + i, 4);
                         word = std::byteswap(word);
