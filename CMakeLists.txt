@@ -16,6 +16,7 @@ include(cmake/Render.cmake)
 include(cmake/Media.cmake)
 include(cmake/Audio.cmake)
 include(cmake/Input.cmake)
+include(cmake/Decrypt.cmake)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
@@ -31,9 +32,14 @@ target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
 
 set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
+# The file dal_inputs produces; a build step, so it need not exist yet.
+if(DAL_EBOOT_ELF STREQUAL "" AND NOT DAL_EBOOT_BIN STREQUAL "")
+  set_property(CACHE DAL_EBOOT_ELF PROPERTY VALUE "${DAL_INPUTS_DIR}/EBOOT.elf")
+endif()
 
 dal_ppu_add_generated_tree()
 dal_runtime_add_core()
+dal_decrypt_add()
 dal_media_add()
 dal_audio_add()
 dal_input_add()
