@@ -60,6 +60,7 @@
 #include "rsx/rsx_frame_builder.h"
 #include "rsx/rsx_registers.h"
 #include "rsx/rsx_state.h"
+#include "rsx/rsx_texture_cache.h"
 #include "rsx/rsx_thread.h"
 #include "rsx/rsx_unimplemented.h"
 #include "rsx_synthetic.h"
@@ -6056,6 +6057,100 @@ public:
     std::vector<std::uint8_t> local, main;
 };
 
+// The texture cache on its own: hash, eviction, epochs and write notes, content ids.
+void testRsxTextureCacheClass() {
+    using dal::RsxTextureCache;
+    const auto blob = [](std::size_t size = 100) { return std::make_shared<const std::vector<std::uint8_t>>(size); };
+    const auto key = [](std::uint32_t offset, std::uint32_t location = 0) {
+        RsxTextureCache::Key k;
+        k.location = location;
+        k.offset = offset;
+        return k;
+    };
+
+    // Hash: any single changed byte, and a changed length of zero bytes, give another value.
+    {
+        std::vector<std::uint8_t> bytes(300);
+        for (std::size_t i = 0; i < bytes.size(); i++) bytes[i] = static_cast<std::uint8_t>(i * 7 + 1);
+        bool distinct = true;
+        for (std::size_t length : {0, 1, 7, 8, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300}) {
+            const std::uint64_t base = dal::rsxHashBytes(std::span(bytes).first(length));
+            for (std::size_t i = 0; i < length; i++) {
+                bytes[i] ^= 0x10;
+                distinct = distinct && dal::rsxHashBytes(std::span(bytes).first(length)) != base;
+                bytes[i] ^= 0x10;
+            }
+            distinct = distinct && base == dal::rsxHashBytes(std::span(bytes).first(length));
+        }
+        CHECK(distinct);
+        const std::vector<std::uint8_t> zeros(64);
+        CHECK(dal::rsxHashBytes(std::span(zeros).first(8)) != dal::rsxHashBytes(std::span(zeros).first(9)));
+    }
+
+    // Eviction: past the byte budget the least recently used entry goes; an entry unused for many flips
+    // goes at the next sweep.
+    {
+        RsxTextureCache cache(250);
+        cache.store(key(0), 0, 1, blob());
+        cache.store(key(100), 0, 2, blob());
+        CHECK(cache.find(key(0)) != nullptr);  // key(100) is now the least recently used
+        const std::uint64_t first_id = cache.find(key(0))->content_id;
+        cache.store(key(200), 0, 3, blob());
+        CHECK(cache.entryCount() == 2 && cache.byteCount() == 200);
+        CHECK(cache.find(key(100)) == nullptr && cache.find(key(0)) != nullptr && cache.find(key(200)) != nullptr);
+        CHECK(cache.find(key(0))->content_id == first_id);
+        cache.onFlip(32);
+        CHECK(cache.entryCount() == 2);
+        cache.onFlip((RsxTextureCache::kIdleFlips / 32 + 2) * 32);  // a sweep flip, past the idle limit
+        CHECK(cache.entryCount() == 0 && cache.byteCount() == 0);
+    }
+
+    // Epochs and RSX writes decide whether an entry may be used without reading guest memory.
+    {
+        RsxTextureCache cache;
+        RsxTextureCache::Entry& entry = cache.store(key(0x1000), 16, 7, blob(64));  // guest range [0x1000, 0x1040)
+        CHECK(cache.fresh(entry));
+        CHECK(cache.stats().stores == 1 && cache.stats().stored_bytes == 64);
+        cache.beginEpoch();
+        CHECK(!cache.fresh(entry));
+        cache.markFresh(entry);
+        CHECK(cache.fresh(entry));
+
+        cache.noteWrite(1, 0x1000, 0x1040);  // the other location
+        cache.noteWrite(0, 0x0000, 0x1000);  // ends where the texture starts
+        cache.noteWrite(0, 0x1040, 0x2000);  // starts where the texture ends
+        CHECK(cache.fresh(entry));
+        cache.noteWrite(0, 0x103F, 0x1100);  // overlaps the last byte
+        CHECK(!cache.fresh(entry));
+        cache.markFresh(entry);
+        CHECK(cache.fresh(entry));           // the write is older than the validation
+        cache.noteWrite(0, 0x0800, 0x1001);  // overlaps the first byte
+        CHECK(!cache.fresh(entry));
+
+        // Past the write list limit a new epoch is cheaper than the scan.
+        cache.beginEpoch();
+        cache.markFresh(entry);
+        const std::uint64_t epochs = cache.stats().epochs;
+        for (std::uint32_t i = 0; i < 64; i++) cache.noteWrite(1, 0x10000 + i * 16, 0x10000 + i * 16 + 8);
+        CHECK(cache.stats().epochs == epochs);
+        cache.noteWrite(1, 0x20000, 0x20008);
+        CHECK(cache.stats().epochs == epochs + 1);
+        CHECK(!cache.fresh(entry));
+    }
+
+    // Content ids are distinct and increasing, and a replaced blob gets a new one.
+    {
+        const std::uint64_t a = RsxTextureCache::nextContentId();
+        const std::uint64_t b = RsxTextureCache::nextContentId();
+        const std::uint64_t c = RsxTextureCache::nextContentId();
+        CHECK(a != 0 && a < b && b < c);
+        RsxTextureCache cache;
+        const std::uint64_t first = cache.store(key(0), 0, 1, blob()).content_id;
+        const std::uint64_t second = cache.store(key(0), 0, 2, blob()).content_id;
+        CHECK(first != second && cache.entryCount() == 1);
+    }
+}
+
 void testRsxFrameBuilder() {
     auto regs = std::make_unique<dal::RsxRegisters>();
     regs->reset();
@@ -8403,6 +8498,7 @@ int main(int argc, char** argv) {
     testRsxArgCensus();
     testRsxRegisters();
     testRsxDecode();
+    testRsxTextureCacheClass();
     testRsxFrameBuilder();
     testRsxCapture();
     testRsxSyntheticCaptures();

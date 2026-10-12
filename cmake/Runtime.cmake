@@ -171,6 +171,7 @@ function(dal_runtime_add_core)
     runtime/src/rsx/rsx_frame_builder.cpp
     runtime/src/rsx/rsx_registers.cpp
     runtime/src/rsx/rsx_state.cpp
+    runtime/src/rsx/rsx_texture_cache.cpp
     runtime/src/rsx/rsx_thread.cpp
     runtime/src/rsx/rsx_unimplemented.cpp)
   target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
