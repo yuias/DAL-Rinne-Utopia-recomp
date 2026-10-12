@@ -25,7 +25,7 @@ struct OptionSpec {
     OptionKind kind;
 };
 
-// The 26 options in usage-text order; the single source for the CLI11 registration and the file
+// The 27 options in usage-text order; the single source for the CLI11 registration and the file
 // schema. Excludes --config, --no-config and --help, which have no file key.
 std::span<const OptionSpec> gameOptionSpecs();
 std::string configKeyFor(std::string_view option_name);  // "game-dir" -> "game_dir"
@@ -41,6 +41,7 @@ struct GameOptions {
     std::vector<PadScriptEvent> pad_script_events;  // loaded from pad_script
     unsigned seconds = 0;
     std::uint32_t dump_frames_every = 1;
+    std::uint32_t fast_forward = 1;  // 1: off; otherwise the guest speed, 2..8
     std::vector<std::uint32_t> rsx_capture_frames;
     bool strict = false, quiet_hle = false, load_only = false, pad_probe = false, vk_validation = false,
          no_window = false;

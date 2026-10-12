@@ -17,12 +17,13 @@
 #include "audio/audio_output.h"
 #include "audio/wav_file.h"
 #include "core/fatal.h"
+#include "core/guest_clock.h"
 #include "hle/hle.h"
 
 namespace dal {
 namespace {
 
-constexpr std::array<OptionSpec, 26> kOptionSpecs{{
+constexpr std::array<OptionSpec, 27> kOptionSpecs{{
         {"game-dir", OptionKind::Path},
         {"vfs-config", OptionKind::Path},
         {"elf", OptionKind::Path},
@@ -47,6 +48,7 @@ constexpr std::array<OptionSpec, 26> kOptionSpecs{{
         {"dump-frames", OptionKind::Path},
         {"dump-frames-every", OptionKind::Unsigned},
         {"shader-cache", OptionKind::Path},
+        {"fast-forward", OptionKind::Unsigned},
         {"vk-validation", OptionKind::Flag},
         {"no-window", OptionKind::Flag},
 }};
@@ -60,7 +62,7 @@ constexpr std::string_view kUsage =
         "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
         "                [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]\n"
         "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
-        "                [--vk-validation] [--no-window]\n"
+        "                [--fast-forward N] [--vk-validation] [--no-window]\n"
         "                [--config FILE | --no-config] [-h|--help]\n";
 
 // The raw value of one option as CLI11 delivers it; the checks run afterwards, in table order.
@@ -288,6 +290,13 @@ std::expected<GameOptions, OptionsExit> validate(const std::vector<Slot>& slots,
         dump_every_given = true;
     }
     o.shader_cache = pathFromUtf8(slot("shader-cache").text);
+    if (const Slot& s = slot("fast-forward"); s.given()) {
+        if (!parseUnsigned(s.text, o.fast_forward) ||
+            (o.fast_forward != 1 && (o.fast_forward < kMinFastForwardSpeed || o.fast_forward > kMaxFastForwardSpeed))) {
+            return usageError(std::format("{} needs 1 (off) or a speed from {} to {}", label(s), kMinFastForwardSpeed,
+                                          kMaxFastForwardSpeed));
+        }
+    }
     o.vk_validation = slot("vk-validation").flag;
     o.no_window = slot("no-window").flag;
 

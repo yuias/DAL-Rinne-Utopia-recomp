@@ -28,6 +28,7 @@
 #include "core/census.h"
 #include "core/elf_loader.h"
 #include "core/fatal.h"
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "core/overrides.h"
@@ -349,6 +350,10 @@ int main() {
     if (const auto applied = dal::applyGameOptions(opt); !applied) {
         std::fprintf(stderr, "error: %s\n", applied.error().c_str());
         return static_cast<int>(dal::ExitCode::Usage);
+    }
+    if (opt.fast_forward > 1) {
+        dal::setFastForwardSpeed(opt.fast_forward);
+        dal::setFastForwardToggled(true);
     }
 
     // Precedence: command-line options, then the configuration file, then the defaults.

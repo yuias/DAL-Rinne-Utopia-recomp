@@ -115,7 +115,7 @@ const std::string kRequired =
 
 void testGameOptionSpecs() {
     const std::span<const dal::OptionSpec> specs = dal::gameOptionSpecs();
-    CHECK(specs.size() == 26);
+    CHECK(specs.size() == 27);
     CHECK(specs.front().name == "game-dir" && specs.back().name == "no-window");
     CHECK(dal::configKeyFor("game-dir") == "game_dir");
     CHECK(dal::configKeyFor("dump-frames-every") == "dump_frames_every");
@@ -139,7 +139,7 @@ void testDerivedValues() {
             CHECK(result->window && result->render_vulkan);
             CHECK(result->pad == "keyboard+gamepad");
             CHECK(result->audio == "wasapi");
-            CHECK(result->seconds == 0 && result->dump_frames_every == 1);
+            CHECK(result->seconds == 0 && result->dump_frames_every == 1 && result->fast_forward == 1);
             CHECK(!result->log_level && result->dialog_answer.empty() && result->warnings.empty());
         }
     }
@@ -677,6 +677,41 @@ void testConfigFileExample() {
     CHECK(!result->values.empty());
 }
 
+// A speed is 1 (off) or 2..8, from the command line and from the file alike.
+void testFastForward() {
+    {
+        const auto result = parse({"--game-dir", "g", "--fast-forward", "4"});
+        CHECK(result.has_value() && result->fast_forward == 4);
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--fast-forward", "1"});
+        CHECK(result.has_value() && result->fast_forward == 1);
+    }
+    for (const char* text : {"2", "8"}) {
+        const auto result = parse({"--game-dir", "g", "--fast-forward", text});
+        CHECK(result.has_value() && result->fast_forward == static_cast<std::uint32_t>(std::stoul(text)));
+    }
+    const std::string_view message = "error: --fast-forward needs 1 (off) or a speed from 2 to 8\n";
+    for (const char* text : {"0", "9", "x", "4x", "-1"}) {
+        CHECK(expectUsageError({"--game-dir", "g", "--fast-forward", text}, message));
+    }
+
+    const TempDir dir("dal_game_options_cfg");
+    const ScopedCwd cwd(dir.path());
+    dir.write("config.json", R"({"game_dir": "g", "fast_forward": 3})");
+    {
+        const auto result = parse({});
+        CHECK(result.has_value() && result->fast_forward == 3);
+    }
+    {
+        const auto result = parse({"--fast-forward", "6"});
+        CHECK(result.has_value() && result->fast_forward == 6);
+    }
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    dir.write("config.json", R"({"game_dir": "g", "fast_forward": 9})");
+    CHECK(expectUsageError({}, "error: " + file + ": fast_forward needs 1 (off) or a speed from 2 to 8\n"));
+}
+
 void testApplyGameOptions() {
     CHECK(!dal::logEnabled(dal::LogLevel::Debug));
     {
@@ -1029,6 +1064,7 @@ int main() {
     testConfigFileFrameList();
     testConfigFileAcceptsEveryKey();
     testConfigFileExample();
+    testFastForward();
     testApplyGameOptions();
     testConfigLookupNoFile();
     testConfigLookupWorkingDirectory();
