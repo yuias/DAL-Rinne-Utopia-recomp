@@ -21,6 +21,7 @@ namespace {
 
 constexpr std::uint32_t kIoPageSize = 0x100000;
 constexpr std::uint32_t kIoPageMask = kIoPageSize - 1;
+constexpr std::uint32_t kBlitColorRegisters = 0x700;  // NV308A_COLOR spans this many registers
 
 // Registers that RPCS3 defers with an execution barrier when they change inside an open draw clause.
 bool isDrawParameter(std::uint32_t method) {
@@ -127,7 +128,24 @@ void RsxFrameBuilder::onWrite(const RsxRegisters& regs, std::uint32_t method, st
         case kMethodNv4097DrawArrays: addRange(false, value); break;
         case kMethodNv4097DrawIndexArray: addRange(true, value); break;
         case kMethodNv4097ClearSurface: clear(regs, value); break;
+        // Points where the guest learns how far the RSX has got (it may rewrite texture memory after them), or
+        // where the RSX changes memory outside a draw (see rsx_texture_cache.h).
+        case kMethodNv406eSetReference:
+        case kMethodNv406eSemaphoreAcquire:
+        case kMethodNv406eSemaphoreRelease:
+        case kMethodNv4097GetReport:
+        case kMethodNv4097BackEndWriteSemaphoreRelease:
+        case kMethodNv4097TextureReadSemaphoreRelease:
+        case kMethodGcmSetUserCommand:
+        case kMethodGcmSetUserCommand + 4:
+        case kMethodNv0039BufferNotify:
+        case kMethodNv3089ImageIn: textures_.beginEpoch(); break;
         default:
+            // The RSX thread writes the inline blit words into guest memory.
+            if (method >= kMethodNv308aColor && method < kMethodNv308aColor + kBlitColorRegisters * 4) {
+                textures_.beginEpoch();
+                break;
+            }
             if (in_draw_ && have_range_ && isDrawParameter(method)) noteState("draw parameter change inside a clause");
             break;
     }
@@ -142,6 +160,7 @@ void RsxFrameBuilder::onFlip(const RsxRegisters&, std::uint32_t buffer, const Rs
     flip.height = display.height;
     flip.flip_index = flips_++;
     commands_.emplace_back(flip);
+    textures_.onFlip(flips_);
 }
 
 std::vector<RsxCommand> RsxFrameBuilder::takeCommands() { return std::exchange(commands_, {}); }
@@ -187,6 +206,15 @@ std::int32_t RsxFrameBuilder::findSurface(std::uint32_t location, std::uint32_t 
 }
 
 std::int32_t RsxFrameBuilder::noteSurface(const RsxSurface& surface) {
+    // The renderer keeps the surface contents on the GPU and guest memory stays as it was, but a texture that
+    // overlaps the surface is then read again, as the RSX would see the pixels written to it.
+    if (surface.pitch == 0 || surface.height == 0) {
+        textures_.beginEpoch();
+    } else {
+        textures_.noteWrite(surface.location, surface.offset,
+                            static_cast<std::uint64_t>(surface.offset) +
+                                    static_cast<std::uint64_t>(surface.pitch) * surface.height);
+    }
     const std::int32_t index = findSurface(surface.location, surface.offset);
     if (index >= 0) {
         known_surfaces_[index] = surface;  // size or pitch may have changed
@@ -270,9 +298,10 @@ bool RsxFrameBuilder::fillVertices(const RsxRegisters& regs, RsxDraw& draw, std:
     return true;
 }
 
-// Texture bytes are copied for the layouts the renderer supports: 2D, one mip level, A8R8G8B8 linear or
-// DXT1/DXT23/DXT45 in any layout (block rows, see below). A texture at a known render target is an alias and carries no
-// bytes. RPCS3 takes the pitch from the row size when the register is 0 (`texture_cache.h` upload path).
+// Texture bytes are attached for the layouts the renderer supports: 2D, one mip level, A8R8G8B8 linear or
+// DXT1/DXT23/DXT45 in any layout (block rows, see below), taken from the texture cache (copyTexture). A texture
+// at a known render target is an alias and carries no bytes. RPCS3 takes the pitch from the row size when the
+// register is 0 (`texture_cache.h` upload path).
 void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
     for (std::uint32_t unit = 0; unit < kRsxTextureUnitCount; unit++) {
         if (!rsxTextureEnabled(regs, unit)) continue;
@@ -294,6 +323,7 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
         const bool supported_format = rsxTextureFormatSampleable(t.format);
         const bool supported_layout = (t.linear_layout || compressed) && !t.cubemap && t.mips <= 1 && t.dimension == 2;
         if (supported_format && supported_layout && t.width != 0 && t.height != 0) {
+            const std::uint32_t register_pitch = t.pitch;
             std::uint64_t row, size;
             if (compressed) {
                 // The pitch register is not used for the block rows (the game's value is a block row or 0).
@@ -311,16 +341,40 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
             } else if (size > kRsxMaxTextureBytes) {
                 rsxNoteUnimplemented("texture layout", "too large");
             } else {
-                auto bytes = std::make_shared<std::vector<std::uint8_t>>(size);
-                if (memory_.read(t.location, t.offset, *bytes)) {
-                    t.data = std::move(bytes);
-                } else {
-                    noteState("unreadable texture memory");
-                }
+                copyTexture(t, register_pitch, size);
             }
         }
         draw.textures.push_back(t);
     }
+}
+
+// The first use of a texture in an epoch (or after an RSX write over it) reads the guest bytes and hashes
+// them; unchanged bytes keep the blob and its content id, so draws and later frames share one blob. The scratch
+// buffer is reused, which makes a texture that did not change cost one read and one hash.
+void RsxFrameBuilder::copyTexture(RsxTextureDesc& t, std::uint32_t register_pitch, std::uint64_t size) {
+    const RsxTextureCache::Key key{t.location, t.offset, t.width, t.height, register_pitch, t.format};
+    RsxTextureCache::Entry* entry = textures_.find(key);
+    if (entry != nullptr && textures_.fresh(*entry)) {
+        textures_.countHit();
+    } else {
+        texture_scratch_.resize(size);
+        if (!memory_.read(t.location, t.offset, texture_scratch_)) {
+            textures_.erase(key);
+            noteState("unreadable texture memory");
+            return;
+        }
+        const std::uint64_t hash = rsxHashBytes(texture_scratch_);
+        textures_.countCheck(size);
+        if (entry != nullptr && entry->hash == hash && entry->data->size() == size) {
+            textures_.markFresh(*entry);
+        } else {
+            entry = &textures_.store(key, t.pitch, hash,
+                                     std::make_shared<const std::vector<std::uint8_t>>(texture_scratch_));
+        }
+    }
+    t.pitch = entry->pitch;
+    t.data = entry->data;
+    t.content_id = entry->content_id;
 }
 
 // SET_SHADER_PROGRAM: location (value & 3) - 1, offset value & ~3 (RPCS3 `rsx_decode.h`). The program

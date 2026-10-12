@@ -5,6 +5,8 @@
 // vertex and index addressing follow RPCS3 `Emu/RSX/NV47/HW/nv4097.cpp` (`set_begin_end`, `draw_arrays`,
 // `draw_index_array`), `NV47/FW/draw_call.hpp` (`draw_clause::append`), `Core/RSXDrawCommands.cpp`,
 // `Utils/rsx_utils.h` and `VK/VKVertexBuffers.cpp`; clears follow `VK/VKGSRender.cpp` `clear_surface`.
+// Texture bytes come from a cache shared by all draws (rsx_texture_cache.h); the builder starts a new cache
+// epoch at the flips and synchronization points where the guest can learn how far the RSX has got.
 
 #include <cstdint>
 #include <span>
@@ -14,6 +16,7 @@
 #include "rsx/rsx_frame.h"
 #include "rsx/rsx_registers.h"
 #include "rsx/rsx_state.h"
+#include "rsx/rsx_texture_cache.h"
 
 namespace dal {
 
@@ -68,6 +71,8 @@ public:
     // Index the next flip command gets; a replay continues the numbering of the run it was captured from.
     void setFlipIndex(std::uint64_t index) { flips_ = index; }
 
+    const RsxTextureCache& textureCache() const { return textures_; }
+
 private:
     struct Range {
         std::uint32_t first = 0, count = 0;
@@ -80,6 +85,7 @@ private:
     void clear(const RsxRegisters& regs, std::uint32_t mask);
     bool fillVertices(const RsxRegisters& regs, RsxDraw& draw, std::uint32_t vertex_base, std::uint32_t vertex_count);
     void fillTextures(const RsxRegisters& regs, RsxDraw& draw);
+    void copyTexture(RsxTextureDesc& t, std::uint32_t register_pitch, std::uint64_t size);
     void fillFragmentProgram(const RsxRegisters& regs, RsxDraw& draw);
     void fillVertexProgram(const RsxRegisters& regs, RsxDraw& draw);
     std::int32_t noteSurface(const RsxSurface& surface);
@@ -89,6 +95,8 @@ private:
     std::vector<RsxCommand> commands_;
     std::vector<RsxSurface> known_surfaces_;
     std::uint64_t flips_ = 0;
+    RsxTextureCache textures_;
+    std::vector<std::uint8_t> texture_scratch_;
 
     // The open draw clause between SET_BEGIN_END(prim) and SET_BEGIN_END(0).
     bool in_draw_ = false;

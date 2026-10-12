@@ -1159,6 +1159,9 @@ std::vector<std::uint8_t> makeChangedTextureCapture() {
         scene.memory().putWord(0, kTextureOffset + (i / kTextureSize) * (kTextureSize * 4) + (i % kTextureSize) * 4,
                                kSecond[i]);
     }
+    // A guest synchronizes with the RSX before it reuses texture memory; without a synchronization point the
+    // frame builder keeps the bytes it already read.
+    scene.write(dal::kMethodNv406eSemaphoreAcquire, 0);
     quad(0.125f, 0.875f);
     return scene.finish();
 }

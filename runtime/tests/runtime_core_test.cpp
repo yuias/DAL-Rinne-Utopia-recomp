@@ -6045,6 +6045,7 @@ class FakeRsxMemory final : public dal::RsxMemoryView {
 public:
     FakeRsxMemory() : local(0x10000), main(0x10000) {}
     bool read(std::uint32_t location, std::uint32_t offset, std::span<std::uint8_t> out) override {
+        reads[{location, offset}]++;
         const std::vector<std::uint8_t>& bytes = location == 0 ? local : main;
         if (offset > bytes.size() || out.size() > bytes.size() - offset) return false;
         std::memcpy(out.data(), bytes.data() + offset, out.size());
@@ -6054,7 +6055,13 @@ public:
         std::vector<std::uint8_t>& bytes = location == 0 ? local : main;
         for (int i = 0; i < 4; i++) bytes[offset + i] = static_cast<std::uint8_t>(word >> (24 - 8 * i));
     }
+    // Reads that started at (location, offset).
+    int readsAt(std::uint32_t location, std::uint32_t offset) const {
+        const auto it = reads.find({location, offset});
+        return it == reads.end() ? 0 : it->second;
+    }
     std::vector<std::uint8_t> local, main;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, int> reads;
 };
 
 // The texture cache on its own: hash, eviction, epochs and write notes, content ids.
@@ -6149,6 +6156,192 @@ void testRsxTextureCacheClass() {
         const std::uint64_t second = cache.store(key(0), 0, 2, blob()).content_id;
         CHECK(first != second && cache.entryCount() == 1);
     }
+}
+
+// The frame builder's use of the texture cache: which events end the trust in a cached blob.
+void testRsxFrameBuilderTextureCache() {
+    dal::rsxUnimplementedReset();
+    auto regs = std::make_unique<dal::RsxRegisters>();
+    regs->reset();
+    FakeRsxMemory memory;
+    dal::RsxFrameBuilder builder(memory);
+    const auto write = [&](std::uint32_t method, std::uint32_t value) {
+        regs->apply(method, value);
+        builder.onWrite(*regs, method, value);
+    };
+    const auto flip = [&] {
+        builder.onFlip(*regs, 0, {});
+        regs->contextReset();
+    };
+    const auto setSurface = [&](std::uint32_t offset, std::uint32_t pitch, std::uint32_t height) {
+        write(0x0200, 16u << 16);
+        write(0x0204, height << 16);
+        write(0x0208, 8u | (2u << 5) | (1u << 8));
+        write(0x020C, pitch);
+        write(0x0210, offset);
+        write(0x0214, 0x900000);
+        write(0x022C, pitch);
+        write(0x0220, 1);
+        write(0x08C0, 16u << 16);
+        write(0x08C4, height << 16);
+    };
+    // Unit `unit` samples a texture at local `offset`: format byte `fmt` (0xA5 is linear A8R8G8B8), width x
+    // height texels, pitch register `pitch`.
+    const auto setTexture = [&](std::uint32_t unit, std::uint32_t offset, std::uint32_t fmt, std::uint32_t width,
+                                std::uint32_t height, std::uint32_t pitch) {
+        write(0x1A00 + unit * 0x20, offset);
+        write(0x1A04 + unit * 0x20, 1u | (2u << 4) | (fmt << 8) | (1u << 16));
+        write(0x1A0C + unit * 0x20, 0x80000000);
+        write(0x1A18 + unit * 0x20, (width << 16) | height);
+        write(0x1840 + unit * 4, pitch);
+    };
+    // A fragment program that ends at its first word, so that the builder does not scan guest memory for the
+    // end flag (and read the texture bytes on the way).
+    memory.putWord(0, 0x2000, 0x00010000);
+    const auto draw = [&]() {
+        write(0x08E4, 0x2000 | 1);
+        write(0x1808, 5);
+        write(0x1814, 2u << 24);
+        write(0x1808, 0);
+        // The commands since the last call: possibly a flip, then the draw.
+        dal::RsxDraw result;
+        int draws = 0;
+        for (const dal::RsxCommand& command : builder.takeCommands()) {
+            if (const auto* found = std::get_if<dal::RsxDraw>(&command)) {
+                result = *found;
+                draws++;
+            }
+        }
+        CHECK(draws == 1);
+        return result;
+    };
+    const auto fill = [&](std::uint32_t offset, std::uint32_t size, std::uint8_t seed) {
+        for (std::uint32_t i = 0; i < size; i++) memory.local[offset + i] = static_cast<std::uint8_t>(i + seed);
+    };
+    const auto size = [](const dal::RsxTextureDesc& t) { return t.data ? t.data->size() : std::size_t{0}; };
+    constexpr std::uint32_t kTex = 0x3000;
+    setSurface(0x100000, 64, 4);
+    fill(kTex, 64, 1);
+    setTexture(0, kTex, 0xA5, 4, 4, 16);
+
+    // Draws in one epoch share the blob and read guest memory once; a guest write nobody announced is not
+    // seen yet.
+    const dal::RsxDraw first = draw();
+    CHECK(first.textures.size() == 1 && first.textures[0].data != nullptr && first.textures[0].content_id != 0);
+    CHECK(size(first.textures[0]) == 64 && (*first.textures[0].data)[0] == 1 && first.textures[0].pitch == 16);
+    fill(kTex, 64, 100);
+    const dal::RsxDraw second = draw();
+    CHECK(second.textures[0].data == first.textures[0].data &&
+          second.textures[0].content_id == first.textures[0].content_id);
+    CHECK(memory.readsAt(0, kTex) == 1);
+    CHECK(builder.textureCache().stats().hits == 1 && builder.textureCache().stats().checks == 1);
+
+    // A flip ends the epoch: the changed bytes get a new blob and id, and the earlier draws keep theirs.
+    flip();
+    setTexture(0, kTex, 0xA5, 4, 4, 16);
+    const dal::RsxDraw third = draw();
+    CHECK(memory.readsAt(0, kTex) == 2);
+    CHECK(third.textures[0].content_id != first.textures[0].content_id &&
+          third.textures[0].data != first.textures[0].data);
+    CHECK((*third.textures[0].data)[0] == 100 && (*first.textures[0].data)[0] == 1);
+
+    // After a flip with the bytes unchanged the guest memory is read and compared, and the blob and id stay.
+    flip();
+    setTexture(0, kTex, 0xA5, 4, 4, 16);
+    const dal::RsxDraw fourth = draw();
+    const dal::RsxDraw fifth = draw();
+    CHECK(memory.readsAt(0, kTex) == 3);
+    CHECK(fourth.textures[0].content_id == third.textures[0].content_id &&
+          fourth.textures[0].data == third.textures[0].data);
+    CHECK(fifth.textures[0].data == third.textures[0].data);
+
+    // Each point where the guest learns how far the RSX has got ends the epoch, so memory it rewrote
+    // before the point is read again.
+    setSurface(0x100000, 64, 4);
+    write(dal::kMethodNv4097SetColorMask, 0x01010101);
+    std::uint64_t previous_id = third.textures[0].content_id;
+    int expected_reads = 3;
+    std::uint8_t seed = 7;
+    for (const std::uint32_t method :
+         {dal::kMethodNv406eSemaphoreAcquire, dal::kMethodNv406eSemaphoreRelease, dal::kMethodNv406eSetReference,
+          dal::kMethodNv4097GetReport, dal::kMethodNv4097BackEndWriteSemaphoreRelease,
+          dal::kMethodNv4097TextureReadSemaphoreRelease, dal::kMethodGcmSetUserCommand,
+          dal::kMethodGcmSetUserCommand + 4}) {
+        fill(kTex, 64, seed++);
+        write(method, 1);
+        const dal::RsxDraw after = draw();
+        CHECK(memory.readsAt(0, kTex) == ++expected_reads);
+        CHECK(after.textures[0].content_id != previous_id && (*after.textures[0].data)[0] == seed - 1);
+        previous_id = after.textures[0].content_id;
+    }
+
+    // A target the RSX draws or clears over the texture's range ends the trust at once, inside the epoch; a
+    // target elsewhere does not.
+    fill(kTex, 64, 11);
+    write(0x1D90, 0xFF102030);
+    write(0x1D8C, 0xFFFFFF00);
+    write(0x1D94, 0xF3);  // clears the surface at 0x100000
+    CHECK(builder.takeCommands().size() == 1);
+    const dal::RsxDraw elsewhere = draw();
+    CHECK(memory.readsAt(0, kTex) == expected_reads && elsewhere.textures[0].content_id == previous_id);
+    setSurface(kTex - 0x40, 64, 4);  // covers [kTex - 0x40, kTex + 0xC0)
+    write(0x1D94, 0xF3);
+    CHECK(builder.takeCommands().size() == 1);
+    const dal::RsxDraw overlapped = draw();
+    CHECK(memory.readsAt(0, kTex) == expected_reads + 1 && overlapped.textures[0].content_id != previous_id);
+    CHECK(overlapped.textures[0].rt_alias == -1 && (*overlapped.textures[0].data)[0] == 11);
+    CHECK(overlapped.surfaces.color.offset == kTex - 0x40);
+    const dal::RsxDraw again = draw();  // the draw above wrote the target again, so the texture is read again
+    CHECK(memory.readsAt(0, kTex) == expected_reads + 2 &&
+          again.textures[0].content_id == overlapped.textures[0].content_id);
+
+    // A texture at the address of a known render target is an alias and carries no bytes, cached blob or not.
+    setSurface(kTex, 64, 4);
+    write(0x1D94, 0xF3);
+    CHECK(builder.takeCommands().size() == 1);
+    const dal::RsxDraw alias = draw();
+    CHECK(alias.textures[0].rt_alias >= 0 && alias.textures[0].data == nullptr && alias.textures[0].content_id == 0);
+
+    // Descriptors that differ in the pitch register, the size or the format byte get their own entries; an
+    // identical one shares.
+    flip();
+    setSurface(0x100000, 64, 4);
+    fill(kTex + 0x100, 256, 3);
+    const std::size_t entries_before = builder.textureCache().entryCount();
+    setTexture(0, kTex + 0x100, 0xA5, 4, 4, 16);
+    setTexture(1, kTex + 0x100, 0xA5, 4, 4, 0);   // pitch register 0 means the row size
+    setTexture(2, kTex + 0x100, 0xA5, 4, 4, 32);  // padded pitch
+    setTexture(3, kTex + 0x100, 0xE5, 4, 4, 16);  // unnormalized coordinates
+    setTexture(4, kTex + 0x100, 0xA5, 8, 2, 32);  // another shape
+    setTexture(5, kTex + 0x100, 0xA5, 4, 4, 16);  // same as unit 0
+    const dal::RsxDraw variants = draw();
+    CHECK(variants.textures.size() == 6);
+    CHECK(builder.textureCache().entryCount() == entries_before + 5);
+    for (std::size_t a = 0; a < 5; a++) {
+        for (std::size_t b = a + 1; b < 5; b++) {
+            CHECK(variants.textures[a].content_id != variants.textures[b].content_id);
+        }
+    }
+    CHECK(variants.textures[5].content_id == variants.textures[0].content_id &&
+          variants.textures[5].data == variants.textures[0].data);
+    CHECK(size(variants.textures[1]) == 64 && variants.textures[1].pitch == 16);
+    CHECK(variants.textures[1].data != variants.textures[0].data &&
+          *variants.textures[1].data == *variants.textures[0].data);
+    CHECK(size(variants.textures[2]) == 32 * 3 + 16 && variants.textures[2].pitch == 32);
+    CHECK(size(variants.textures[4]) == 32 + 32);
+    CHECK(unimplementedCount("state unreadable texture memory") == 0);
+
+    // An unreadable range is counted on every draw and leaves no entry.
+    for (std::uint32_t unit = 0; unit < 6; unit++) write(0x1A0C + unit * 0x20, 0);
+    setTexture(6, 0xFFF0, 0xA5, 16, 16, 64);
+    const dal::RsxDraw unreadable = draw();
+    CHECK(unreadable.textures.size() == 1 && size(unreadable.textures[0]) == 0 &&
+          unreadable.textures[0].content_id == 0);
+    CHECK(unimplementedCount("state unreadable texture memory") == 1);
+    draw();
+    CHECK(unimplementedCount("state unreadable texture memory") == 2);
+    CHECK(builder.textureCache().entryCount() == entries_before + 5);
+    dal::rsxUnimplementedReset();
 }
 
 void testRsxFrameBuilder() {
@@ -8502,6 +8695,7 @@ int main(int argc, char** argv) {
     testRsxDecode();
     testRsxTextureCacheClass();
     testRsxFrameBuilder();
+    testRsxFrameBuilderTextureCache();
     testRsxCapture();
     testRsxSyntheticCaptures();
     testRsxConsumer();
