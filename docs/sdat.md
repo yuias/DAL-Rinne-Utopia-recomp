@@ -11,20 +11,20 @@ not stored in this repository. `dal_sdat --keys` reads them from RPCS3's `rpcs3/
 a source file it only parses; no RPCS3 code is compiled or linked.
 
 When the build is configured with a game directory (`-GameDir`, CMake variable `DAL_GAME_DIR`),
-configuration downloads `key_vault.h` from a pinned RPCS3 commit into
-`generated/deps/rpcs3/<commit>/` (git-ignored) and checks its SHA-256; the pin is in
-`cmake/sdat_keys.cmake`. A copy that is already there and matches is not downloaded again. To build
-without the download, set the CMake cache variable `DAL_RPCS3_CRYPTO_DIR` to a local `key_vault.h`
-or the directory that holds it (`cmake -S . -B build/<preset> -DDAL_RPCS3_CRYPTO_DIR=<dir>`). If
-the download fails, configuration warns and the build skips the cache; the game then stops at its
-own error dialog for the missing file.
+configuration downloads `key_vault.h` and `key_vault.cpp` from a pinned RPCS3 commit into
+`generated/deps/rpcs3/<commit>/` (git-ignored) and checks their SHA-256; the pins are in
+`cmake/rpcs3_keys.cmake`. These are the same files that the `EBOOT.BIN` decryption uses (see
+[Keys](building.md#keys)). A copy that is already there and matches is not downloaded again. To build
+without the download, pass `-Rpcs3CryptoDir <dir>` (CMake variable `DAL_RPCS3_CRYPTO_DIR`) with the
+`rpcs3/Crypto` directory of a local RPCS3 checkout. If the download fails, configuration warns and
+the build skips the cache; the game then stops at its own error dialog for the missing file.
 
 ## Build step
 
 With the keys and a game directory, the build target `sdata_cache` runs
 
 ```sh
-dal_sdat --keys <key_vault.h> --game-dir <game-dir> --out build/<preset>/sdata_cache
+dal_sdat --keys <key-dir> --game-dir <game-dir> --out build/<preset>/sdata_cache
 ```
 
 and the `game_boot`, `game_input`, `game_audio` and `atrac_decode` tests use that cache. The step

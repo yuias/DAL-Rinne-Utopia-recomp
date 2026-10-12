@@ -8,12 +8,14 @@ files are registered only when those are configured, and configuration prints wh
 | Target | What it checks | Needs |
 | --- | --- | --- |
 | `runtime_version`, `runtime_musttail` | The runtime stub starts, and the compiler supports `musttail` | - |
-| `tools_unittest` | The Python unit tests (below) | - |
+| `tools_unittest` | The Python unit tests (below). CTest passes `DAL_EBOOT_ELF` to them, so they include the real-executable tests when `-EbootElf` or `-EbootBin` is given | - |
 | `ppu_header_check`, `ppu_semantics` | Contract header and the semantics harness (see [Emitting C](emitter.md)). The header check includes hand-written wrappers in the shape `emit` generates for a hook and an override, with `dalCountCall` and an empty table. The harness has the override and hook cases (see [Semantics harness](emitter.md#semantics-harness)): every way into an overridden function reaches its wrapper, an override can run the original, a hook runs first and can rewrite an argument, a hook does not grow the host stack in a tail-call cycle, and the call counters are exact | - |
 | `ppu_link` | The generated code links with the stub runtime. It also checks the generated override table: addresses strictly ascending, dispatch reaches the wrapper and not the original body, and every entry has a counter and a handler name. Its ok line gives the number of overrides | `-GeneratedDir` |
 | `runtime_core` | Runtime core unit tests (memory, threads, lv2, HLE, VFS, fake RSX). `testOverrides` covers the start-up check of the override table, its log lines, the `census: overrides` section and the four generic handlers | - |
 | `game_options` | The `dal_game` option parser (`runtime/src/app`), with no game files: derived values, every validation message, last-wins and CLI11 errors, `--name=value` and `--flag=false`, UTF-8 paths, the configuration file reader (every kind, paths, every error text, unknown keys), the lookup (working directory, executable directory, `--config`, `--no-config`), precedence, error notes and the `dal: config:` log line, and that `config/dal_game.example.json` parses without errors or warnings. The tests run in scratch working directories, so a `config.json` of yours does not affect them | - |
 | `sdat_tests` | SDAT decryption and decompression on synthetic data | - |
+| `decrypt_core` | `dal_decrypt` on synthetic data: crypto known answers, key file parsing, SCE containers, SELF reassembly and the command line | - |
+| `decrypt_eboot` | `dal_decrypt self` on the real `EBOOT.BIN`; the output must match the pin of `EBOOT.elf` (the file is written under `build/<preset>/decrypt_test`) | `-EbootBin` |
 | `render_core`, `vp_translator`, `fp_translator` | Renderer and shader translators (see [Rendering](rendering.md)) | a Vulkan 1.3 device for the rendering parts |
 | `rsx_replay` | Replays a local capture and compares it with a reference image | a local capture (see [Capture and replay](rendering.md#capture-and-replay)) |
 | `media_core` | PAMF parser and demuxer, the movie player and the cellSail HLE on synthetic data, with fake codecs; with `DAL_GAME_DIR` set it also demuxes every `.pam` file of the game | - |
@@ -24,7 +26,7 @@ files are registered only when those are configured, and configuration prints wh
 | `input_core` | Gamepad code behind the backend interface, with a fake backend and no GameInput: value, reading and device formatting; the `--pad-probe` logic (a line per change, one `no gamepad reading` per device, devices coming and going, the `SteamVirtualGamepadInfo` lines); the button table, dead zone, stick bytes, trigger threshold, merging of pads and motor conversion; Steam virtual path parsing, `SDL_GAMECONTROLLER_IGNORE_DEVICES` parsing and the selection rule (recorded runs, a virtual pad, the ignore list, no Steam); the hub (use of a pad, removal, two pads, a virtual pad and its physical pad, the focus gate, vibration, the provider following plugging) and the gamepad thread with a fake backend (unavailable backend, feeding the pad, start lines, probe alone) | - |
 | `input_gameinput` | The GameInput backend: the Steam context, then (with a GameInput runtime of API version 3) the device list, unique non-zero ids, a stable device generation, and `read`, `readRaw` and `setRumble` on unknown ids. No pad has to be connected. Exit code 77 (skipped) with the reason when no such runtime is installed | a GameInput runtime for all but the Steam context part (see [Input](input.md#the-gameinput-runtime-and-the-gameinput-unavailable-warning)) |
 | `atrac_decode` | `dal_audiotool at3` on the title BGM (entry 19 of the decrypted `Bgm.sdat`): frame count, sample count and the SHA-256 of the decoded PCM, pinned in `cmake/atrac_decode.cmake` | the sdata cache (registered when it exists or can be built), the FFmpeg DLLs |
-| `game_boot` | The game reaches a milestone in a 20 s run (below) | `-GeneratedDir`, `-EbootElf`, `-GameDir` |
+| `game_boot` | The game reaches a milestone in a 20 s run (below) | `-GeneratedDir`, `-GameDir` and `-EbootElf` or `-EbootBin` |
 | `game_input_hdd_clean`, `game_input` | A pad script leaves the title screen and the game reaches a milestone in a 40 s run (below) | as `game_boot`, plus the `.sdat` keys ([SDAT files](sdat.md#keys)) |
 | `game_audio_hdd_clean`, `game_audio` | The same run as `game_input` with `--audio none --audio-dump`: the `atrac` line of the audio census reports decoded frames with audible content (below) | as `game_input` |
 
@@ -37,7 +39,8 @@ conversion or the audio decoder differently, which needs new pins (the YUV hashe
 
 CTest registers `game_boot` only when `DAL_PPU_GENERATED_DIR`, `DAL_EBOOT_ELF` and
 `DAL_GAME_DIR` are all set (`-GeneratedDir`, `-EbootElf`, `-GameDir`); otherwise configuration prints
-that it is not registered. It runs `dal_game --game-dir <dir> --elf <elf>` with the arguments
+that it is not registered. `-EbootBin` also sets `DAL_EBOOT_ELF`, to the produced
+`generated/inputs/EBOOT.elf`, unless `-EbootElf` is given. It runs `dal_game --game-dir <dir> --elf <elf>` with the arguments
 from the pin file (the run keeps its game data in `build/<preset>/game_hdd`), with a 60 s time
 limit, and passes when the output matches the milestone regular expression. The exit code is not
 checked: the run ends at the 20 s watchdog or at a stop somewhere after the milestone, and a

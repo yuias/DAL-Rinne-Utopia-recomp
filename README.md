@@ -4,8 +4,10 @@ Static recompilation of the PS3 title *デート・ア・ライブ 凜祢ユー�
 Windows, built from your own copy of the game.
 
 This repository contains no game data (see [Licence and legal notice](#licence-and-legal-notice)).
-No executables, keys, or decrypted binaries are included or accepted by version control; you
-supply your own `EBOOT.elf`, and all tool output is written to ignored directories.
+No executables, keys, or decrypted binaries are included or accepted by version control. You
+supply your own `EBOOT.BIN`; the build decrypts it into the ignored `generated/inputs/`, and the keys
+it needs are downloaded at configure time, not stored (see [Building](#building)). All tool output is
+written to ignored directories.
 
 Current state: the game boots, plays its intro movies with sound and reaches the title screen.
 NEW GAME plays the opening movie and then the first story scenes, with their pictures, music and
@@ -25,20 +27,19 @@ checked. See [Status](docs/status.md).
 - The Vulkan SDK, with the `VULKAN_SDK` environment variable set
 - A Vulkan 1.3 device and driver
 - Python 3.10 or newer (the tools use only the standard library)
-- RPCS3, to decrypt the game's executable
+- Internet access for the first build that decrypts the game's files: two RPCS3 source files that
+  contain the keys are downloaded (see [Building](docs/building.md#keys) for an offline
+  alternative)
 
-## Obtaining `EBOOT.elf`
+## Game files
 
-The tools work on the decrypted PPU executable, not on `EBOOT.BIN`.
+Dump your own disc or digital copy. The directory that contains `PS3_GAME` is the game directory
+(`<game-dir>` below).
 
-1. Dump your own disc or digital copy. The directory that contains `PS3_GAME` is the game
-   directory (`<game-dir>` below).
-2. In RPCS3, use Utilities > Decrypt PS3 Binaries and select the game's `EBOOT.BIN`.
-3. Place the resulting `EBOOT.elf` at `<game-dir>/PS3_GAME/USRDIR/EBOOT.elf`, where `dal_game`
-   looks for it.
-
-The supported executable has the SHA-256
-`8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348`; `dal_game` refuses any other.
+The tools work on the decrypted PPU executable, `EBOOT.elf`, not on `EBOOT.BIN`. The build produces
+it from `<game-dir>/PS3_GAME/USRDIR/EBOOT.BIN` (step 3 below); RPCS3 is not needed. The supported
+executable has the SHA-256 `8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348`;
+the build and `dal_game` refuse any other.
 
 ## Building
 
@@ -60,21 +61,33 @@ Run these from the repository root:
    msiexec /i generated\deps\gameinput\<version>\redist\GameInputRedist.msi
    ```
 
-3. Recompile the executable into C source under `generated/ppu`:
+3. Decrypt the executable. This configures, downloads the key files, builds `dal_decrypt` and runs
+   it:
 
    ```powershell
-   python tools/ps3tool.py emit <game-dir>/PS3_GAME/USRDIR/EBOOT.elf --out generated/ppu
+   pwsh -NoProfile -File tools/build.ps1 -Preset release -EbootBin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN
    ```
 
-4. Build:
+   The output is `generated/inputs/EBOOT.elf`. It is checked against the size and SHA-256 in
+   `config/target.json`; a file that does not match is refused and nothing is written. The build
+   log shows `matches the pin`.
+
+4. Recompile the executable into C source under `generated/ppu`:
 
    ```powershell
-   pwsh -NoProfile -File tools/build.ps1 -Preset release -GeneratedDir generated/ppu -GameDir <game-dir>
+   python tools/ps3tool.py emit generated/inputs/EBOOT.elf --out generated/ppu
+   ```
+
+5. Build:
+
+   ```powershell
+   pwsh -NoProfile -File tools/build.ps1 -Preset release -GeneratedDir generated/ppu -GameDir <game-dir> -EbootBin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN
    ```
 
 The build writes `dal_game` to `build/release/bin/` and decrypts the game's `.sdat` files into
-`build/release/sdata_cache`. The keys for that are read from RPCS3's `key_vault.h`, which the first
-build downloads from a pinned RPCS3 commit (see [SDAT files](docs/sdat.md)).
+`build/release/sdata_cache`. The keys for both decryptions are read from RPCS3's `key_vault.h` and
+`key_vault.cpp`, which the first build downloads from a pinned RPCS3 commit (see
+[Building](docs/building.md#decrypting-ebootbin) and [SDAT files](docs/sdat.md)).
 
 Every build parameter, the CMake variables and the test builds are described in
 [Building](docs/building.md).
@@ -82,14 +95,17 @@ Every build parameter, the CMake variables and the test builds are described in
 ## Running the game
 
 ```powershell
-build/release/bin/dal_game.exe --game-dir <game-dir>
+build/release/bin/dal_game.exe --game-dir <game-dir> --elf generated/inputs/EBOOT.elf
 ```
+
+`--elf` names the decrypted executable. Without it `dal_game` looks for
+`<game-dir>/PS3_GAME/USRDIR/EBOOT.elf`; copying the produced file there works too.
 
 Closing the window ends the run. Game data and saves are written to `build/release/hdd`;
 `tools/build.ps1 -Clean` deletes them together with the rest of `build/release`.
 
 The build with `-GameDir` also writes `build/release/bin/config.json` (with `game_dir`, and `elf` if
-you gave `-EbootElf`) when that file does not exist yet. `dal_game.exe` reads a `config.json` from
+you gave `-EbootBin` or `-EbootElf`) when that file does not exist yet. `dal_game.exe` reads a `config.json` from
 the working directory or, when there is none, from its own folder. So `dal_game.exe` needs no
 options when you start it from `build/release/bin` (for example by double-click, or from a shortcut
 whose "Start in" is that folder). To use a file elsewhere, pass `--config <file>`; `--no-config`

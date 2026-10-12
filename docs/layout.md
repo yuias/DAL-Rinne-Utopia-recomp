@@ -7,7 +7,9 @@
 | `CMakeLists.txt`, `CMakePresets.json`, `cmake/` | Build configuration (clang, Ninja, `debug` and `release` presets) |
 | `runtime/` | Runtime executable stub (`dal_runtime`), stub runtime for generated code (`dal_ppu_stub`), the runtime core and `dal_game` (`runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `media`, `audio`, `app`, `game_main.cpp`; see [Runtime internals](runtime.md) and [`dal_game` options](runtime-options.md)) and runtime-side tests |
 | `runtime/src/app/` | `dal_game` option handling (`dal_game_options`): the option table, command-line parsing with CLI11, the `config.json` reader, validation and derived values, and the usage text; see [`dal_game` options](runtime-options.md) |
-| `tools/dal_sdat/`, `cmake/sdat_keys.cmake` | `dal_sdat`, the SDAT decryption tool, and its tests, and the pin of the downloaded key file; see [SDAT files](sdat.md) |
+| `tools/dal_sdat/` | `dal_sdat`, the SDAT decryption tool, and its tests; see [SDAT files](sdat.md) |
+| `tools/dal_decrypt/` | `dal_decrypt`: decrypts `EBOOT.BIN` into `EBOOT.elf`, with its synthetic unit tests; see [Decrypting `EBOOT.BIN`](building.md#decrypting-ebootbin) |
+| `cmake/Decrypt.cmake`, `cmake/rpcs3_keys.cmake` | The `dal_decrypt` targets, the `dal_inputs` target that writes `generated/inputs` and the tests `decrypt_core` and `decrypt_eboot`; and the pin of the two RPCS3 key files that `dal_decrypt` and `dal_sdat` read, and their download |
 | `externals/spdlog` | spdlog submodule used by the runtime logger |
 | `externals/libpng`, `externals/zlib` | libpng (v1.6.59) and zlib (v1.3.2) submodules, the PNG codec behind `cellPngDec` |
 | `externals/yyjson` | yyjson submodule (0.13.0, built as a static library), used to parse the VFS configuration and `config.json` |
@@ -39,7 +41,7 @@
 | `tools/tests/ppu_semantics/` | Semantics harness cases and the C generator; see [Semantics harness](emitter.md#semantics-harness) |
 | `runtime/include/dal/` | Contract header and inline helpers for generated code, and `ppu_override.h`, the override and hook handler interface |
 | `runtime/src/game/overrides/` | Game-specific override and hook handlers (`*.cpp`, compiled into `dal_game`); the directory is absent until a game needs one; see [Function overrides and hooks](overrides.md#game-handlers) |
-| `config/target.json` | Pinned size and hashes of the target executable |
+| `config/target.json` | Pinned size and hashes of the target executable (`EBOOT.BIN` and `EBOOT.elf`) |
 | `config/overrides.json` | Guest functions replaced or hooked by native handlers at emit time (no entries by default); see [Function overrides and hooks](overrides.md#configuration-file) |
 | `config/vfs.example.json` | Example VFS configuration for `dal_game --vfs-config`, placeholder paths only; see [VFS configuration file](virtual-file-system.md#vfs-configuration-file) |
 | `config/dal_game.example.json` | Example `config.json` for `dal_game`, placeholder paths only; see [Configuration file](runtime-options.md#configuration-file) |
@@ -48,5 +50,7 @@
 | `docs/` | Development documentation |
 | `LICENSE`, `THIRD_PARTY_NOTICES.md` | Licence of this project (0BSD) and notices of third-party components (FFmpeg, GameInput, CLI11) |
 | `generated/` | Tool output, including `generated/ppu` from `emit` (git-ignored) |
+| `generated/inputs/` | The decrypted `EBOOT.elf` written by the build with `-EbootBin` (git-ignored) |
+| `generated/deps/rpcs3/` | The downloaded RPCS3 key files `key_vault.h` and `key_vault.cpp`, one directory per commit (git-ignored) |
 | `build/` | Build output (git-ignored) |
 | `game/` | Suggested place for your own `EBOOT.elf` (git-ignored) |

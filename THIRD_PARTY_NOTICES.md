@@ -417,13 +417,24 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ````
 
-## RPCS3 `key_vault.h`
+## RPCS3 key files
 
-To decrypt the game's `.sdat` files, the build downloads `rpcs3/Crypto/key_vault.h` from the RPCS3
-repository (<https://github.com/RPCS3/rpcs3>, GNU General Public License, version 2) at a pinned
-commit into `generated/deps/rpcs3`, and `dal_sdat` reads four key constants from it. The file is
-not part of this repository, is not compiled or linked, and is not copied into the build output.
-The pin and its SHA-256 are in `cmake/sdat_keys.cmake`; see [SDAT files](docs/sdat.md).
+To decrypt the game's `EBOOT.BIN` and `.sdat` files, `dal_decrypt` and `dal_sdat` need keys. They
+read them from two source files of RPCS3, <https://github.com/RPCS3/rpcs3>, licensed under the GNU
+General Public License, version 2:
+
+| | |
+| --- | --- |
+| Commit | `f9b8c209a3800c1865bcfeade611f65f5237138c` |
+| `rpcs3/Crypto/key_vault.h` | SHA-256 `d5d0cede74c7900bb23ca8d60066194648ed4b976eaee60315c0bcbed7dc2aaf` |
+| `rpcs3/Crypto/key_vault.cpp` | SHA-256 `a2947ff6b681258c198552ec6344e16685e2df649018206daa3f41a0a1aadbd7` |
+
+The files are downloaded at configuration time into `generated/deps/rpcs3/<commit>/`, and their
+SHA-256 is checked (the pins are in `cmake/rpcs3_keys.cmake`). Alternatively `DAL_RPCS3_CRYPTO_DIR`
+(`-Rpcs3CryptoDir`) names the `rpcs3/Crypto` directory of a local RPCS3 checkout. The tools read only
+the key constants from the files, as data. They are not compiled, linked, committed or
+redistributed, and no key appears in this repository or in any build output other than the
+decrypted files themselves. See [Building](docs/building.md#keys) and [SDAT files](docs/sdat.md).
 
 ## Microsoft GameInput
 
