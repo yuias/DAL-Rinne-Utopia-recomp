@@ -10,11 +10,12 @@
 // CALL_COMPLETED(OPEN_STREAM), Start reports START_TRANSITION and RUNNING and then
 // CALL_COMPLETED(START), and the end of the stream reports STOP_TRANSITION and OPENED. The game
 // never stops the stream: it leaves RUNNING only because the state changes, so the end is detected by
-// the wall clock when the game polls for frames.
+// the movie clock when the game polls for frames.
 //
 // A stream plays on the host movie player (media/movie_player.h): Start launches its decode thread
 // and frames are copied into the game's buffers when the game polls the graphics adapter. The
-// clock is the host's steady clock, restarted when the first frame and the first PCM are decoded, so
+// clock is guest time (it runs faster than real time while fast-forwarding, like everything else the
+// game can observe), restarted when the first frame and the first PCM are decoded, so
 // the decoder's start-up does not make the first frames late. The buffers come from the graphics
 // adapter's pAlloc callback at OpenStream and go back through pFree at Finalize.
 //
@@ -120,12 +121,16 @@ constexpr std::uint32_t kDefaultWidth = 1280, kDefaultHeight = 720;
 constexpr std::uint32_t kDefaultSampleRate = 48000;
 constexpr double kTicksPerSecond = 90000.0;
 
+// The movie clock: 90 kHz ticks of guest time, so movies advance and end at the guest speed. The
+// decode thread reads it too; systemTimeUs() is lock-free.
+std::int64_t guestMovieClockTicks() { return static_cast<std::int64_t>(systemTimeUs()) * 9 / 100; }
+
 // One opened stream: the host player and everything allocated in guest memory for it. Created by
 // OpenStream, released by Finalize. It is shared with the service-thread calls that touch it, so a
 // call that runs after Finalize still finds valid host state; guest addresses in it are only used
 // while the call holds them (see the checks of isCurrent).
 struct Stream {
-    MoviePlayer movie;
+    MoviePlayer movie{MoviePlayerOptions{.clock = guestMovieClockTicks}};
     std::string guest_path;
     std::uint32_t session_id = 0;
 
@@ -1112,7 +1117,7 @@ void playerStart(DalPpuContext* ctx, std::uint8_t*) {
 }
 
 // The player has to leave RUNNING on its own at the end of the stream, since the game never stops it.
-// The wall clock decides, not the decoder: a slow decoder drops frames and the movie still ends on
+// The movie clock decides, not the decoder: a slow decoder drops frames and the movie still ends on
 // time. Called from the frame polls, which the game makes every tick while the state is RUNNING.
 void checkStreamEnd(std::uint32_t self, Player& player, Stream& stream) {
     if (!stream.running || stream.eos || !stream.movie.atEnd(stream.movie.now())) return;
