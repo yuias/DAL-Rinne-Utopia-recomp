@@ -57,8 +57,10 @@ struct RsxTextureDesc {
                   border = 0;
     std::int32_t rt_alias = -1;  // index into the builder's known surfaces, -1 = bytes in `data`
     // Guest bytes of the texture, exactly the range the builder read (rows at `pitch`, the last row without
-    // padding; DXT: whole block rows). Null means no bytes were copied. `content_id` names the content: 0 is
-    // "unnamed" (hand-made descriptors), and such a blob is always treated as new.
+    // padding; DXT: whole block rows). Null means no bytes were copied. The blob is shared by every draw that
+    // samples the same unchanged guest texture, and `content_id` names its content: equal for those draws,
+    // different from the id of any other blob whichever builder made it, so a renderer can skip an upload
+    // whose id it already holds. 0 is "unnamed" (hand-made descriptors): such a blob is always treated as new.
     std::shared_ptr<const std::vector<std::uint8_t>> data;
     std::uint64_t content_id = 0;
 };

@@ -39,7 +39,9 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   to it, and turns the stream into three kinds of plain commands: clear, draw and flip. The state
   decoders (`rsx_decode.cpp`) read surface, blend, depth, texture, vertex and program state from
   the register file. Each command carries every guest byte it needs (vertex and index data,
-  texture texels, shader ucode), so the renderer never touches guest memory. Draw boundaries,
+  texture texels, shader ucode), so the renderer never touches guest memory. The texture bytes come
+  from a cache shared between draws (see [Texture cache](#texture-cache-of-the-frame-builder)), so
+  draws that sample the same unchanged texture share one copy. Draw boundaries,
   addressing and register meanings follow RPCS3's `Emu/RSX` sources. At a flip the registers are
   reset the way RPCS3 resets them, so the next frame starts from the same state.
 - **Renderer** (`vk_renderer.cpp` and neighbours). Vulkan 1.3 with dynamic rendering, the loader
@@ -49,8 +51,9 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   a known render target is sampled from that target (render target aliasing), and a draw that
   samples the target it renders to reads a copy of it. Other textures are uploaded from the
   guest bytes into B8G8R8A8 images (linear A8R8G8B8) or BC1/BC2/BC3 images (DXT1/DXT23/DXT45,
-  one 2D mip level, block rows copied as stored whatever the layout bit says); a unit without a
-  usable texture reads a 1x1 magenta image.
+  one 2D mip level, block rows copied as stored whatever the layout bit says), and only when
+  their content changes: a draw whose texture the image already holds does not upload it again. A
+  unit without a usable texture reads a 1x1 magenta image.
   Cull mode, depth state, viewport, scissor, topology and blend constants are dynamic state;
   pipelines are cached by what is baked into them.
 - **Readback** is gated. Copying the display buffer back to the host costs 8 MiB per flip at 1080p,
@@ -77,14 +80,78 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   that depends on one of them is skipped or drawn incompletely, and the `skipped` count in the
   `rsx` section says which.
 
+### Texture cache of the frame builder
+
+Copying every enabled texture out of guest memory for every draw, and uploading it again, dominated the
+cost of UI screens: the OPTION menu draws about 100 times per frame with the same two unchanged textures,
+and it ran at 15 flips and 30 vertical blanks per second until the builder kept the bytes (`rsx_texture_cache.cpp`)
+and the renderer uploaded them once. With the cache it runs at 30 and 60, like the title menu.
+
+- *Key.* Everything that decides the copied bytes: location, offset, width, height, the pitch register
+  (before the 0 -> row size fix-up) and the raw format byte (it carries the linear and unnormalized flags).
+  Two descriptors that differ in any of them get separate entries; the filter, address, remap and border
+  words only affect sampling and are not part of the key. A texture at the address of a known render target
+  is an alias and never reaches the cache.
+- *Entry.* The blob (the raw guest bytes, rows at the pitch; the renderer still byte swaps A8R8G8B8 on
+  upload), a content id, a 64-bit hash of those bytes (`rsxHashBytes`, four multiply-fold lanes over 64
+  bytes per step), the guest range and the pitch to hand out. The content id comes from a process-wide
+  counter, so two blobs never share an id, whichever builder made them. A draw carries the blob and the id in
+  its `RsxTextureDesc`, and keeps the blob alive after the cache drops or replaces it.
+- *Epochs.* Guest memory can change between draws and the builder cannot see it, so an entry is trusted only
+  inside an epoch, a stretch of the command stream with no synchronization point. A new epoch starts at every
+  flip and at `NV406E_SEMAPHORE_ACQUIRE`, `NV406E_SEMAPHORE_RELEASE`, `NV406E_SET_REFERENCE`,
+  `NV4097_GET_REPORT`, `NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE`, `NV4097_TEXTURE_READ_SEMAPHORE_RELEASE`
+  and the two registers of `GCM_SET_USER_COMMAND`: the points where the guest can learn how far the RSX
+  has got. It also starts at `NV3089_IMAGE_IN` and `NV0039_BUFFER_NOTIFY`, which this build does not execute
+  but which would let the RSX write memory. A game has to synchronize with the RSX before it reuses
+  texture memory the RSX may still read, so a change it makes behind the RSX's back shows up at the next of
+  these points. Inside an epoch an entry is used without reading guest memory. On the first use in a
+  later epoch the guest range is read into a scratch buffer and hashed; an unchanged hash keeps the blob and
+  its id, a changed one stores a new blob under a new id.
+- *Writes by the RSX.* A clear with color bits or a draw with a color write mask, to a color surface, ends the
+  trust in every entry whose range overlaps the surface, at once and without a new epoch (a surface with no
+  pitch or height starts a new epoch). Each `NV308A_COLOR` word of an inline blit does the same for its
+  4 destination bytes, which the RSX thread writes into guest memory, so only a texture the word overlaps is
+  read again. Such an entry is read and hashed again at its next use. The renderer keeps surface contents on
+  the GPU and never writes them back, so the guest bytes are normally unchanged and the hash keeps the blob.
+  Depth and stencil writes are not tracked: the builder keeps no depth surface and guest memory under
+  one never changes. More than 64 distinct written ranges in one epoch start a new epoch.
+- *Bounds.* Blobs are kept up to 256 MiB; past that the least recently used entries go. Every 32 flips,
+  entries unused for 600 flips are dropped. A texture larger than the per-texture limit is counted as
+  `texture layout too large` and gets no bytes.
+- *Limitation.* A guest write that is not followed by one of the synchronization points before the RSX
+  consumes the draw is not seen until the next epoch. Progress the guest learns only by polling the `get`
+  word of the control register is not a synchronization point, and nothing watches guest pages.
+
+The renderer uploads from a blob only when the image does not hold it already: each `TextureImage` remembers
+the content id it last received, and `prepareTextures` skips the upload when the id matches (an id of 0,
+used by hand-made descriptors, always uploads; an image re-created after the image cache trimmed it starts
+without an id). `RendererStats::texture_uploads` counts the uploads. An upload that replaces content
+mid-frame is ordered after the draws recorded earlier by the image barrier of the upload, whose source scope
+is all commands.
+
+At stop, `dal_game` logs one line with the counters, for example:
+
+```
+dal: rsx: texture cache: 6426 epochs, 54167 hits, 2849 checks (9366.3 MiB), 127 new blobs (445.5 MiB), 4 entries (12.7 MiB)
+```
+
+A hit is a use served without reading guest memory. A check is a guest read plus a hash (the first use in an
+epoch, or after an RSX write), with the bytes it read in parentheses. A new blob is a changed or first-seen
+texture, with the bytes it stored. The last figures are the entries and bytes still cached. About one
+check per sampled texture per flip is expected; a check per draw means texture memory overlaps a render
+target that every draw writes.
+
 ### Capture and replay
 
 `--rsx-capture N[,M...]` records the RSX inputs of the given frames: the numbers are 1-based flip
 numbers, and each capture is written when its frame's flip completes, to
 `generated/rsx/captures/frame_<N>.dalcap` (relative to the working directory). A capture holds the
 register writes from the previous flip to this one, the guest bytes the frame builder read while
-handling them, and the register and surface state the frame started from. It needs no renderer
-and no window. Captures are derived from the game, so they are git-ignored with the rest of
+handling them, and the register and surface state the frame started from. The builder reads a texture at
+its first use in an epoch, and the flip that begins a captured frame starts an epoch, so a capture records
+each texture at its first use in the frame and the replay, which starts with an empty cache, makes the same
+read. It needs no renderer and no window. Captures are derived from the game, so they are git-ignored with the rest of
 `generated/`.
 
 `dal_rsxreplay` replays a capture through the frame builder and the renderer without the game:
