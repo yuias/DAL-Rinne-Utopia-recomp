@@ -1080,6 +1080,19 @@ void testStartupSyscalls() {
         CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(15));
         CHECK(syscall(141, 0) == 0);  // yield
         CHECK(syscall(142, 0) == 0);
+
+        // While fast-forwarding, a guest sleep and a guest timeout take 1/speed of the host time.
+        CHECK(dal::waitTimeout(400000) == std::chrono::microseconds(400000));
+        dal::setFastForwardSpeed(4);
+        dal::setFastForwardToggled(true);
+        CHECK(dal::waitTimeout(400000) == std::chrono::microseconds(100000));
+        CHECK(!dal::waitTimeout(0).has_value());
+        const auto fast_start = std::chrono::steady_clock::now();
+        CHECK(syscall(141, 200000) == 0);
+        const auto fast_elapsed = std::chrono::steady_clock::now() - fast_start;
+        CHECK(fast_elapsed >= std::chrono::milliseconds(40) && fast_elapsed <= std::chrono::milliseconds(150));
+        dal::setFastForwardToggled(false);
+        CHECK(dal::waitTimeout(400000) == std::chrono::microseconds(400000));
     }
 
     p.main.free(scratch);

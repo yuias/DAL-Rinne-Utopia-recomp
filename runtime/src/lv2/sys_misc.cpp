@@ -11,6 +11,7 @@
 
 #include "core/census.h"
 #include "core/fatal.h"
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/threads.h"
 #include "dal/ppu_context.h"
@@ -41,7 +42,7 @@ void sleepFor(DalPpuContext* ctx, std::uint8_t* base, std::uint64_t microseconds
     static std::condition_variable_any never_signalled;
     blockingWait(
             never_signalled, [] { return false; }, "sys_timer_usleep",
-            std::chrono::microseconds(std::min(microseconds, kMaxSleepUs)));
+            hostDuration(std::chrono::microseconds(std::min(microseconds, kMaxSleepUs))));
 }
 
 }  // namespace

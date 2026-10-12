@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 
+#include "core/guest_clock.h"
 #include "dal/ppu_context.h"
 
 namespace dal {
@@ -56,12 +57,13 @@ inline constexpr std::uint32_t kLwmutexSize = 24;
 inline constexpr std::uint32_t kSyncPriorityInherit = 3;
 inline constexpr std::uint32_t kSyncNotRecursive = 0x20;
 
-// lv2 timeouts are in microseconds, 0 meaning "wait forever" (nullopt: counts toward stall
-// detection). Long timeouts are clamped so the steady-clock deadline cannot overflow.
+// lv2 timeouts are in guest microseconds, 0 meaning "wait forever" (nullopt: counts toward stall
+// detection). Long timeouts are clamped so the steady-clock deadline cannot overflow. The result is
+// the host wait, which is shorter than the guest timeout while fast-forwarding.
 inline std::optional<std::chrono::microseconds> waitTimeout(std::uint64_t microseconds) {
     constexpr std::uint64_t kMaxWaitUs = 24ull * 3600 * 1000000;
     if (microseconds == 0) return std::nullopt;
-    return std::chrono::microseconds(microseconds < kMaxWaitUs ? microseconds : kMaxWaitUs);
+    return hostDuration(std::chrono::microseconds(microseconds < kMaxWaitUs ? microseconds : kMaxWaitUs));
 }
 
 // lv2 errors reach the guest as sign-extended s32 values.

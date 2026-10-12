@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "dal/ppu_context.h"
@@ -200,8 +201,11 @@ void closeDialog(DalPpuContext* ctx, std::uint8_t*) {
         return;
     }
     const float delay = std::max(static_cast<float>(ctx->fpr[1].f64), 0.0f);
-    g_dialog.close_at =
-            Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<float, std::milli>(delay));
+    // The delay is guest time, so it shrinks while fast-forwarding. The auto-answer delay is a host
+    // bound and stays as is.
+    const auto guest_delay =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::duration<float, std::milli>(delay));
+    g_dialog.close_at = Clock::now() + std::chrono::duration_cast<Clock::duration>(hostDuration(guest_delay));
     logInfo("dal: msgdialog: close requested in {} ms", delay);
     ctx->gpr[3] = kCellOk;
 }
