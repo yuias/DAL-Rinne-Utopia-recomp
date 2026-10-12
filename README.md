@@ -105,7 +105,7 @@ Closing the window ends the run. Game data and saves are written to `build/relea
 `tools/build.ps1 -Clean` deletes them together with the rest of `build/release`.
 
 The build with `-GameDir` also writes `build/release/bin/config.json` (with `game_dir`, and `elf` if
-you gave `-EbootBin` or `-EbootElf`) when that file does not exist yet. `dal_game.exe` reads a `config.json` from
+you gave `-EbootBin` or `-EbootElf` in this or an earlier build of the preset) when that file does not exist yet. `dal_game.exe` reads a `config.json` from
 the working directory or, when there is none, from its own folder. So `dal_game.exe` needs no
 options when you start it from `build/release/bin` (for example by double-click, or from a shortcut
 whose "Start in" is that folder). To use a file elsewhere, pass `--config <file>`; `--no-config`

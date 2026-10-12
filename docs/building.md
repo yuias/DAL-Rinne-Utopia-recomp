@@ -40,8 +40,8 @@ With `-GameDir`, after a successful build that produced `build/<preset>/bin/dal_
 - The file is written only when the directory holds the game data (`<game-dir>/PS3_GAME/PARAM.SFO`
   exists). Otherwise the build prints `config.json not written: <game-dir> has no PS3_GAME/PARAM.SFO`.
 - It holds `game_dir` (the full path of `-GameDir`) and `elf`: the full path of `-EbootElf` if it is
-  given, otherwise of `generated/inputs/EBOOT.elf` if `-EbootBin` is given. Without either there is no
-  `elf`. The build prints `wrote <path>`.
+  given, otherwise of `generated/inputs/EBOOT.elf` if `-EbootBin` is given, otherwise the `DAL_EBOOT_ELF`
+  value kept in the CMake cache from an earlier build. When all three are empty there is no `elf`. The build prints `wrote <path>`.
 - An existing `config.json` is never modified, so your own edits survive later builds. The build
   prints `config.json left unchanged: ...` when the file cannot be parsed, when its `game_dir` is
   another directory than `-GameDir`, or when `-EbootElf` or `-EbootBin` is given and the file has no

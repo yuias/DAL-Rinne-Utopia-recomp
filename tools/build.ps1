@@ -104,7 +104,16 @@ try {
             # Where the build has just decrypted EBOOT.BIN to (cmake/Decrypt.cmake).
             $writeArgs['EbootElf'] = Join-Path (Get-Location) 'generated/inputs/EBOOT.elf'
         }
-        & (Join-Path $PSScriptRoot 'write-game-config.ps1') @writeArgs
+        else {
+            # The cache keeps the ELF of an earlier build (from -EbootElf or -EbootBin), which the game
+            # tests also use.
+            $cacheLine = Select-String -LiteralPath "build/$Preset/CMakeCache.txt" -Pattern '^DAL_EBOOT_ELF:[A-Z]+=(.+)$' |
+                Select-Object -First 1
+            if ($cacheLine) {
+                $writeArgs['EbootElf'] = $cacheLine.Matches[0].Groups[1].Value
+            }
+        }
+        &(Join-Path $PSScriptRoot 'write-game-config.ps1') @writeArgs
     }
 
     if ($Test) {
