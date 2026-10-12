@@ -81,6 +81,12 @@ struct AudioEngineStats {
 };
 AudioEngineStats audioEngineStats();  // any thread
 
+// The engine stays on host time while the guest runs faster than real time (guestSpeed() > 1), so
+// the sound would play out of sync with the picture. The output therefore gets silence in that state
+// unless this is on; the dump always gets the mixed blocks. Off by default. Any thread.
+void setFastForwardSound(bool on);
+bool fastForwardSound();
+
 // Patches the dump header and closes the file; later blocks are not written. For the stop path,
 // which ends the process without running destructors. No-op without a dump.
 void finishAudioDump();

@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "audio/wav_file.h"
+#include "core/guest_clock.h"
 #include "core/log.h"
 #include "core/sleeper.h"
 
@@ -78,6 +79,8 @@ bool isNonSilent(std::span<const float> block) {
 }
 
 constexpr AudioBlock kSilentBlock{};
+
+std::atomic<bool> g_fast_forward_sound{false};
 
 // One debug line per this many correction updates (seconds).
 constexpr unsigned kClockLogEvery = 10;
@@ -197,7 +200,9 @@ private:
             dump_warned_ = true;
             logWarn("dal: audio: writing the dump failed; the dump stops here");
         }
-        output_->submit(block);
+        // Read per block so a speed change takes effect within one period.
+        const bool muted = guestSpeed() > 1 && !g_fast_forward_sound.load(std::memory_order_relaxed);
+        output_->submit(muted ? std::span<const float>(kSilentBlock) : block);
     }
 
     void run() {
@@ -311,6 +316,10 @@ AudioEngineStats audioEngineStats() {
     const auto engine = currentEngine();
     return engine ? engine->stats() : AudioEngineStats{};
 }
+
+void setFastForwardSound(bool on) { g_fast_forward_sound.store(on, std::memory_order_relaxed); }
+
+bool fastForwardSound() { return g_fast_forward_sound.load(std::memory_order_relaxed); }
 
 void finishAudioDump() {
     if (const auto engine = currentEngine()) engine->finishDump();

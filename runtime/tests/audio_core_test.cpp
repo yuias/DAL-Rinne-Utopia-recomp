@@ -34,6 +34,7 @@
 #include "audio/audio_engine.h"
 #include "audio/audio_output.h"
 #include "audio/wav_file.h"
+#include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/log.h"
 #include "core/threads.h"
@@ -1162,6 +1163,56 @@ void testEngineResumesAfterStop() {
         CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
         const auto wav = dal::readWav(dump_path);
         CHECK(wav.has_value() && wav->samples == samples);
+    }
+}
+
+// While the guest runs faster than real time the output is muted unless the sound is enabled; the
+// dump and the non-silent count always see the mixed blocks.
+void testEngineMutesWhileFastForwarding() {
+    CHECK(!dal::fastForwardSound());
+    struct Case {
+        bool fast_forward;
+        bool sound;
+        bool output_muted;
+    };
+    // off; on and muted; on with sound; off with the sound switch left on
+    for (const Case& c :
+         {Case{false, false, false}, Case{true, false, true}, Case{true, true, false}, Case{false, true, false}}) {
+        const fs::path dump_path = g_dir / "engine_ff.wav";
+        const auto recording = std::make_shared<Recording>();
+        const auto state = std::make_shared<ProducerState>();
+        dal::setFastForwardToggled(c.fast_forward);
+        dal::setFastForwardSound(c.sound);
+        CHECK(dal::fastForwardSound() == c.sound);
+        dal::configureAudioEngine(engineConfig(recording, true, dump_path));
+        dal::startAudioEngine(makeProducer(state));
+        CHECK(waitFor([&] { return state->calls.load() >= 10; }));
+        dal::AudioEngineStats stats;
+        CHECK(dal::stopAudioEngineForTest(&stats));
+        dal::setFastForwardToggled(false);
+        dal::setFastForwardSound(false);
+
+        const std::vector<float> samples = recording->take();
+        const RecordedBlocks recorded = analyse(samples);
+        const std::uint64_t calls = state->calls.load();
+        CHECK(recorded.total == stats.blocks + stats.skipped_blocks);
+        CHECK(stats.non_silent_blocks == calls);
+        if (c.output_muted) {
+            CHECK(recorded.silent == recorded.total);
+            CHECK(std::all_of(samples.begin(), samples.end(), [](float s) { return s == 0.0f; }));
+        } else {
+            CHECK(recorded.tags.size() == calls);
+            CHECK(recorded.ramps_intact);
+        }
+
+        // The dump holds the mixed blocks in every case.
+        const auto wav = dal::readWav(dump_path);
+        CHECK(wav.has_value());
+        if (wav) {
+            const RecordedBlocks dumped = analyse(wav->samples);
+            CHECK(dumped.tags.size() == calls);
+            CHECK(dumped.ramps_intact);
+        }
     }
 }
 
@@ -2772,6 +2823,7 @@ int main(int argc, char** argv) {
     testEngineOutputOpenFails();
     testEngineFinishDumpDuringOpen();
     testEngineResumesAfterStop();
+    testEngineMutesWhileFastForwarding();
     testEngineFollowsReportedFill();
     testCellAudioStateErrors();
     testCellAudioPortOpenAndConfig();
