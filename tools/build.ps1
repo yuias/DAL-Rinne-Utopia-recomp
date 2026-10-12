@@ -8,6 +8,8 @@ param(
     [string]$EbootElf,
     [string]$GeneratedDir,
     [string]$GameDir,
+    [string]$EbootBin,
+    [string]$Rpcs3CryptoDir,
     [string]$LlvmBin = $env:DAL_LLVM_BIN
 )
 
@@ -46,6 +48,17 @@ if ($GameDir) {
     $GameDir = [System.IO.Path]::GetFullPath($GameDir, $PWD.ProviderPath)
 }
 
+# These must exist; the paths are fixed here because Resolve-Path would otherwise run after Push-Location.
+if ($EbootElf) {
+    $EbootElf = (Resolve-Path -LiteralPath $EbootElf).ProviderPath
+}
+if ($EbootBin) {
+    $EbootBin = (Resolve-Path -LiteralPath $EbootBin).ProviderPath
+}
+if ($Rpcs3CryptoDir) {
+    $Rpcs3CryptoDir = (Resolve-Path -LiteralPath $Rpcs3CryptoDir).ProviderPath
+}
+
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
     if ($Clean) {
@@ -55,13 +68,19 @@ try {
 
     $configureArgs = @('--preset', $Preset)
     if ($EbootElf) {
-        $configureArgs += "-DDAL_EBOOT_ELF=$((Resolve-Path -LiteralPath $EbootElf).Path)"
+        $configureArgs += "-DDAL_EBOOT_ELF=$EbootElf"
     }
     if ($GeneratedDir) {
         $configureArgs += "-DDAL_PPU_GENERATED_DIR=$GeneratedDir"
     }
     if ($GameDir) {
         $configureArgs += "-DDAL_GAME_DIR=$GameDir"
+    }
+    if ($EbootBin) {
+        $configureArgs += "-DDAL_EBOOT_BIN=$EbootBin"
+    }
+    if ($Rpcs3CryptoDir) {
+        $configureArgs += "-DDAL_RPCS3_CRYPTO_DIR=$Rpcs3CryptoDir"
     }
     & cmake @configureArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -79,7 +98,11 @@ try {
     if ($GameDir -and (Test-Path -LiteralPath (Join-Path $binDir 'dal_game.exe'))) {
         $writeArgs = @{ BinDir = $binDir; GameDir = $GameDir }
         if ($EbootElf) {
-            $writeArgs['EbootElf'] = (Resolve-Path -LiteralPath $EbootElf).Path
+            $writeArgs['EbootElf'] = $EbootElf
+        }
+        elseif ($EbootBin) {
+            # Where the build has just decrypted EBOOT.BIN to (cmake/Decrypt.cmake).
+            $writeArgs['EbootElf'] = Join-Path (Get-Location) 'generated/inputs/EBOOT.elf'
         }
         & (Join-Path $PSScriptRoot 'write-game-config.ps1') @writeArgs
     }

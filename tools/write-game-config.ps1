@@ -41,6 +41,10 @@ if (Test-Path -LiteralPath $configPath) {
         (ConvertTo-ComparablePath $existingGameDir) -ne (ConvertTo-ComparablePath $GameDir)) {
         "config.json left unchanged: game_dir in $configPath differs from $GameDir"
     }
+    elseif ($EbootElf -and -not ($existing['elf'] -is [string])) {
+        # Without elf, dal_game looks for EBOOT.elf in the game directory, not where the build put it.
+        "config.json left unchanged: $configPath has no elf; add `"elf`": $($EbootElf | ConvertTo-Json)"
+    }
     return
 }
 
