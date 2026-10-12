@@ -12,8 +12,9 @@ drawn; with `--render vulkan` the same thread also feeds a renderer (see [Render
   synchronization methods: semaphores and labels, reports and timestamps, `ref`, the flip
   command and the user command. It then publishes `get`. Method semantics follow RPCS3's
   `Emu/RSX/NV47/HW` sources. Every register write is counted for the census, and the thread
-  raises one vertical-blank event every 1/60 s. A flip from the command buffer completes where
-  the command executes, as in RPCS3, and does not wait for a vertical blank. Where the game's
+  raises one vertical-blank event every 1/60 s, also while it works through a long stretch of
+  commands. A flip from the command buffer completes where the command executes, as in RPCS3,
+  and does not wait for a vertical blank. Where the game's
   frame rate comes from is described under [Rendering](#rendering).
 - `_gcm_intr_thread` is a guest service thread, created as in RPCS3. The RSX thread queues the
   interrupts and this thread runs the handlers the game registered with
