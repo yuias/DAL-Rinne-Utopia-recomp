@@ -464,7 +464,7 @@ bool Presenter::createSwapchain(const VkSurfaceCapabilitiesKHR& caps, VkExtent2D
     return true;
 }
 
-bool Presenter::acquire(std::size_t frame_slot, Target& target) {
+bool Presenter::acquire(std::size_t frame_slot, Target& target, bool wait) {
     if (frame_slot >= acquire_semaphores_.size()) {
         logOnce(LogLevel::Warn, "window-frame-slot",
                 "dal: render: window: frame slot {} but the presenter has {} acquire semaphores", frame_slot,
@@ -481,14 +481,15 @@ bool Presenter::acquire(std::size_t frame_slot, Target& target) {
         const auto start = std::chrono::steady_clock::now();
         // After a timeout the presentation engine is stalled (locked session, occluded window): poll without
         // waiting until an image comes back, so a stall does not cost a full timeout per flip.
-        const VkResult result =
-                vkAcquireNextImageKHR(context_.device(), swapchain_, acquire_stalled_ ? 0 : kAcquireTimeoutNs,
-                                      acquire_semaphores_[frame_slot], VK_NULL_HANDLE, &index);
+        const std::uint64_t timeout = wait && !acquire_stalled_ ? kAcquireTimeoutNs : 0;
+        const VkResult result = vkAcquireNextImageKHR(context_.device(), swapchain_, timeout,
+                                                      acquire_semaphores_[frame_slot], VK_NULL_HANDLE, &index);
         const auto waited = std::chrono::steady_clock::now() - start;
         stats_.acquires++;
         stats_.acquire_total += waited;
         stats_.acquire_max = std::max<std::chrono::nanoseconds>(stats_.acquire_max, waited);
-        if (result == VK_TIMEOUT) acquire_stalled_ = true;
+        // A poll that finds no free image is the expected case when not waiting, not a stall.
+        if (result == VK_TIMEOUT && wait) acquire_stalled_ = true;
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             acquire_stalled_ = false;
             if (result == VK_SUBOPTIMAL_KHR) needs_recreate_ = true;  // the image is still usable this time

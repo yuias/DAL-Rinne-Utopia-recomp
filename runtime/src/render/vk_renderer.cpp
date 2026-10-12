@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/guest_clock.h"
 #include "core/log.h"
 #include "render/fp_translator.h"
 #include "render/frame_dump.h"
@@ -1380,7 +1381,10 @@ void RsxRenderer::recordFlip(const RsxFlip& flip) {
 // `source` is null). Without an image (minimised window, timeout) nothing is recorded and the frame is
 // submitted as usual. FIFO presentation can make the acquire block; the presenter measures it.
 void RsxRenderer::recordPresentBlit(FrameSlot& slot, RenderTarget* source) {
-    if (!presenter_->acquire(current_slot_, present_target_)) return;
+    // While fast-forwarding the guest outruns the display. Waiting for a swapchain image here would hold
+    // the RSX thread, and with it the vblanks, at the display rate, so a flip with no free image is
+    // submitted without a present and the surplus flips are not shown.
+    if (!presenter_->acquire(current_slot_, present_target_, guestSpeed() == 1)) return;
     present_pending_ = true;
     const Presenter::Target& dst = present_target_;
     const VkCommandBuffer cmd = slot.cmd;

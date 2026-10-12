@@ -99,8 +99,9 @@ public:
     // Acquires the next swapchain image, recreating the swapchain after a resize. False when there is
     // nothing to present to this time (minimised window, no image within the timeout, a failure): the
     // frame is then submitted without a swapchain image. The image is in an undefined layout; the caller
-    // leaves it in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
-    bool acquire(std::size_t frame_slot, Target& target);
+    // leaves it in VK_IMAGE_LAYOUT_PRESENT_SRC_KHR. With `wait` false no image being free right now is
+    // counted as skipped and returns false at once, without marking the presenter as stalled.
+    bool acquire(std::size_t frame_slot, Target& target, bool wait = true);
 
     // Number of frame slots acquire accepts (one acquire semaphore each).
     std::size_t frameSlots() const { return acquire_semaphores_.size(); }
