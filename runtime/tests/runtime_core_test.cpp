@@ -7282,7 +7282,8 @@ void testRsxConsumer() {
     const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
     const std::uint32_t area = p.user1m.allocate(0x400000, 0x100000);
     CHECK(scratch != 0 && area != 0);
-    CHECK(dal::gcmInitBody(base, scratch, 0x10000, 0x100000, area, 0x200000) == 0);
+    // Local memory is big enough for a 1280x720 surface and a copy of it further up.
+    CHECK(dal::gcmInitBody(base, scratch, 0x10000, 0x100000, area, 0x900000) == 0);
 
     constexpr std::uint32_t kControl = 0x10100040, kLabels = 0x10300000, kDevice = 0x10000000;
     constexpr std::uint32_t kStart = 0x1000;
@@ -7550,6 +7551,95 @@ void testRsxConsumer() {
         CHECK(replayed.size() == 3 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]) &&
               sameCommand(live[4], replayed[2]));
         CHECK(capturing.takeCaptures().empty());
+    }
+
+    // A guest copy queued under the guest lock is applied by the next pump before it parses, so it lands
+    // between the commands consumed so far and the ones put afterwards.
+    {
+        constexpr std::uint32_t kSource = 0x100000, kDest = 0x500000, kBytes = 0x1400 * 720;
+        constexpr std::uint32_t kQueueLimit = 64;
+        const dal::RsxGuestCopy request{0, kSource, 0, kDest, kBytes};
+        dal::rsxUnimplementedReset();
+        lines.clear();
+        dalWrite32(base, kControl + 4, at);
+        dal::RsxConsumer copying(base);
+        copying.enableFrameBuilder();
+        emit(0x0200, {1280u << 16});
+        emit(0x0204, {720u << 16});
+        emit(0x0208, {8u | (2u << 5) | (1u << 8)});
+        emit(0x020C, {0x1400});
+        emit(0x0210, {kSource});
+        emit(0x0220, {1});
+        emit(0x08C0, {1280u << 16});
+        emit(0x08C4, {720u << 16});
+        emit(0x1D90, {0xFF102030});
+        emit(0x1D94, {0xF0});
+        dalWrite32(base, kControl, at);
+        CHECK(copying.pump(200) == FifoStatus::Idle);
+
+        copying.queueGuestCopy(request);
+        emit(dal::kMethodGcmFlipCommand, {1});
+        dalWrite32(base, kControl, at);
+        CHECK(copying.pump(200) == FifoStatus::Idle);
+        std::vector<dal::RsxCommand> taken = copying.takeCommands();
+        CHECK(taken.size() == 3 && std::holds_alternative<dal::RsxClear>(taken[0]) &&
+              std::holds_alternative<dal::RsxCopy>(taken[1]) && std::holds_alternative<dal::RsxFlip>(taken[2]));
+        if (taken.size() == 3 && std::holds_alternative<dal::RsxCopy>(taken[1])) {
+            const dal::RsxCopy& copy = std::get<dal::RsxCopy>(taken[1]);
+            CHECK(copy.source.offset == kSource && copy.destination.offset == kDest && copy.source.width == 1280 &&
+                  copy.destination.pitch == 0x1400);
+        }
+        CHECK(countContaining(lines,
+                              "dal: rsx: render target copy in frame 1: local 0x100000 -> local 0x500000 "
+                              "(0x384000 bytes)") == 1);
+        copying.countCommands(taken);
+        CHECK(copying.commandCounts().copies == 1 && copying.commandCounts().flips == 1);
+
+        // Up to 64 copies wait; the 65th drops the oldest, which is the only one that would have made a command.
+        for (std::uint32_t i = 0; i < kQueueLimit; i++) {
+            copying.queueGuestCopy(i == 0 ? request : dal::RsxGuestCopy{0, 0x890000, 0, kDest, kBytes});
+        }
+        CHECK(unimplementedCount("state guest copy queue full") == 0);
+        copying.queueGuestCopy({0, 0x890000, 0, kDest, kBytes});
+        CHECK(unimplementedCount("state guest copy queue full") == 1);
+        CHECK(copying.pump(200) == FifoStatus::Idle && copying.takeCommands().empty());
+        // Drained: nothing is left for the next pump.
+        CHECK(copying.pump(200) == FifoStatus::Idle && copying.takeCommands().empty());
+
+        // A copy from memory that is not a known surface is an ordinary memcpy: no command.
+        copying.queueGuestCopy({0, 0x8A0000, 0, kDest, kBytes});
+        CHECK(copying.pump(200) == FifoStatus::Idle && copying.takeCommands().empty());
+
+        // Without a frame builder a copy is not queued, and one queued before the builder went away is dropped.
+        dal::RsxConsumer without(base);
+        without.queueGuestCopy(request);
+        CHECK(without.pump(200) == FifoStatus::Idle && without.takeCommands().empty());
+        dal::RsxConsumer dropped(base);
+        dropped.enableFrameBuilder();
+        dropped.queueGuestCopy(request);
+        dropped.disableFrameBuilder();
+        CHECK(!dropped.frameBuilderLive());
+        CHECK(dropped.pump(200) == FifoStatus::Idle && dropped.takeCommands().empty());
+        CHECK(copying.commandCounts().copies == 1);
+
+        // Effective addresses to RSX locations: local to local, local to IO-mapped main memory; a source outside
+        // local memory, an unmapped destination and a source that runs past local memory are refused.
+        dal::RsxGuestCopy found;
+        CHECK(dal::rsxGuestCopyFromEa(0xC0000000 + kDest, 0xC0000000 + kSource, kBytes, found));
+        CHECK(found.src_location == 0 && found.src_offset == kSource && found.dst_location == 0 &&
+              found.dst_offset == kDest && found.size == kBytes);
+        CHECK(dal::rsxGuestCopyFromEa(area + 0x1000, 0xC0000000 + kSource, 0x100, found));
+        CHECK(found.dst_location == 1 && found.dst_offset == 0x1000 && found.src_offset == kSource);
+        CHECK(!dal::rsxGuestCopyFromEa(0xC0000000 + kDest, area, 0x100, found));
+        CHECK(!dal::rsxGuestCopyFromEa(0xC0000000 + kDest, 0xBFFFFFF0, 0x100, found));
+        CHECK(!dal::rsxGuestCopyFromEa(scratch, 0xC0000000 + kSource, 0x100, found));
+        CHECK(!dal::rsxGuestCopyFromEa(0xC0000000 + kDest, 0xC0000000 + 0x900000 - 0x80, 0x100, found));
+        CHECK(!dal::rsxGuestCopyFromEa(0xC0000000 + kDest, 0xC0000000 + kSource, 0, found));
+
+        // No RSX thread runs in this test, so the handler's entry point has nothing to queue to.
+        dal::rsxNoteGuestCopy(0xC0000000 + kDest, 0xC0000000 + kSource, kBytes);
+        CHECK(copying.pump(200) == FifoStatus::Idle && copying.takeCommands().empty());
+        dal::rsxUnimplementedReset();
     }
 
     // A capture requested at run time records the first whole frame that starts after the request, with no

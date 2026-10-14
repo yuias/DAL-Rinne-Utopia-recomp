@@ -157,6 +157,29 @@ void RsxConsumer::finishPendingDraw() {
     if (capture_ != nullptr) capture_->onWrite(pending_end_.first, pending_end_.second);
 }
 
+void RsxConsumer::queueGuestCopy(const RsxGuestCopy& copy) {
+    // Not builder_: the RSX thread may reset it in disableFrameBuilder() without the guest lock.
+    if (!builder_live_.load(std::memory_order_acquire)) return;
+    constexpr std::size_t kMaxPendingCopies = 64;
+    if (guest_copies_.size() >= kMaxPendingCopies) {
+        guest_copies_.erase(guest_copies_.begin());
+        rsxNoteUnimplemented("state", "guest copy queue full");
+    }
+    guest_copies_.push_back(copy);
+}
+
+void RsxConsumer::drainGuestCopies() {
+    if (guest_copies_.empty()) return;
+    std::vector<RsxGuestCopy> copies = std::exchange(guest_copies_, {});
+    if (builder_ == nullptr || faulted_) return;
+    for (const RsxGuestCopy& copy : copies) {
+        if (!builder_->onGuestCopy(copy)) continue;
+        logInfo("dal: rsx: render target copy in frame {}: {} {:#x} -> {} {:#x} ({:#x} bytes)", flips_reached_ + 1,
+                copy.src_location == 0 ? "local" : "main", copy.src_offset, copy.dst_location == 0 ? "local" : "main",
+                copy.dst_offset, copy.size);
+    }
+}
+
 void RsxConsumer::enableFrameBuilder() {
     if (builder_ != nullptr) return;
     regs_ = std::make_unique<RsxRegisters>();
@@ -250,20 +273,22 @@ std::vector<RsxCommand> RsxConsumer::takeCommands() {
 }
 
 void RsxConsumer::countCommands(const std::vector<RsxCommand>& commands) {
-    std::uint64_t clears = 0, draws = 0, flips = 0;
+    std::uint64_t clears = 0, draws = 0, flips = 0, copies = 0;
     for (const RsxCommand& command : commands) {
         clears += std::holds_alternative<RsxClear>(command);
         draws += std::holds_alternative<RsxDraw>(command);
         flips += std::holds_alternative<RsxFlip>(command);
+        copies += std::holds_alternative<RsxCopy>(command);
     }
     clears_.fetch_add(clears, std::memory_order_relaxed);
     draws_.fetch_add(draws, std::memory_order_relaxed);
     built_flips_.fetch_add(flips, std::memory_order_relaxed);
+    copies_.fetch_add(copies, std::memory_order_relaxed);
 }
 
 RsxConsumer::CommandCounts RsxConsumer::commandCounts() const {
     return {clears_.load(std::memory_order_relaxed), draws_.load(std::memory_order_relaxed),
-            built_flips_.load(std::memory_order_relaxed)};
+            built_flips_.load(std::memory_order_relaxed), copies_.load(std::memory_order_relaxed)};
 }
 
 RsxConsumer::TextureCacheCounts RsxConsumer::textureCacheCounts() const {
@@ -515,6 +540,9 @@ FifoStatus RsxConsumer::pump(std::uint32_t max_words) {
     // report or flip, which the writes after the draw produce; so the draw is copied before any of them runs. Normally
     // takeCommands() already did this outside the lock.
     finishPendingDraw();
+    // Before parsing: the guest made these copies while the consumer stood at this position of the stream, so they
+    // land after every command consumed so far and before any put since.
+    drainGuestCopies();
     if (faulted_) return FifoStatus::Fault;
     if (!get_known_) {
         get_ = dalRead32(base_, kRsxControlAddr + kControlGet);
@@ -601,7 +629,8 @@ void onStop() {
     if (g_consumer == nullptr) return;
     if (g_consumer->frameBuilderEnabled()) {
         const RsxConsumer::CommandCounts counts = g_consumer->commandCounts();
-        logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips", counts.clears, counts.draws, counts.flips);
+        logInfo("dal: rsx: frame builder: {} clears, {} draws, {} flips, {} copies", counts.clears, counts.draws,
+                counts.flips, counts.copies);
         const RsxConsumer::TextureCacheCounts tex = g_consumer->textureCacheCounts();
         constexpr double kMiB = 1024.0 * 1024.0;
         logInfo("dal: rsx: texture cache: {} epochs, {} hits, {} checks ({:.1f} MiB), {} new blobs ({:.1f} MiB), "
@@ -777,6 +806,29 @@ RsxCaptureStatus rsxCaptureStatus() {
     status.last_path = g_capture_last.last_path;
     status.last_error = g_capture_last.last_error;
     return status;
+}
+
+bool rsxGuestCopyFromEa(std::uint32_t dst_ea, std::uint32_t src_ea, std::uint32_t size, RsxGuestCopy& out) {
+    const std::uint32_t local_size = rsxState().local_size;
+    const std::uint32_t src_offset = src_ea - kRsxLocalBase;
+    if (size == 0 || src_offset >= local_size || size > local_size - src_offset) return false;
+    std::uint32_t dst_offset = 0;
+    if (!rsxEaToOffset(dst_ea, dst_offset)) return false;
+    out.src_location = 0;
+    out.src_offset = src_offset;
+    out.dst_location = dst_ea - kRsxLocalBase < local_size ? 0 : 1;
+    out.dst_offset = dst_offset;
+    out.size = size;
+    return true;
+}
+
+void rsxNoteGuestCopy(std::uint32_t dst_ea, std::uint32_t src_ea, std::uint32_t size) {
+    // Local memory is rarely read by the PPU, so a generic copy routine mostly leaves here, before any atomic load.
+    if (src_ea - kRsxLocalBase >= rsxState().local_size) return;
+    RsxConsumer* consumer = g_live_consumer.load();
+    if (consumer == nullptr || !consumer->frameBuilderLive()) return;
+    RsxGuestCopy copy;
+    if (rsxGuestCopyFromEa(dst_ea, src_ea, size, copy)) consumer->queueGuestCopy(copy);
 }
 
 void setRsxExecutorFactory(RsxExecutorFactory factory) {

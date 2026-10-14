@@ -81,13 +81,17 @@ public:
     bool frameBuilderLive() const { return builder_live_.load(std::memory_order_acquire); }
     // Drops the frame builder again. Only while nothing was written yet and no capture is enabled.
     void disableFrameBuilder();
+    // Guest lock held: queues a copy the guest CPU made, to be applied at the next pump() (see
+    // RsxFrameBuilder::onGuestCopy). Ignored without a frame builder. At most 64 are pending; beyond that the
+    // oldest is dropped and counted as `state guest copy queue full`.
+    void queueGuestCopy(const RsxGuestCopy& copy);
     // Commands built since the last call, after building a pending draw. Needs no guest lock (only the
     // pump's thread may call it); the draw's copies then run without it.
     std::vector<RsxCommand> takeCommands();
     // Counts the commands by kind for the stop line; any thread.
     void countCommands(const std::vector<RsxCommand>& commands);
     struct CommandCounts {
-        std::uint64_t clears = 0, draws = 0, flips = 0;
+        std::uint64_t clears = 0, draws = 0, flips = 0, copies = 0;
     };
     CommandCounts commandCounts() const;
     // Texture cache counters as of the last takeCommands(); any thread.
@@ -140,6 +144,8 @@ private:
     void publishGet(std::uint32_t get);
     // Builds the draw the last SET_BEGIN_END(0) left pending and records that write in the capture.
     void finishPendingDraw();
+    // Hands the queued guest copies to the frame builder in order, or drops them without one.
+    void drainGuestCopies();
     // Effective address of `offset` in the context DMA `location`; false when out of range or not
     // one of the areas the consumer serves.
     bool resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size, std::uint32_t& ea) const;
@@ -175,7 +181,9 @@ private:
     std::unique_ptr<RsxRegisters> regs_;
     std::unique_ptr<GuestRsxMemoryView> memory_view_;
     std::unique_ptr<RsxFrameBuilder> builder_;
-    std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0};
+    std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0}, copies_{0};
+    // Touched only under the guest lock: the handler pushes, pump() drains.
+    std::vector<RsxGuestCopy> guest_copies_;
     // Copy of the builder's texture cache counters, published by takeCommands() for the stop path.
     std::atomic<std::uint64_t> tex_epochs_{0}, tex_hits_{0}, tex_checks_{0}, tex_checked_bytes_{0}, tex_stores_{0},
             tex_stored_bytes_{0}, tex_entries_{0}, tex_bytes_{0};
@@ -269,6 +277,16 @@ RsxCaptureStatus rsxCaptureStatus();  // any thread
 // Turns the argument census on for the consumer startRsxThread creates; written to `json_path` (the
 // program dumps go to generated/rsx) when the process stops. Call before startRsxThread.
 void setRsxArgCensusFile(std::string json_path);
+
+// Fills `out` for a guest copy between effective addresses; false when the source is not in RSX local
+// memory or the destination is neither local nor IO-mapped main memory (rsxEaToOffset). Pure, for tests.
+bool rsxGuestCopyFromEa(std::uint32_t dst_ea, std::uint32_t src_ea, std::uint32_t size, RsxGuestCopy& out);
+
+// Called by a guest thread holding the guest lock, after it copied `size` bytes from `src_ea` to `dst_ea`.
+// When a frame builder runs and rsxGuestCopyFromEa accepts the copy, queues it for the RSX thread, which
+// turns it into a render target copy if the source is a known color surface (RsxFrameBuilder::onGuestCopy).
+// Otherwise does nothing. Cheap for copies that do not read local memory, so a generic memcpy may call it.
+void rsxNoteGuestCopy(std::uint32_t dst_ea, std::uint32_t src_ea, std::uint32_t size);
 
 // Starts the consumer thread over the guest memory at `base` and registers its census section.
 // Call once after the RSX state is initialised; later calls do nothing.
