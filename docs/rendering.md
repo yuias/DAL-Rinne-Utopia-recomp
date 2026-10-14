@@ -178,8 +178,8 @@ is made on the GPU instead.
   stop position (`kFifoNoStop` for none) and ends the run, at a command boundary, when `get` equals it.
   So the copy lands after every command the guest had submitted by then and before everything it submits
   later, which is what the guest's bytes reflect on hardware once the RSX has executed the submitted work.
-  The game makes the copy in its update phase after presenting the previous frame, so that `put` lies past
-  the previous frame's whole redraw of the layer. The consumer's current position is not used: the RSX
+  In this game `put` at the call lies past the frame's whole redraw of the layer and its composite passes,
+  just before the frame's last display draw and flip. The consumer's current position is not used: the RSX
   thread leaves the guest lock after every draw end and every hold budget, so at the call it can stand
   inside a layer's redraw (after the layer's clear, before most of its draws), and a copy applied there
   copied a half-drawn layer. A copy tagged behind a pending draw waits for that draw to be built first.
@@ -229,10 +229,10 @@ Guest copies of render targets (see above) are part of the stream. The capture f
 reader still accepts versions 1 and 2). A `COPY` chunk holds each copy request the consumer applied, in
 stream order with the register writes and the guest bytes (the builder reads the destination bytes before
 the chunk), and replay hands it to the builder at the same point, which decides again from the recorded
-bytes. The chunk is recorded where the copy is applied, not where the game made it, so it can fall in the
-capture of the frame after the one in which the game drew the source. A replay of that capture has no
-render target for the source and leaves the destination transparent black (counted as `state render
-target copy from an unknown target`). The surface records of the start state carry the copy fields of
+bytes. The chunk is recorded where the copy is applied, not where the game made it; in this game that is
+in the capture of the frame that drew the source. A copy applied in a later frame's capture would find no
+render target for the source in a replay, which leaves the destination transparent black (counted as
+`state render target copy from an unknown target`). The surface records of the start state carry the copy fields of
 the known surfaces (`copied`, `copy_stale` and the hash); version 1 and 2 files have none. A replay has no
 GPU contents from before the captured frame: in a frame after the copy, the texture is still an alias of
 the copied surface, but that surface shows transparent black (counted as `texture alias of unknown render
