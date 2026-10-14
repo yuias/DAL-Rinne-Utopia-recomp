@@ -1,6 +1,13 @@
 {
   "schema": 1,
   "executable_sha256": "8b4362daac30cad2e597fdd30e6540a3226da88760dbded4b7c14890f8a88348",
-  "comment": "Functions replaced or hooked by native handlers at emit time. Empty by default.",
-  "entries": []
+  "comment": "Functions replaced or hooked by native handlers at emit time. The memmove is overridden so that a guest copy of a render target's bytes also copies the image on the GPU.",
+  "entries": [
+    {
+      "address": "0x000c006c",
+      "kind": "override",
+      "handler": "renderTargetCopy",
+      "label": "memmove"
+    }
+  ]
 }

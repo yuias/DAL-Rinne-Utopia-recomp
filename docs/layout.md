@@ -42,9 +42,9 @@
 | `tools/tests/` | Unit tests |
 | `tools/tests/ppu_semantics/` | Semantics harness cases and the C generator; see [Semantics harness](emitter.md#semantics-harness) |
 | `runtime/include/dal/` | Contract header and inline helpers for generated code, and `ppu_override.h`, the override and hook handler interface |
-| `runtime/src/game/overrides/` | Game-specific override and hook handlers (`*.cpp`, compiled into `dal_game`); the directory is absent until a game needs one; see [Function overrides and hooks](overrides.md#game-handlers) |
+| `runtime/src/game/overrides/` | Game-specific override and hook handlers (`*.cpp`, compiled into `dal_game`); see [Function overrides and hooks](overrides.md#game-handlers) |
 | `config/target.json` | Pinned size and hashes of the target executable (`EBOOT.BIN` and `EBOOT.elf`) |
-| `config/overrides.json` | Guest functions replaced or hooked by native handlers at emit time (no entries by default); see [Function overrides and hooks](overrides.md#configuration-file) |
+| `config/overrides.json` | Guest functions replaced or hooked by native handlers at emit time (the game's `memmove`); see [Function overrides and hooks](overrides.md#configuration-file) |
 | `config/vfs.example.json` | Example VFS configuration for `dal_game --vfs-config`, placeholder paths only; see [VFS configuration file](virtual-file-system.md#vfs-configuration-file) |
 | `config/dal_game.example.json` | Example `config.json` for `dal_game`, placeholder paths only; see [Configuration file](runtime-options.md#configuration-file) |
 | `config/nids.json`, `config/lv2_syscalls.json` | FNID and lv2 syscall name tables generated from RPCS3 sources |

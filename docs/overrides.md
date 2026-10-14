@@ -23,8 +23,8 @@ run-time switch in `dal_game`.
 
 ## Configuration file
 
-`config/overrides.json` is tracked and ships with no entries. Another file can be chosen with
-`emit --overrides PATH`.
+`config/overrides.json` is tracked and names this game's handlers (see [Game handlers](#game-handlers)).
+Another file can be chosen with `emit --overrides PATH`.
 
 ```json
 {
@@ -271,6 +271,14 @@ and name it in the file:
 ```
 
 Then run `emit` and build.
+
+This game's handler is `renderTargetCopy` (`runtime/src/game/overrides/render_target_copy.cpp`), an
+override on the game's statically linked `memmove`, labelled `memmove` in `config/overrides.json`. It
+reads destination, source and byte count from r3..r5, runs the original, and then calls
+`rsxNoteGuestCopy`. The renderer keeps render targets on the GPU only, so a guest copy of a render
+target's bytes would read stale memory; `rsxNoteGuestCopy` lets the RSX thread copy the image instead
+(see [Rendering](rendering.md)). Calls that do not read RSX local memory return
+from it at once.
 
 ### Missing handlers
 

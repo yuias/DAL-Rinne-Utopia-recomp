@@ -274,11 +274,18 @@ class LoadOverridesTest(unittest.TestCase):
     def test_default_path_is_config_overrides_json(self):
         self.assertEqual(DEFAULT_OVERRIDES, REPO_ROOT / "config" / "overrides.json")
 
-    def test_committed_file_has_no_entries_and_the_pinned_sha(self):
+    def test_committed_file_has_the_pinned_sha_and_defined_handlers(self):
         config = load_overrides(DEFAULT_OVERRIDES, required=True)
         functions = json.loads((REPO_ROOT / "config" / "functions.json").read_text("utf-8"))
-        self.assertEqual(config.entries, ())
         self.assertEqual(config.sha256, functions["input"]["executable_sha256"])
+        generic = {"dalHookNop", "dalHookLogCall", "dalOverrideReturn0", "dalOverrideOriginal"}
+        sources = "\n".join(
+            path.read_text("utf-8")
+            for path in (REPO_ROOT / "runtime" / "src" / "game" / "overrides").glob("*.cpp"))
+        for item in config.entries:
+            if item.handler not in generic:
+                self.assertIn("DAL_OVERRIDE_HANDLER(%s)" % item.handler, sources,
+                              "no definition of handler %s" % item.handler)
 
 
 class CheckOverridesTest(unittest.TestCase):
