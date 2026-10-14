@@ -36,7 +36,8 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
 
 - **Frame builder** (`rsx_frame_builder.cpp`). It keeps a host copy of the RSX register file and the
   vertex program and constant stores (`rsx_registers.cpp`), applies every completed register write
-  to it, and turns the stream into three kinds of plain commands: clear, draw and flip. The state
+  to it, and turns the stream into four kinds of plain commands: clear, draw, flip and copy (a render
+  target copied into another one, see [Guest copies of render targets](#guest-copies-of-render-targets)). The state
   decoders (`rsx_decode.cpp`) read surface, blend, depth, texture, vertex and program state from
   the register file. Each command carries every guest byte it needs (vertex and index data,
   texture texels, shader ucode), so the renderer never touches guest memory. The texture bytes come
@@ -124,6 +125,8 @@ and the renderer uploaded them once. With the cache it runs at 30 and 60, like t
   4 destination bytes, which the RSX thread writes into guest memory, so only a texture the word overlaps is
   read again. Such an entry is read and hashed again at its next use. The renderer keeps surface contents on
   the GPU and never writes them back, so the guest bytes are normally unchanged and the hash keeps the blob.
+  A guest copy of a surface's bytes reads those stale bytes too; see
+  [Guest copies of render targets](#guest-copies-of-render-targets).
   Depth and stencil writes are not tracked: the builder keeps no depth surface and guest memory under
   one never changes. More than 64 distinct written ranges in one epoch start a new epoch.
 - *Bounds.* Blobs are kept up to 256 MiB; past that the least recently used entries go. Every 32 flips,
@@ -152,6 +155,57 @@ texture, with the bytes it stored. The last figures are the entries and bytes st
 check per sampled texture per flip is expected; a check per draw means texture memory overlaps a render
 target that every draw writes.
 
+### Guest copies of render targets
+
+The renderer keeps render target pixels on the GPU only, so the guest bytes of a surface are stale. That
+matters when the game copies them with the CPU and then draws the copy as a texture: during dialogue it
+snapshots the character layer into a new buffer before each expression crossfade and draws that buffer as
+the fading-out old expression. Read from guest memory, the buffer held whatever was there before (title
+screen art), and that flashed over the scene. Writing the pixels back to guest memory is not done; the copy
+is made on the GPU instead.
+
+- *The override.* The game's statically linked `memmove` is overridden by the `renderTargetCopy` handler
+  (see [Overrides](overrides.md#game-handlers)). It reads destination, source and byte count, runs the
+  original copy so guest memory stays exactly as it was, and then calls `rsxNoteGuestCopy`. That function
+  returns at once unless the source lies in RSX local memory, so the roughly 5.95 million calls of a 200 s
+  run cost almost nothing; for the others it checks that the destination is local or IO-mapped main memory
+  and queues the request (`RsxConsumer::queueGuestCopy`, at most 64 pending, past that the oldest is dropped
+  and counted as `state guest copy queue full`). The handler notes the copy after the original because
+  the original may give up the guest lock (at loop back edges); noted earlier, the RSX thread could hash a
+  half-copied destination.
+- *Position in the stream.* `RsxConsumer::pump()` hands the queued copies to the frame builder before it
+  parses new commands, under the guest lock. The guest holds the same lock when it queues, and the consumer
+  parses only under it, so the copy lands after every command consumed before the call and before every
+  command put after it. A copy waits for the next `pump()`, at the latest the next vertical blank. Without a
+  frame builder the queue is discarded. The guest does not wait for the RSX to finish drawing before the
+  copy, so if the consumer has not pumped the previous frame's draws yet, the GPU copy takes the layer one
+  frame earlier; for this crossfade that is the same old expression.
+- *The command.* `RsxFrameBuilder::onGuestCopy` accepts a copy only when the source is the first byte of a
+  known color surface and the copy covers the surface (`pitch * (height - 1) + width * 4` bytes); the
+  destination gets the source's size, pitch and format A8R8G8B8. It then emits `RsxCopy`, and the renderer
+  copies the source render target's image into a render target at the destination with `vkCmdCopyImage` over
+  the common extent (`RendererStats::target_copies`). A source the renderer does not know yet leaves the
+  destination cleared to transparent black and is counted as `state render target copy from an unknown
+  target`. When a copy is made, the consumer logs
+  `dal: rsx: render target copy in frame N: local 0x... -> local 0x... (0x... bytes)`, and the stop line
+  `dal: rsx: frame builder: N clears, N draws, N flips, N copies` counts them.
+- *The alias.* The destination is registered as a known surface marked `copied`, so a later texture at its
+  address is sampled from the copied render target (render target aliasing) instead of the guest bytes. The
+  alias holds only while the guest bytes under the destination hash to the value taken right after the copy
+  (`copy_hash`). They are read and hashed again at the first use in each epoch (see
+  [Texture cache](#texture-cache-of-the-frame-builder)); a different hash marks the surface `copy_stale` and
+  the texture is read from guest memory again, as the game has reused the buffer. A new copy to the same
+  address replaces the entry in place and revives it. A draw or clear that writes the surface makes it an
+  ordinary render target (`copied` is cleared), because the RSX now owns its contents. The game makes a new
+  destination per use, so when the 64-entry table of known surfaces is full a new destination reuses the slot
+  of a stale copied surface, else of the one copied longest ago; surfaces the RSX drew are never evicted.
+- *Not handled.* Copies that are not a whole surface from its first byte (sub-rectangles, row-by-row copies,
+  other pitches or formats, sources in main memory) are not turned into commands; one that touches the bytes
+  of a known surface without covering it is counted as `state guest copy of part of a render target`, and a
+  copy onto the surface itself as `state guest copy onto its own render target`. Any other CPU read of a
+  render target still sees the stale bytes. An inline blit into a copy destination is seen only at the next
+  epoch, as for any texture.
+
 ### Capture and replay
 
 `--rsx-capture N[,M...]` records the RSX inputs of the given frames: the numbers are 1-based flip
@@ -163,6 +217,16 @@ its first use in an epoch, and the flip that begins a captured frame starts an e
 each texture at its first use in the frame and the replay, which starts with an empty cache, makes the same
 read. It needs no renderer and no window. Captures are derived from the game, so they are git-ignored with the rest of
 `generated/`.
+
+Guest copies of render targets (see above) are part of the stream. The capture file is version 3 (the
+reader still accepts versions 1 and 2). A `COPY` chunk holds each copy request the consumer drained, in
+stream order with the register writes and the guest bytes (the builder reads the destination bytes before
+the chunk), and replay hands it to the builder at the same point, which decides again from the recorded
+bytes. The surface records of the start state carry the copy fields of the known surfaces (`copied`,
+`copy_stale` and the hash); version 1 and 2 files have none. A replay has no GPU contents from before the
+captured frame: in a frame after the copy, the texture is still an alias of the copied surface, but that
+surface shows transparent black (counted as `texture alias of unknown render target`). A copy whose source was drawn earlier in the captured frame is made for
+real.
 
 `dal_rsxreplay` replays a capture through the frame builder and the renderer without the game:
 
@@ -183,7 +247,8 @@ dal_rsxreplay CAPTURE [--out DIR] [--compare PNG [--max-diff N] [--max-mean X] [
 | `--shader-cache DIR` | SPIR-V cache directory. Without it nothing is cached. |
 
 The thresholds are optional and unchecked unless given, and they need `--compare`. The tool prints
-the commands the frame builder produced (`clear`, `draw`, `flip`), then a summary line
+the commands the frame builder produced (`clear`, `draw`, `flip`, and `copy 1280x720@0x3420000 -> @0x9020300`
+for a render target copy: source width, height and offset, then the destination offset), then a summary line
 `replay: N commands, N draws, N skipped` (with the diff figures when comparing), the
 `rsx unimplemented` section (`census: rsx unimplemented 0 kinds` when it is empty), the path of
 the PNG, and `validation: active|inactive|disabled, N errors`. The exit code is 1 when a

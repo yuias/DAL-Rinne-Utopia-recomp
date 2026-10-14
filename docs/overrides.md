@@ -277,8 +277,8 @@ override on the game's statically linked `memmove`, labelled `memmove` in `confi
 reads destination, source and byte count from r3..r5, runs the original, and then calls
 `rsxNoteGuestCopy`. The renderer keeps render targets on the GPU only, so a guest copy of a render
 target's bytes would read stale memory; `rsxNoteGuestCopy` lets the RSX thread copy the image instead
-(see [Rendering](rendering.md)). Calls that do not read RSX local memory return
-from it at once.
+(see [Guest copies of render targets](rendering.md#guest-copies-of-render-targets)). Calls that do not
+read RSX local memory return from it at once.
 
 ### Missing handlers
 
