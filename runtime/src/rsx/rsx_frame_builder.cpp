@@ -86,6 +86,17 @@ void clipAxis(std::uint32_t parent, std::uint32_t& pos, std::uint32_t& length) {
     }
 }
 
+// Bytes a linear copy of the surface covers: all rows, the last one without its padding.
+std::uint64_t surfaceCopyBytes(const RsxSurface& surface) {
+    return static_cast<std::uint64_t>(surface.pitch) * (surface.height - 1) +
+           static_cast<std::uint64_t>(surface.width) * 4;
+}
+
+// The bytes a surface's pitch and height make it own; the range an RSX write to it invalidates textures in.
+std::uint64_t surfaceExtentEnd(const RsxSurface& surface) {
+    return static_cast<std::uint64_t>(surface.offset) + static_cast<std::uint64_t>(surface.pitch) * surface.height;
+}
+
 }  // namespace
 
 bool GuestRsxMemoryView::read(std::uint32_t location, std::uint32_t offset, std::span<std::uint8_t> out) {
@@ -233,11 +244,127 @@ std::int32_t RsxFrameBuilder::noteSurface(const RsxSurface& surface) {
         return index;
     }
     if (known_surfaces_.size() >= kRsxMaxKnownSurfaces) {
-        noteState("too many render targets");
-        return -1;
+        // The game makes a new copy destination per use, so they must not fill the table for good: reuse the slot
+        // of a stale one, else of the one copied longest ago. A surface the RSX drew is never evicted, and the index
+        // stays valid because the slot is replaced in place.
+        std::int32_t victim = -1;
+        std::uint64_t victim_order = 0;
+        for (std::size_t i = 0; i < known_surfaces_.size(); i++) {
+            const RsxSurface& candidate = known_surfaces_[i];
+            if (!candidate.copied) continue;
+            const auto found = copy_order_.find(static_cast<std::int32_t>(i));
+            // Stale sorts before any live one; a slot without a recorded order (restored by setKnownSurfaces) is
+            // oldest.
+            const std::uint64_t order = candidate.copy_stale ? 0 : (found == copy_order_.end() ? 1 : found->second + 1);
+            if (victim < 0 || order < victim_order) {
+                victim = static_cast<std::int32_t>(i);
+                victim_order = order;
+            }
+        }
+        if (victim < 0) {
+            noteState("too many render targets");
+            return -1;
+        }
+        known_surfaces_[victim] = surface;
+        copy_checked_.erase(victim);
+        copy_order_.erase(victim);
+        return victim;
     }
     known_surfaces_.push_back(surface);
     return static_cast<std::int32_t>(known_surfaces_.size() - 1);
+}
+
+bool RsxFrameBuilder::hashSurfaceBytes(const RsxSurface& surface, std::uint64_t& hash) {
+    if (surface.pitch == 0 || surface.height == 0) return false;
+    const std::uint64_t size = surfaceCopyBytes(surface);
+    if (size > kRsxMaxTextureBytes) return false;
+    texture_scratch_.resize(size);
+    if (!memory_.read(surface.location, surface.offset, texture_scratch_)) return false;
+    hash = rsxHashBytes(texture_scratch_);
+    textures_.countCheck(size);
+    return true;
+}
+
+// The renderer copies the image of the source target, so the destination needs no guest bytes; they are only
+// hashed, to notice later that the guest reused the buffer (see aliasIndex).
+bool RsxFrameBuilder::onGuestCopy(const RsxGuestCopy& copy) {
+    constexpr std::string_view kPartial = "guest copy of part of a render target";
+    // aliasIndex validates a copied source against its guest bytes, so a buffer the guest has reused is not copied.
+    const std::int32_t index = aliasIndex(copy.src_location, copy.src_offset);
+    if (index < 0) {
+        // A plain memcpy elsewhere is silent; one that touches a surface's bytes without covering it is not.
+        const std::uint64_t begin = copy.src_offset, end = begin + copy.size;
+        for (const RsxSurface& surface : known_surfaces_) {
+            if (surface.location != copy.src_location || surface.copy_stale) continue;
+            if (begin < surfaceExtentEnd(surface) && surface.offset < end) {
+                noteState(kPartial);
+                break;
+            }
+        }
+        return false;
+    }
+    const RsxSurface source = known_surfaces_[index];
+    if (source.pitch == 0 || source.height == 0 || copy.size < surfaceCopyBytes(source)) {
+        noteState(kPartial);
+        return false;
+    }
+
+    RsxSurface destination;
+    destination.location = copy.dst_location;
+    destination.offset = copy.dst_offset;
+    destination.pitch = source.pitch;
+    destination.width = source.width;
+    destination.height = source.height;
+    destination.format = RsxColorFormat::A8R8G8B8;
+    if (destination.location == source.location && destination.offset < surfaceExtentEnd(source) &&
+        source.offset < surfaceExtentEnd(destination)) {
+        noteState("guest copy onto its own render target");
+        return false;
+    }
+
+    std::uint64_t hash = 0;
+    if (!hashSurfaceBytes(destination, hash)) {
+        noteState("unreadable guest copy destination");
+        return false;
+    }
+
+    // The copy fields belong to the builder's bookkeeping; the command carries plain surfaces.
+    RsxSurface command_source = source;
+    command_source.copied = command_source.copy_stale = false;
+    command_source.copy_hash = 0;
+    commands_.emplace_back(RsxCopy{command_source, destination});
+
+    const std::int32_t destination_index = noteSurface(destination);
+    if (destination_index >= 0) {
+        RsxSurface& known = known_surfaces_[destination_index];
+        known.copied = true;
+        known.copy_stale = false;
+        known.copy_hash = hash;
+        copy_checked_[destination_index] = textures_.epoch();
+        copy_order_[destination_index] = ++copy_serial_;
+    }
+    // The command is already queued and the renderer copies the image whether or not the table has a slot; only
+    // the alias for later textures is lost.
+    return true;
+}
+
+std::int32_t RsxFrameBuilder::aliasIndex(std::uint32_t location, std::uint32_t offset) {
+    const std::int32_t index = findSurface(location, offset);
+    if (index < 0) return -1;
+    RsxSurface& surface = known_surfaces_[index];
+    if (!surface.copied) return index;
+    if (surface.copy_stale) return -1;
+    const std::uint64_t epoch = textures_.epoch();
+    const auto checked = copy_checked_.find(index);
+    if (checked != copy_checked_.end() && checked->second == epoch) return index;
+    // First use in this epoch: the guest may have reused the buffer since the copy.
+    std::uint64_t hash = 0;
+    if (hashSurfaceBytes(surface, hash) && hash == surface.copy_hash) {
+        copy_checked_[index] = epoch;
+        return index;
+    }
+    surface.copy_stale = true;
+    return -1;
 }
 
 // RPCS3 `VKGSRender::clear_surface`: the stencil bit is dropped while the stencil write mask is 0, a
@@ -319,7 +446,7 @@ void RsxFrameBuilder::fillTextures(const RsxRegisters& regs, RsxDraw& draw) {
         if (!rsxTextureEnabled(regs, unit)) continue;
         RsxTextureDesc t = decodeTexture(regs, unit);
 
-        t.rt_alias = findSurface(t.location, t.offset);
+        t.rt_alias = aliasIndex(t.location, t.offset);
         if (t.rt_alias >= 0) {
             draw.textures.push_back(t);
             continue;

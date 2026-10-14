@@ -77,6 +77,8 @@ public:
 
     // The guest may have changed any texture since the last epoch began.
     void beginEpoch();
+    // Changes at every beginEpoch(); for callers that keep their own per-epoch state.
+    std::uint64_t epoch() const { return epoch_; }
     // The RSX wrote [begin, end) of `location`.
     void noteWrite(std::uint32_t location, std::uint64_t begin, std::uint64_t end);
     // A flip ended: starts an epoch, and every 32 flips drops entries unused for kIdleFlips flips and entries

@@ -6435,6 +6435,232 @@ void testRsxFrameBuilderTextureCache() {
     dal::rsxUnimplementedReset();
 }
 
+// A guest copy of a render target's bytes becomes a copy command, and the destination is an alias for a texture
+// only while the guest bytes under it stay as they were right after the copy.
+void testRsxFrameBuilderGuestCopy() {
+    dal::rsxUnimplementedReset();
+    auto regs = std::make_unique<dal::RsxRegisters>();
+    regs->reset();
+    FakeRsxMemory memory;
+    memory.local.resize(0x201000);  // the destination ends exactly at the end of memory
+    dal::RsxFrameBuilder builder(memory);
+    constexpr std::uint32_t kSource = 0x100000, kDest = 0x200000, kPitch = 256, kWidth = 64, kHeight = 16;
+    constexpr std::uint32_t kNeed = kPitch * (kHeight - 1) + kWidth * 4;
+    const auto write = [&](std::uint32_t method, std::uint32_t value) {
+        regs->apply(method, value);
+        builder.onWrite(*regs, method, value);
+    };
+    const auto flip = [&] {
+        builder.onFlip(*regs, 0, {});
+        regs->contextReset();
+    };
+    const auto setSurface = [&](std::uint32_t offset) {
+        write(0x0200, kWidth << 16);
+        write(0x0204, kHeight << 16);
+        write(0x0208, 8u | (2u << 5) | (1u << 8));
+        write(0x020C, kPitch);
+        write(0x0210, offset);
+        write(0x0214, 0x900000);
+        write(0x022C, kPitch);
+        write(0x0220, 1);
+        write(0x08C0, kWidth << 16);
+        write(0x08C4, kHeight << 16);
+    };
+    const auto clear = [&](std::uint32_t offset) {
+        setSurface(offset);
+        write(0x1D90, 0xFF102030);
+        write(0x1D94, 0xF0);
+    };
+    const auto setTexture = [&](std::uint32_t offset = kDest) {
+        write(0x1A00, offset);
+        write(0x1A04, 1u | (2u << 4) | (0xA5u << 8) | (1u << 16));
+        write(0x1A0C, 0x80000000);
+        write(0x1A18, (kWidth << 16) | kHeight);
+        write(0x1840, kPitch);
+    };
+    memory.putWord(0, 0x2000, 0x00010000);  // a fragment program that ends at its first word
+    const auto draw = [&] {
+        write(0x08E4, 0x2000 | 1);
+        write(0x1808, 5);
+        write(0x1814, 2u << 24);
+        write(0x1808, 0);
+        dal::RsxDraw result;
+        int draws = 0;
+        for (const dal::RsxCommand& command : builder.takeCommands()) {
+            if (const auto* found = std::get_if<dal::RsxDraw>(&command)) {
+                result = *found;
+                draws++;
+            }
+        }
+        CHECK(draws == 1);
+        return result;
+    };
+    const auto fillDest = [&](std::uint8_t seed) {
+        for (std::uint32_t i = 0; i < kNeed; i++) memory.local[kDest + i] = static_cast<std::uint8_t>(i + seed);
+    };
+    const auto isSurface = [&](const dal::RsxSurface& s, std::uint32_t offset) {
+        return s.location == 0 && s.offset == offset && s.pitch == kPitch && s.width == kWidth && s.height == kHeight &&
+               s.format == dal::RsxColorFormat::A8R8G8B8;
+    };
+    const dal::RsxGuestCopy whole{0, kSource, 0, kDest, kNeed};
+    fillDest(1);
+
+    // (a) A copy of a cleared surface from its first byte: a clear, then the copy, and the destination is known.
+    clear(kSource);
+    CHECK(builder.onGuestCopy(whole));
+    {
+        const std::vector<dal::RsxCommand> commands = builder.takeCommands();
+        CHECK(commands.size() == 2 && std::holds_alternative<dal::RsxClear>(commands[0]));
+        const auto* copy = commands.size() == 2 ? std::get_if<dal::RsxCopy>(&commands[1]) : nullptr;
+        CHECK(copy != nullptr && isSurface(copy->source, kSource) && isSurface(copy->destination, kDest));
+        CHECK(copy != nullptr && !copy->source.copied && !copy->destination.copied);
+    }
+    CHECK(builder.knownSurfaces().size() == 2 && isSurface(builder.knownSurfaces()[1], kDest));
+    CHECK(builder.knownSurfaces()[1].copied && !builder.knownSurfaces()[1].copy_stale &&
+          !builder.knownSurfaces()[0].copied);
+    CHECK(memory.readsAt(0, kDest) == 1);
+
+    // (b) Draws in the copy's epoch sample the destination as a render target without reading it again.
+    setSurface(kSource);
+    setTexture();
+    const dal::RsxDraw first = draw();
+    const dal::RsxDraw second = draw();
+    CHECK(first.textures.size() == 1 && first.textures[0].rt_alias == 1 && first.textures[0].data == nullptr);
+    CHECK(second.textures.size() == 1 && second.textures[0].rt_alias == 1 && second.textures[0].data == nullptr);
+    CHECK(memory.readsAt(0, kDest) == 1);
+
+    // (c) After a flip with unchanged bytes the destination is read and compared once, and stays an alias.
+    flip();
+    setSurface(kSource);
+    setTexture();
+    const dal::RsxDraw third = draw();
+    const dal::RsxDraw fourth = draw();
+    CHECK(third.textures[0].rt_alias == 1 && third.textures[0].data == nullptr && fourth.textures[0].rt_alias == 1);
+    CHECK(memory.readsAt(0, kDest) == 2);
+    CHECK(!builder.knownSurfaces()[1].copy_stale);
+
+    // (d) After a flip with changed bytes the guest has reused the buffer: the texture comes from memory.
+    fillDest(77);
+    flip();
+    setSurface(kSource);
+    setTexture();
+    const dal::RsxDraw fifth = draw();
+    CHECK(fifth.textures[0].rt_alias == -1 && fifth.textures[0].data != nullptr);
+    CHECK(fifth.textures[0].data != nullptr && fifth.textures[0].data->size() == kNeed &&
+          (*fifth.textures[0].data)[0] == 77);
+    CHECK(builder.knownSurfaces()[1].copied && builder.knownSurfaces()[1].copy_stale);
+    CHECK(memory.readsAt(0, kDest) == 4);  // the comparison, then the texture upload
+
+    // A stale destination is no copy source.
+    CHECK(!builder.onGuestCopy({0, kDest, 0, kSource + 0x10000, kNeed}));
+    CHECK(unimplementedCount("state guest copy of part of a render target") == 0);
+    CHECK(builder.takeCommands().empty());
+
+    // (e) A new copy to the destination revives it in place.
+    CHECK(builder.onGuestCopy(whole));
+    {
+        const std::vector<dal::RsxCommand> commands = builder.takeCommands();
+        CHECK(commands.size() == 1 && std::holds_alternative<dal::RsxCopy>(commands[0]));
+    }
+    CHECK(builder.knownSurfaces().size() == 2 && builder.knownSurfaces()[1].copied &&
+          !builder.knownSurfaces()[1].copy_stale);
+    setSurface(kSource);
+    setTexture();
+    const dal::RsxDraw sixth = draw();
+    CHECK(sixth.textures[0].rt_alias == 1 && sixth.textures[0].data == nullptr);
+
+    // (f) Part of a surface is counted, a source outside every surface is silent.
+    const std::uint64_t partial = unimplementedCount("state guest copy of part of a render target");
+    CHECK(!builder.onGuestCopy({0, kSource, 0, kDest, kNeed - 1}));
+    CHECK(unimplementedCount("state guest copy of part of a render target") == partial + 1);
+    CHECK(!builder.onGuestCopy({0, kSource + 0x100, 0, kDest, 0x100}));
+    CHECK(unimplementedCount("state guest copy of part of a render target") == partial + 2);
+    CHECK(!builder.onGuestCopy({0, 0x8000, 0, kDest, 0x100}));
+    CHECK(unimplementedCount("state guest copy of part of a render target") == partial + 2);
+    CHECK(!builder.onGuestCopy({0, kSource, 0, kSource + 0x400, kNeed}));
+    CHECK(unimplementedCount("state guest copy onto its own render target") == 1);
+    CHECK(builder.takeCommands().empty());
+
+    // (g) A surface the RSX draws or clears is no longer a copy: its address stays an alias whatever the bytes.
+    clear(kDest);
+    CHECK(builder.takeCommands().size() == 1);
+    CHECK(builder.knownSurfaces().size() == 2 && !builder.knownSurfaces()[1].copied);
+    fillDest(5);
+    flip();
+    setSurface(kSource);
+    setTexture();
+    const dal::RsxDraw seventh = draw();
+    CHECK(seventh.textures[0].rt_alias == 1 && seventh.textures[0].data == nullptr);
+    CHECK(!builder.knownSurfaces()[1].copy_stale);
+
+    // (h) A destination the builder cannot read gives no command.
+    CHECK(!builder.onGuestCopy({0, kSource, 0, 0x300000, kNeed}));
+    CHECK(unimplementedCount("state unreadable guest copy destination") == 1);
+    CHECK(builder.takeCommands().empty());
+
+    // (i) A copied surface the guest has rewritten is no copy source, even before a texture noticed it.
+    CHECK(builder.onGuestCopy(whole));
+    fillDest(9);
+    flip();
+    builder.takeCommands();
+    const std::uint64_t partial_i = unimplementedCount("state guest copy of part of a render target");
+    CHECK(!builder.onGuestCopy({0, kDest, 0, 0x150000, kNeed}));
+    CHECK(builder.knownSurfaces()[1].copied && builder.knownSurfaces()[1].copy_stale);
+    CHECK(unimplementedCount("state guest copy of part of a render target") == partial_i);
+    CHECK(builder.takeCommands().empty());
+
+    // (j) With the table full of surfaces the RSX drew and copy destinations, a copy still gets a slot: the stale
+    // destination goes first, then the one copied longest ago; a surface the RSX drew never goes.
+    std::uint32_t rsx_offset = 0x110000, copy_offset = 0x160000;
+    const std::uint32_t oldest = copy_offset;
+    bool next_is_copy = true;
+    while (builder.knownSurfaces().size() < dal::kRsxMaxKnownSurfaces) {
+        if (next_is_copy) {
+            const bool copied = builder.onGuestCopy({0, kSource, 0, copy_offset, kNeed});
+            CHECK(copied);
+            copy_offset += 0x1000;
+        } else {
+            clear(rsx_offset);
+            rsx_offset += 0x1000;
+        }
+        next_is_copy = !next_is_copy;
+    }
+    builder.takeCommands();
+    const auto drawnCount = [&] {
+        std::size_t drawn = 0;
+        for (const dal::RsxSurface& surface : builder.knownSurfaces()) drawn += surface.copied ? 0 : 1;
+        return drawn;
+    };
+    const std::size_t drawn_before = drawnCount();
+    // Whether a texture at `offset` is an alias, in a draw of its own.
+    const auto aliased = [&](std::uint32_t offset) {
+        setSurface(kSource);
+        setTexture(offset);
+        const dal::RsxDraw result = draw();
+        CHECK(result.textures.size() == 1);
+        return result.textures[0].rt_alias >= 0 && result.textures[0].data == nullptr;
+    };
+    constexpr std::uint32_t kNewA = 0x1C0000, kNewB = 0x1C1000;
+    CHECK(builder.onGuestCopy({0, kSource, 0, kNewA, kNeed}));
+    {
+        const std::vector<dal::RsxCommand> commands = builder.takeCommands();
+        CHECK(commands.size() == 1 && std::holds_alternative<dal::RsxCopy>(commands[0]));
+    }
+    CHECK(builder.knownSurfaces().size() == dal::kRsxMaxKnownSurfaces && drawnCount() == drawn_before);
+    CHECK(aliased(kNewA));
+    CHECK(!aliased(kDest));  // the stale destination lost its slot
+    CHECK(aliased(oldest));
+
+    CHECK(builder.onGuestCopy({0, kSource, 0, kNewB, kNeed}));
+    builder.takeCommands();
+    CHECK(builder.knownSurfaces().size() == dal::kRsxMaxKnownSurfaces && drawnCount() == drawn_before);
+    CHECK(aliased(kNewB) && aliased(kNewA));
+    CHECK(!aliased(oldest));  // the destination copied longest ago went
+    CHECK(aliased(oldest + 0x1000));
+    CHECK(unimplementedCount("state too many render targets") == 0);
+    dal::rsxUnimplementedReset();
+}
+
 void testRsxFrameBuilder() {
     auto regs = std::make_unique<dal::RsxRegisters>();
     regs->reset();
@@ -6717,6 +6943,10 @@ bool sameCommand(const dal::RsxCommand& left, const dal::RsxCommand& right) {
         const auto& b = std::get<dal::RsxFlip>(right);
         return a->buffer == b.buffer && a->offset == b.offset && a->pitch == b.pitch && a->width == b.width &&
                a->height == b.height && a->flip_index == b.flip_index;
+    }
+    if (const auto* a = std::get_if<dal::RsxCopy>(&left)) {
+        const auto& b = std::get<dal::RsxCopy>(right);
+        return sameSurface(a->source, b.source) && sameSurface(a->destination, b.destination);
     }
     const auto& a = std::get<dal::RsxDraw>(left);
     const auto& b = std::get<dal::RsxDraw>(right);
@@ -8955,6 +9185,7 @@ int main(int argc, char** argv) {
     testRsxTextureCacheClass();
     testRsxFrameBuilder();
     testRsxFrameBuilderTextureCache();
+    testRsxFrameBuilderGuestCopy();
     testRsxCapture();
     testRsxSyntheticCaptures();
     testRsxConsumer();

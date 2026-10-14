@@ -31,6 +31,12 @@ enum class RsxPrimitive : std::uint8_t {
 struct RsxSurface {  // location 0 = local, 1 = main
     std::uint32_t location = 0, offset = 0, pitch = 0, width = 0, height = 0;
     RsxColorFormat format = RsxColorFormat::Unsupported;
+    // Kept only on the frame builder's known surfaces; false/0 everywhere else, and the renderer ignores
+    // them. `copied`: the surface was registered by a guest copy (RsxCopy destination), not by a draw or
+    // clear, and its alias holds only while the guest bytes under it hash to `copy_hash` (taken right after
+    // the copy). `copy_stale`: they no longer do, so the address is not an alias any more.
+    bool copied = false, copy_stale = false;
+    std::uint64_t copy_hash = 0;
 };
 
 struct RsxSurfaceState {
