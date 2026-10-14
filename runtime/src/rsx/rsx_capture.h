@@ -3,8 +3,11 @@
 // Capture of one RSX frame as inputs (register writes, the guest bytes the frame builder read, and the
 // state the frame started from), so that a decoder or builder fix can be tested on an old capture.
 // The file is little-endian with the `.dalcap` extension:
-//   header  "DALRSXC1", u32 version (2), u64 flip index of the flip command that ends the frame
-//   chunks  {u32 tag, u32 size, bytes}: REGS, DISP, SURF, then in stream order WRIT / MEMR / FLIP, END
+//   header  "DALRSXC1", u32 version (3), u64 flip index of the flip command that ends the frame
+//   chunks  {u32 tag, u32 size, bytes}: REGS, DISP, SURF, then in stream order WRIT / MEMR / COPY / FLIP, END
+// COPY holds a copy the guest CPU made (u32 src_location, src_offset, dst_location, dst_offset, size); replay
+// hands it to the builder at the same point. SURF records are 6 u32 (location, offset, pitch, width, height,
+// format), and from version 3 also u32 flags (bit 0 copied, bit 1 copy_stale) and u64 copy_hash.
 // A capture holds the writes after the previous flip command up to and including the next one. The
 // start registers are those the previous flip left behind: after its context reset and after the flip
 // method write itself.
@@ -28,14 +31,15 @@ namespace dal {
 
 // The REGS chunk size follows kRsxVpInstructionCount and kRsxVpConstantCount: changing either needs a
 // version bump, or old captures would be rejected as malformed. The writer writes this version; the
-// reader also accepts version 1, whose REGS chunk lacks the vertex default written mask.
-inline constexpr std::uint32_t kRsxCaptureVersion = 2;
+// reader also accepts version 1, whose REGS chunk lacks the vertex default written mask, and version 2, whose
+// SURF records lack the copy fields and which has no COPY chunk.
+inline constexpr std::uint32_t kRsxCaptureVersion = 3;
 
 // The file image in three parts, so the bulk of it (the recorded stream) is moved rather than copied
 // while the guest lock is held.
 struct RsxCaptureFile {
     std::vector<std::uint8_t> head;    // header, REGS, DISP, SURF
-    std::vector<std::uint8_t> stream;  // WRIT / MEMR / FLIP chunks
+    std::vector<std::uint8_t> stream;  // WRIT / MEMR / COPY / FLIP chunks
     std::vector<std::uint8_t> tail;    // END
     std::size_t size() const { return head.size() + stream.size() + tail.size(); }
     std::vector<std::uint8_t> flatten() const;
@@ -52,6 +56,9 @@ public:
     void onWrite(std::uint32_t method, std::uint32_t value);
     // Guest bytes the frame builder read, in the order it read them.
     void onMemory(std::uint32_t location, std::uint32_t offset, std::span<const std::uint8_t> bytes);
+    // A guest copy the consumer drained; call after the frame builder handled it, so the destination bytes it
+    // read come first.
+    void onCopy(const RsxGuestCopy& copy);
     void onFlip(std::uint32_t buffer);
 
     // Ends the stream and returns the file image. The display buffers are those the flip command used.
@@ -66,7 +73,7 @@ private:
 
     std::vector<std::uint8_t> head_;      // header, REGS
     std::vector<std::uint8_t> surfaces_;  // the SURF chunk
-    std::vector<std::uint8_t> stream_;    // WRIT / MEMR / FLIP chunks so far
+    std::vector<std::uint8_t> stream_;    // WRIT / MEMR / COPY / FLIP chunks so far
     std::vector<std::uint8_t> pending_;   // method/value pairs not yet flushed into a WRIT chunk
     std::uint64_t writes_ = 0, ranges_ = 0;
 };
@@ -85,10 +92,11 @@ private:
 
 class RsxCaptureReader {
 public:
-    enum class EventKind : std::uint8_t { Write, Memory, Flip };
+    enum class EventKind : std::uint8_t { Write, Memory, Flip, Copy };
     struct Event {
         EventKind kind = EventKind::Write;
-        // Write: method/value. Memory: location/offset and `size` bytes at `data_pos`. Flip: buffer in `a`.
+        // Write: method/value. Memory: location/offset and `size` bytes at `data_pos`. Flip: buffer in `a`. Copy: the
+        // 20-byte record at `data_pos` (see copyRecord()).
         std::uint32_t a = 0, b = 0, size = 0;
         std::size_t data_pos = 0;
     };
@@ -106,6 +114,7 @@ public:
     std::span<const std::uint8_t> memoryBytes(const Event& event) const {
         return std::span<const std::uint8_t>(data_).subspan(event.data_pos, event.size);
     }
+    RsxGuestCopy copyRecord(const Event& event) const;
     std::uint64_t writeCount() const { return writes_; }
     std::uint64_t rangeCount() const { return ranges_; }
 

@@ -173,7 +173,11 @@ void RsxConsumer::drainGuestCopies() {
     std::vector<RsxGuestCopy> copies = std::exchange(guest_copies_, {});
     if (builder_ == nullptr || faulted_) return;
     for (const RsxGuestCopy& copy : copies) {
-        if (!builder_->onGuestCopy(copy)) continue;
+        const bool made = builder_->onGuestCopy(copy);
+        // Recorded either way: the replay builder decides again from the same recorded bytes. After the builder,
+        // so the destination bytes it read come first.
+        if (capture_ != nullptr) capture_->onCopy(copy);
+        if (!made) continue;
         logInfo("dal: rsx: render target copy in frame {}: {} {:#x} -> {} {:#x} ({:#x} bytes)", flips_reached_ + 1,
                 copy.src_location == 0 ? "local" : "main", copy.src_offset, copy.dst_location == 0 ? "local" : "main",
                 copy.dst_offset, copy.size);

@@ -7142,7 +7142,7 @@ void testRsxCapture() {
     dal::RsxCaptureReader second_reader;
     const std::vector<std::uint8_t> second_file = second.finish({}, 0).flatten();
     CHECK(second_reader.parse(second_file, error));
-    CHECK(second_file[8] == 2);
+    CHECK(second_file[8] == 3);
     CHECK(second_reader.startRegisters().vertex_default_written == regs->vertex_default_written &&
           (regs->vertex_default_written & (1u << 9)) != 0);
     CHECK(second_reader.flipIndex() == 11 && second_reader.events().empty());
@@ -7152,6 +7152,64 @@ void testRsxCapture() {
     CHECK(second_reader.startRegisters().vp_load == 3 && second_reader.startRegisters().vp_start == 4 &&
           second_reader.startRegisters().constant_load == 6);
     CHECK(second_reader.surfaces().size() == 1 && sameSurface(second_reader.surfaces()[0], known));
+    CHECK(!second_reader.surfaces()[0].copied && !second_reader.surfaces()[0].copy_stale &&
+          second_reader.surfaces()[0].copy_hash == 0);
+
+    // Version 3 SURF records carry the copy fields, and a COPY chunk comes back as the record that was written.
+    dal::RsxSurface copied_surface{0, 0x4000, 0x800, 64, 32, dal::RsxColorFormat::A8R8G8B8};
+    copied_surface.copied = true;
+    copied_surface.copy_hash = 0x1122334455667788ull;
+    dal::RsxSurface stale_surface = copied_surface;
+    stale_surface.offset = 0x8000;
+    stale_surface.copy_stale = true;
+    const dal::RsxSurface with_copy_fields[] = {known, copied_surface, stale_surface};
+    dal::RsxCaptureWriter third(12, *regs, with_copy_fields);
+    third.onWrite(0x0200, 5);
+    third.onCopy({0, 0x2000, 1, 0x4000, 0x10000});
+    third.onFlip(1);
+    dal::RsxCaptureReader third_reader;
+    const std::vector<std::uint8_t> third_file = third.finish({}, 0).flatten();
+    CHECK(third_reader.parse(third_file, error));
+    CHECK(third_reader.surfaces().size() == 3 && sameSurface(third_reader.surfaces()[1], copied_surface) &&
+          third_reader.surfaces()[1].copied && !third_reader.surfaces()[1].copy_stale &&
+          third_reader.surfaces()[1].copy_hash == 0x1122334455667788ull);
+    CHECK(third_reader.surfaces()[2].copied && third_reader.surfaces()[2].copy_stale &&
+          third_reader.surfaces()[2].copy_hash == 0x1122334455667788ull && !third_reader.surfaces()[0].copied);
+    CHECK(third_reader.events().size() == 3 && third_reader.events()[1].kind == dal::RsxCaptureReader::EventKind::Copy);
+    if (third_reader.events().size() == 3) {
+        const dal::RsxGuestCopy record = third_reader.copyRecord(third_reader.events()[1]);
+        CHECK(record.src_location == 0 && record.src_offset == 0x2000 && record.dst_location == 1 &&
+              record.dst_offset == 0x4000 && record.size == 0x10000);
+    }
+
+    // A version 2 file has 24-byte SURF records and no copy fields: the same file with the SURF chunk rewritten
+    // still parses, and the fields read as false/0. A COPY chunk is not part of version 2.
+    constexpr std::size_t kHeaderBytes = 20;
+    constexpr std::size_t kRegsBytesV2 =
+            (0x4000 + dal::kRsxVpInstructionCount * 4 + dal::kRsxVpConstantCount * 4 + 3) * 4 + 4;
+    const std::size_t surf_chunk = kHeaderBytes + 8 + kRegsBytesV2 + 8 + 4 + dal::kRsxDisplayBufferCount * 16;
+    CHECK(second_file.size() == surf_chunk + 8 + 4 + 36 + 8);
+    std::vector<std::uint8_t> v2_file(second_file.begin(), second_file.begin() + surf_chunk);
+    const auto put_u32 = [](std::vector<std::uint8_t>& out, std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) out.push_back(static_cast<std::uint8_t>(value >> shift));
+    };
+    put_u32(v2_file, 0x46525553);  // "SURF"
+    put_u32(v2_file, 4 + 24);
+    put_u32(v2_file, 1);
+    v2_file.insert(v2_file.end(), second_file.begin() + surf_chunk + 12, second_file.begin() + surf_chunk + 12 + 24);
+    v2_file.insert(v2_file.end(), second_file.end() - 8, second_file.end());  // END
+    v2_file[8] = 2;
+    dal::RsxCaptureReader v2_reader;
+    CHECK(v2_reader.parse(v2_file, error));
+    CHECK(v2_reader.surfaces().size() == 1 && sameSurface(v2_reader.surfaces()[0], known) &&
+          !v2_reader.surfaces()[0].copied && v2_reader.surfaces()[0].copy_hash == 0 && v2_reader.events().empty());
+    std::vector<std::uint8_t> v2_with_copy(v2_file.begin(), v2_file.end() - 8);
+    put_u32(v2_with_copy, 0x59504F43);  // "COPY"
+    put_u32(v2_with_copy, 20);
+    for (std::uint32_t word : {0u, 0x2000u, 0u, 0x4000u, 0x10000u}) put_u32(v2_with_copy, word);
+    v2_with_copy.insert(v2_with_copy.end(), v2_file.end() - 8, v2_file.end());
+    CHECK(!v2_reader.parse(v2_with_copy, error) && error == "bad COPY chunk");
+    CHECK(v2_reader.parse(v2_file, error));
 
     // A version 1 file has no written mask in its REGS chunk: the same bytes without the mask word and with
     // the version and chunk size of v1 load, and the mask is inferred from the default attribute registers
@@ -7159,7 +7217,7 @@ void testRsxCapture() {
     constexpr std::size_t kRegsChunkOffset = 20;  // header, then the REGS chunk: tag, size, data
     constexpr std::size_t kRegsBytesV1 =
             (0x4000 + dal::kRsxVpInstructionCount * 4 + dal::kRsxVpConstantCount * 4 + 3) * 4;
-    std::vector<std::uint8_t> v1_file = second_file;
+    std::vector<std::uint8_t> v1_file = v2_file;
     v1_file[8] = 1;
     v1_file.erase(v1_file.begin() + kRegsChunkOffset + 8 + kRegsBytesV1,
                   v1_file.begin() + kRegsChunkOffset + 8 + kRegsBytesV1 + 4);
@@ -7177,7 +7235,7 @@ void testRsxCapture() {
     bad[0] = 'X';
     CHECK(!reader.parse(bad, error));
     bad = file;
-    bad[8] = 3;  // unknown version
+    bad[8] = 4;  // unknown version
     CHECK(!reader.parse(bad, error));
     bad = file;
     bad[8] = 0;
@@ -7474,13 +7532,15 @@ void testRsxConsumer() {
 
     // Capturing through a consumer: frame 2 starts from what flip 1 left behind (its context reset
     // applied, the surface cleared in frame 1 known) and replays to the commands built after that flip.
+    // A guest copy of the frame-1 surface is queued during frame 2 and recorded in its place in the stream; the
+    // capture of frame 3 then starts with the copy destination among its known surfaces.
     // The first consumer is done, so the second one starts at the current put.
     {
         state.display[1] = {0x400000, 0x1400, 1280, 720};
         state.display_count = 2;
         dalWrite32(base, kControl + 4, at);
         dal::RsxConsumer capturing(base);
-        capturing.enableCapture({2});
+        capturing.enableCapture({2, 3});
         emit(0x0200, {1280u << 16});
         emit(0x0204, {720u << 16});
         emit(0x0208, {8u | (2u << 5) | (1u << 8)});
@@ -7511,6 +7571,7 @@ void testRsxConsumer() {
         emit(dal::kMethodNv4097SetBeginEnd, {0});
         const std::uint32_t after_draw = at;
         emit(dal::kMethodGcmFlipCommand, {2});
+        emit(dal::kMethodGcmFlipCommand, {1});
         dalWrite32(base, kControl, at);
 
         // The pump stops right after the draw end (a command of its own here, so get is published past it);
@@ -7519,19 +7580,23 @@ void testRsxConsumer() {
         CHECK(dalRead32(base, kControl + 4) == after_draw);
         std::vector<dal::RsxCommand> live = capturing.takeCommands();
         CHECK(!capturing.stopAfterWrite());
+        constexpr std::uint32_t kCopyDest = 0x500000;
+        const dal::RsxGuestCopy copy_request{0, 0x100000, 0, kCopyDest, 0x1400 * 720};
+        capturing.queueGuestCopy(copy_request);
         CHECK(capturing.pump(200) == FifoStatus::Idle);
         for (dal::RsxCommand& command : capturing.takeCommands()) live.push_back(std::move(command));
-        CHECK(live.size() == 5 && std::holds_alternative<dal::RsxClear>(live[2]) &&
-              std::holds_alternative<dal::RsxDraw>(live[3]) && std::holds_alternative<dal::RsxFlip>(live[4]));
+        CHECK(live.size() == 7 && std::holds_alternative<dal::RsxClear>(live[2]) &&
+              std::holds_alternative<dal::RsxDraw>(live[3]) && std::holds_alternative<dal::RsxCopy>(live[4]) &&
+              std::holds_alternative<dal::RsxFlip>(live[5]) && std::holds_alternative<dal::RsxFlip>(live[6]));
         CHECK(std::get<dal::RsxClear>(live[0]).surfaces.color.offset == 0x100000);
         CHECK(std::get<dal::RsxClear>(live[2]).surfaces.color.offset == 0);
-        CHECK(std::get<dal::RsxFlip>(live[4]).flip_index == 1);
+        CHECK(std::get<dal::RsxFlip>(live[5]).flip_index == 1);
         const dal::RsxDraw& draw = std::get<dal::RsxDraw>(live[3]);
         CHECK(draw.count == 3 && draw.vertex_data.size() == 36 && draw.vertex_data[0] == 1 &&
               draw.vertex_data[35] == 36);
 
         std::vector<dal::RsxConsumer::FinishedCapture> captures = capturing.takeCaptures();
-        CHECK(captures.size() == 1 && captures[0].frame == 2);
+        CHECK(captures.size() == 2 && captures[0].frame == 2 && captures[1].frame == 3);
         dal::RsxCaptureReader reader;
         std::string error;
         CHECK(reader.parse(captures[0].file.flatten(), error));
@@ -7548,8 +7613,37 @@ void testRsxConsumer() {
         dal::RsxFrameBuilder replay_builder(view);
         dal::replayCapture(reader, view, replay_builder);
         const std::vector<dal::RsxCommand> replayed = replay_builder.takeCommands();
-        CHECK(replayed.size() == 3 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]) &&
-              sameCommand(live[4], replayed[2]));
+        CHECK(replayed.size() == 4 && sameCommand(live[2], replayed[0]) && sameCommand(live[3], replayed[1]) &&
+              sameCommand(live[4], replayed[2]) && sameCommand(live[5], replayed[3]));
+
+        // The copy is in the stream after the MEMR of its destination and before the flip, with the request's fields.
+        const auto& events = reader.events();
+        std::size_t copy_event = events.size();
+        for (std::size_t i = 0; i < events.size(); i++) {
+            if (events[i].kind == dal::RsxCaptureReader::EventKind::Copy) copy_event = i;
+        }
+        CHECK(copy_event != events.size() && copy_event > 0 && copy_event + 1 < events.size());
+        if (copy_event != events.size() && copy_event > 0 && copy_event + 1 < events.size()) {
+            const dal::RsxGuestCopy recorded = reader.copyRecord(events[copy_event]);
+            CHECK(recorded.src_location == 0 && recorded.src_offset == 0x100000 && recorded.dst_location == 0 &&
+                  recorded.dst_offset == kCopyDest && recorded.size == copy_request.size);
+            const auto& before = events[copy_event - 1];
+            CHECK(before.kind == dal::RsxCaptureReader::EventKind::Memory && before.a == 0 && before.b == kCopyDest &&
+                  before.size == copy_request.size);
+            CHECK(events[copy_event + 1].kind == dal::RsxCaptureReader::EventKind::Flip);
+        }
+        CHECK(replay_builder.knownSurfaces().size() == 3 && replay_builder.knownSurfaces()[2].copied &&
+              replay_builder.knownSurfaces()[2].offset == kCopyDest);
+
+        // The capture of frame 3 starts with the destination known as a copied, not stale surface.
+        dal::RsxCaptureReader later;
+        CHECK(later.parse(captures[1].file.flatten(), error));
+        const dal::RsxSurface* dest_surface = nullptr;
+        for (const dal::RsxSurface& surface : later.surfaces()) {
+            if (surface.location == 0 && surface.offset == kCopyDest) dest_surface = &surface;
+        }
+        CHECK(dest_surface != nullptr && dest_surface->copied && !dest_surface->copy_stale &&
+              dest_surface->copy_hash != 0 && dest_surface->width == 1280 && dest_surface->pitch == 0x1400);
         CHECK(capturing.takeCaptures().empty());
     }
 

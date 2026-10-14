@@ -26,12 +26,18 @@ constexpr std::uint32_t kTagSurf = fourcc("SURF");
 constexpr std::uint32_t kTagWrit = fourcc("WRIT");
 constexpr std::uint32_t kTagMemr = fourcc("MEMR");
 constexpr std::uint32_t kTagFlip = fourcc("FLIP");
+constexpr std::uint32_t kTagCopy = fourcc("COPY");
 constexpr std::uint32_t kTagEnd = fourcc("END ");
 
 constexpr char kMagic[8] = {'D', 'A', 'L', 'R', 'S', 'X', 'C', '1'};
 constexpr std::size_t kHeaderSize = 8 + 4 + 8;
 constexpr std::size_t kChunkHeaderSize = 8;
-constexpr std::size_t kSurfaceRecordSize = 6 * 4;
+// Version 3 appends u32 flags and u64 copy_hash to the version 1 and 2 record.
+constexpr std::size_t kSurfaceRecordSizeV2 = 6 * 4;
+constexpr std::size_t kSurfaceRecordSize = kSurfaceRecordSizeV2 + 4 + 8;
+constexpr std::uint32_t kSurfaceFlagCopied = 1u << 0;
+constexpr std::uint32_t kSurfaceFlagCopyStale = 1u << 1;
+constexpr std::size_t kCopyRecordSize = 5 * 4;
 constexpr std::size_t kDisplayRecordSize = 4 * 4;
 constexpr std::size_t kMemoryHeaderSize = 3 * 4;
 
@@ -92,6 +98,8 @@ RsxCaptureWriter::RsxCaptureWriter(std::uint64_t flip_index, const RsxRegisters&
         put32(surfaces_, surface.width);
         put32(surfaces_, surface.height);
         put32(surfaces_, static_cast<std::uint32_t>(surface.format));
+        put32(surfaces_, (surface.copied ? kSurfaceFlagCopied : 0) | (surface.copy_stale ? kSurfaceFlagCopyStale : 0));
+        put64(surfaces_, surface.copy_hash);
     }
 }
 
@@ -117,6 +125,16 @@ void RsxCaptureWriter::onMemory(std::uint32_t location, std::uint32_t offset, st
     put32(stream_, static_cast<std::uint32_t>(bytes.size()));
     stream_.insert(stream_.end(), bytes.begin(), bytes.end());
     ranges_++;
+}
+
+void RsxCaptureWriter::onCopy(const RsxGuestCopy& copy) {
+    flushWrites();
+    beginChunk(stream_, kTagCopy, kCopyRecordSize);
+    put32(stream_, copy.src_location);
+    put32(stream_, copy.src_offset);
+    put32(stream_, copy.dst_location);
+    put32(stream_, copy.dst_offset);
+    put32(stream_, copy.size);
 }
 
 void RsxCaptureWriter::onFlip(std::uint32_t buffer) {
@@ -176,13 +194,14 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
         return false;
     }
     const std::uint32_t version = get32(base + 8);
-    if (version != 1 && version != kRsxCaptureVersion) {
+    if (version < 1 || version > kRsxCaptureVersion) {
         error = std::format("unsupported capture version {}", version);
         return false;
     }
     flip_index_ = get64(base + 12);
 
     bool have_regs = false, have_disp = false, have_surf = false, have_end = false;
+    const std::size_t surface_record_size = version >= 3 ? kSurfaceRecordSize : kSurfaceRecordSizeV2;
     std::size_t pos = kHeaderSize;
     while (!have_end) {
         if (size - pos < kChunkHeaderSize) {
@@ -200,7 +219,7 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
         const std::uint8_t* chunk = base + pos;
 
         if (tag == kTagRegs) {
-            // Version 1 has no written mask; version 2 must have it.
+            // Version 1 has no written mask; later versions must have it.
             if (have_regs || chunk_size != (version == 1 ? kRegsBytesBase : kRegsBytes)) {
                 error = "bad REGS chunk";
                 return false;
@@ -248,19 +267,26 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
             }
             const std::uint32_t count = get32(chunk);
             if (count > kRsxMaxKnownSurfaces ||
-                chunk_size != 4 + static_cast<std::size_t>(count) * kSurfaceRecordSize) {
+                chunk_size != 4 + static_cast<std::size_t>(count) * surface_record_size) {
                 error = "bad SURF chunk";
                 return false;
             }
             for (std::uint32_t i = 0; i < count; i++) {
-                const std::uint8_t* p = chunk + 4 + i * kSurfaceRecordSize;
+                const std::uint8_t* p = chunk + 4 + i * surface_record_size;
                 const std::uint32_t format = get32(p + 20);
                 if (format > static_cast<std::uint32_t>(RsxColorFormat::Unsupported)) {
                     error = "bad surface format in SURF chunk";
                     return false;
                 }
-                surfaces_.push_back({get32(p), get32(p + 4), get32(p + 8), get32(p + 12), get32(p + 16),
-                                     static_cast<RsxColorFormat>(format)});
+                RsxSurface surface{get32(p),      get32(p + 4),  get32(p + 8),
+                                   get32(p + 12), get32(p + 16), static_cast<RsxColorFormat>(format)};
+                if (version >= 3) {
+                    const std::uint32_t flags = get32(p + 24);
+                    surface.copied = (flags & kSurfaceFlagCopied) != 0;
+                    surface.copy_stale = (flags & kSurfaceFlagCopyStale) != 0;
+                    surface.copy_hash = get64(p + 28);
+                }
+                surfaces_.push_back(surface);
             }
             have_surf = true;
         } else if (tag == kTagWrit) {
@@ -286,6 +312,14 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
             }
             events_.push_back({EventKind::Memory, location, offset, length, pos + kMemoryHeaderSize});
             ranges_++;
+        } else if (tag == kTagCopy) {
+            const std::uint32_t src_location = chunk_size >= 4 ? get32(chunk) : 0;
+            const std::uint32_t dst_location = chunk_size >= 12 ? get32(chunk + 8) : 0;
+            if (version < 3 || !have_regs || chunk_size != kCopyRecordSize || src_location > 1 || dst_location > 1) {
+                error = "bad COPY chunk";
+                return false;
+            }
+            events_.push_back({EventKind::Copy, 0, 0, static_cast<std::uint32_t>(kCopyRecordSize), pos});
         } else if (tag == kTagFlip) {
             if (!have_regs || chunk_size != 4) {
                 error = "bad FLIP chunk";
@@ -313,6 +347,11 @@ bool RsxCaptureReader::parse(std::vector<std::uint8_t> bytes, std::string& error
         return false;
     }
     return true;
+}
+
+RsxGuestCopy RsxCaptureReader::copyRecord(const Event& event) const {
+    const std::uint8_t* p = data_.data() + event.data_pos;
+    return {get32(p), get32(p + 4), get32(p + 8), get32(p + 12), get32(p + 16)};
 }
 
 bool RsxCaptureReader::load(const std::filesystem::path& path, std::string& error) {
@@ -400,6 +439,7 @@ void replayCapture(const RsxCaptureReader& reader, ReplayRsxMemoryView& memory, 
                 builder.onWrite(*regs, event.a, event.b);
                 break;
             case RsxCaptureReader::EventKind::Memory: memory.add(event.a, event.b, reader.memoryBytes(event)); break;
+            case RsxCaptureReader::EventKind::Copy: builder.onGuestCopy(reader.copyRecord(event)); break;
             case RsxCaptureReader::EventKind::Flip: {
                 static constexpr RsxDisplayBuffer kNoBuffer{};
                 builder.onFlip(*regs, event.a,
