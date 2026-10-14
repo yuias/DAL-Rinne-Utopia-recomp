@@ -163,16 +163,24 @@ public:
 enum class FifoStatus {
     Idle,     // get == put, or spinning on a jump to itself
     Waiting,  // a write returned false
-    Budget,   // max_words consumed, or the sink asked to stop after a write
+    Budget,   // max_words consumed, the sink asked to stop after a write, or get reached the stop position
     Fault,    // malformed header or unmapped read; sticky until reset()
 };
+
+// Never equal to a get (unaligned): run() with it has no stop position.
+inline constexpr std::uint32_t kFifoNoStop = 0xFFFFFFFF;
 
 class FifoParser {
 public:
     // Consumes words from `get` toward `put` (both IO offsets; the low two bits of put are ignored).
     // `get` always names the next unread word, so it already points past a write that returned false:
     // that write is kept inside the parser. After Fault `get` names the offending word.
-    FifoStatus run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink);
+    // The run also ends with Budget, before reading another word, when `get` equals `stop` at a command
+    // boundary (no argument of a method outstanding; a refused write has already been retried). get == put
+    // still ends it with Idle first. A run that starts there returns Budget at once. `put` stays the bound,
+    // so a stop that is never met cannot make the parser read past it.
+    FifoStatus run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink,
+                   std::uint32_t stop = kFifoNoStop);
 
     std::string_view lastFault() const { return fault_; }
     // Method headers with at least one argument, for the census.

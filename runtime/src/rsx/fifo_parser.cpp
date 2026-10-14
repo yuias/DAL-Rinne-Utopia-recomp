@@ -13,7 +13,8 @@ FifoStatus FifoParser::fail(std::string message) {
     return FifoStatus::Fault;
 }
 
-FifoStatus FifoParser::run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink) {
+FifoStatus FifoParser::run(std::uint32_t& get, std::uint32_t put, std::uint32_t max_words, RsxSink& sink,
+                           std::uint32_t stop) {
     if (faulted_) return FifoStatus::Fault;
     put &= ~3u;
     std::uint32_t words = 0;
@@ -25,6 +26,8 @@ FifoStatus FifoParser::run(std::uint32_t& get, std::uint32_t put, std::uint32_t 
             if (sink.stopAfterWrite()) return FifoStatus::Budget;
         }
         if (get == put) return FifoStatus::Idle;
+        // Checked after jumps have moved get, and only between commands: a stop inside a command is passed.
+        if (get == stop && remaining_ == 0) return FifoStatus::Budget;
         if (words >= max_words) return FifoStatus::Budget;
         if ((get & 3) != 0) return fail(std::format("unaligned get 0x{:x}", get));
 

@@ -5572,6 +5572,65 @@ void testFifoParser() {
         CHECK(parser.run(get, 0x4008, 100, sink) == FifoStatus::Idle && get == 0x4008);
         CHECK((sink.writes == Writes{{0x1800, 5}, {0x1800, 6}}));
     }
+
+    // A stop position ends the run with Budget at a command boundary, before the command there is read.
+    {
+        FakeSink sink;
+        FifoParser parser;
+        sink.put(kBase, {0x1800 | (1u << 18), 1, 0x1800 | (1u << 18), 2});
+        std::uint32_t get = kBase;
+        CHECK(parser.run(get, kBase + 16, 100, sink, kBase + 8) == FifoStatus::Budget && get == kBase + 8);
+        CHECK((sink.writes == Writes{{0x1800, 1}}));
+        CHECK(parser.run(get, kBase + 16, 100, sink, kBase + 8) == FifoStatus::Budget && get == kBase + 8);
+        CHECK((sink.writes == Writes{{0x1800, 1}}));
+        CHECK(parser.run(get, kBase + 16, 100, sink, dal::kFifoNoStop) == FifoStatus::Idle && get == kBase + 16);
+        CHECK((sink.writes == Writes{{0x1800, 1}, {0x1800, 2}}));
+    }
+
+    // A stop equal to a jump target is met after the jump.
+    {
+        FakeSink sink;
+        FifoParser parser;
+        sink.put(kBase, {0x1800 | (1u << 18), 1, 0x00000001u | (kBase + 0x100)});
+        sink.put(kBase + 0x100, {0x1800 | (1u << 18), 2});
+        std::uint32_t get = kBase;
+        CHECK(parser.run(get, kBase + 0x108, 100, sink, kBase + 0x100) == FifoStatus::Budget);
+        CHECK(get == kBase + 0x100 && (sink.writes == Writes{{0x1800, 1}}));
+        CHECK(parser.run(get, kBase + 0x108, 100, sink) == FifoStatus::Idle && get == kBase + 0x108);
+        CHECK((sink.writes == Writes{{0x1800, 1}, {0x1800, 2}}));
+    }
+
+    // A stop inside a command (between its arguments) is passed.
+    {
+        FakeSink sink;
+        FifoParser parser;
+        sink.put(kBase, {0x1d6c | (2u << 18), 1, 2});
+        std::uint32_t get = kBase;
+        CHECK(parser.run(get, kBase + 12, 100, sink, kBase + 8) == FifoStatus::Idle && get == kBase + 12);
+        CHECK((sink.writes == Writes{{0x1d6c, 1}, {0x1d70, 2}}));
+    }
+
+    // get == put wins over a stop at the same position.
+    {
+        FakeSink sink;
+        FifoParser parser;
+        std::uint32_t get = kBase;
+        CHECK(parser.run(get, kBase, 100, sink, kBase) == FifoStatus::Idle && get == kBase);
+    }
+
+    // A refused write is retried before the stop is looked at; get names the command that is not done.
+    {
+        FakeSink sink;
+        FifoParser parser;
+        sink.refuse = 1;
+        sink.put(kBase, {0x1800 | (1u << 18), 1, 0x1800 | (1u << 18), 2});
+        std::uint32_t get = kBase;
+        CHECK(parser.run(get, kBase + 16, 100, sink, kBase + 8) == FifoStatus::Waiting);
+        CHECK(get == kBase + 8 && parser.commandGet(get) == kBase && sink.writes.empty());
+        CHECK(parser.run(get, kBase + 16, 100, sink, kBase + 8) == FifoStatus::Budget);
+        CHECK(get == kBase + 8 && parser.commandGet(get) == kBase + 8);
+        CHECK((sink.writes == Writes{{0x1800, 1}}));
+    }
 }
 
 std::vector<std::pair<dal::RsxInterrupt, std::uint32_t>> g_interrupts;
