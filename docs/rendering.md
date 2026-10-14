@@ -173,13 +173,20 @@ is made on the GPU instead.
   and counted as `state guest copy queue full`). The handler notes the copy after the original because
   the original may give up the guest lock (at loop back edges); noted earlier, the RSX thread could hash a
   half-copied destination.
-- *Position in the stream.* `RsxConsumer::pump()` hands the queued copies to the frame builder before it
-  parses new commands, under the guest lock. The guest holds the same lock when it queues, and the consumer
-  parses only under it, so the copy lands after every command consumed before the call and before every
-  command put after it. A copy waits for the next `pump()`, at the latest the next vertical blank. Without a
-  frame builder the queue is discarded. The guest does not wait for the RSX to finish drawing before the
-  copy, so if the consumer has not pumped the previous frame's draws yet, the GPU copy takes the layer one
-  frame earlier; for this crossfade that is the same old expression.
+- *Position in the stream.* `queueGuestCopy` tags each request with the `put` the guest had written when it
+  made the copy, and the copy is applied where the parser reaches that position: `FifoParser::run` takes a
+  stop position (`kFifoNoStop` for none) and ends the run, at a command boundary, when `get` equals it.
+  So the copy lands after every command the guest had submitted by then and before everything it submits
+  later, which is what the guest's bytes reflect on hardware once the RSX has executed the submitted work.
+  The game makes the copy in its update phase after presenting the previous frame, so that `put` lies past
+  the previous frame's whole redraw of the layer. The consumer's current position is not used: the RSX
+  thread leaves the guest lock after every draw end and every hold budget, so at the call it can stand
+  inside a layer's redraw (after the layer's clear, before most of its draws), and a copy applied there
+  copied a half-drawn layer. A copy tagged behind a pending draw waits for that draw to be built first.
+  A tag that the parser passes inside a command or never meets is applied once the stream is fully consumed
+  and counted as `state guest copy position missed`; late is better than never. A copy therefore waits
+  until the stream reaches its tag, at the latest the next `pump()` after the guest puts more commands or
+  the next vertical blank. Without a frame builder the queue is discarded.
 - *The command.* `RsxFrameBuilder::onGuestCopy` accepts a copy only when the source is the first byte of a
   known color surface and the copy covers the surface (`pitch * (height - 1) + width * 4` bytes); the
   destination gets the source's size, pitch and format A8R8G8B8. It then emits `RsxCopy`, and the renderer
@@ -219,14 +226,17 @@ read. It needs no renderer and no window. Captures are derived from the game, so
 `generated/`.
 
 Guest copies of render targets (see above) are part of the stream. The capture file is version 3 (the
-reader still accepts versions 1 and 2). A `COPY` chunk holds each copy request the consumer drained, in
+reader still accepts versions 1 and 2). A `COPY` chunk holds each copy request the consumer applied, in
 stream order with the register writes and the guest bytes (the builder reads the destination bytes before
 the chunk), and replay hands it to the builder at the same point, which decides again from the recorded
-bytes. The surface records of the start state carry the copy fields of the known surfaces (`copied`,
-`copy_stale` and the hash); version 1 and 2 files have none. A replay has no GPU contents from before the
-captured frame: in a frame after the copy, the texture is still an alias of the copied surface, but that
-surface shows transparent black (counted as `texture alias of unknown render target`). A copy whose source was drawn earlier in the captured frame is made for
-real.
+bytes. The chunk is recorded where the copy is applied, not where the game made it, so it can fall in the
+capture of the frame after the one in which the game drew the source. A replay of that capture has no
+render target for the source and leaves the destination transparent black (counted as `state render
+target copy from an unknown target`). The surface records of the start state carry the copy fields of
+the known surfaces (`copied`, `copy_stale` and the hash); version 1 and 2 files have none. A replay has no
+GPU contents from before the captured frame: in a frame after the copy, the texture is still an alias of
+the copied surface, but that surface shows transparent black (counted as `texture alias of unknown render
+target`). A copy whose source was drawn earlier in the captured frame is made for real.
 
 `dal_rsxreplay` replays a capture through the frame builder and the renderer without the game:
 
