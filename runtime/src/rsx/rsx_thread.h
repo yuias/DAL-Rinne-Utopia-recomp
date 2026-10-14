@@ -81,9 +81,9 @@ public:
     bool frameBuilderLive() const { return builder_live_.load(std::memory_order_acquire); }
     // Drops the frame builder again. Only while nothing was written yet and no capture is enabled.
     void disableFrameBuilder();
-    // Guest lock held: queues a copy the guest CPU made, to be applied at the next pump() (see
-    // RsxFrameBuilder::onGuestCopy). Ignored without a frame builder. At most 64 are pending; beyond that the
-    // oldest is dropped and counted as `state guest copy queue full`.
+    // Guest lock held: queues a copy the guest CPU made, tagged with the put the guest had written. pump() applies
+    // it when the parser reaches that put (see RsxFrameBuilder::onGuestCopy). Ignored without a frame builder.
+    // At most 64 are pending; beyond that the oldest is dropped and counted as `state guest copy queue full`.
     void queueGuestCopy(const RsxGuestCopy& copy);
     // Commands built since the last call, after building a pending draw. Needs no guest lock (only the
     // pump's thread may call it); the draw's copies then run without it.
@@ -144,8 +144,16 @@ private:
     void publishGet(std::uint32_t get);
     // Builds the draw the last SET_BEGIN_END(0) left pending and records that write in the capture.
     void finishPendingDraw();
-    // Hands the queued guest copies to the frame builder in order, or drops them without one.
-    void drainGuestCopies();
+    struct PendingGuestCopy {
+        RsxGuestCopy copy;
+        std::uint32_t put = 0;  // control-register put when the guest made the copy, low bits cleared
+    };
+    // True when the parser stands at the copy's put with no command unfinished and no refused write held.
+    bool guestCopyReached(const PendingGuestCopy& pending) const;
+    // Hands one copy to the frame builder and the capture.
+    void applyGuestCopy(const RsxGuestCopy& copy);
+    // Applies the copies at the front of the queue, in order, while the parser stands at their put.
+    void applyReachedGuestCopies();
     // Effective address of `offset` in the context DMA `location`; false when out of range or not
     // one of the areas the consumer serves.
     bool resolve(std::uint32_t offset, std::uint32_t location, std::uint32_t size, std::uint32_t& ea) const;
@@ -182,8 +190,8 @@ private:
     std::unique_ptr<GuestRsxMemoryView> memory_view_;
     std::unique_ptr<RsxFrameBuilder> builder_;
     std::atomic<std::uint64_t> clears_{0}, draws_{0}, built_flips_{0}, copies_{0};
-    // Touched only under the guest lock: the handler pushes, pump() drains.
-    std::vector<RsxGuestCopy> guest_copies_;
+    // Touched only under the guest lock, in put order: the handler pushes, pump() applies them at their put.
+    std::vector<PendingGuestCopy> guest_copies_;
     // Copy of the builder's texture cache counters, published by takeCommands() for the stop path.
     std::atomic<std::uint64_t> tex_epochs_{0}, tex_hits_{0}, tex_checks_{0}, tex_checked_bytes_{0}, tex_stores_{0},
             tex_stored_bytes_{0}, tex_entries_{0}, tex_bytes_{0};

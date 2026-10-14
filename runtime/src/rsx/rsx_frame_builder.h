@@ -48,7 +48,7 @@ inline constexpr std::uint32_t kRsxMaxTextureBytes = 64u << 20;
 inline constexpr std::size_t kRsxMaxKnownSurfaces = 64;
 
 // A copy the guest CPU made of `size` bytes from src to dst (location 0 = local, 1 = main through the IO
-// map), at the point of the command stream the RSX consumer had reached when the copy ended.
+// map). Applied where the command stream reaches the put the guest had written when the copy ended.
 struct RsxGuestCopy {
     std::uint32_t src_location = 0, src_offset = 0, dst_location = 0, dst_offset = 0, size = 0;
 };

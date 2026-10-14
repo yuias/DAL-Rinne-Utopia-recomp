@@ -165,23 +165,35 @@ void RsxConsumer::queueGuestCopy(const RsxGuestCopy& copy) {
         guest_copies_.erase(guest_copies_.begin());
         rsxNoteUnimplemented("state", "guest copy queue full");
     }
-    guest_copies_.push_back(copy);
+    // The guest has submitted everything up to this put, so the copy belongs after those commands and before any
+    // it submits later. Not compared with get_ here: it may not be known yet.
+    guest_copies_.push_back({copy, dalRead32(base_, kRsxControlAddr + kControlPut) & ~3u});
 }
 
-void RsxConsumer::drainGuestCopies() {
-    if (guest_copies_.empty()) return;
-    std::vector<RsxGuestCopy> copies = std::exchange(guest_copies_, {});
-    if (builder_ == nullptr || faulted_) return;
-    for (const RsxGuestCopy& copy : copies) {
-        const bool made = builder_->onGuestCopy(copy);
-        // Recorded either way: the replay builder decides again from the same recorded bytes. After the builder,
-        // so the destination bytes it read come first.
-        if (capture_ != nullptr) capture_->onCopy(copy);
-        if (!made) continue;
-        logInfo("dal: rsx: render target copy in frame {}: {} {:#x} -> {} {:#x} ({:#x} bytes)", flips_reached_ + 1,
-                copy.src_location == 0 ? "local" : "main", copy.src_offset, copy.dst_location == 0 ? "local" : "main",
-                copy.dst_offset, copy.size);
+bool RsxConsumer::guestCopyReached(const PendingGuestCopy& pending) const {
+    // commandGet() names the header of an unfinished command or a refused write, so a flip still waiting for the
+    // vblank right before the tag keeps the copy waiting.
+    return get_known_ && parser_.commandGet(get_) == pending.put;
+}
+
+void RsxConsumer::applyGuestCopy(const RsxGuestCopy& copy) {
+    const bool made = builder_->onGuestCopy(copy);
+    // Recorded either way: the replay builder decides again from the same recorded bytes. After the builder,
+    // so the destination bytes it read come first.
+    if (capture_ != nullptr) capture_->onCopy(copy);
+    if (!made) return;
+    logInfo("dal: rsx: render target copy in frame {}: {} {:#x} -> {} {:#x} ({:#x} bytes)", flips_reached_ + 1,
+            copy.src_location == 0 ? "local" : "main", copy.src_offset, copy.dst_location == 0 ? "local" : "main",
+            copy.dst_offset, copy.size);
+}
+
+void RsxConsumer::applyReachedGuestCopies() {
+    std::size_t applied = 0;
+    while (applied < guest_copies_.size() && guestCopyReached(guest_copies_[applied])) {
+        applyGuestCopy(guest_copies_[applied].copy);
+        applied++;
     }
+    guest_copies_.erase(guest_copies_.begin(), guest_copies_.begin() + static_cast<std::ptrdiff_t>(applied));
 }
 
 void RsxConsumer::enableFrameBuilder() {
@@ -544,9 +556,7 @@ FifoStatus RsxConsumer::pump(std::uint32_t max_words) {
     // report or flip, which the writes after the draw produce; so the draw is copied before any of them runs. Normally
     // takeCommands() already did this outside the lock.
     finishPendingDraw();
-    // Before parsing: the guest made these copies while the consumer stood at this position of the stream, so they
-    // land after every command consumed so far and before any put since.
-    drainGuestCopies();
+    if (builder_ == nullptr || faulted_) guest_copies_.clear();
     if (faulted_) return FifoStatus::Fault;
     if (!get_known_) {
         get_ = dalRead32(base_, kRsxControlAddr + kControlGet);
@@ -554,7 +564,28 @@ FifoStatus RsxConsumer::pump(std::uint32_t max_words) {
         get_known_ = true;
     }
     const std::uint32_t put = dalRead32(base_, kRsxControlAddr + kControlPut);
-    const FifoStatus status = parser_.run(get_, put, max_words, *this);
+    // A guest copy lands where the stream reaches the put the guest had written when it made the copy. The
+    // parser stops there; after a draw end the copy waits for the next pump, which builds the draw first.
+    FifoStatus status;
+    for (;;) {
+        applyReachedGuestCopies();
+        const std::uint32_t stop = guest_copies_.empty() ? kFifoNoStop : guest_copies_.front().put;
+        status = parser_.run(get_, put, max_words, *this, stop);
+        if (status != FifoStatus::Budget || stopAfterWrite() || guest_copies_.empty() ||
+            !guestCopyReached(guest_copies_.front())) {
+            break;
+        }
+    }
+    if (status == FifoStatus::Idle && get_ == (put & ~3u)) {
+        // Fully consumed, so every tag is behind. One that was not met was inside a command or off the path;
+        // applying it late is better than never.
+        applyReachedGuestCopies();
+        for (const PendingGuestCopy& pending : guest_copies_) {
+            rsxNoteUnimplemented("state", "guest copy position missed");
+            applyGuestCopy(pending.copy);
+        }
+        guest_copies_.clear();
+    }
     // The guest sees `get` at the start of an unfinished command (a semaphore wait, a flip waiting
     // for VBlank), so "get == put" means the work is really done. The wrap callback only needs get
     // to leave the fragment it is about to refill, which this also guarantees.

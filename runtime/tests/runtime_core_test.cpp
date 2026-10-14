@@ -7631,7 +7631,8 @@ void testRsxConsumer() {
         const std::uint32_t after_draw = at;
         emit(dal::kMethodGcmFlipCommand, {2});
         emit(dal::kMethodGcmFlipCommand, {1});
-        dalWrite32(base, kControl, at);
+        // Put only up to the draw end for now: the guest copy below is made when that is all it has submitted.
+        dalWrite32(base, kControl, after_draw);
 
         // The pump stops right after the draw end (a command of its own here, so get is published past it);
         // the draw is built when the commands are taken, and the rest of the frame follows on the next pump.
@@ -7642,6 +7643,7 @@ void testRsxConsumer() {
         constexpr std::uint32_t kCopyDest = 0x500000;
         const dal::RsxGuestCopy copy_request{0, 0x100000, 0, kCopyDest, 0x1400 * 720};
         capturing.queueGuestCopy(copy_request);
+        dalWrite32(base, kControl, at);
         CHECK(capturing.pump(200) == FifoStatus::Idle);
         for (dal::RsxCommand& command : capturing.takeCommands()) live.push_back(std::move(command));
         CHECK(live.size() == 7 && std::holds_alternative<dal::RsxClear>(live[2]) &&
@@ -7706,8 +7708,9 @@ void testRsxConsumer() {
         CHECK(capturing.takeCaptures().empty());
     }
 
-    // A guest copy queued under the guest lock is applied by the next pump before it parses, so it lands
-    // between the commands consumed so far and the ones put afterwards.
+    // A guest copy queued under the guest lock is tagged with the put at that moment and applied by the pump that
+    // reaches it. Here the consumer stands at that put, so it lands between the commands consumed so far and the
+    // ones put afterwards.
     {
         constexpr std::uint32_t kSource = 0x100000, kDest = 0x500000, kBytes = 0x1400 * 720;
         constexpr std::uint32_t kQueueLimit = 64;
@@ -7792,6 +7795,89 @@ void testRsxConsumer() {
         // No RSX thread runs in this test, so the handler's entry point has nothing to queue to.
         dal::rsxNoteGuestCopy(0xC0000000 + kDest, 0xC0000000 + kSource, kBytes);
         CHECK(copying.pump(200) == FifoStatus::Idle && copying.takeCommands().empty());
+        dal::rsxUnimplementedReset();
+    }
+
+    // A copy made while the consumer is still behind the guest's put waits for that put: the commands the guest had
+    // submitted by then, including a draw that stops the pump, come first. A put inside a command is never met by
+    // the parser; the copy is then applied when the stream is consumed, and counted.
+    {
+        constexpr std::uint32_t kSource = 0x100000, kDest = 0x500000, kBytes = 0x1400 * 720;
+        for (std::uint32_t i = 0; i < 36; i++) base[area + 0x80000 + i] = static_cast<std::uint8_t>(i + 1);
+        const auto setUp = [&](dal::RsxConsumer& target) {
+            dalWrite32(base, kControl + 4, at);
+            target.enableFrameBuilder();
+            emit(0x0200, {1280u << 16});
+            emit(0x0204, {720u << 16});
+            emit(0x0208, {8u | (2u << 5) | (1u << 8)});
+            emit(0x020C, {0x1400});
+            emit(0x0210, {kSource});
+            emit(0x0220, {1});
+            emit(0x08C0, {1280u << 16});
+            emit(0x08C4, {720u << 16});
+            emit(0x1D90, {0xFF102030});
+            emit(0x1D94, {0xF0});
+            dalWrite32(base, kControl, at);
+            CHECK(target.pump(200) == FifoStatus::Idle);
+            const std::vector<dal::RsxCommand> cleared = target.takeCommands();
+            CHECK(cleared.size() == 1 && std::holds_alternative<dal::RsxClear>(cleared[0]));
+        };
+        const auto emitDraw = [&] {
+            emit(dal::kMethodNv4097SetVertexDataArrayFormat, {2u | (3u << 4) | (12u << 8)});
+            emit(dal::kMethodNv4097SetVertexDataArrayOffset, {0x80080000});
+            emit(dal::kMethodNv4097SetBeginEnd, {5});
+            emit(dal::kMethodNv4097DrawArrays, {2u << 24});
+            emit(dal::kMethodNv4097SetBeginEnd, {0});
+        };
+        const auto pumpToIdle = [&](dal::RsxConsumer& target) {
+            std::vector<dal::RsxCommand> all;
+            FifoStatus status = FifoStatus::Budget;
+            for (int i = 0; i < 10 && status != FifoStatus::Idle; i++) {
+                status = target.pump(200);
+                for (dal::RsxCommand& command : target.takeCommands()) all.push_back(std::move(command));
+            }
+            CHECK(status == FifoStatus::Idle);
+            return all;
+        };
+        const dal::RsxGuestCopy request{0, kSource, 0, kDest, kBytes};
+        dal::rsxUnimplementedReset();
+        lines.clear();
+
+        dal::RsxConsumer behind(base);
+        setUp(behind);
+        emitDraw();
+        emitDraw();
+        emit(dal::kMethodGcmFlipCommand, {1});
+        dalWrite32(base, kControl, at);
+        CHECK(behind.pump(200) == FifoStatus::Budget && behind.stopAfterWrite());
+        const std::vector<dal::RsxCommand> first = behind.takeCommands();
+        CHECK(first.size() == 1 && std::holds_alternative<dal::RsxDraw>(first[0]));
+        behind.queueGuestCopy(request);
+        // The guest keeps submitting after the copy; the parser must stop at the copy's put and then go on.
+        emit(dal::kMethodGcmFlipCommand, {2});
+        dalWrite32(base, kControl, at);
+        const std::vector<dal::RsxCommand> rest = pumpToIdle(behind);
+        CHECK(rest.size() == 4 && std::holds_alternative<dal::RsxDraw>(rest[0]) &&
+              std::holds_alternative<dal::RsxFlip>(rest[1]) && std::holds_alternative<dal::RsxCopy>(rest[2]) &&
+              std::holds_alternative<dal::RsxFlip>(rest[3]));
+        if (rest.size() == 4 && std::holds_alternative<dal::RsxCopy>(rest[2])) {
+            const dal::RsxCopy& copy = std::get<dal::RsxCopy>(rest[2]);
+            CHECK(copy.source.offset == kSource && copy.destination.offset == kDest);
+        }
+        CHECK(unimplementedCount("state guest copy position missed") == 0);
+
+        dal::RsxConsumer missed(base);
+        setUp(missed);
+        const std::uint32_t command_at = at;
+        emit(dal::kMethodNv4097SetViewportOffset, {0, 0, 0, 0});
+        dalWrite32(base, kControl, command_at + 8);  // the second argument
+        missed.queueGuestCopy(request);
+        emit(dal::kMethodGcmFlipCommand, {1});
+        dalWrite32(base, kControl, at);
+        const std::vector<dal::RsxCommand> late = pumpToIdle(missed);
+        CHECK(late.size() == 2 && std::holds_alternative<dal::RsxFlip>(late[0]) &&
+              std::holds_alternative<dal::RsxCopy>(late[1]));
+        CHECK(unimplementedCount("state guest copy position missed") == 1);
         dal::rsxUnimplementedReset();
     }
 
