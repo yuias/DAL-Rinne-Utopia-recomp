@@ -124,6 +124,14 @@ struct RsxFlip {
     std::uint64_t flip_index = 0;
 };
 
-using RsxCommand = std::variant<RsxClear, RsxDraw, RsxFlip>;
+// The pixels of the color surface `source` copied into `destination` (same pitch, size and format),
+// recorded where the guest copied the source's bytes in memory. The renderer copies its render target
+// images; guest memory is not involved.
+struct RsxCopy {
+    RsxSurface source;
+    RsxSurface destination;
+};
+
+using RsxCommand = std::variant<RsxClear, RsxDraw, RsxFlip, RsxCopy>;
 
 }  // namespace dal

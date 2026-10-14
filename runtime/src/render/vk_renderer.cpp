@@ -1325,6 +1325,48 @@ bool RsxRenderer::ensureReadback(FrameSlot& slot, VkDeviceSize size) {
     return true;
 }
 
+// The guest copied the bytes of a render target; the bytes are stale (targets live on the GPU only), so the
+// image is copied instead. The destination becomes a target of its own, which a later texture at that
+// address samples as a render target alias.
+void RsxRenderer::recordCopy(const RsxCopy& copy) {
+    if (copy.source.location == copy.destination.location && copy.source.offset == copy.destination.offset) {
+        rsxNoteUnimplemented("state", "render target copy onto itself");
+        return;
+    }
+    const std::shared_ptr<RenderTarget> dst = acquireColor(copy.destination);
+    if (!valid()) return;
+    if (!dst) {
+        rsxNoteUnimplemented("state", "render target copy: destination unavailable");
+        return;
+    }
+
+    // Not acquireColor: a size mismatch must not replace the source target.
+    const auto found = color_targets_.find(TargetKey{copy.source.location, copy.source.offset});
+    const VkCommandBuffer cmd = slots_[current_slot_]->cmd;
+    if (found == color_targets_.end()) {
+        // Clear the destination so it does not keep showing an older copy.
+        rsxNoteUnimplemented("state", "render target copy from an unknown target");
+        transition(*dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkClearColorValue value{};
+        const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+        return;
+    }
+    const std::shared_ptr<RenderTarget> src = found->second;
+    touch(src);
+    touch(dst);
+    transition(*src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transition(*dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {std::min(src->width, dst->width), std::min(src->height, dst->height), 1};
+    vkCmdCopyImage(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    stats_.target_copies++;
+}
+
 // The display buffer is the color target at (location 0, offset). When the flip is read back (every flip
 // with readback_all, otherwise only a dumped or requested one) its pixels are copied into the slot's
 // readback buffer here, inside the frame's command buffer, so readDisplay needs no further GPU work. A
@@ -1464,6 +1506,8 @@ void RsxRenderer::execute(std::span<RsxCommand> commands) {
             recordClear(*clear);
         } else if (const auto* draw = std::get_if<RsxDraw>(&command)) {
             recordDraw(*draw);
+        } else if (const auto* copy = std::get_if<RsxCopy>(&command)) {
+            recordCopy(*copy);
         } else {
             recordFlip(std::get<RsxFlip>(command));
             if (valid() && (dumpDue() || dump_this_flip_)) {

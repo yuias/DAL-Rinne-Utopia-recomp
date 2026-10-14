@@ -45,6 +45,7 @@ struct RendererStats {
     std::uint64_t flips = 0;
     std::uint64_t texture_uploads = 0;  // texture images written from guest bytes (once per new content id per image)
     std::uint64_t feedback_copies = 0;  // render target copies made for draws that sample their own target
+    std::uint64_t target_copies = 0;    // render target images copied for RsxCopy
 };
 
 // Single-threaded: execute, readDisplay and stats are called from one thread. The renderer never
@@ -129,6 +130,7 @@ private:
     void recordClear(const RsxClear& clear);
     void recordMaskedColorClear(const RsxClear& clear, RenderTarget& color, std::uint32_t color_bits);
     void recordDraw(const RsxDraw& draw);
+    void recordCopy(const RsxCopy& copy);
     void recordFlip(const RsxFlip& flip);
     void recordPresentBlit(FrameSlot& slot, RenderTarget* source);
     bool ensureReadback(FrameSlot& slot, VkDeviceSize size);

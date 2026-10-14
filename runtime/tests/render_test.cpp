@@ -660,6 +660,88 @@ void testRendererScissorAndMask(dal::VkContext& ctx) {
     dal::rsxUnimplementedReset();
 }
 
+dal::RsxSurface testSurface(std::uint32_t offset) {
+    dal::RsxSurface surface;
+    surface.location = 0;
+    surface.offset = offset;
+    surface.pitch = 256;
+    surface.width = 64;
+    surface.height = 16;
+    surface.format = dal::RsxColorFormat::A8R8G8B8;
+    return surface;
+}
+
+dal::RsxFlip testFlip(const dal::RsxSurface& surface) {
+    dal::RsxFlip flip;
+    flip.offset = surface.offset;
+    flip.pitch = surface.pitch;
+    flip.width = surface.width;
+    flip.height = surface.height;
+    return flip;
+}
+
+// RsxCopy copies the pixels of the source target into the destination target, never touches the source,
+// clears the destination when the source is unknown, and ignores a copy onto the same address.
+void testRendererTargetCopy(dal::VkContext& ctx) {
+    dal::rsxUnimplementedReset();
+    dal::RsxRenderer renderer(ctx, readbackAllOptions());
+    CHECK(renderer.valid());
+    std::vector<std::uint8_t> bgra;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+
+    const dal::RsxSurface a = testSurface(0x100000);
+    const dal::RsxSurface b = testSurface(0x200000);
+    const dal::RsxSurface c = testSurface(0x300000);
+    constexpr std::uint8_t kColor[4] = {0x30, 0x20, 0x10, 0xFF};  // B, G, R, A of 0xFF102030
+
+    dal::RsxClear clear;
+    clear.surfaces.color = a;
+    clear.surfaces.has_color = true;
+    clear.mask = dal::kRsxClearRed | dal::kRsxClearGreen | dal::kRsxClearBlue | dal::kRsxClearAlpha;
+    clear.color_argb = 0xFF102030;
+    clear.scissor[2] = a.width;
+    clear.scissor[3] = a.height;
+
+    std::vector<dal::RsxCommand> commands;
+    commands.emplace_back(clear);
+    commands.emplace_back(dal::RsxCopy{a, b});
+    commands.emplace_back(testFlip(b));
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height) && width == 64 && height == 16);
+    CHECK(displayIsUniform(bgra, width, height, kColor));
+    CHECK(renderer.stats().target_copies == 1);
+
+    // The source keeps its pixels.
+    commands.clear();
+    commands.emplace_back(testFlip(a));
+    renderer.execute(commands);
+    CHECK(renderer.readDisplay(bgra, width, height) && displayIsUniform(bgra, width, height, kColor));
+
+    // A source that was never drawn clears the destination instead of leaving the older copy.
+    commands.clear();
+    commands.emplace_back(dal::RsxCopy{c, b});
+    commands.emplace_back(testFlip(b));
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height) && width == 64 && height == 16);
+    CHECK(displayIsUniform(bgra, width, height, {0, 0, 0, 0}));
+    CHECK(unimplementedCount("state render target copy from an unknown target") == 1);
+    CHECK(renderer.stats().target_copies == 1);
+
+    // A copy onto the same address does nothing.
+    commands.clear();
+    commands.emplace_back(dal::RsxCopy{a, a});
+    commands.emplace_back(testFlip(a));
+    renderer.execute(commands);
+    CHECK(renderer.valid());
+    CHECK(renderer.readDisplay(bgra, width, height) && displayIsUniform(bgra, width, height, kColor));
+    CHECK(unimplementedCount("state render target copy onto itself") == 1);
+    CHECK(renderer.stats().target_copies == 1);
+    dal::rsxUnimplementedReset();
+}
+
 // ---- vertex_convert (no Vulkan device needed) ----
 
 void testVertexConvert() {
@@ -1662,6 +1744,7 @@ int main() {
     testRendererRequestedDumpSharesDumpDir(*ctx);
     testPresentOverlayNeedsPresenter(*ctx);
     testRendererScissorAndMask(*ctx);
+    testRendererTargetCopy(*ctx);
     testRendererQuad(*ctx);
     testRendererTextures(*ctx);
     CHECK(ctx->validationErrorCount() == 0);

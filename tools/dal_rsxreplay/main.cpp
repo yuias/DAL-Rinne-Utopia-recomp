@@ -162,6 +162,9 @@ int main(int argc, char** argv) {
         } else if (const auto* draw = std::get_if<dal::RsxDraw>(&command)) {
             printDraw(*draw, builder.knownSurfaces());
             draws++;
+        } else if (const auto* copy = std::get_if<dal::RsxCopy>(&command)) {
+            std::printf("copy %ux%u@0x%x -> @0x%x\n", copy->source.width, copy->source.height, copy->source.offset,
+                        copy->destination.offset);
         } else {
             const auto& flip = std::get<dal::RsxFlip>(command);
             std::printf("flip buffer=%u %ux%u@0x%x\n", flip.buffer, flip.width, flip.height, flip.offset);
