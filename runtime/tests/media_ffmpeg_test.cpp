@@ -679,17 +679,30 @@ void playGameMovie(const std::filesystem::path& movie, const char* name, int max
     }
 }
 
-// Optional: needs DAL_GAME_DIR.
-void testMoviePlayerWithGameFile() {
+// DAL_GAME_DIR, or empty when unset.
+std::string gameDirFromEnv() {
+#if defined(_WIN32)
+    // _dupenv_s: the CRT marks getenv as deprecated.
     char* dir = nullptr;
     std::size_t dir_len = 0;
-    if (_dupenv_s(&dir, &dir_len, "DAL_GAME_DIR") != 0 || dir == nullptr || *dir == '\0') {
-        std::free(dir);
+    std::string result;
+    if (_dupenv_s(&dir, &dir_len, "DAL_GAME_DIR") == 0 && dir != nullptr) result = dir;
+    std::free(dir);
+    return result;
+#else
+    const char* dir = std::getenv("DAL_GAME_DIR");
+    return dir != nullptr ? dir : "";
+#endif
+}
+
+// Optional: needs DAL_GAME_DIR.
+void testMoviePlayerWithGameFile() {
+    const std::string dir = gameDirFromEnv();
+    if (dir.empty()) {
         std::printf("movie player game file: skipped (DAL_GAME_DIR is not set)\n");
         return;
     }
     const std::filesystem::path movie_dir = std::filesystem::path(dir) / "PS3_GAME" / "USRDIR" / "Movie";
-    std::free(dir);
     if (!std::filesystem::exists(movie_dir / "ch_logo.pam")) {
         std::printf("movie player game file: skipped (ch_logo.pam not found)\n");
         return;
