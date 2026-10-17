@@ -64,10 +64,11 @@ function(dal_audio_add)
   target_compile_options(dal_audiotool PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   # dal_media supplies the FFmpeg ATRAC3plus decoder for `at3`; the DLLs are loaded from the
   # executable's directory.
+  target_link_libraries(dal_audiotool PRIVATE dal_media dal_crypto)
   if(WIN32)
-    target_link_libraries(dal_audiotool PRIVATE dal_audio_wasapi dal_media)
+    target_link_libraries(dal_audiotool PRIVATE dal_audio_wasapi)
   else()
-    target_link_libraries(dal_audiotool PRIVATE dal_media)
+    target_link_libraries(dal_audiotool PRIVATE dal_audio_coreaudio)
   endif()
   add_dependencies(dal_audiotool dal_ffmpeg_runtime)
 endfunction()

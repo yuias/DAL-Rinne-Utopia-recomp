@@ -13,3 +13,7 @@ set(DAL_ATRAC_DECODE_SAMPLES 2794736)
 # the hash was identical over repeated runs, but FFmpeg's float DSP may round differently between
 # builds or CPU feature sets; re-pin then (the counts stay).
 set(DAL_ATRAC_DECODE_PCM_SHA256 "b1279257925d9804c2058529afdae2c0d8bb79bc2209019643ca9edb3422f385")
+if(APPLE)
+  # Homebrew FFmpeg on Apple silicon (NEON float DSP); identical over repeated runs, counts unchanged.
+  set(DAL_ATRAC_DECODE_PCM_SHA256 "d39f882b421e65c7d80ddad3c77208b8e76e6e1cd98cc45bd834f17dfa0106d9")
+endif()

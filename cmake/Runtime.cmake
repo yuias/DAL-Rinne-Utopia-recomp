@@ -230,8 +230,6 @@ function(dal_runtime_add_core)
   # PRIVATE: only core/elf_loader.cpp hashes the executable.
   target_link_libraries(dal_runtime_core PRIVATE dal_crypto)
   if(WIN32)
-    # Stays PUBLIC until the tools move to dal_crypto: they still call BCrypt.
-    target_link_libraries(dal_runtime_core PUBLIC bcrypt)
     # timeBeginPeriod (core/timer_resolution.cpp).
     target_link_libraries(dal_runtime_core PRIVATE winmm)
   endif()
