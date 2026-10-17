@@ -38,7 +38,7 @@ dal_sdat --keys <key_vault.h or its directory> --game-dir <game-dir> --out <cach
 
 - `--game-dir` is searched recursively for `*.sdat`; each file is written under `--out` at its
   path relative to the game directory. The tool verifies every block's AES-CMAC, so a wrong key
-  or a damaged file is an error (exit 1). It uses Windows CNG for AES and is built together with
+  or a damaged file is an error (exit 1). It uses the host crypto library for AES (CNG on Windows, CommonCrypto on macOS) and is built together with
   the runtime (its tests are the CTest entry `sdat_tests`, which use made-up keys).
 - The container layout and the block compression follow RPCS3's `Crypto/unedat.cpp` and
   `Crypto/lz.cpp` (behaviour only; the code is independent).

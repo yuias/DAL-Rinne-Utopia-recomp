@@ -17,7 +17,7 @@ What the runtime does on the pinned executable today, and what it does not imple
   `dal_rsxreplay`, which renders single recorded frames without the game (see
   [Rendering](rendering.md)).
 - Movie playback through FFmpeg (see [Movies](movies.md)) and sound through the game's own mixer
-  and WASAPI (see [Audio](audio.md)).
+  and WASAPI on Windows or CoreAudio on macOS (see [Audio](audio.md)).
 
 ## How far a run gets
 
@@ -41,9 +41,13 @@ game streams through `cellAtrac`, is covered by unit tests only: no scene a stan
 voice. With `--render vulkan` the only entry in the `rsx unimplemented` census is the constant ZPASS
 report value.
 
+On macOS (Apple Silicon) the game boots, draws the notice screen and plays sound through CoreAudio.
+What was verified there: the boot, the rendering of the notice screen, the CoreAudio output, and the
+keyboard mapping (by tests). Gamepads and real key presses on macOS have not been tried by hand.
+
 Without the `.sdat` cache the game stops earlier, at its error dialog for the missing file; without
-the FFmpeg DLLs the movies run their full length as black frames and the game's music and sound
-effects are silent.
+FFmpeg (the DLLs on Windows, Homebrew's libraries on macOS) the movies run their full length as
+black frames and the game's music and sound effects are silent.
 
 ## Not implemented
 
@@ -53,16 +57,16 @@ effects are silent.
   [Rendering](rendering.md#rendering)). Known gaps are the ZPASS report values (the constant 0 is
   written, no occlusion query runs) and user clip planes (the vertex translator does not write the
   clip distances).
-- Audio: WASAPI is the only device output, in shared mode on the default device. The output is
-  stereo (the game's 8-channel port is reduced to its front pair), and there is no volume setting or
+- Audio: the only device outputs are WASAPI on Windows (shared mode, on the default device) and
+  CoreAudio on macOS (the default output device). The output is stereo (the game's 8-channel port is reduced to its front pair), and there is no volume setting or
   device choice. ATRAC3 (non-plus) is not supported; the game has none. Only the `cellAudio` and
   `cellAtrac` calls this game makes are implemented.
 - Movies: only the `cellSail` calls this game makes are implemented (PAMF files with H.264 video and
   ATRAC3plus audio). Repeat mode is stored but not acted on.
 - Input: the `neutral`, `none`, `keyboard`, `gamepad` and `keyboard+gamepad` pad providers. The
   keyboard has a fixed mapping, no analog sticks and no vibration; gamepads are read through
-  GameInput with a fixed mapping; an Xbox Wireless Controller and a DualShock 4 (second model, no
-  vibration) were verified, and the first DualShock 4 model is not used. Only port 0 exists; there is no mouse or `cellKb` input. See [Input](input.md).
+  GameInput on Windows and GameController.framework on macOS, with a fixed mapping; an Xbox Wireless
+  Controller and a DualShock 4 (second model, no vibration) were verified on Windows, and the first DualShock 4 model is not used. Only port 0 exists; there is no mouse or `cellKb` input. See [Input](input.md).
 - SPU and SPURS: SPU system calls only keep bookkeeping, no SPU code runs, SPURS workloads are not
   scheduled.
 - Every import of this game has a handler, but some are minimal (for example `cellSpurs`, which only

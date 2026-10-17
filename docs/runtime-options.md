@@ -233,8 +233,8 @@ exits:
 | 7 | All guest threads ended without a process exit | `dal: stop: no guest threads left` |
 
 A fatal stop also prints the registers and the call trace (the most recent function entries) of
-the faulting guest thread. The runtime never calls `abort`: the CRT and Windows error dialogs are
-disabled, so a run always ends with an exit code, also when it is started from a script.
+the faulting guest thread. The runtime never calls `abort`: on Windows the CRT and Windows error
+dialogs are disabled, so a run always ends with an exit code, also when it is started from a script.
 
 ## Examples by purpose
 
