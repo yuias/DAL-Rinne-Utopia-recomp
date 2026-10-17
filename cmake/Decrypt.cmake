@@ -22,7 +22,7 @@ function(dal_decrypt_add)
     tools/dal_decrypt/self.cpp)
   target_compile_options(dal_decrypt_lib PRIVATE ${decrypt_options})
   target_include_directories(dal_decrypt_lib PUBLIC tools/dal_decrypt)
-  target_link_libraries(dal_decrypt_lib PUBLIC bcrypt zlibstatic)
+  target_link_libraries(dal_decrypt_lib PUBLIC zlibstatic PRIVATE dal_crypto)
 
   add_executable(dal_decrypt tools/dal_decrypt/main.cpp)
   target_compile_options(dal_decrypt PRIVATE ${decrypt_options})

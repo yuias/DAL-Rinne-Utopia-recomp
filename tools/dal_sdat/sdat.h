@@ -32,7 +32,8 @@ struct Keys {
 // missing or has the wrong size.
 bool loadKeys(const std::filesystem::path& path, Keys& keys, std::string& error);
 
-// AES-128 primitives over Windows CNG. Lengths of the CBC calls must be a multiple of 16.
+// AES-128 primitives on the host crypto library (dal::crypto). Lengths of the CBC calls must be a
+// multiple of 16.
 bool aesEcbEncrypt(const Block16& key, const Block16& in, Block16& out);
 bool aesCbcEncrypt(const Block16& key, const Block16& iv, std::span<const std::uint8_t> in, std::uint8_t* out);
 bool aesCbcDecrypt(const Block16& key, const Block16& iv, std::span<const std::uint8_t> in, std::uint8_t* out);
