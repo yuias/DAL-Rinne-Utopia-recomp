@@ -127,6 +127,13 @@ endfunction()
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
   dal_crypto_add()
+  if(WIN32)
+    set(host_memory_provider runtime/src/core/host_memory_win32.cpp)
+  elseif(APPLE)
+    set(host_memory_provider runtime/src/core/host_memory_posix.cpp)
+  else()
+    message(FATAL_ERROR "DAL: no host memory provider for this platform")
+  endif()
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
   dal_runtime_add_yyjson()
@@ -144,6 +151,7 @@ function(dal_runtime_add_core)
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_clock.cpp
     runtime/src/core/guest_memory.cpp
+    ${host_memory_provider}
     runtime/src/core/json_read.cpp
     runtime/src/core/log.cpp
     runtime/src/core/override_handlers.cpp
