@@ -96,9 +96,37 @@ function(dal_runtime_add_cli11)
   message(STATUS "DAL: CLI11 ${cli11_version}")
 endfunction()
 
+# Host crypto (AES, AES-CMAC, HMAC-SHA1, SHA-256) on the OS's own library: CNG on Windows,
+# CommonCrypto (part of libSystem, nothing to link) on macOS. Independent of the runtime core.
+# Call after enable_testing().
+function(dal_crypto_add)
+  if(WIN32)
+    set(crypto_provider runtime/src/crypto/host_crypto_bcrypt.cpp)
+  elseif(APPLE)
+    set(crypto_provider runtime/src/crypto/host_crypto_commoncrypto.cpp)
+  else()
+    message(FATAL_ERROR "DAL: no host crypto provider for this platform")
+  endif()
+  add_library(dal_crypto STATIC ${crypto_provider})
+  target_compile_options(dal_crypto PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  target_include_directories(dal_crypto PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
+  if(WIN32)
+    target_link_libraries(dal_crypto PRIVATE bcrypt)
+  endif()
+
+  add_executable(dal_crypto_tests runtime/tests/crypto_test.cpp)
+  target_compile_options(dal_crypto_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  target_link_libraries(dal_crypto_tests PRIVATE dal_crypto)
+
+  add_test(NAME crypto_core COMMAND dal_crypto_tests)
+  set_tests_properties(crypto_core PROPERTIES
+    PASS_REGULAR_EXPRESSION "crypto tests: [0-9]+ passed, 0 failed")
+endfunction()
+
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
+  dal_crypto_add()
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
   dal_runtime_add_yyjson()
