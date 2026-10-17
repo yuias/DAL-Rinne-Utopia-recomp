@@ -134,6 +134,11 @@ function(dal_runtime_add_core)
   else()
     message(FATAL_ERROR "DAL: no host memory provider for this platform")
   endif()
+  if(WIN32)
+    set(timer_resolution_provider runtime/src/core/timer_resolution.cpp)
+  else()
+    set(timer_resolution_provider runtime/src/core/timer_resolution_posix.cpp)
+  endif()
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
   dal_runtime_add_yyjson()
@@ -158,7 +163,7 @@ function(dal_runtime_add_core)
     runtime/src/core/overrides.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
-    runtime/src/core/timer_resolution.cpp
+    ${timer_resolution_provider}
     runtime/src/hle/cell_atrac.cpp
     runtime/src/hle/cell_atrac_stream.cpp
     runtime/src/hle/cell_audio.cpp

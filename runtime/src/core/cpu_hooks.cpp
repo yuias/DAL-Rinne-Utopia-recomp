@@ -14,7 +14,7 @@
 namespace {
 
 // delta * mul / frequency without a 128-bit division (needs compiler-rt, which is not linked).
-// The remainder term stays below frequency * mul, far under 2^64 for a QPC frequency in the MHz.
+// The remainder term stays below frequency * mul, under 2^64 for a counter frequency up to 1 GHz.
 std::uint64_t scaleCounter(std::uint64_t delta, std::uint64_t mul) {
     const std::uint64_t frequency = dal::guestClockFrequency();
     return (delta / frequency) * mul + (delta % frequency) * mul / frequency;
