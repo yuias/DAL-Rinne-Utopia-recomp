@@ -104,6 +104,11 @@ function(dal_render_add)
     runtime/src/render/vk_textures.cpp
     runtime/src/render/vk_window.cpp
     runtime/src/render/vp_translator.cpp)
+  if(WIN32)
+    target_sources(dal_render PRIVATE runtime/src/render/vk_window_win32.cpp)
+  elseif(APPLE)
+    target_sources(dal_render PRIVATE runtime/src/render/vk_window_macos.mm)
+  endif()
   target_compile_options(dal_render PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_include_directories(dal_render SYSTEM PUBLIC
@@ -119,6 +124,9 @@ function(dal_render_add)
   if(WIN32)
     # ImmAssociateContext turns the IME off for the game window.
     target_link_libraries(dal_render PRIVATE imm32)
+  elseif(APPLE)
+    # AppKit windows; QuartzCore for the CAMetalLayer that MoltenVK renders into.
+    target_link_libraries(dal_render PRIVATE "-framework Cocoa" "-framework QuartzCore")
   endif()
   # PRIVATE: libpng types stay inside frame_dump.cpp.
   target_link_libraries(dal_render PRIVATE png_static)
