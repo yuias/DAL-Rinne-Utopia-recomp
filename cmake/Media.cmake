@@ -142,10 +142,10 @@ function(dal_media_add)
     PASS_REGULAR_EXPRESSION "media ffmpeg tests: [0-9]+ passed, 0 failed")
 
   # Decodes a movie headless. Writes PNGs only where told. dal_render is defined after this function
-  # runs; target names resolve at generate time. It supplies the PNG writer.
+  # runs; target names resolve at generate time. It supplies the PNG writer; dal_crypto the SHA-256.
   add_executable(dal_moviedump tools/dal_moviedump/main.cpp)
   target_compile_options(dal_moviedump PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
-  target_link_libraries(dal_moviedump PRIVATE dal_media dal_render)
+  target_link_libraries(dal_moviedump PRIVATE dal_media dal_render dal_crypto)
   add_dependencies(dal_moviedump dal_ffmpeg_runtime)
 
   include("${CMAKE_SOURCE_DIR}/cmake/movie_decode.cmake")

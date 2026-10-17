@@ -26,12 +26,8 @@
 #include <string_view>
 #include <vector>
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <bcrypt.h>
-
 #include "core/log.h"
+#include "crypto/host_crypto.h"
 #include "media/ffmpeg_codecs.h"
 #include "media/movie_decoder.h"
 #include "media/pamf.h"
@@ -170,10 +166,7 @@ bool parseOptions(int argc, char** argv, Options& options) {
 
 std::optional<Digest> sha256(std::span<const std::uint8_t> data) {
     Digest digest{};
-    const NTSTATUS status =
-            BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<PUCHAR>(data.data()),
-                       static_cast<ULONG>(data.size()), digest.data(), static_cast<ULONG>(digest.size()));
-    if (status < 0) return std::nullopt;
+    if (!dal::crypto::sha256(data, digest)) return std::nullopt;
     return digest;
 }
 
