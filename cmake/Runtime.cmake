@@ -175,13 +175,15 @@ function(dal_runtime_add_core)
     runtime/src/rsx/rsx_texture_cache.cpp
     runtime/src/rsx/rsx_thread.cpp
     runtime/src/rsx/rsx_unimplemented.cpp)
-  target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_runtime_core PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_runtime_core PUBLIC
     ${CMAKE_SOURCE_DIR}/runtime/src
     ${CMAKE_SOURCE_DIR}/runtime/include)
-  target_link_libraries(dal_runtime_core PUBLIC bcrypt)
-  # timeBeginPeriod (core/timer_resolution.cpp).
-  target_link_libraries(dal_runtime_core PRIVATE winmm)
+  if(WIN32)
+    target_link_libraries(dal_runtime_core PUBLIC bcrypt)
+    # timeBeginPeriod (core/timer_resolution.cpp).
+    target_link_libraries(dal_runtime_core PRIVATE winmm)
+  endif()
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
@@ -190,7 +192,7 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PRIVATE yyjson)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
-  target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_runtime_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   # The tests build their PNG inputs with libpng's writer and test the json_read.h helpers.
   target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core png_static yyjson)
 
@@ -200,7 +202,7 @@ function(dal_runtime_add_core)
 
   # The movie pipeline's core needs no FFmpeg, so its tests link the core library only.
   add_executable(dal_media_core_tests runtime/tests/media_core_test.cpp)
-  target_compile_options(dal_media_core_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_media_core_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_media_core_tests PRIVATE dal_runtime_core)
 
   add_test(NAME media_core COMMAND dal_media_core_tests)
@@ -211,12 +213,12 @@ function(dal_runtime_add_core)
   add_library(dal_game_options STATIC
     runtime/src/app/config_file.cpp
     runtime/src/app/game_options.cpp)
-  target_compile_options(dal_game_options PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_game_options PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_game_options PUBLIC dal_runtime_core)
   target_link_libraries(dal_game_options PRIVATE CLI11 yyjson)
 
   add_executable(dal_game_options_tests runtime/tests/game_options_test.cpp)
-  target_compile_options(dal_game_options_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_game_options_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_compile_definitions(dal_game_options_tests PRIVATE DAL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(dal_game_options_tests PRIVATE dal_game_options)
 
@@ -231,16 +233,18 @@ endfunction()
 # tool runs, so nothing here (or in any test) contains key material.
 function(dal_sdat_add_tool)
   add_library(dal_sdat_lib STATIC tools/dal_sdat/sdat.cpp tools/dal_sdat/sdat_lz.cpp)
-  target_compile_options(dal_sdat_lib PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat_lib PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_sdat_lib PUBLIC ${CMAKE_SOURCE_DIR}/tools/dal_sdat)
-  target_link_libraries(dal_sdat_lib PUBLIC bcrypt)
+  if(WIN32)
+    target_link_libraries(dal_sdat_lib PUBLIC bcrypt)
+  endif()
 
   add_executable(dal_sdat tools/dal_sdat/main.cpp)
-  target_compile_options(dal_sdat PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_sdat PRIVATE dal_sdat_lib)
 
   add_executable(dal_sdat_tests tools/dal_sdat/sdat_test.cpp)
-  target_compile_options(dal_sdat_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_sdat_tests PRIVATE dal_sdat_lib)
   add_test(NAME sdat_tests COMMAND dal_sdat_tests)
   set_tests_properties(sdat_tests PROPERTIES PASS_REGULAR_EXPRESSION "sdat tests: [0-9]+ passed, 0 failed")

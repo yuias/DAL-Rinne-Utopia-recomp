@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.29)
 
 project(DalRinneUtopiaRecomp VERSION 0.1.0 LANGUAGES C CXX)
 
+if(APPLE)
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 26)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+  set(CMAKE_OBJCXX_EXTENSIONS OFF)
+  add_compile_options($<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+endif()
+
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -25,11 +33,11 @@ enable_testing()
 
 add_executable(dal_runtime runtime/src/main.cpp)
 target_compile_definitions(dal_runtime PRIVATE DAL_VERSION="${PROJECT_VERSION}")
-target_compile_options(dal_runtime PRIVATE -march=x86-64-v3 -Wall -Wextra)
+target_compile_options(dal_runtime PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
 target_include_directories(dal_runtime PRIVATE runtime/include)
 
 add_library(dal_ppu_stub STATIC runtime/src/ppu_stub_runtime.cpp)
-target_compile_options(dal_ppu_stub PRIVATE -march=x86-64-v3 -Wall -Wextra)
+target_compile_options(dal_ppu_stub PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
 
 set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
@@ -49,8 +57,11 @@ dal_overlay_add()
 if(TARGET dal_game)
   # dal_media supplies the FFmpeg codec factory that game_main installs for the cellSail movies; the
   # FFmpeg DLLs it loads at run time are copied next to the executable by dal_ffmpeg_runtime.
-  # shell32: CommandLineToArgvW, for the UTF-8 arguments.
-  target_link_libraries(dal_game PRIVATE dal_render dal_overlay dal_media dal_game_options shell32)
+  target_link_libraries(dal_game PRIVATE dal_render dal_overlay dal_media dal_game_options)
+  if(WIN32)
+    # shell32: CommandLineToArgvW, for the UTF-8 arguments.
+    target_link_libraries(dal_game PRIVATE shell32)
+  endif()
   add_dependencies(dal_game dal_ffmpeg_runtime)
 endif()
 
