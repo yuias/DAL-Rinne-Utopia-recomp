@@ -7,7 +7,7 @@ option(DAL_PPU_WERROR "Treat warnings in generated PPU code as errors" ON)
 function(dal_ppu_codegen_options target)
   target_compile_options(${target} PRIVATE
     -O1
-    -march=x86-64-v3
+    ${DAL_ARCH_FLAGS}
     -ffp-contract=off
     -fpatchable-function-entry=8
     -Wall
@@ -56,7 +56,7 @@ function(dal_ppu_add_generated_tree)
   # The stand-in handlers exist only here: dal_game must fail to link when a handler named in the
   # overrides file is missing, while this test links with the stub runtime whatever the file names.
   add_executable(dal_ppu_link_test runtime/tests/ppu_link_test.cpp ${DAL_PPU_OVERRIDE_STUB_SOURCES})
-  target_compile_options(dal_ppu_link_test PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_ppu_link_test PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_ppu_link_test PRIVATE ${CMAKE_SOURCE_DIR}/runtime/include)
   target_link_libraries(dal_ppu_link_test PRIVATE dal_ppu_generated dal_ppu_stub)
 
@@ -66,8 +66,12 @@ function(dal_ppu_add_generated_tree)
   # Only game_main.cpp references the generated tables, so the runtime core builds without them.
   # The runtime core supplies every hook; the stub must not be linked here (duplicate symbols).
   add_executable(dal_game runtime/src/game_main.cpp)
-  target_compile_options(dal_game PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core dal_audio_wasapi dal_input_gameinput)
+  target_compile_options(dal_game PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  if(WIN32)
+    target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core dal_audio_wasapi dal_input_gameinput)
+  else()
+    target_link_libraries(dal_game PRIVATE dal_ppu_generated dal_runtime_core)
+  endif()
 
   # Per-game override handlers. A glob rather than a source list: the directory is the drop-in point
   # for a port, which adds handler files without editing CMake.

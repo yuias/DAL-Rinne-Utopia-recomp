@@ -56,37 +56,41 @@ endfunction()
 
 # The input libraries and tools. Call after dal_runtime_add_core() and enable_testing().
 function(dal_input_add)
-  dal_input_find_gameinput()
+  if(WIN32)
+    dal_input_find_gameinput()
 
-  # The only target that sees GameInput.h and Windows.h for gamepads; dal_runtime_core stays free of
-  # them. The v3 header directory is a SYSTEM include so it is searched before the Windows SDK's
-  # older GameInput.h. GameInput.lib is the package's static loader (it resolves the installed
-  # runtime with LoadLibrary), so no GameInput DLL appears in an import table.
-  add_library(dal_input_gameinput STATIC runtime/src/input/gameinput_backend.cpp)
-  target_compile_options(dal_input_gameinput PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_include_directories(dal_input_gameinput SYSTEM PRIVATE "${DAL_GAMEINPUT_INCLUDE_DIR}")
-  target_link_libraries(dal_input_gameinput PUBLIC dal_runtime_core PRIVATE "${DAL_GAMEINPUT_LIB}")
+    # The only target that sees GameInput.h and Windows.h for gamepads; dal_runtime_core stays free
+    # of them. The v3 header directory is a SYSTEM include so it is searched before the Windows SDK's
+    # older GameInput.h. GameInput.lib is the package's static loader (it resolves the installed
+    # runtime with LoadLibrary), so no GameInput DLL appears in an import table.
+    add_library(dal_input_gameinput STATIC runtime/src/input/gameinput_backend.cpp)
+    target_compile_options(dal_input_gameinput PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+    target_include_directories(dal_input_gameinput SYSTEM PRIVATE "${DAL_GAMEINPUT_INCLUDE_DIR}")
+    target_link_libraries(dal_input_gameinput PUBLIC dal_runtime_core PRIVATE "${DAL_GAMEINPUT_LIB}")
+  endif()
 
   # Pure core code behind the GamepadBackend interface; no GameInput or Windows.
   add_executable(dal_input_core_tests runtime/tests/input_core_test.cpp)
-  target_compile_options(dal_input_core_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_input_core_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_input_core_tests PRIVATE dal_runtime_core)
 
   add_test(NAME input_core COMMAND dal_input_core_tests)
   set_tests_properties(input_core PROPERTIES
     PASS_REGULAR_EXPRESSION "input core tests: [0-9]+ passed, 0 failed")
 
-  # Exits 77 (skipped) when no GameInput runtime with API version 3 is available.
-  add_executable(dal_input_gameinput_tests runtime/tests/input_gameinput_test.cpp)
-  target_compile_options(dal_input_gameinput_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_input_gameinput_tests PRIVATE dal_input_gameinput)
+  if(WIN32)
+    # Exits 77 (skipped) when no GameInput runtime with API version 3 is available.
+    add_executable(dal_input_gameinput_tests runtime/tests/input_gameinput_test.cpp)
+    target_compile_options(dal_input_gameinput_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+    target_link_libraries(dal_input_gameinput_tests PRIVATE dal_input_gameinput)
 
-  add_test(NAME input_gameinput COMMAND dal_input_gameinput_tests)
-  set_tests_properties(input_gameinput PROPERTIES
-    SKIP_RETURN_CODE 77
-    PASS_REGULAR_EXPRESSION "input gameinput tests: [0-9]+ passed, 0 failed")
+    add_test(NAME input_gameinput COMMAND dal_input_gameinput_tests)
+    set_tests_properties(input_gameinput PROPERTIES
+      SKIP_RETURN_CODE 77
+      PASS_REGULAR_EXPRESSION "input gameinput tests: [0-9]+ passed, 0 failed")
 
-  add_executable(dal_padtool tools/dal_padtool/main.cpp)
-  target_compile_options(dal_padtool PRIVATE -march=x86-64-v3 -Wall -Wextra)
-  target_link_libraries(dal_padtool PRIVATE dal_input_gameinput)
+    add_executable(dal_padtool tools/dal_padtool/main.cpp)
+    target_compile_options(dal_padtool PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+    target_link_libraries(dal_padtool PRIVATE dal_input_gameinput)
+  endif()
 endfunction()

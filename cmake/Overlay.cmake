@@ -1,8 +1,9 @@
 include_guard(GLOBAL)
 
-# Dear ImGui comes from a pinned submodule and is built from its core files plus the Win32 and Vulkan
-# backends (no demo window). Vulkan entry points resolve through volk, so the backend must not
-# include <vulkan/vulkan.h> prototypes. Nothing is fetched or generated at configure time.
+# Dear ImGui comes from a pinned submodule and is built from its core files plus the Vulkan backend
+# and, on Windows, the Win32 backend (no demo window). Vulkan entry points resolve through volk, so
+# the backend must not include <vulkan/vulkan.h> prototypes. Nothing is fetched or generated at
+# configure time.
 function(dal_overlay_add_imgui)
   if(NOT EXISTS ${CMAKE_SOURCE_DIR}/externals/imgui/LICENSE.txt)
     message(FATAL_ERROR
@@ -15,17 +16,21 @@ function(dal_overlay_add_imgui)
     ${imgui_dir}/imgui_draw.cpp
     ${imgui_dir}/imgui_tables.cpp
     ${imgui_dir}/imgui_widgets.cpp
-    ${imgui_dir}/backends/imgui_impl_win32.cpp
     ${imgui_dir}/backends/imgui_impl_vulkan.cpp)
   target_include_directories(imgui SYSTEM PUBLIC ${imgui_dir} ${imgui_dir}/backends)
-  # The game window has no IME and the overlay takes no gamepad input.
   target_compile_definitions(imgui PUBLIC
     IMGUI_IMPL_VULKAN_USE_VOLK
-    IMGUI_DISABLE_OBSOLETE_FUNCTIONS
-    IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
-    IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS)
-  target_compile_options(imgui PRIVATE -march=x86-64-v3)
-  target_link_libraries(imgui PUBLIC volk PRIVATE dwmapi gdi32)
+    IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+  target_compile_options(imgui PRIVATE ${DAL_ARCH_FLAGS})
+  target_link_libraries(imgui PUBLIC volk)
+  if(WIN32)
+    target_sources(imgui PRIVATE ${imgui_dir}/backends/imgui_impl_win32.cpp)
+    # The game window has no IME and the overlay takes no gamepad input.
+    target_compile_definitions(imgui PUBLIC
+      IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+      IMGUI_DISABLE_WIN32_DEFAULT_IME_FUNCTIONS)
+    target_link_libraries(imgui PRIVATE dwmapi gdi32)
+  endif()
 endfunction()
 
 # The overlay libraries. Call after dal_render_add(), which defines volk and dal_render and enables
@@ -38,13 +43,13 @@ function(dal_overlay_add)
     runtime/src/overlay/overlay_model.cpp
     runtime/src/overlay/overlay_panels.cpp
     runtime/src/overlay/overlay_sources.cpp)
-  target_compile_options(dal_overlay PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_overlay PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_overlay PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_link_libraries(dal_overlay PUBLIC imgui dal_render)
 
   # Needs no GPU for the model tests; the Vulkan parts skip without a device.
   add_executable(dal_overlay_tests runtime/tests/overlay_test.cpp)
-  target_compile_options(dal_overlay_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_overlay_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_overlay_tests PRIVATE dal_overlay)
 
   add_test(NAME overlay_core COMMAND dal_overlay_tests)
