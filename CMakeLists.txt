@@ -39,6 +39,12 @@ target_include_directories(dal_runtime PRIVATE runtime/include)
 add_library(dal_ppu_stub STATIC runtime/src/ppu_stub_runtime.cpp)
 target_compile_options(dal_ppu_stub PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
 target_include_directories(dal_ppu_stub PUBLIC runtime/include)
+if(APPLE)
+  # The stub refers to the generated import table through weak references (see ppu_stub_runtime.cpp).
+  # ld64 rejects an undefined weak symbol unless it is declared allowed; dyld then binds it to null.
+  target_link_options(dal_ppu_stub INTERFACE
+    LINKER:-U,_kDalPpuImports LINKER:-U,_kDalPpuImportCount)
+endif()
 
 set(DAL_EBOOT_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for optional tests")
 # The file dal_inputs produces; a build step, so it need not exist yet.

@@ -20,13 +20,48 @@ function(dal_render_add_libraries)
     ${CMAKE_SOURCE_DIR}/externals/Vulkan-Headers/include)
   # No link against the Vulkan loader import library: volk loads it at run time.
   target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES)
-  target_compile_options(volk PRIVATE -march=x86-64-v3)
+  target_compile_options(volk PRIVATE ${DAL_ARCH_FLAGS})
 endfunction()
 
 # The run-time shader compiler is the SDK's static shaderc, located through $VULKAN_SDK. The
 # debug variant (shaderc_combinedd.lib) is built against the debug CRT (/MDd) and must be used
 # with Debug only; every other configuration uses the release library (/MD).
+#
+# On macOS the SDK ships one libshaderc_combined.a for every configuration. $VULKAN_SDK (the SDK's
+# macOS directory) is tried first, then /usr/local, where the SDK's system-global install puts the
+# same files; the variable is often not exported in the shell that runs CMake.
 function(dal_render_add_shaderc)
+  if(APPLE)
+    set(shaderc_prefix "")
+    set(shaderc_label "")
+    if(DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+      file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" sdk)
+      if(EXISTS "${sdk}/lib/libshaderc_combined.a" AND EXISTS "${sdk}/include/shaderc/shaderc.hpp")
+        set(shaderc_prefix "${sdk}")
+        set(shaderc_label "$VULKAN_SDK")
+      endif()
+    endif()
+    if(shaderc_prefix STREQUAL "" AND
+       EXISTS "/usr/local/lib/libshaderc_combined.a" AND
+       EXISTS "/usr/local/include/shaderc/shaderc.hpp")
+      set(shaderc_prefix "/usr/local")
+      set(shaderc_label "/usr/local")
+    endif()
+    if(shaderc_prefix STREQUAL "")
+      message(FATAL_ERROR
+        "DAL: shaderc not found. Install the LunarG Vulkan SDK and export VULKAN_SDK (the SDK's "
+        "macOS directory) or install its system-global component; expected "
+        "lib/libshaderc_combined.a and include/shaderc/shaderc.hpp")
+    endif()
+
+    add_library(shaderc_combined STATIC IMPORTED GLOBAL)
+    set_target_properties(shaderc_combined PROPERTIES
+      IMPORTED_LOCATION "${shaderc_prefix}/lib/libshaderc_combined.a")
+    target_include_directories(shaderc_combined SYSTEM INTERFACE "${shaderc_prefix}/include")
+    message(STATUS "DAL: shaderc: libshaderc_combined.a from ${shaderc_label}/lib")
+    return()
+  endif()
+
   if(NOT DEFINED ENV{VULKAN_SDK} OR "$ENV{VULKAN_SDK}" STREQUAL "")
     message(FATAL_ERROR
       "DAL: VULKAN_SDK is not set; expected $VULKAN_SDK/Lib/shaderc_combined.lib "
@@ -69,7 +104,7 @@ function(dal_render_add)
     runtime/src/render/vk_textures.cpp
     runtime/src/render/vk_window.cpp
     runtime/src/render/vp_translator.cpp)
-  target_compile_options(dal_render PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_render PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_render PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_include_directories(dal_render SYSTEM PUBLIC
     ${CMAKE_SOURCE_DIR}/externals/VulkanMemoryAllocator/include)
@@ -81,13 +116,15 @@ function(dal_render_add)
     VMA_VULKAN_VERSION=1003000)
   target_link_libraries(dal_render PUBLIC volk dal_runtime_core)
   target_link_libraries(dal_render PRIVATE shaderc_combined)
-  # ImmAssociateContext turns the IME off for the game window.
-  target_link_libraries(dal_render PRIVATE imm32)
+  if(WIN32)
+    # ImmAssociateContext turns the IME off for the game window.
+    target_link_libraries(dal_render PRIVATE imm32)
+  endif()
   # PRIVATE: libpng types stay inside frame_dump.cpp.
   target_link_libraries(dal_render PRIVATE png_static)
 
   add_executable(dal_render_tests runtime/tests/render_test.cpp)
-  target_compile_options(dal_render_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_render_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_render_tests PRIVATE dal_render)
 
   add_test(NAME render_core COMMAND dal_render_tests)
@@ -97,7 +134,7 @@ function(dal_render_add)
 
   # Needs no GPU. The dumped programs come from generated/rsx; the test skips them when absent.
   add_executable(dal_vp_translator_tests runtime/tests/vp_translator_test.cpp)
-  target_compile_options(dal_vp_translator_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_vp_translator_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_compile_definitions(dal_vp_translator_tests PRIVATE
     DAL_RSX_DUMP_DIR="${CMAKE_SOURCE_DIR}/generated/rsx")
   target_link_libraries(dal_vp_translator_tests PRIVATE dal_render)
@@ -106,7 +143,7 @@ function(dal_render_add)
     PASS_REGULAR_EXPRESSION "vp translator tests: [0-9]+ passed, 0 failed")
 
   add_executable(dal_fp_translator_tests runtime/tests/fp_translator_test.cpp)
-  target_compile_options(dal_fp_translator_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_fp_translator_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_compile_definitions(dal_fp_translator_tests PRIVATE
     DAL_RSX_DUMP_DIR="${CMAKE_SOURCE_DIR}/generated/rsx")
   target_link_libraries(dal_fp_translator_tests PRIVATE dal_render)
@@ -117,7 +154,7 @@ function(dal_render_add)
   # Replays a capture without the game: prints the command list from the frame builder, renders it
   # headless and writes the displayed frame as a PNG.
   add_executable(dal_rsxreplay tools/dal_rsxreplay/main.cpp)
-  target_compile_options(dal_rsxreplay PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_rsxreplay PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_rsxreplay PRIVATE dal_render)
 
   include("${CMAKE_SOURCE_DIR}/cmake/rsx_replay.cmake")
