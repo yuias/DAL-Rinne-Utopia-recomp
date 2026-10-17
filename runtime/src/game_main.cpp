@@ -47,6 +47,8 @@
 #include "hle/hle.h"
 #if defined(_WIN32)
 #include "input/gameinput_backend.h"
+#elif defined(__APPLE__)
+#include "input/gamecontroller_backend.h"
 #endif
 #include "input/gamepad_hub.h"
 #include "input/keyboard_pad.h"
@@ -528,6 +530,18 @@ int main(int argc, char** argv) {
         dal::startGamepadHub(
                 []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
                     return dal::makeGameInputBackend({});
+                },
+                padUsesGamepad(opt.pad) ? keyboard : nullptr,
+                {.is_foreground = dal::processOwnsForegroundWindow,
+                 .detect_steam = dal::detectSteamContext,
+                 .probe = opt.pad_probe});
+    }
+#elif defined(__APPLE__)
+    // The framework reports controllers on the main queue, which runWithHostEventLoop below serves.
+    if (padUsesGamepad(opt.pad) || opt.pad_probe) {
+        dal::startGamepadHub(
+                []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
+                    return dal::makeGameControllerBackend();
                 },
                 padUsesGamepad(opt.pad) ? keyboard : nullptr,
                 {.is_foreground = dal::processOwnsForegroundWindow,

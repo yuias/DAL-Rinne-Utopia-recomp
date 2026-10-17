@@ -69,6 +69,19 @@ function(dal_input_add)
     target_link_libraries(dal_input_gameinput PUBLIC dal_runtime_core PRIVATE "${DAL_GAMEINPUT_LIB}")
   endif()
 
+  if(APPLE)
+    # Objective-C++; the only target that sees the GameController headers. dal_runtime_core stays free
+    # of Apple types. AppKit is for NSRunningApplication (the focus check).
+    add_library(dal_input_gamecontroller STATIC runtime/src/input/gamecontroller_backend.mm)
+    target_compile_options(dal_input_gamecontroller PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+    target_link_libraries(dal_input_gamecontroller PUBLIC dal_runtime_core
+      PRIVATE "-framework Cocoa" "-framework GameController")
+
+    if(TARGET dal_game)
+      target_link_libraries(dal_game PRIVATE dal_input_gamecontroller)
+    endif()
+  endif()
+
   # Pure core code behind the GamepadBackend interface; no GameInput or Windows.
   add_executable(dal_input_core_tests runtime/tests/input_core_test.cpp)
   target_compile_options(dal_input_core_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
@@ -77,6 +90,19 @@ function(dal_input_add)
   add_test(NAME input_core COMMAND dal_input_core_tests)
   set_tests_properties(input_core PROPERTIES
     PASS_REGULAR_EXPRESSION "input core tests: [0-9]+ passed, 0 failed")
+
+  if(APPLE)
+    # Waits up to 3 s for a controller; exits 77 (skipped) when none is connected.
+    add_executable(dal_input_gamecontroller_tests runtime/tests/input_gamecontroller_test.cpp)
+    target_compile_options(dal_input_gamecontroller_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+    target_link_libraries(dal_input_gamecontroller_tests PRIVATE dal_input_gamecontroller
+      "-framework CoreFoundation")
+
+    add_test(NAME input_gamecontroller COMMAND dal_input_gamecontroller_tests)
+    set_tests_properties(input_gamecontroller PROPERTIES
+      SKIP_RETURN_CODE 77
+      PASS_REGULAR_EXPRESSION "input gamecontroller tests: [0-9]+ passed, 0 failed")
+  endif()
 
   if(WIN32)
     # Exits 77 (skipped) when no GameInput runtime with API version 3 is available.
