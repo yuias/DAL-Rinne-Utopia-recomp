@@ -71,11 +71,11 @@ function(dal_input_add)
 
   if(APPLE)
     # Objective-C++; the only target that sees the GameController headers. dal_runtime_core stays free
-    # of Apple types. AppKit is for NSRunningApplication (the focus check).
+    # of Apple types. AppKit is for NSRunningApplication (the focus check), CoreHaptics for rumble.
     add_library(dal_input_gamecontroller STATIC runtime/src/input/gamecontroller_backend.mm)
     target_compile_options(dal_input_gamecontroller PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
     target_link_libraries(dal_input_gamecontroller PUBLIC dal_runtime_core
-      PRIVATE "-framework Cocoa" "-framework GameController")
+      PRIVATE "-framework Cocoa" "-framework CoreHaptics" "-framework GameController")
 
     if(TARGET dal_game)
       target_link_libraries(dal_game PRIVATE dal_input_gamecontroller)
