@@ -28,3 +28,7 @@ set(DAL_MOVIE_DECODE_RGB_SHA256
 # may round differently between builds or CPU feature sets; re-pin then (the sample count stays).
 set(DAL_MOVIE_DECODE_AUDIO_SAMPLES 342016)
 set(DAL_MOVIE_DECODE_PCM_SHA256 "71a55bf85de4af084d3d875cdf53c4c0449311f0912bb36550a3e571190a024c")
+if(APPLE)
+  # Homebrew FFmpeg on Apple silicon (NEON float DSP); identical over repeated runs, sample count unchanged.
+  set(DAL_MOVIE_DECODE_PCM_SHA256 "a6781be4c8073f013142067696f5ba84c7aaac976bc68ceb7a4bdda5aa7f5f20")
+endif()
