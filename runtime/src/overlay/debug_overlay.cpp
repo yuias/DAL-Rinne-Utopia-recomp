@@ -77,6 +77,8 @@ MessageRoute DebugOverlay::onWindowMessage(const WindowMessage& message) {
     // The platform backend may need the thread that owns the window, so the input is fed from here and not
     // queued to the renderer's thread.
     std::lock_guard lock(mutex_);
+    // shutdown() may have run while this waited for the mutex.
+    if (!initialized_.load(std::memory_order_acquire)) return route;
     overlay_platform::forwardMessage(message, route);
     // Key-ups always reach the pad, so a key that went down before the overlay took the focus is released.
     if (overlay_platform::isKeyDown(message)) route.withhold_key = ImGui::GetIO().WantCaptureKeyboard;
@@ -101,13 +103,21 @@ void DebugOverlay::fail(const char* what) {
 }
 
 void DebugOverlay::shutdown() {
+    bool platform_backend = false;
+    {
+        std::lock_guard lock(mutex_);
+        initialized_.store(false, std::memory_order_release);
+        if (imgui_ != nullptr) ImGui::SetCurrentContext(imgui_);
+        platform_backend = platform_backend_;
+        platform_backend_ = false;
+    }
+    // Not under the mutex: the macOS backend stops on the main thread, which may be inside onWindowMessage
+    // waiting for the mutex. It cannot touch the context any more, as initialized_ is clear.
+    if (platform_backend) overlay_platform::shutdownBackend();
+
     std::lock_guard lock(mutex_);
-    initialized_.store(false, std::memory_order_release);
-    if (imgui_ != nullptr) ImGui::SetCurrentContext(imgui_);
     if (vulkan_backend_) ImGui_ImplVulkan_Shutdown();
-    if (platform_backend_) overlay_platform::shutdownBackend();
     vulkan_backend_ = false;
-    platform_backend_ = false;
     if (imgui_ != nullptr) {
         ImGui::DestroyContext(imgui_);
         imgui_ = nullptr;

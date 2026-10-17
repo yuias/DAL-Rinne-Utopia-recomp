@@ -287,6 +287,8 @@ private:
             // ARC owns the window; closing it must not release it a second time.
             [window_ setReleasedWhenClosed:NO];
             [window_ setTitle:[NSString stringWithUTF8String:kWindowTitle]];
+            // The debug overlay hovers its widgets, which needs the pointer position without a button down.
+            [window_ setAcceptsMouseMovedEvents:YES];
 
             view_ = [[DalMetalView alloc] initWithFrame:content];
             [view_ setWantsLayer:YES];
