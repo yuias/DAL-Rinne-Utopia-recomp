@@ -1,6 +1,6 @@
 // Self-checking tests for the debug overlay library. The model and panel tests need no GPU or window; the
-// overlay tests draw into an offscreen image on the first Vulkan device. The only window they create is a
-// hidden one, to give the Win32 backend a handle.
+// overlay tests draw into an offscreen image on the first Vulkan device. On Windows they also create a
+// hidden window, to give the Win32 backend a handle.
 
 #include <chrono>
 #include <cmath>
@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -17,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -330,18 +332,43 @@ void testRuntimeSources() {
     CHECK(sources.log_level() == level);
 }
 
-// Raw Win32 key message values, so the test needs no windows.h.
+constexpr bool kKeyDown = true;
+constexpr bool kKeyUp = false;
+
+#if defined(_WIN32)
+// Raw Win32 key message values, so these helpers need no windows.h.
 constexpr std::uint32_t kWmKeyDown = 0x0100;
 constexpr std::uint32_t kWmKeyUp = 0x0101;
+constexpr std::uint32_t kWmKillFocus = 0x0008;
 constexpr std::int64_t kRepeatBit = std::int64_t{1} << 30;
 
-dal::WindowMessage keyMessage(std::uint32_t message, std::uint32_t scan_code, bool repeat = false) {
+dal::WindowMessage keyMessage(bool down, std::uint32_t scan_code, bool repeat = false) {
     dal::WindowMessage result;
-    result.message = message;
+    result.message = down ? kWmKeyDown : kWmKeyUp;
     result.wparam = 0x70;  // the virtual key is only a fallback when the scan code is zero
     result.lparam = static_cast<std::int64_t>(scan_code) << 16 | (repeat ? kRepeatBit : 0);
     return result;
 }
+
+dal::WindowMessage focusLostMessage() {
+    dal::WindowMessage result;
+    result.message = kWmKillFocus;
+    return result;
+}
+#else
+dal::WindowMessage keyMessage(bool down, std::uint32_t scan_code, bool repeat = false) {
+    dal::WindowMessage result;
+    result.kind = dal::WindowEventKind::Key;
+    result.key = dal::KeyMessage{scan_code, down, repeat};
+    return result;
+}
+
+dal::WindowMessage focusLostMessage() {
+    dal::WindowMessage result;
+    result.kind = dal::WindowEventKind::FocusLost;
+    return result;
+}
+#endif
 
 // The overlay needs a VkContext only to be constructed; the key path touches neither Vulkan nor ImGui.
 void testToggleKey(dal::VkContext& ctx) {
@@ -349,26 +376,26 @@ void testToggleKey(dal::VkContext& ctx) {
     const std::uint32_t f1 = dal::kOverlayToggleScanCode;
     CHECK(!overlay.visible() && !overlay.wantsDraw());
 
-    dal::MessageRoute route = overlay.onWindowMessage(keyMessage(kWmKeyDown, f1));
+    dal::MessageRoute route = overlay.onWindowMessage(keyMessage(kKeyDown, f1));
     CHECK(overlay.visible() && overlay.wantsDraw() && route.withhold_key && !route.handled);
 
     // Auto-repeat neither toggles nor reaches the pad.
-    route = overlay.onWindowMessage(keyMessage(kWmKeyDown, f1, true));
+    route = overlay.onWindowMessage(keyMessage(kKeyDown, f1, true));
     CHECK(overlay.visible() && route.withhold_key);
-    route = overlay.onWindowMessage(keyMessage(kWmKeyUp, f1));
+    route = overlay.onWindowMessage(keyMessage(kKeyUp, f1));
     CHECK(overlay.visible() && route.withhold_key);
 
-    route = overlay.onWindowMessage(keyMessage(kWmKeyDown, f1));
+    route = overlay.onWindowMessage(keyMessage(kKeyDown, f1));
     CHECK(!overlay.visible() && route.withhold_key);
-    overlay.onWindowMessage(keyMessage(kWmKeyUp, f1));
+    overlay.onWindowMessage(keyMessage(kKeyUp, f1));
 
     // Other keys are never withheld here: the overlay is hidden or has no window input yet.
     constexpr std::uint32_t kScanZ = 0x2C;
-    CHECK(!overlay.onWindowMessage(keyMessage(kWmKeyDown, kScanZ)).withhold_key);
-    CHECK(!overlay.onWindowMessage(keyMessage(kWmKeyUp, kScanZ)).withhold_key);
+    CHECK(!overlay.onWindowMessage(keyMessage(kKeyDown, kScanZ)).withhold_key);
+    CHECK(!overlay.onWindowMessage(keyMessage(kKeyUp, kScanZ)).withhold_key);
     overlay.setVisible(true);
-    CHECK(!overlay.onWindowMessage(keyMessage(kWmKeyDown, kScanZ)).withhold_key);
-    CHECK(!overlay.onWindowMessage(keyMessage(kWmKeyUp, kScanZ)).withhold_key);
+    CHECK(!overlay.onWindowMessage(keyMessage(kKeyDown, kScanZ)).withhold_key);
+    CHECK(!overlay.onWindowMessage(keyMessage(kKeyUp, kScanZ)).withhold_key);
 }
 
 // Tab holds fast-forward; the hold is released by a key-up or by the window losing the keyboard focus.
@@ -378,33 +405,30 @@ void testHoldKey(dal::VkContext& ctx) {
     sources.set_fast_forward_held = [&](bool held) { calls.push_back(held); };
     dal::DebugOverlay overlay(ctx, sources);
     const std::uint32_t tab = dal::kFastForwardHoldScanCode;
-    constexpr std::uint32_t kWmKillFocus = 0x0008;
 
     // The same sequence with the overlay hidden and shown.
     for (const bool visible : {false, true}) {
         overlay.setVisible(visible);
         calls.clear();
 
-        dal::MessageRoute route = overlay.onWindowMessage(keyMessage(kWmKeyDown, tab));
+        dal::MessageRoute route = overlay.onWindowMessage(keyMessage(kKeyDown, tab));
         CHECK(calls == std::vector<bool>{true} && route.withhold_key && !route.handled);
 
-        route = overlay.onWindowMessage(keyMessage(kWmKeyDown, tab, true));
+        route = overlay.onWindowMessage(keyMessage(kKeyDown, tab, true));
         CHECK(calls == std::vector<bool>{true} && route.withhold_key && !route.handled);
 
-        route = overlay.onWindowMessage(keyMessage(kWmKeyUp, tab));
+        route = overlay.onWindowMessage(keyMessage(kKeyUp, tab));
         CHECK((calls == std::vector<bool>{true, false}) && route.withhold_key && !route.handled);
 
         calls.clear();
-        dal::WindowMessage kill_focus;
-        kill_focus.message = kWmKillFocus;
-        route = overlay.onWindowMessage(kill_focus);
+        route = overlay.onWindowMessage(focusLostMessage());
         CHECK(calls == std::vector<bool>{false} && !route.handled && !route.withhold_key);
     }
 
     // Tab is withheld even without a provider.
     dal::DebugOverlay bare(ctx, dal::OverlaySources{});
-    CHECK(bare.onWindowMessage(keyMessage(kWmKeyDown, tab)).withhold_key);
-    CHECK(bare.onWindowMessage(keyMessage(kWmKeyUp, tab)).withhold_key);
+    CHECK(bare.onWindowMessage(keyMessage(kKeyDown, tab)).withhold_key);
+    CHECK(bare.onWindowMessage(keyMessage(kKeyUp, tab)).withhold_key);
 }
 
 constexpr std::uint32_t kTargetWidth = 1280;
@@ -617,6 +641,7 @@ void drawTwice(dal::VkContext& ctx, OffscreenTarget& target) {
     CHECK(!target.anyLit(1270, 710, 1270, 710));
 }
 
+#if defined(_WIN32)
 dal::DebugOverlay* g_forward_overlay = nullptr;
 WNDPROC g_forward_previous = nullptr;
 int g_forwarded_capture_changes = 0;
@@ -661,11 +686,11 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
         CHECK(ImGui::GetIO().WantCaptureMouse);
 
         // Hiding and showing again must leave ImGui focused, or it would drop all input.
-        overlay.onWindowMessage(keyMessage(kWmKeyDown, dal::kOverlayToggleScanCode));
-        overlay.onWindowMessage(keyMessage(kWmKeyUp, dal::kOverlayToggleScanCode));
+        overlay.onWindowMessage(keyMessage(kKeyDown, dal::kOverlayToggleScanCode));
+        overlay.onWindowMessage(keyMessage(kKeyUp, dal::kOverlayToggleScanCode));
         CHECK(!overlay.visible());
-        overlay.onWindowMessage(keyMessage(kWmKeyDown, dal::kOverlayToggleScanCode));
-        overlay.onWindowMessage(keyMessage(kWmKeyUp, dal::kOverlayToggleScanCode));
+        overlay.onWindowMessage(keyMessage(kKeyDown, dal::kOverlayToggleScanCode));
+        overlay.onWindowMessage(keyMessage(kKeyUp, dal::kOverlayToggleScanCode));
         CHECK(overlay.visible());
         overlay.onWindowMessage(move);
         stats.flips = 4;
@@ -689,6 +714,7 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
     }
     DestroyWindow(hwnd);
 }
+#endif
 
 void testOverlayRecording(dal::VkContext& ctx) {
     OffscreenTarget target(ctx);
@@ -699,7 +725,9 @@ void testOverlayRecording(dal::VkContext& ctx) {
     drawTwice(ctx, target);
     // The first overlay is gone; a second one starts from scratch on the same device.
     drawTwice(ctx, target);
+#if defined(_WIN32)
     testWin32Input(ctx, target);
+#endif
 
     const std::uint32_t errors = ctx.validationErrorCount() - errors_before;
     std::printf("overlay tests: validation %s, %u error(s)\n", ctx.validationEnabled() ? "active" : "inactive", errors);

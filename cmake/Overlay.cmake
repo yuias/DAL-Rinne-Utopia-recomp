@@ -43,6 +43,12 @@ function(dal_overlay_add)
     runtime/src/overlay/overlay_model.cpp
     runtime/src/overlay/overlay_panels.cpp
     runtime/src/overlay/overlay_sources.cpp)
+  if(WIN32)
+    target_sources(dal_overlay PRIVATE runtime/src/overlay/overlay_platform_win32.cpp)
+  elseif(APPLE)
+    target_sources(dal_overlay PRIVATE runtime/src/overlay/overlay_platform_macos.mm)
+    target_link_libraries(dal_overlay PRIVATE "-framework Cocoa")
+  endif()
   target_compile_options(dal_overlay PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_overlay PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
   target_link_libraries(dal_overlay PUBLIC imgui dal_render)

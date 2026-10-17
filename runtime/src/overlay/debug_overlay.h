@@ -34,8 +34,9 @@ public:
     // Window thread, from PresenterOptions::on_message. F1 and Tab work while the overlay is hidden;
     // losing the keyboard focus releases the fast-forward hold.
     MessageRoute onWindowMessage(const WindowMessage& message);
-    // Renderer's thread, before the first record(). Null means no Win32 input (tests).
-    void attachWindow(void* hwnd);
+    // Renderer's thread, before the first record(). `native_window` is the HWND on Windows and the content
+    // NSView on macOS (Presenter::nativeWindowHandle). Null means no window input (tests).
+    void attachWindow(void* native_window);
 
     bool visible() const { return visible_.load(std::memory_order_relaxed); }  // any thread
     void setVisible(bool visible);                                             // any thread
@@ -61,13 +62,14 @@ private:
     std::atomic<bool> visible_{false};
     std::atomic<bool> failed_{false};
     std::atomic<bool> initialized_{false};  // set under mutex_ once the backends are up
-    std::atomic<void*> hwnd_{nullptr};
+    std::atomic<void*> native_window_{nullptr};
 
     // Renderer's thread only (the backends hold pointers into these).
     ImGuiContext* imgui_ = nullptr;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkFormat color_format_ = VK_FORMAT_UNDEFINED;
-    bool win32_backend_ = false;
+    float scale_ = 1.0f;  // window scale at initialisation; the layout-unit to pixel ratio on macOS
+    bool platform_backend_ = false;
     bool vulkan_backend_ = false;
     std::chrono::steady_clock::time_point last_frame_time_{};
 };

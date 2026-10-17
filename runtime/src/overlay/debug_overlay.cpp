@@ -4,29 +4,16 @@
 #include <cmath>
 #include <optional>
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include "core/log.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
-#include "imgui_impl_win32.h"
 #include "overlay/overlay_panels.h"
+#include "overlay/overlay_platform.h"
 #include "render/vk_renderer.h"
-
-// The header keeps this declaration under `#if 0` so that it does not pull in <windows.h>.
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace dal {
 
 namespace {
-
-constexpr std::uint32_t kWmKillFocus = 0x0008;
 
 constexpr float kBaseFontSize = 13.0f;
 constexpr float kMinDeltaTime = 1e-4f;
@@ -55,7 +42,7 @@ DebugOverlay::~DebugOverlay() {
     shutdown();
 }
 
-void DebugOverlay::attachWindow(void* hwnd) { hwnd_.store(hwnd, std::memory_order_release); }
+void DebugOverlay::attachWindow(void* native_window) { native_window_.store(native_window, std::memory_order_release); }
 
 void DebugOverlay::setVisible(bool visible) {
     if (visible_.exchange(visible) == visible || !initialized_.load(std::memory_order_acquire)) return;
@@ -68,10 +55,9 @@ void DebugOverlay::setVisible(bool visible) {
 MessageRoute DebugOverlay::onWindowMessage(const WindowMessage& message) {
     MessageRoute route;
     // A key-up is not delivered once the window has lost the focus, so the hold would stay on.
-    if (message.message == kWmKillFocus && sources_.set_fast_forward_held) sources_.set_fast_forward_held(false);
+    if (overlay_platform::isFocusLoss(message) && sources_.set_fast_forward_held) sources_.set_fast_forward_held(false);
 
-    const std::optional<KeyMessage> key =
-            keyMessageFromWin32(message.message, message.wparam, static_cast<std::uint64_t>(message.lparam));
+    const std::optional<KeyMessage> key = overlay_platform::keyOf(message);
     if (key && key->scan_code == kOverlayToggleScanCode) {
         if (key->down && !key->repeat) setVisible(!visible());
         route.withhold_key = true;
@@ -84,22 +70,16 @@ MessageRoute DebugOverlay::onWindowMessage(const WindowMessage& message) {
     }
 
     if (!visible() || !initialized_.load(std::memory_order_acquire) ||
-        hwnd_.load(std::memory_order_acquire) == nullptr) {
+        native_window_.load(std::memory_order_acquire) == nullptr) {
         return route;
     }
 
-    // The handler calls SetCapture, TrackMouseEvent and GetKeyState, which only work on the thread that
-    // owns the window, so the input is fed from here and not queued to the renderer's thread.
+    // The platform backend may need the thread that owns the window, so the input is fed from here and not
+    // queued to the renderer's thread.
     std::lock_guard lock(mutex_);
-    const LRESULT result =
-            ImGui_ImplWin32_WndProcHandler(static_cast<HWND>(message.hwnd), static_cast<UINT>(message.message),
-                                           static_cast<WPARAM>(message.wparam), static_cast<LPARAM>(message.lparam));
-    route.handled = result != 0;
-    route.result = static_cast<std::intptr_t>(result);
+    overlay_platform::forwardMessage(message, route);
     // Key-ups always reach the pad, so a key that went down before the overlay took the focus is released.
-    if (message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN) {
-        route.withhold_key = ImGui::GetIO().WantCaptureKeyboard;
-    }
+    if (overlay_platform::isKeyDown(message)) route.withhold_key = ImGui::GetIO().WantCaptureKeyboard;
     return route;
 }
 
@@ -125,9 +105,9 @@ void DebugOverlay::shutdown() {
     initialized_.store(false, std::memory_order_release);
     if (imgui_ != nullptr) ImGui::SetCurrentContext(imgui_);
     if (vulkan_backend_) ImGui_ImplVulkan_Shutdown();
-    if (win32_backend_) ImGui_ImplWin32_Shutdown();
+    if (platform_backend_) overlay_platform::shutdownBackend();
     vulkan_backend_ = false;
-    win32_backend_ = false;
+    platform_backend_ = false;
     if (imgui_ != nullptr) {
         ImGui::DestroyContext(imgui_);
         imgui_ = nullptr;
@@ -139,7 +119,7 @@ void DebugOverlay::shutdown() {
 }
 
 bool DebugOverlay::initialize(const Presenter::Target& target) {
-    void* hwnd = hwnd_.load(std::memory_order_acquire);
+    void* native_window = native_window_.load(std::memory_order_acquire);
     color_format_ = target.format;
     g_first_vk_error.store(VK_SUCCESS);
 
@@ -153,18 +133,24 @@ bool DebugOverlay::initialize(const Presenter::Target& target) {
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui::StyleColorsDark();
 
-    const float scale = hwnd != nullptr ? ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd) : 1.0f;
+    const float scale = overlay_platform::windowScale(native_window);
+    scale_ = scale;
     ImFontConfig font_config;
     font_config.SizePixels = std::round(kBaseFontSize * scale);
     io.Fonts->AddFontDefault(&font_config);
-    ImGui::GetStyle().ScaleAllSizes(scale);
+    if (overlay_platform::usesPointCoordinates()) {
+        // Layout stays in points; the atlas is rasterised at the framebuffer's pixel density.
+        io.FontGlobalScale = 1.0f / scale;
+    } else {
+        ImGui::GetStyle().ScaleAllSizes(scale);
+    }
 
-    if (hwnd != nullptr) {
-        if (!ImGui_ImplWin32_Init(hwnd)) {
-            fail("Win32 backend");
+    if (native_window != nullptr) {
+        if (!overlay_platform::initBackend(native_window)) {
+            fail("window backend");
             return false;
         }
-        win32_backend_ = true;
+        platform_backend_ = true;
     }
 
     VkDescriptorPoolSize pool_size{};
@@ -234,9 +220,14 @@ void DebugOverlay::record(VkCommandBuffer cmd, const Presenter::Target& target) 
 
     std::lock_guard lock(mutex_);
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(static_cast<float>(target.width), static_cast<float>(target.height));
-    // ImGui_ImplWin32_NewFrame is not used: its key workaround calls GetKeyState on the calling thread,
-    // which would report every key up here and release Shift and Ctrl each frame.
+    if (overlay_platform::usesPointCoordinates()) {
+        io.DisplaySize = ImVec2(static_cast<float>(target.width) / scale_, static_cast<float>(target.height) / scale_);
+        io.DisplayFramebufferScale = ImVec2(scale_, scale_);
+    } else {
+        io.DisplaySize = ImVec2(static_cast<float>(target.width), static_cast<float>(target.height));
+    }
+    // The platform backend's NewFrame is not used: the Win32 one's key workaround calls GetKeyState on the
+    // calling thread, which would report every key up here and release Shift and Ctrl each frame.
     io.DeltaTime = last_frame_time_.time_since_epoch().count() == 0
                            ? kFirstDeltaTime
                            : std::clamp(std::chrono::duration<float>(now - last_frame_time_).count(), kMinDeltaTime,
