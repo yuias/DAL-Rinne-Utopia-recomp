@@ -28,6 +28,8 @@
 #include "audio/audio_output.h"
 #if defined(_WIN32)
 #include "audio/wasapi_output.h"
+#elif defined(__APPLE__)
+#include "audio/coreaudio_output.h"
 #endif
 #include "core/boot.h"
 #include "core/census.h"
@@ -294,7 +296,9 @@ void configureAudio(const dal::GameOptions& opt) {
     dal::AudioEngineConfig config;
 #if defined(_WIN32)
     // Only the wasapi choice builds a device output, so a run without it never touches COM.
-    if (opt.audio == "wasapi") config.make_output = [] { return dal::makeWasapiOutput(); };
+    if (opt.audio == dal::kHostAudioOutput) config.make_output = [] { return dal::makeWasapiOutput(); };
+#elif defined(__APPLE__)
+    if (opt.audio == dal::kHostAudioOutput) config.make_output = [] { return dal::makeCoreAudioOutput(); };
 #endif
     config.dump = opt.audio_dump;
     dal::configureAudioEngine(std::move(config));

@@ -16,6 +16,15 @@
 
 namespace dal {
 
+// The device output --audio can select besides "none": WASAPI on Windows, CoreAudio on macOS.
+#if defined(_WIN32)
+inline constexpr std::string_view kHostAudioOutput = "wasapi";
+#elif defined(__APPLE__)
+inline constexpr std::string_view kHostAudioOutput = "coreaudio";
+#else
+#error "no host audio output for this platform"
+#endif
+
 enum class OptionKind : std::uint8_t { Path, String, Unsigned, Flag, FrameList };
 
 // One dal_game option. `name` is the long name without "--" ("game-dir"); its config file key is
@@ -37,7 +46,7 @@ struct GameOptions {
     std::optional<LogLevel> log_level;              // nullopt: keep the default
     std::string dialog_answer;                      // empty: keep the default
     std::string pad;                                // settled: none|neutral|keyboard|gamepad|keyboard+gamepad
-    std::string audio;                              // settled: none|wasapi
+    std::string audio;                              // settled: none|kHostAudioOutput
     std::vector<PadScriptEvent> pad_script_events;  // loaded from pad_script
     unsigned seconds = 0;
     std::uint32_t dump_frames_every = 1;

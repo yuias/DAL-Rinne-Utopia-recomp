@@ -54,6 +54,10 @@ function(dal_audio_add)
       SKIP_RETURN_CODE 77
       RUN_SERIAL TRUE
       PASS_REGULAR_EXPRESSION "audio coreaudio tests: [0-9]+ passed, 0 failed")
+
+    if(TARGET dal_game)
+      target_link_libraries(dal_game PRIVATE dal_audio_coreaudio)
+    endif()
   endif()
 
   add_executable(dal_audiotool tools/dal_audiotool/main.cpp)
