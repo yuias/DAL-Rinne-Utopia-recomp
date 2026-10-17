@@ -91,6 +91,54 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   that depends on one of them is skipped or drawn incompletely, and the `skipped` count in the
   `rsx` section says which.
 
+### Vulkan on macOS
+
+On macOS the renderer runs on a Vulkan driver that sits on top of Metal. The window is a Cocoa window
+whose content view is backed by a `CAMetalLayer`; the surface is made with `VK_EXT_metal_surface`, and
+the swapchain, the letterboxing and the overlay work as described above. The window belongs to the
+process main thread, which runs the event loop while the game runs on another thread (see
+[Building](building.md#running-and-debugging-on-a-mac)). The swapchain size is the window's size in
+pixels, the content size in points times the backing scale of the screen. Without a window-server
+session (an SSH login, for example) no window can be created: the RSX thread logs the reason and the
+game goes on without rendering, as for any other renderer failure.
+
+- **Drivers.** The LunarG Vulkan SDK installs two: KosmicKrisp (a Mesa driver, Vulkan 1.4, without the
+  portability subset) and MoltenVK (a portability driver). They are listed as integrated GPUs in no
+  fixed order and report the same device name, so `dal_game` does not depend on the order: among the
+  usable devices it takes a discrete GPU first, then the device whose driver is KosmicKrisp, then the
+  first usable one. `vulkaninfo --summary` shows which drivers are installed.
+- **Choosing a driver yourself.** `dal_game` has no option for it; use the Vulkan loader's variables.
+  `VK_LOADER_DRIVERS_SELECT` takes a comma-separated list of patterns for the driver manifest file
+  names and uses only the matching drivers; the manifests are in `/usr/local/share/vulkan/icd.d`
+  after the SDK's system-global install (`libkosmickrisp_icd.json`, `MoltenVK_icd.json`).
+  `VK_DRIVER_FILES` replaces the list of manifests with the files you name. `VK_ADD_DRIVER_FILES`
+  adds files to the list and so does not restrict it.
+
+  ```sh
+  VK_LOADER_DRIVERS_SELECT='*MoltenVK*' build/macos-release/bin/dal_game --game-dir <game-dir>
+  VK_DRIVER_FILES=/usr/local/share/vulkan/icd.d/libkosmickrisp_icd.json build/macos-release/bin/dal_game --game-dir <game-dir>
+  ```
+
+- **Portability.** The loader hides portability drivers unless the application asks, so the instance
+  is created with `VK_KHR_portability_enumeration` and its enumeration flag when the loader offers
+  it. A device that advertises `VK_KHR_portability_subset` (MoltenVK) is created with that extension
+  and with every subset feature it reports as supported. The features that MoltenVK's subset lacks
+  (point polygons, sampler mip LOD bias, tessellation isolines and point mode) are not used.
+- **Depth format.** Neither driver has `D24_UNORM_S8_UINT`; the renderer uses `D32_SFLOAT_S8_UINT`,
+  its existing fallback. The log line `dal: render: vulkan device ...` shows `d24s8 no`.
+- **Triangle fans.** MoltenVK reports triangle fans as supported but draws only the first triangle of a
+  fan when the primitive topology is set dynamically, which is how the renderer sets it. The renderer
+  therefore draws a triangle fan as a triangle list wherever the device cannot do fans: on MoltenVK,
+  and on any portability-subset device that reports no `triangleFans`. A fan of N vertices becomes
+  N-2 triangles `first, first+i, first+i+1`; an array draw becomes an indexed draw with 32-bit indices,
+  and an indexed fan is expanded by its indices, split at the restart index when primitive restart is
+  on. The list topology takes no restart. KosmicKrisp draws fans directly.
+- **Loader.** The loader is found at run time. If the normal search fails, the paths in
+  [Building](building.md#vulkan-shaderc-and-ffmpeg) are tried.
+- **Guard pages.** A caveat of the host rather than of Vulkan: a guest stack guard page that shares a
+  16 KiB host page with a live allocation is accessible (see
+  [Building](building.md#running-and-debugging-on-a-mac)).
+
 ### Texture cache of the frame builder
 
 Copying every enabled texture out of guest memory for every draw, and uploading it again, dominated the

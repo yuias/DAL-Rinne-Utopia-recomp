@@ -4,23 +4,24 @@ The game has no audio code of its own that talks to hardware: its mixer thread r
 `cellAudio` port, its sound manager mixes `cellAtrac` sounds and the decoded movie audio into that
 mixer, and the runtime plays what the mixer wrote. The runtime implements the `cellAudio` and
 `cellAtrac` calls the game makes, drives the mixer with a host clock and sends the result to the
-default Windows audio device (WASAPI) or to nowhere.
+default audio device (WASAPI on Windows, CoreAudio on macOS) or to nowhere.
 
 ```
-game mixer thread -> cellAudio port (guest memory) -> audio engine thread -> output ring -> WASAPI device thread
+game mixer thread -> cellAudio port (guest memory) -> audio engine thread -> output ring -> device thread (WASAPI or CoreAudio)
 game sound thread -> cellAtrac (FFmpeg ATRAC3plus) / cellSail sound adapter (movie audio) -> game mixer
 ```
 
-The code is in `runtime/src/audio/` (engine, outputs, WAV files), `runtime/src/hle/cell_audio*.cpp`,
-`runtime/src/hle/cell_atrac*.cpp` and `runtime/src/media/at3_file.*`, `atrac_decoder.h` and
-`ffmpeg_codecs.*` (the AT3 parser and the decoder). `tools/dal_audiotool/` is the command-line
-tool.
+The code is in `runtime/src/audio/` (engine, outputs, WAV files; `stream_output.*` holds the device
+thread that both device outputs share, `wasapi_output.*` and `coreaudio_output.*` the two APIs),
+`runtime/src/hle/cell_audio*.cpp`, `runtime/src/hle/cell_atrac*.cpp` and `runtime/src/media/at3_file.*`,
+`atrac_decoder.h` and `ffmpeg_codecs.*` (the AT3 parser and the decoder). `tools/dal_audiotool/` is
+the command-line tool.
 
 ## Options
 
 | Option | Meaning |
 | --- | --- |
-| `--audio none\|wasapi` | The output. `wasapi` plays through the default render device; `none` has no device but the clock and the game's mixer run the same, without the device-clock correction. Default: `wasapi` with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. Any other value is a usage error. |
+| `--audio none\|wasapi` (Windows), `--audio none\|coreaudio` (macOS) | The output. `wasapi` and `coreaudio` play through the default render device (the default output device on macOS); `none` has no device but the clock and the game's mixer run the same, without the device-clock correction. Default: the system's device output (`wasapi` or `coreaudio`) with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. Any other value, including the other system's output name, is a usage error. |
 | `--audio-dump FILE` | Write the mix to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. The file is created while the arguments are handled, so a path that cannot be written is a usage error (exit code 2). |
 
 ## Architecture
@@ -79,7 +80,10 @@ Two more timing facts matter for the sound:
 - The game's decode threads poll with 1 ms `sys_timer_usleep` calls. Windows rounds timed waits to
   its timer tick (15.6 ms), so `dal_game` requests a 1 ms system timer resolution for the whole run
   (`runtime/src/core/timer_resolution.*`, `timeBeginPeriod`). Without it the ATRAC decode loop would
-  poll about six times a second instead of about sixty and could not feed the mixer.
+  poll about six times a second instead of about sixty and could not feed the mixer. macOS has no
+  coarse tick to raise, so timed waits there already have the precision requested and the request
+  counts as granted (the debug line says `system period unknown`); the host event loop of
+  `dal_game` turns off App Nap and timer coalescing for the process while it runs.
 - A guest thread created with a numerically lower priority than its creator runs before the
   creator continues (see [Runtime internals](runtime.md#threads)). The game's mixer thread
   (priority 90) is created by the main thread (1005) and has to store its notify queue key before
@@ -97,8 +101,18 @@ thread only, never blocks), `description`, `stats` and `fillFrames`.
   float32 and the Windows audio engine converts it to the device's mix format
   (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). The device buffer is 40 ms. The device thread runs with
   the "Pro Audio" multimedia scheduler class when that is available.
+- **coreaudio** (`coreaudio_output.cpp`, library `dal_audio_coreaudio`, uses the C APIs of
+  AudioToolbox and CoreAudio) plays through the system's default output `AudioUnit`, which follows a
+  change of the default device. The stream format is 48 kHz stereo float32 and the unit converts it to
+  the device's. The render callback takes frames from a lock-free FIFO of 40 ms (1920 frames) that the
+  device thread fills, plays silence for what is missing and wakes the device thread; the callback does
+  not lock, allocate, log or touch guest memory. The device period is the device's buffer size. The unit
+  is started when the output is opened and plays silence until the device thread starts the stream, so
+  that CoreAudio's start-up time (6 to 34 ms) is spent before the engine's clock runs and not in its
+  fill level.
 
-The engine thread and the device thread are joined by a lock-free ring of 32 blocks. The device
+The engine thread and the device thread are joined by a lock-free ring of 32 blocks; this and the
+device thread (`dal_audio_stream`) are the same for both outputs. The device
 starts playing once 4 blocks are queued (`kPrimeBlocks`), and above 12 blocks (`kHighWaterBlocks`)
 `submit` drops the oldest block and counts it. When the device runs dry it plays silence and the
 missing frames are counted as underrun.
@@ -120,6 +134,23 @@ If the device is lost while running (`AUDCLNT_E_DEVICE_INVALIDATED` or another s
 output logs `dal: audio: wasapi: device lost (<hresult>); retrying`, keeps draining its ring at the
 nominal rate so the engine does not notice, and tries to open the default device again at once and
 then every 2 seconds. A successful reopen logs `dal: audio: wasapi: reopened <description>`.
+
+CoreAudio does the same with `coreaudio` in the lines. It counts the default output device changing
+or the device in use stopping being alive (both reported by CoreAudio property listeners) as a loss,
+so that the reopened stream reads the new device's rate and buffer size. A status that is a
+four-character code with printable characters is shown as that code in quotes, for example `'!dev'`,
+otherwise as a number.
+
+### Debug builds
+
+On macOS the debug build (`macos-debug`) is not a good basis for judging the sound. While the game
+loads, some 3 to 6 s into a run, a guest-lock stall of about 185 ms keeps the engine from producing
+blocks (see [Guest lock](#guest-lock)): the census then shows skipped periods, dropped blocks and
+underrun. The release build (`macos-release`) does not. A 40 s run of it gave `skipped 12, dropped 0,
+underrun 512 frames, max producer 30.95 ms, clock +31 ppm`; the census example below shows 23.77 ms
+for the longest producer call on Windows. The fill starts below the target of 6 blocks (the device
+starts playing at the prime level, as on Windows), the clock controller takes about 20 s to settle,
+and a producer stall of about 30 ms during the load costs one or two periods of underrun once.
 
 ### Dump file
 
@@ -238,7 +269,7 @@ Audio problems never stop the game: the game must not stall because of sound.
 
 | Case | Behaviour |
 | --- | --- |
-| WASAPI cannot be opened (no device, COM error, format rejected, no answer within 2 s) | One warning `dal: audio: wasapi: <reason>; continuing without sound`, the engine switches to the null output and the clock keeps running. The census shows the output as `none (wasapi failed)`. |
+| The device output cannot be opened (WASAPI: no device, COM error, format rejected, no answer within 2 s; CoreAudio: no default output device or a failing call, with the status) | One warning `dal: audio: <wasapi\|coreaudio>: <reason>; continuing without sound`, the engine switches to the null output and the clock keeps running. The census shows the output as `none (wasapi failed)` or `none (coreaudio failed)`. |
 | Device lost while running | `device lost` warning, silence, reopen attempts (see above). The clock keeps running. |
 | The engine wakes late | One block is produced; the missed periods are skipped as silence and counted. |
 | `--audio-dump` file cannot be created or written | A usage error before the run starts; a write error during the run logs one warning and stops the dump. |
@@ -253,24 +284,24 @@ Lines start with `dal: audio:`, `dal: atrac:`, `dal: timer:` or `dal: thread:`.
 
 | Line | Level | When |
 | --- | --- | --- |
-| `dal: audio: output <name>[ (<description>)]` | info | The engine opened its output. WASAPI's description is `<device>, mix <rate> Hz <ch> ch, buffer <ms> ms, period <ms> ms`. |
+| `dal: audio: output <name>[ (<description>)]` | info | The engine opened its output. The description of both device outputs is `<device>, mix <rate> Hz <ch> ch, buffer <ms> ms, period <ms> ms`; on macOS the mix is the device's nominal rate and output channel count, the buffer is the 40 ms FIFO and the period is the device's buffer size. |
 | `dal: audio: dump <file name>` | info | The dump file was created. |
 | `dal: audio: port <n> open: <ch> ch, <blocks> blocks, attr <hex>, level <f>` | info | `cellAudioPortOpen` |
 | `dal: audio: notify queue key <hex> -> <queue id hex\|not found>` | info | `cellAudioSetNotifyEventQueue` |
 | `dal: audio: input channel <n> carries signal; the stereo downmix drops it` | info | First non-zero sample on a dropped channel |
-| `dal: audio: <output>: <reason>; continuing without sound` | warn | The output could not be opened |
+| `dal: audio: <output>: <reason>; continuing without sound` | warn | The output could not be opened (`<output>` is `wasapi` or `coreaudio`) |
 | `dal: audio: dump <file name>: <reason>; continuing without a dump`, `dal: audio: writing the dump failed; the dump stops here` | warn | Dump problems |
-| `dal: audio: wasapi: device lost (<hresult>); retrying` | warn | Device lost |
-| `dal: audio: wasapi: reopened <description>` | info | The device came back |
-| `dal: audio: wasapi: reopen failed: <reason>` | debug | A reopen attempt failed (retried every 2 s) |
-| `dal: audio: wasapi: device thread failed[: <reason>]` | warn | The device thread stopped on an error |
+| `dal: audio: wasapi: device lost (<hresult>); retrying` | warn | Device lost. On macOS the line says `coreaudio` and gives the status instead of an HRESULT |
+| `dal: audio: wasapi: reopened <description>` | info | The device came back (`coreaudio` on macOS) |
+| `dal: audio: wasapi: reopen failed: <reason>` | debug | A reopen attempt failed (retried every 2 s; `coreaudio` on macOS) |
+| `dal: audio: wasapi: device thread failed[: <reason>]` | warn | The device thread stopped on an error (`coreaudio` on macOS) |
 | `dal: audio: cannot start the engine thread: <reason>; continuing without sound` | warn | The engine thread could not be created |
 | `dal: audio: clock <+-ppm> ppm, mean fill <n> frames (target <n>), dropped <n>, underrun <n> frames` | debug | Every 10 s |
 | `dal: atrac: decoder <handle hex>: <ch> ch <rate> Hz, <frames> frames, loop <start>-<end>\|none, all on memory\|streaming` | info | `cellAtracCreateDecoder` |
 | `dal: atrac: no decoder: <reason>` | warn | No FFmpeg decoder (once) |
 | `dal: atrac: handle <hex>: unusable data: <reason>` | warn | `SetDataAndGetMemSize` failed (once per handle) |
 | `dal: atrac: handle <hex>: decode error, playing silence for such frames: <reason>` | warn | First rejected frame of a handle |
-| `dal: timer: requested <n> ms, system period <x> ms\|unknown` | debug | Start-up |
+| `dal: timer: requested <n> ms, system period <x> ms\|unknown` | debug | Start-up (always `unknown` on macOS) |
 | `dal: timer: the 1 ms resolution request was refused; timed waits use the default tick` | warn | Start-up |
 | `dal: thread: <id> <name> prio <p> starts before creator <id> prio <q>` | debug | A thread was created with a lower priority number than its creator |
 | `dal: thread: <id> <name> not queued within 5 ms; creator continues` | info | The new thread did not queue for the guest lock in time |
@@ -288,8 +319,8 @@ census: audio
   atrac 6 decoders, 7623 frames decoded (6120 non-silent), 0 errors, 0 without decoder
 ```
 
-(The numbers are examples.) The first line is the engine: the output name, blocks produced and how
-many were non-silent, periods skipped, blocks dropped and frames of underrun at the output, notifies
+(The numbers are examples; the first line says `audio coreaudio` on macOS.) The first line is the
+engine: the output name, blocks produced and how many were non-silent, periods skipped, blocks dropped and frames of underrun at the output, notifies
 sent and failed, the longest producer call (it includes the wait for the guest lock; a few ms of
 it at start-up is normal) and the clock correction. `audio input` counts periods and the non-zero
 samples per input channel. The `atrac` line appears when a decoder was created: decoders created,
@@ -304,17 +335,19 @@ fails and 2 on a usage error.
 | Subcommand | What it does |
 | --- | --- |
 | `wavstat FILE [--window S]` | Per window of `S` seconds (default 1) the RMS and peak level in dBFS and the number of non-silent frames, then `wavstat: <seconds> s, non-silent windows <k> of <m>`. Reads the dump file, PCM 16-bit or float32, mono or stereo. |
-| `devices` | Lists the active render devices with their mix format and device periods; the default one is marked. Exit code 1 when there is none. |
-| `tone [--output none\|wasapi] [--seconds N] [--hz F] [--db L]` | Plays a sine through an output (default `wasapi`, 2 s, 440 Hz, -18 dBFS) and prints the output statistics (submitted, dropped, underrun, played, device errors). |
-| `play FILE.wav [--output none\|wasapi]` | Plays a 48 kHz mono or stereo WAV file the same way. |
+| `devices` | Lists the active render devices with their mix format and device periods; the default one is marked. On macOS these are the output devices, with their nominal rate, channel count and buffer size. Exit code 1 when there is none. |
+| `tone [--output none\|wasapi] [--seconds N] [--hz F] [--db L]` | Plays a sine through an output (default `wasapi`, 2 s, 440 Hz, -18 dBFS) and prints the output statistics (submitted, dropped, underrun, played, device errors). On macOS the output is `none` or `coreaudio`, the default. |
+| `play FILE.wav [--output none\|wasapi]` | Plays a 48 kHz mono or stereo WAV file the same way (`coreaudio` instead of `wasapi` on macOS). |
 | `at3scan FILE` | Lists the ATRAC3plus RIFF entries of an archive such as the decrypted `Bgm.sdat` (offset, size, channels, rate, block size, samples, delay, loop) with summary lines. |
-| `at3 FILE [--index N \| --offset N] [--wav OUT] [--hash] [--play] [--expect-frames N] [--expect-samples N] [--expect-pcm SHA256]` | Decodes one entry (the `N`-th of the `at3scan` list, default 0, or the one at a byte offset) through FFmpeg, cuts it to the valid samples, prints `at3: <frames> frames, <samples> samples[, pcm-sha256 <hash>], <us> us/frame` and `at3 ok`. `--hash` prints the SHA-256 of the interleaved little-endian float32 result, `--wav` writes it, `--play` plays it through WASAPI. The `--expect-*` options turn it into a check (exit code 1). It also fails when the sample count differs from the file's `fact` count. |
+| `at3 FILE [--index N \| --offset N] [--wav OUT] [--hash] [--play] [--expect-frames N] [--expect-samples N] [--expect-pcm SHA256]` | Decodes one entry (the `N`-th of the `at3scan` list, default 0, or the one at a byte offset) through FFmpeg, cuts it to the valid samples, prints `at3: <frames> frames, <samples> samples[, pcm-sha256 <hash>], <us> us/frame` and `at3 ok`. `--hash` prints the SHA-256 of the interleaved little-endian float32 result, `--wav` writes it, `--play` plays it through the system's device output (WASAPI or CoreAudio). The `--expect-*` options turn it into a check (exit code 1). It also fails when the sample count differs from the file's `fact` count. |
 
-`at3` needs the FFmpeg DLLs next to the executable, like the game.
+`at3` needs the FFmpeg libraries like the game: the DLLs next to the executable on Windows,
+Homebrew's libraries on macOS (see [Movies](movies.md#ffmpeg-on-macos)).
 
 ## Tests
 
-`audio_core`, `audio_wasapi`, `atrac_decode` and `game_audio` are described in [Tests](tests.md).
+`audio_core`, `audio_wasapi` (Windows), `audio_coreaudio` (macOS), `atrac_decode` and `game_audio`
+are described in [Tests](tests.md).
 The creation rule for threads, the timer resolution and the event queue keys are covered by
 `runtime_core`.
 
@@ -330,9 +363,9 @@ The WASAPI output follows Microsoft's documentation.
 
 ## Not implemented
 
-- Output libraries other than WASAPI, exclusive mode, multichannel output (the game's 8-channel port
-  is downmixed to stereo), a volume option and the choice of the output device (the default render
-  device is used).
+- Output libraries other than WASAPI (Windows) and CoreAudio (macOS), exclusive mode, multichannel
+  output (the game's 8-channel port is downmixed to stereo), a volume option and the choice of the output device (the default render
+  or output device is used).
 - ATRAC3 (non-plus) data: the game has none.
 - `cellAudio` functions the game does not import, `cellAtracMulti`, `cellAudioIn` and microphone
   input.
