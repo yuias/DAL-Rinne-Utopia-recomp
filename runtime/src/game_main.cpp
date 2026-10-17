@@ -1,5 +1,6 @@
 // dal_game: loads the decrypted EBOOT.elf and runs it through the generated PPU code.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -15,15 +16,19 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#endif
 
 #include "app/game_options.h"
 #include "audio/audio_engine.h"
 #include "audio/audio_output.h"
+#if defined(_WIN32)
 #include "audio/wasapi_output.h"
+#endif
 #include "core/boot.h"
 #include "core/census.h"
 #include "core/elf_loader.h"
@@ -38,7 +43,9 @@
 #include "dal/ppu_context.h"
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
+#if defined(_WIN32)
 #include "input/gameinput_backend.h"
+#endif
 #include "input/gamepad_hub.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_script.h"
@@ -285,8 +292,10 @@ std::vector<std::string> audioCensusLines() {
 
 void configureAudio(const dal::GameOptions& opt) {
     dal::AudioEngineConfig config;
+#if defined(_WIN32)
     // Only the wasapi choice builds a device output, so a run without it never touches COM.
     if (opt.audio == "wasapi") config.make_output = [] { return dal::makeWasapiOutput(); };
+#endif
     config.dump = opt.audio_dump;
     dal::configureAudioEngine(std::move(config));
     dal::setAudioCensusProvider(&audioCensusLines);
@@ -319,7 +328,8 @@ void applyBuildDirDefaults(dal::VfsLayout& layout) {
 }
 
 // The arguments after the program name as UTF-8, so option paths do not depend on the ANSI code page.
-std::vector<std::string> utf8Arguments() {
+#if defined(_WIN32)
+std::vector<std::string> utf8Arguments(int /*argc*/, char** /*argv*/) {
     std::vector<std::string> args;
     int argc = 0;
     wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -333,14 +343,22 @@ std::vector<std::string> utf8Arguments() {
     LocalFree(wide);
     return args;
 }
+#else
+// POSIX passes the bytes of the command line as they are, which are UTF-8 on the supported systems.
+std::vector<std::string> utf8Arguments(int argc, char** argv) {
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    return args;
+}
+#endif
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     dal::installProcessSettings();
     dal::installCensus();
 
-    const std::vector<std::string> args = utf8Arguments();
+    const std::vector<std::string> args = utf8Arguments(argc, argv);
     auto parsed = dal::parseGameOptions(args);
     if (!parsed) {
         const dal::OptionsExit& stop = parsed.error();
@@ -501,6 +519,7 @@ int main() {
     if (keyboard && !opt.pad_script.empty()) dal::startPadScript(opt.pad_script_events, keyboard);
     // GameInput takes about a second to initialise, so the gamepad thread creates the backend itself.
     // The probe alone (no gamepad in the pad) runs the thread without a state to write.
+#if defined(_WIN32)
     if (padUsesGamepad(opt.pad) || opt.pad_probe) {
         dal::startGamepadHub(
                 []() -> std::expected<std::shared_ptr<dal::GamepadBackend>, std::string> {
@@ -511,6 +530,15 @@ int main() {
                  .detect_steam = dal::detectSteamContext,
                  .probe = opt.pad_probe});
     }
-    dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
-    dal::runSupervisor(opt.seconds);
+#else
+    if (padUsesGamepad(opt.pad) || opt.pad_probe) dal::logWarn("dal: pad: no gamepad backend on this platform");
+#endif
+    // The window belongs to the main thread on macOS, so the boot and the supervisor run on a thread of
+    // their own while the main thread serves the user interface; on Windows this is a plain call.
+    dal::runWithHostEventLoop(
+            [&] {
+                dal::bootMainThread(exe, "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN");
+                dal::runSupervisor(opt.seconds);
+            },
+            opt.window);
 }
