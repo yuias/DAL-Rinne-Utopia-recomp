@@ -106,7 +106,8 @@ game goes on without rendering, as for any other renderer failure.
   portability subset) and MoltenVK (a portability driver). They are listed as integrated GPUs in no
   fixed order and report the same device name, so `dal_game` does not depend on the order: among the
   usable devices it takes a discrete GPU first, then the device whose driver is KosmicKrisp, then the
-  first usable one. `vulkaninfo --summary` shows which drivers are installed.
+  first usable one. The log line `dal: render: vulkan device ... driver <name> ...` names the driver in
+  use; `vulkaninfo --summary` shows which drivers are installed.
 - **Choosing a driver yourself.** `dal_game` has no option for it; use the Vulkan loader's variables.
   `VK_LOADER_DRIVERS_SELECT` takes a comma-separated list of patterns for the driver manifest file
   names and uses only the matching drivers; the manifests are in `/usr/local/share/vulkan/icd.d`
