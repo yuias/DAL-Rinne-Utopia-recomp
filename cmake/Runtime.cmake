@@ -168,6 +168,7 @@ function(dal_runtime_add_core)
     runtime/src/core/override_handlers.cpp
     runtime/src/core/overrides.cpp
     runtime/src/core/param_sfo.cpp
+    runtime/src/core/png_image.cpp
     runtime/src/core/threads.cpp
     ${timer_resolution_provider}
     runtime/src/hle/cell_atrac.cpp
@@ -238,7 +239,7 @@ function(dal_runtime_add_core)
   endif()
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
-  # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
+  # PRIVATE as well: libpng types stay inside cell_png_dec.cpp and png_image.cpp.
   target_link_libraries(dal_runtime_core PRIVATE png_static)
   # PRIVATE as well: JSON types stay inside json_read.*, vfs_config.cpp and rsx_census.cpp.
   target_link_libraries(dal_runtime_core PRIVATE yyjson)
