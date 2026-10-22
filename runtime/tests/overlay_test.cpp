@@ -3,6 +3,7 @@
 // hidden window, to give the Win32 backend a handle.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -38,6 +40,8 @@
 #include "overlay/overlay_stack.h"
 #include "overlay/save_dialog_overlay.h"
 #include "overlay/ui_font.h"
+#include "render/frame_dump.h"
+#include "render/vk_renderer.h"
 #include "rsx/rsx_unimplemented.h"
 
 namespace {
@@ -615,6 +619,12 @@ public:
         return {p[0], p[1], p[2], p[3]};
     }
 
+    // Writes the readback as an RGB PNG.
+    bool savePng(const std::filesystem::path& path, std::string& error) const {
+        const std::span<const std::uint8_t> bgra(pixels_, static_cast<std::size_t>(kTargetWidth) * kTargetHeight * 4);
+        return dal::writePngRgb(path, dal::rgbFromBgra(bgra, kTargetWidth, kTargetHeight), error);
+    }
+
     // True when any pixel of the rectangle (inclusive) has a non-zero colour channel.
     bool anyLit(std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) const {
         for (std::uint32_t y = y0; y <= y1; ++y) {
@@ -838,6 +848,320 @@ bool anyBright(const OffscreenTarget& target, std::uint32_t x0, std::uint32_t y0
     return false;
 }
 
+// True when a pixel of the rectangle (inclusive) is lighter than the dim in any channel; unlike anyBright this also
+// finds the saturated colours of the button symbols.
+bool anyAboveDim(const OffscreenTarget& target, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1,
+                 std::uint32_t y1) {
+    for (std::uint32_t y = y0; y <= y1; ++y) {
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            if (target.pixel(x, y).maxChannel() > 130) return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t crc32(const std::uint8_t* data, std::size_t size) {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < t.size(); ++i) {
+            std::uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void appendBigEndian(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(value >> shift));
+}
+
+void appendPngChunk(std::vector<std::uint8_t>& out, const char (&type)[5], const std::vector<std::uint8_t>& data) {
+    appendBigEndian(out, static_cast<std::uint32_t>(data.size()));
+    std::vector<std::uint8_t> body(type, type + 4);
+    body.insert(body.end(), data.begin(), data.end());
+    out.insert(out.end(), body.begin(), body.end());
+    appendBigEndian(out, crc32(body.data(), body.size()));
+}
+
+using PngPixelFn = std::array<std::uint8_t, 3> (*)(std::uint32_t x, std::uint32_t y);
+
+// An 8-bit RGB PNG whose zlib stream holds stored blocks, so the test needs no compressor.
+std::shared_ptr<const std::vector<std::uint8_t>> makePng(std::uint32_t width, std::uint32_t height, PngPixelFn pixel) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        raw.push_back(0);  // filter: none
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const std::array<std::uint8_t, 3> rgb = pixel(x, y);
+            raw.insert(raw.end(), rgb.begin(), rgb.end());
+        }
+    }
+    std::vector<std::uint8_t> zlib = {0x78, 0x01};
+    for (std::size_t pos = 0; pos < raw.size() || pos == 0;) {
+        const std::size_t length = std::min<std::size_t>(65535, raw.size() - pos);
+        const bool last = pos + length >= raw.size();
+        zlib.push_back(last ? 1 : 0);
+        zlib.push_back(static_cast<std::uint8_t>(length));
+        zlib.push_back(static_cast<std::uint8_t>(length >> 8));
+        zlib.push_back(static_cast<std::uint8_t>(~length));
+        zlib.push_back(static_cast<std::uint8_t>((~length) >> 8));
+        zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos),
+                    raw.begin() + static_cast<std::ptrdiff_t>(pos + length));
+        pos += length;
+        if (last) break;
+    }
+    std::uint32_t a = 1;
+    std::uint32_t b = 0;
+    for (const std::uint8_t byte : raw) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    appendBigEndian(zlib, (b << 16) | a);
+
+    std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<std::uint8_t> header;
+    appendBigEndian(header, width);
+    appendBigEndian(header, height);
+    header.insert(header.end(), {8, 2, 0, 0, 0});  // 8 bit, RGB, deflate, no filter variants, no interlace
+    appendPngChunk(png, "IHDR", header);
+    appendPngChunk(png, "IDAT", zlib);
+    appendPngChunk(png, "IEND", {});
+    return std::make_shared<const std::vector<std::uint8_t>>(std::move(png));
+}
+
+constexpr std::uint32_t kIconPngWidth = 320;
+constexpr std::uint32_t kIconPngHeight = 176;
+
+std::shared_ptr<const std::vector<std::uint8_t>> redIconPng() {
+    return makePng(kIconPngWidth, kIconPngHeight,
+                   [](std::uint32_t, std::uint32_t) { return std::array<std::uint8_t, 3>{255, 0, 0}; });
+}
+
+// A diagonal colour ramp with a lighter frame, for looking at the render.
+std::shared_ptr<const std::vector<std::uint8_t>> gradientIconPng() {
+    return makePng(kIconPngWidth, kIconPngHeight, [](std::uint32_t x, std::uint32_t y) {
+        if (x < 4 || y < 4 || x >= kIconPngWidth - 4 || y >= kIconPngHeight - 4) {
+            return std::array<std::uint8_t, 3>{235, 235, 235};
+        }
+        return std::array<std::uint8_t, 3>{
+                static_cast<std::uint8_t>(x * 255 / kIconPngWidth), static_cast<std::uint8_t>(y * 255 / kIconPngHeight),
+                static_cast<std::uint8_t>(255 - (x + y) * 255 / (kIconPngWidth + kIconPngHeight))};
+    });
+}
+
+// `icon` goes to every row except each third one, which keeps its placeholder.
+std::shared_ptr<dal::SaveDialogContent> listContent(std::uint64_t id, int row_count,
+                                                    std::shared_ptr<const std::vector<std::uint8_t>> icon = nullptr) {
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->id = id;
+    content->kind = dal::DialogKind::List;
+    content->list_kind = dal::SaveListKind::Save;
+    for (int i = 0; i < row_count; ++i) {
+        dal::SaveDialogRow row;
+        row.new_data = i == 0;
+        if (i % 3 != 2) row.icon_png = icon;
+        row.title =
+                row.new_data
+                        ? "\xE6\x96\xB0\xE3\x81\x97\xE3\x81\x84\xE3\x83\x87\xE3\x83\xBC\xE3\x82\xBF"  // 新しいデータ
+                        : "Stage " + std::to_string(i) + " \xE3\x82\xBB\xE3\x83\xBC\xE3\x83\x96";     // セーブ
+        row.info = row.new_data
+                           ? "\xE6\x96\xB0\xE3\x81\x97\xE3\x81\x84\xE3\x83\x87\xE3\x83\xBC\xE3\x82\xBF\xE3\x82\x92"
+                             "\xE4\xBD\x9C\xE6\x88\x90\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x99"  // 新しいデータを作成します
+                           : "2026/10/" + std::to_string(10 + i) + " 21:" + std::to_string(30 + i) + "   " +
+                                     std::to_string(120 + i * 7) + " KB";
+        // Three detail lines like the game's, and one row with a fourth that the row cuts with "...".
+        if (!row.new_data && i % 2 == 1) {
+            row.detail =
+                    "走り出す運命\nルドガー　Ｌｖ　" + std::to_string(i) + "\nプレイ時間　0：0" + std::to_string(i);
+        } else if (i == 2) {
+            row.detail = "Chapter 2\nAfter the harbour\nThe long road to the capital\nA fourth line is cut";
+        }
+        content->rows.push_back(std::move(row));
+    }
+    return content;
+}
+
+// Set DAL_OVERLAY_TEST_LIST_PNG to a file path to keep the render of a 7-row list for looking at.
+void saveListRenderIfRequested(const OffscreenTarget& target) {
+#if defined(_WIN32)
+    // getenv is deprecated in the MSVC runtime.
+    char path_buffer[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableA("DAL_OVERLAY_TEST_LIST_PNG", path_buffer, sizeof(path_buffer));
+    if (length == 0 || length >= sizeof(path_buffer)) return;
+    const char* path = path_buffer;
+#else
+    const char* path = std::getenv("DAL_OVERLAY_TEST_LIST_PNG");
+    if (path == nullptr || *path == '\0') return;
+#endif
+    std::string error;
+    const bool saved = target.savePng(path, error);
+    std::printf("overlay tests: list render %s %s\n", saved ? "saved to" : "not saved:", saved ? path : error.c_str());
+}
+
+void testSaveListLayout(dal::SaveDialogBoard& board, dal::SaveDialogOverlay& overlay, OffscreenTarget& target,
+                        const dal::RendererStats& stats) {
+    constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    // Seven rows of which four show, the second one selected: the dim, the heading, the focus border and the scrollbar
+    // thumb.
+    dal::SaveDialogSnapshot snapshot;
+    snapshot.content = listContent(10, 7, gradientIconPng());
+    snapshot.selected_row = 1;
+    snapshot.first_visible_row = 0;
+    snapshot.opacity = 1.0f;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(!overlay.failed());
+    CHECK(target.pixel(4, 700).maxChannel() <= 115);
+    CHECK(target.pixel(4, 700).minChannel() > 50);
+    const OffscreenTarget::Pixel focus = target.pixel(210, 112 + 130 + 65);
+    CHECK(focus.b >= focus.r + 60);
+    CHECK(anyBright(target, 64, 36, 200, 72));
+    const OffscreenTarget::Pixel thumb = target.pixel(1085, 114);
+    const OffscreenTarget::Pixel track = target.pixel(1085, 620);
+    CHECK(thumb.minChannel() > track.minChannel());
+    CHECK(track.minChannel() > 102);                 // the track is lighter than the plain dim
+    CHECK(anyAboveDim(target, 184, 662, 200, 678));  // the enter symbol
+    CHECK(anyAboveDim(target, 64, 662, 80, 678));    // the back symbol
+    saveListRenderIfRequested(target);
+
+    // Scrolled to the end: the thumb is at the bottom of the track.
+    snapshot.selected_row = 6;
+    snapshot.first_visible_row = 3;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(1085, 114).minChannel() == track.minChannel());
+    CHECK(target.pixel(1085, 628).minChannel() > track.minChannel());
+
+    // Three rows fit: no scrollbar.
+    snapshot.content = listContent(11, 3);
+    snapshot.selected_row = 0;
+    snapshot.first_visible_row = 0;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(1085, 114).maxChannel() <= 115);
+    CHECK(target.pixel(1085, 300).maxChannel() <= 115);
+
+    // An empty list shows only the back item.
+    snapshot.content = listContent(12, 0);
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(4, 700).maxChannel() <= 115);
+    CHECK(!anyAboveDim(target, 184, 662, 200, 678));
+    CHECK(anyAboveDim(target, 64, 662, 80, 678));
+    CHECK(anyBright(target, 400, 350, 880, 390));  // the "no data" line in the middle of the list box
+}
+
+bool isRed(const OffscreenTarget::Pixel& pixel) { return pixel.r > 200 && pixel.g < 60 && pixel.b < 60; }
+
+// The icon cells of rows 0 and 1 of a list that shows its first page (canvas == target pixels).
+constexpr std::uint32_t kIconCellX = 220;
+constexpr std::uint32_t kIconCellWidth = 160;
+constexpr std::uint32_t kIconCellHeight = 88;
+std::uint32_t iconCellY(std::uint32_t row) { return 112 + 130 * row + 8; }
+
+void testSaveDialogIcons(dal::VkContext& ctx, OffscreenTarget& target) {
+    constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
+    constexpr std::size_t kFrames = dal::RsxRenderer::kFramesInFlight;
+    dal::RendererStats stats;
+    stats.flips = 1;
+
+    dal::SaveDialogBoard board;
+    dal::SaveDialogOverlayOptions options;
+    options.font_candidates.push_back(dal::executableDirectory() / "fonts" / "BIZUDPGothic-Regular.ttf");
+    dal::SaveDialogOverlay overlay(ctx, board, options);
+
+    const auto publish = [&](std::shared_ptr<dal::SaveDialogContent> content, int selected, int first) {
+        dal::SaveDialogSnapshot snapshot;
+        snapshot.content = std::move(content);
+        snapshot.selected_row = selected;
+        snapshot.first_visible_row = first;
+        snapshot.opacity = 1.0f;
+        board.publish(std::move(snapshot));
+    };
+    const auto draw = [&] {
+        const bool drawn = target.drawOnce(overlay, stats, kWhite);
+        CHECK(drawn);
+        CHECK(!overlay.failed());
+    };
+
+    // A red icon shows within two records, a bad PNG leaves the placeholder, and a row without an icon too.
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->id = 30;
+    content->kind = dal::DialogKind::List;
+    content->rows.resize(3);
+    content->rows[0].icon_png = redIconPng();
+    content->rows[1].icon_png =
+            std::make_shared<const std::vector<std::uint8_t>>(std::vector<std::uint8_t>{1, 2, 3, 4});
+    publish(content, 2, 0);
+    draw();
+    draw();
+    const std::uint32_t red_x = kIconCellX + kIconCellWidth / 2;
+    CHECK(isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    CHECK(isRed(target.pixel(kIconCellX + 2, iconCellY(0) + 2)));  // the 160x88 cell is filled by the 320x176 image
+    CHECK(isRed(target.pixel(kIconCellX + kIconCellWidth - 3, iconCellY(0) + kIconCellHeight - 3)));
+    CHECK(overlay.iconTextureCount() == 1);
+    // The placeholder: its fill lifts the dim (102 over white) a little and its border more.
+    for (const std::uint32_t row : {1u, 2u}) {
+        const OffscreenTarget::Pixel inside = target.pixel(red_x, iconCellY(row) + kIconCellHeight / 2);
+        CHECK(!isRed(inside) && inside.minChannel() >= 105 && inside.maxChannel() <= 125);
+        CHECK(target.pixel(kIconCellX, iconCellY(row) + kIconCellHeight / 2).minChannel() > 135);
+    }
+    // A failed row is not decoded again, whatever the number of records.
+    for (int i = 0; i < 3; ++i) draw();
+    CHECK(overlay.iconTextureCount() == 1);
+
+    // 40 rows scrolled through, in single steps and in jumps over the whole window: never more than 32 textures,
+    // counting the ones that wait for their frames.
+    content = std::make_shared<dal::SaveDialogContent>();
+    content->id = 31;
+    content->kind = dal::DialogKind::List;
+    const auto red = redIconPng();
+    content->rows.resize(40);
+    for (dal::SaveDialogRow& row : content->rows) row.icon_png = red;
+    std::size_t most = 0;
+    const auto scroll_to = [&](int first) {
+        publish(content, first, first);
+        draw();
+        most = std::max(most, overlay.iconTextureCount());
+    };
+    for (int first = 0; first <= 36; ++first) scroll_to(first);
+    for (const int first : {0, 15, 30, 36, 21, 6, 0, 18, 36, 0}) scroll_to(first);
+    CHECK(most > 0 && most <= 32);
+
+    // At rest the window [first - 5, first + 10) holds its icons; the visible page draws red.
+    for (int i = 0; i < 10; ++i) scroll_to(20);
+    CHECK(overlay.iconTextureCount() == 15);
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        CHECK(isRed(target.pixel(red_x, iconCellY(row) + kIconCellHeight / 2)));
+    }
+
+    // New content: the old textures go once the frames that may use them are done, and not before.
+    auto next = std::make_shared<dal::SaveDialogContent>();
+    next->id = 32;
+    next->kind = dal::DialogKind::List;
+    next->rows.resize(2);
+    publish(next, 0, 0);
+    draw();
+    CHECK(overlay.iconTextureCount() == 15);
+    CHECK(!isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    for (std::size_t i = 0; i < kFrames; ++i) draw();
+    CHECK(overlay.iconTextureCount() == 15);
+    draw();
+    CHECK(overlay.iconTextureCount() == 0);
+
+    // The same row numbers again after a release: the new dialog decodes its own icons.
+    next->id = 33;
+    next->rows[0].icon_png = red;
+    publish(next, 0, 0);
+    draw();
+    CHECK(isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    CHECK(overlay.iconTextureCount() == 1);
+}
+
 void testSaveDialogOverlay(dal::VkContext& ctx, OffscreenTarget& target) {
     constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
     dal::RendererStats stats;
@@ -887,14 +1211,7 @@ void testSaveDialogOverlay(dal::VkContext& ctx, OffscreenTarget& target) {
         CHECK(target.drawOnce(overlay, stats, kWhite));
         CHECK(overlay.atlasBuildCount() == 2);
 
-        // A list draws its dim for now.
-        auto list = std::make_shared<dal::SaveDialogContent>();
-        list->id = 4;
-        list->kind = dal::DialogKind::List;
-        publishDialog(board, list, 1.0f);
-        CHECK(target.drawOnce(overlay, stats, kWhite));
-        CHECK(target.pixel(4, 700).maxChannel() <= 115);
-        CHECK(target.pixel(4, 700).minChannel() > 50);
+        testSaveListLayout(board, overlay, target, stats);
 
         // Fully faded out: nothing is drawn.
         publishDialog(board, messageContent(5, dal::DialogKind::YesNo, "line"), 0.0f);
@@ -939,6 +1256,7 @@ void testOverlayRecording(dal::VkContext& ctx) {
     testShutdownInsideScope(ctx, target);
     testDebugOverlayKeepsCurrentContext(ctx, target);
     testSaveDialogOverlay(ctx, target);
+    testSaveDialogIcons(ctx, target);
 
     const std::uint32_t errors = ctx.validationErrorCount() - errors_before;
     std::printf("overlay tests: validation %s, %u error(s)\n", ctx.validationEnabled() ? "active" : "inactive", errors);
