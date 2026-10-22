@@ -190,6 +190,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/hle.cpp
     runtime/src/hle/sail_service.cpp
     runtime/src/hle/save_dialog_model.cpp
+    runtime/src/hle/save_dialog_text.cpp
     runtime/src/hle/sce_np.cpp
     runtime/src/hle/sce_np_trophy.cpp
     runtime/src/hle/sys_prx_for_user.cpp
