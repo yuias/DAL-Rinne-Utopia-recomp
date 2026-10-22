@@ -10,6 +10,7 @@
 #include <pthread.h>
 
 #include "imgui.h"
+#include "overlay/imgui_context.h"
 #include "overlay/imgui_osx_bridge.h"
 
 namespace dal::overlay_platform {
@@ -21,8 +22,8 @@ namespace {
 bool g_backend_active = false;
 
 // Runs `work` on the main thread, which serves the window's event loop while the renderer runs on another
-// thread. The caller must not hold a lock that the main thread can wait for: the window thread takes the
-// overlay's mutex inside its event dispatch.
+// thread. The caller must not hold a lock that the main thread can wait for: the window thread takes
+// imguiMutex() inside its event dispatch.
 void runOnMain(dispatch_block_t work) {
     if (pthread_main_np() != 0) {
         work();
@@ -50,19 +51,23 @@ float windowScale(void* native_window) {
 
 bool usesPointCoordinates() { return true; }
 
-bool initBackend(void* native_window) {
+bool initBackend(void* native_window, ImGuiContext* context) {
     __block bool started = false;
     runOnMain(^{
+      // Opened on the main thread, after the dispatch: the caller holds no lock, so taking imguiMutex() here
+      // cannot wait for a thread that waits for the main thread.
+      ImGuiContextScope scope(context);
       started = dalImGuiOsxInit(native_window);
       g_backend_active = started;
     });
     return started;
 }
 
-void shutdownBackend() {
+void shutdownBackend(ImGuiContext* context) {
     runOnMain(^{
       if (!g_backend_active) return;
       g_backend_active = false;
+      ImGuiContextScope scope(context);
       dalImGuiOsxShutdown();
     });
 }
@@ -79,7 +84,7 @@ bool isKeyDown(const WindowMessage& message) {
 
 void forwardMessage(const WindowMessage& message, MessageRoute& route) {
     // A message can arrive after the backend went away: the overlay checks its state before it takes the
-    // mutex that shutdown also needs.
+    // ImGui mutex that shutdown also needs.
     if (!g_backend_active) return;
     switch (message.kind) {
         case WindowEventKind::FocusGained:

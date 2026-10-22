@@ -689,7 +689,10 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
         CHECK(target.drawOnce(overlay, stats));
         stats.flips = 3;
         CHECK(target.drawOnce(overlay, stats));
-        CHECK(ImGui::GetIO().WantCaptureMouse);
+        {
+            dal::ImGuiContextScope scope(overlay.imguiContext());
+            CHECK(ImGui::GetIO().WantCaptureMouse);
+        }
 
         // Hiding and showing again must leave ImGui focused, or it would drop all input.
         overlay.onWindowMessage(keyMessage(kKeyDown, dal::kOverlayToggleScanCode));
@@ -701,7 +704,10 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
         overlay.onWindowMessage(move);
         stats.flips = 4;
         CHECK(target.drawOnce(overlay, stats));
-        CHECK(ImGui::GetIO().WantCaptureMouse);
+        {
+            dal::ImGuiContextScope scope(overlay.imguiContext());
+            CHECK(ImGui::GetIO().WantCaptureMouse);
+        }
 
         // A click goes through the window procedure like in the game. The button-up makes the handler call
         // ReleaseCapture, which sends WM_CAPTURECHANGED to the same window procedure before the handler returns.
@@ -722,6 +728,74 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
 }
 #endif
 
+// Destroying an overlay while its own context is current must leave no freed context current afterwards.
+void testShutdownInsideScope(dal::VkContext& ctx, OffscreenTarget& target) {
+    auto overlay = std::make_unique<dal::DebugOverlay>(ctx, makeFakeSources());
+    overlay->attachWindow(nullptr);
+    overlay->setVisible(true);
+    dal::RendererStats stats;
+    stats.flips = 1;
+    CHECK(target.drawOnce(*overlay, stats));
+    CHECK(overlay->imguiContext() != nullptr);
+    {
+        dal::ImGuiContextScope scope(overlay->imguiContext());
+        overlay.reset();
+        CHECK(ImGui::GetCurrentContext() == nullptr);
+    }
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+}
+
+// Starting, drawing and stopping an overlay must not switch the context another user of ImGui has current, and
+// the window thread's calls into the overlay wait for whoever holds the ImGui lock.
+void testDebugOverlayKeepsCurrentContext(dal::VkContext& ctx, OffscreenTarget& target) {
+    ImGuiContext* other = ImGui::CreateContext();
+    ImGui::SetCurrentContext(other);
+    {
+        dal::DebugOverlay overlay(ctx, makeFakeSources());
+        overlay.attachWindow(nullptr);
+        overlay.setVisible(true);
+        dal::RendererStats stats;
+        stats.flips = 1;
+        CHECK(target.drawOnce(overlay, stats));
+        CHECK(!overlay.failed());
+        CHECK(overlay.imguiContext() != nullptr && overlay.imguiContext() != other);
+        CHECK(ImGui::GetCurrentContext() == other);
+        stats.flips = 2;
+        CHECK(target.drawOnce(overlay, stats));
+        CHECK(ImGui::GetCurrentContext() == other);
+
+        // setVisible changes the flag at once but feeds the focus event to ImGui only under the lock.
+        // The thread does not use CHECK, whose counters are not atomic.
+        std::atomic<bool> done{false};
+        std::thread window_thread;
+        {
+            dal::ImGuiContextScope held(other);
+            window_thread = std::thread([&] {
+                overlay.setVisible(false);
+                done.store(true);
+            });
+            for (int i = 0; i < 5; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(!done.load());
+            CHECK(ImGui::GetCurrentContext() == other);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!done.load()) {
+            // Joining a thread that is still blocked would hang the test run.
+            std::fprintf(stderr, "check failed (line %d): setVisible never returned\n", __LINE__);
+            std::_Exit(1);
+        }
+        window_thread.join();
+        CHECK(!overlay.visible());
+        CHECK(ImGui::GetCurrentContext() == other);
+    }
+    CHECK(ImGui::GetCurrentContext() == other);
+    ImGui::SetCurrentContext(nullptr);
+    ImGui::DestroyContext(other);
+}
+
 void testOverlayRecording(dal::VkContext& ctx) {
     OffscreenTarget target(ctx);
     CHECK(target.ok());
@@ -734,6 +808,8 @@ void testOverlayRecording(dal::VkContext& ctx) {
 #if defined(_WIN32)
     testWin32Input(ctx, target);
 #endif
+    testShutdownInsideScope(ctx, target);
+    testDebugOverlayKeepsCurrentContext(ctx, target);
 
     const std::uint32_t errors = ctx.validationErrorCount() - errors_before;
     std::printf("overlay tests: validation %s, %u error(s)\n", ctx.validationEnabled() ? "active" : "inactive", errors);
