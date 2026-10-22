@@ -329,7 +329,11 @@ Deviations from RPCS3 and limits:
 - The dialog is drawn on the swapchain image only, so it is never part of `--dump-frames` files, requested dumps,
   `readDisplay` or captures; checking it in a window needs a person or the log lines above.
 - The tests cover the model, the text, the drivers (including the timed wait and the game's message dialog), the pad
-  interception and the overlay recorded over an offscreen image (see [Tests](tests.md)).
+  interception and the overlay recorded over an offscreen image (see [Tests](tests.md)). A window run confirmed,
+  through the log lines with a pad script and `--save-dialog window`, the load list from CONTINUE on the title
+  (Yes loads the save; No returns to the list, and back cancels with `CELL_CANCEL`), the save list from the in-game
+  system menu (a new save through the new-data row) and, on a first boot, that the NODATA message is not shown while
+  the game's loading dialog is open.
 
 ## Input
 
