@@ -1,5 +1,7 @@
 include_guard(GLOBAL)
 
+include("${CMAKE_SOURCE_DIR}/cmake/ui_font.cmake")
+
 # Dear ImGui comes from a pinned submodule and is built from its core files plus the Vulkan backend
 # and, on Windows, the Win32 backend or, on macOS, the Cocoa bridge (no demo window). Vulkan entry
 # points resolve through volk, so the backend must not include <vulkan/vulkan.h> prototypes. Nothing
@@ -68,4 +70,7 @@ function(dal_overlay_add)
   add_test(NAME overlay_core COMMAND dal_overlay_tests)
   set_tests_properties(overlay_core PROPERTIES
     PASS_REGULAR_EXPRESSION "overlay tests: [0-9]+ passed, 0 failed")
+
+  # Fallback font of the save dialog, copied next to the executables.
+  dal_ui_fonts_add()
 endfunction()
