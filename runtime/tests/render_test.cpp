@@ -566,11 +566,58 @@ public:
         return {};
     }
     bool wantsDraw() const override { return true; }
+    bool wantsIdlePresent() const override { return true; }
     void record(VkCommandBuffer, const dal::Presenter::Target&) override { records++; }
 
     int on_flip = 0;
     int records = 0;
 };
+
+void testIdlePresentDue() {
+    using Clock = dal::RsxRenderer::Clock;
+    using std::chrono::milliseconds;
+    const Clock::time_point flip = Clock::now();
+    const auto due = [](Clock::time_point last_flip, Clock::time_point last_idle, Clock::time_point now) {
+        return dal::RsxRenderer::idlePresentDue(last_flip, last_idle, now);
+    };
+    // No idle present until the game has not flipped for 100 ms, however old the last idle present is.
+    CHECK(!due(flip, flip - std::chrono::seconds(1), flip));
+    CHECK(!due(flip, flip - std::chrono::seconds(1), flip + milliseconds(99)));
+    CHECK(due(flip, flip - std::chrono::seconds(1), flip + milliseconds(100)));
+    // The next one follows 33 ms after the previous idle present, not after the flip.
+    const Clock::time_point idle = flip + milliseconds(100);
+    CHECK(!due(flip, idle, idle));
+    CHECK(!due(flip, idle, idle + milliseconds(32)));
+    CHECK(due(flip, idle, idle + milliseconds(33)));
+    // A new flip restarts the stall wait even when the last idle present is long ago.
+    const Clock::time_point next_flip = idle + milliseconds(500);
+    CHECK(!due(next_flip, idle, next_flip + milliseconds(99)));
+    CHECK(due(next_flip, idle, next_flip + milliseconds(100)));
+}
+
+// Without a presenter nothing can be shown, so an idle present does nothing, before and after a flip.
+void testPresentIdleNeedsPresenter(dal::VkContext& ctx) {
+    dal::rsxUnimplementedReset();
+    CountingOverlay overlay;
+    dal::RsxRenderer renderer(ctx, readbackAllOptions());
+    CHECK(renderer.valid());
+    renderer.setPresentOverlay(&overlay);
+    renderer.presentIdle();
+    CHECK(renderer.valid() && renderer.stats().flips == 0);
+    std::vector<dal::RsxCommand> commands = replaySynthetic(dal::rsx_synthetic::makeClearCapture(0xFF102030));
+    renderer.execute(commands);
+    CHECK(renderer.valid() && renderer.stats().flips == 1);
+    std::vector<std::uint8_t> before;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    CHECK(renderer.readDisplay(before, width, height));
+    renderer.presentIdle();
+    CHECK(renderer.valid() && renderer.stats().flips == 1);
+    CHECK(overlay.on_flip == 0 && overlay.records == 0);
+    std::vector<std::uint8_t> after;
+    CHECK(renderer.readDisplay(after, width, height) && after == before);
+    dal::rsxUnimplementedReset();
+}
 
 // The overlay hook belongs to the present path: a renderer without a presenter never calls it.
 void testPresentOverlayNeedsPresenter(dal::VkContext& ctx) {
@@ -1749,6 +1796,7 @@ int main() {
     testFrameDump();
     testPartialStencilNote();
     testVertexConvert();
+    testIdlePresentDue();
 
     dal::VkContextOptions options;
     options.validation = true;
@@ -1775,6 +1823,7 @@ int main() {
     testRendererRequestedDump(*ctx);
     testRendererRequestedDumpSharesDumpDir(*ctx);
     testPresentOverlayNeedsPresenter(*ctx);
+    testPresentIdleNeedsPresenter(*ctx);
     testRendererScissorAndMask(*ctx);
     testRendererTargetCopy(*ctx);
     testRendererQuad(*ctx);

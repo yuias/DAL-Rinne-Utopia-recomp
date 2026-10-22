@@ -245,6 +245,7 @@ RsxRenderer::~RsxRenderer() {
     if (placeholder_view_ != VK_NULL_HANDLE) vkDestroyImageView(device, placeholder_view_, nullptr);
     if (placeholder_image_ != VK_NULL_HANDLE)
         vmaDestroyImage(context_.allocator(), placeholder_image_, placeholder_allocation_);
+    last_display_.reset();
     color_targets_.clear();
     depth_targets_.clear();
 }
@@ -1430,9 +1431,11 @@ void RsxRenderer::recordFlip(const RsxFlip& flip) {
         display_width_ = flip.width;
         display_height_ = flip.height;
         display_copied_ = read_back;
+        last_display_.reset();
     } else {
         const std::shared_ptr<RenderTarget> target = it->second;
         touch(target);
+        last_display_ = target;
         display_width_ = target->width;
         display_height_ = target->height;
         if (read_back && ensureReadback(slot, static_cast<VkDeviceSize>(display_width_) * display_height_ * 4)) {
@@ -1458,7 +1461,33 @@ void RsxRenderer::recordFlip(const RsxFlip& flip) {
     }
     if (!valid()) return;
     if (presenter_ != nullptr) recordPresentBlit(slot, display_black_ ? nullptr : it->second.get());
-    if (submitFrame()) has_flip_ = true;
+    if (submitFrame()) {
+        has_flip_ = true;
+        last_flip_ = Clock::now();
+    }
+}
+
+// A frame that holds only the present blit and the overlays. A draw or clear since the last flip means the game is
+// mid-frame: that recording also holds draws the next flip must submit with it, and last_display_ may already be
+// overwritten, so only the game's own flip presents then.
+void RsxRenderer::presentIdle() {
+    if (presenter_ == nullptr || overlay_ == nullptr || !valid() || !has_flip_) return;
+    if (!overlay_->wantsIdlePresent()) return;
+    const Clock::time_point now = Clock::now();
+    if (!idlePresentDue(last_flip_, last_idle_present_, now)) return;
+    if (recording_) {
+        logOnce(LogLevel::Warn, "render-idle-present-frame-open",
+                "dal: render: idle present skipped, a frame is open; an overlay shows only when the game flips");
+        return;
+    }
+    if (!beginFrame()) return;
+    if (last_display_) touch(last_display_);
+    recordPresentBlit(*slots_[current_slot_], last_display_.get());
+    // readDisplay and the dumps read the slot of the last flip, which this frame must not take over.
+    const std::size_t flip_slot = display_slot_;
+    submitFrame();
+    display_slot_ = flip_slot;
+    last_idle_present_ = now;
 }
 
 // Acquires a swapchain image and records the copy of the display buffer into it (a black frame when

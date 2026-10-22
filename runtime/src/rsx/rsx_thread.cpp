@@ -781,7 +781,10 @@ void consumerLoop(RsxConsumer* consumer, std::uint8_t* base) {
 
         const bool tick = tickDue(Clock::now());
         const std::uint32_t put = std::byteswap(put_word.load(std::memory_order_relaxed));
-        if (!tick && !consumer->hasWork(put)) continue;
+        if (!tick && !consumer->hasWork(put)) {
+            if (executor) executor->idle();
+            continue;
+        }
 
         bool pending_tick = tick;
         FifoStatus status;

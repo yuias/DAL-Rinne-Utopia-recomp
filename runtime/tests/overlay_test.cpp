@@ -827,6 +827,8 @@ public:
         return requests_;
     }
     bool wantsDraw() const override { return wants_; }
+    bool wantsIdlePresent() const override { return wants_idle_; }
+    void setWantsIdlePresent(bool wants) { wants_idle_ = wants; }
     void record(VkCommandBuffer, const dal::Presenter::Target&) override {
         log_.push_back("record" + std::to_string(id_));
     }
@@ -835,6 +837,7 @@ private:
     int id_;
     std::vector<std::string>& log_;
     bool wants_;
+    bool wants_idle_ = false;
     dal::PresentOverlayRequests requests_;
 };
 
@@ -887,6 +890,18 @@ void testOverlayStack() {
     none.record(VK_NULL_HANDLE, {});
     CHECK(log_none.empty());
     CHECK(!none.onFlip({}).dump_display);
+
+    // wantsIdlePresent is independent of wantsDraw and true when any child wants it.
+    CHECK(!empty.wantsIdlePresent());
+    CHECK(!none.wantsIdlePresent());
+    CHECK(!stack.wantsIdlePresent());
+    third.setWantsIdlePresent(true);
+    CHECK(stack.wantsIdlePresent());
+    third.setWantsIdlePresent(false);
+    first.setWantsIdlePresent(true);
+    CHECK(stack.wantsIdlePresent());
+    first.setWantsIdlePresent(false);
+    CHECK(!stack.wantsIdlePresent());
 }
 
 void testImGuiContextScope() {
