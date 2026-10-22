@@ -3,22 +3,20 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <format>
 
 #include "core/fatal.h"
+#include "core/host_memory.h"
 #include "core/log.h"
 #include "dal/ppu_context.h"
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
 
 namespace dal {
 namespace {
 
 constexpr std::uint64_t kGuestSpace = 1ull << 32;
 constexpr std::uint64_t kPageSize = 0x1000;
-constexpr std::uint64_t kFaultStackBytes = 0x20000;
+constexpr std::size_t kReserveBytes = static_cast<std::size_t>(kGuestSpace) + kDalGuestGuardSize;
 
 // The reservation the fault handler recognises, set by GuestMemory::reserve().
 std::atomic<std::uintptr_t> g_reserve_begin{0};
@@ -26,23 +24,53 @@ std::atomic<std::uintptr_t> g_reserve_end{0};
 
 std::uint64_t alignUp(std::uint64_t value, std::uint64_t align) { return (value + align - 1) / align * align; }
 
-LONG CALLBACK faultHandler(EXCEPTION_POINTERS* info) {
-    const EXCEPTION_RECORD& rec = *info->ExceptionRecord;
-    if (rec.ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+std::uint64_t hostPage() { return host::pageSize(); }
+
+// True when any logical page of the host page holding logical page `page` has its bit set.
+bool hostPageLive(const std::atomic<std::uint64_t>* bitmap, std::uint64_t page) {
+    const std::uint64_t per_host = hostPage() / kPageSize;
+    const std::uint64_t first = page / per_host * per_host;
+    // A host page is a power-of-two multiple of kPageSize and aligned, so its bits sit in one word.
+    const std::uint64_t mask = (per_host >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << per_host) - 1))
+                               << (first % 64);
+    return (bitmap[first / 64].load(std::memory_order_acquire) & mask) != 0;
+}
+
+// Zero-fills the logical pages of [first_page, end_page) that are not committed yet but share a live
+// host page, before their bits are set. Such a host page stayed committed because a neighbouring
+// logical page is live, so its other logical pages may still hold the data of an earlier allocation.
+void zeroStaleSiblings(std::uint8_t* base, const std::atomic<std::uint64_t>* bitmap, std::uint64_t first_page,
+                       std::uint64_t end_page) {
+    const std::uint64_t per_host = hostPage() / kPageSize;
+    if (per_host == 1) {
+        return;
+    }
+    for (std::uint64_t host_first = first_page / per_host * per_host; host_first < end_page; host_first += per_host) {
+        if (!hostPageLive(bitmap, host_first)) {
+            continue;
+        }
+        for (std::uint64_t page = std::max(host_first, first_page); page < std::min(host_first + per_host, end_page);
+             page++) {
+            if (((bitmap[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) == 0) {
+                std::memset(base + page * kPageSize, 0, kPageSize);
+            }
+        }
+    }
+}
+
+void faultHandler(const host::FaultInfo& fault) {
+    if (fault.stack_overflow) {
         fatal(FatalKind::GuestFault, "host stack overflow");
     }
-    if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const std::uintptr_t address = rec.ExceptionInformation[1];
     const std::uintptr_t begin = g_reserve_begin.load();
-    if (begin == 0 || address < begin || address >= g_reserve_end.load()) {
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (begin == 0 || fault.address < begin || fault.address >= g_reserve_end.load()) {
+        return;
     }
-    const ULONG_PTR access = rec.ExceptionInformation[0];
-    const char* what = access == 1 ? "write to" : access == 8 ? "execute at" : "read from";
+    const char* what = fault.access == host::FaultAccess::Write     ? "write to"
+                       : fault.access == host::FaultAccess::Execute ? "execute at"
+                                                                    : "read from";
     fatal(FatalKind::GuestFault,
-          std::format("{} guest address {:#010x}", what, static_cast<std::uint64_t>(address - begin)));
+          std::format("{} guest address {:#010x}", what, static_cast<std::uint64_t>(fault.address - begin)));
 }
 
 }  // namespace
@@ -55,22 +83,26 @@ GuestMemory::~GuestMemory() {
     if (g_reserve_begin.compare_exchange_strong(expected, 0)) {
         g_reserve_end.store(0);
     }
-    VirtualFree(base_, 0, MEM_RELEASE);
+    host::release(base_, kReserveBytes);
 }
 
 bool GuestMemory::reserve() {
     if (base_ != nullptr) {
         return true;
     }
-    const std::size_t total = static_cast<std::size_t>(kGuestSpace) + kDalGuestGuardSize;
-    void* p = VirtualAlloc(nullptr, total, MEM_RESERVE, PAGE_NOACCESS);
+    const std::uint64_t host_page = hostPage();
+    if (host_page < kPageSize || host_page > kPageSize * 64 || !std::has_single_bit(host_page)) {
+        logError("unsupported host page size {:#x}", host_page);
+        return false;
+    }
+    void* p = host::reserve(kReserveBytes);
     if (p == nullptr) {
-        logError("cannot reserve {:#x} bytes of guest address space (error {})", total, GetLastError());
+        logError("cannot reserve {:#x} bytes of guest address space ({})", kReserveBytes, host::lastErrorText());
         return false;
     }
     base_ = static_cast<std::uint8_t*>(p);
     committed_pages_ = std::make_unique<std::atomic<std::uint64_t>[]>(kGuestSpace / kPageSize / 64);  // zeroed
-    g_reserve_end.store(reinterpret_cast<std::uintptr_t>(base_) + total);
+    g_reserve_end.store(reinterpret_cast<std::uintptr_t>(base_) + kReserveBytes);
     g_reserve_begin.store(reinterpret_cast<std::uintptr_t>(base_));
     return true;
 }
@@ -87,9 +119,13 @@ bool GuestMemory::commit(std::uint32_t addr, std::uint32_t size) {
     if (end > kGuestSpace) {
         return false;
     }
-    if (VirtualAlloc(base_ + begin, static_cast<std::size_t>(end - begin), MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+    const std::uint64_t host_page = hostPage();
+    const std::uint64_t host_begin = begin / host_page * host_page;
+    const std::uint64_t host_end = alignUp(end, host_page);
+    if (!host::commit(base_ + host_begin, static_cast<std::size_t>(host_end - host_begin))) {
         return false;
     }
+    zeroStaleSiblings(base_, committed_pages_.get(), begin / kPageSize, end / kPageSize);
     markPages(begin / kPageSize, end / kPageSize, true);
     return true;
 }
@@ -102,7 +138,21 @@ void GuestMemory::decommit(std::uint32_t addr, std::uint32_t size) {
     const std::uint64_t end = std::min(alignUp(static_cast<std::uint64_t>(addr) + size, kPageSize), kGuestSpace);
     // Cleared first, so a concurrent isCommitted never reports a page that is already being released.
     markPages(begin / kPageSize, end / kPageSize, false);
-    VirtualFree(base_ + begin, static_cast<std::size_t>(end - begin), MEM_DECOMMIT);
+
+    // Only host pages with no committed logical page left are given back. Pages strictly between the
+    // first and the last host page lie wholly inside the range, so only those two can be shared.
+    const std::uint64_t host_page = hostPage();
+    std::uint64_t host_begin = begin / host_page * host_page;
+    std::uint64_t host_end = alignUp(end, host_page);
+    if (host_begin < host_end && hostPageLive(committed_pages_.get(), host_begin / kPageSize)) {
+        host_begin += host_page;
+    }
+    if (host_end > host_begin && hostPageLive(committed_pages_.get(), (host_end - host_page) / kPageSize)) {
+        host_end -= host_page;
+    }
+    if (host_begin < host_end) {
+        host::decommit(base_ + host_begin, static_cast<std::size_t>(host_end - host_begin));
+    }
 }
 
 void GuestMemory::markPages(std::uint64_t first_page, std::uint64_t end_page, bool committed) {
@@ -249,16 +299,10 @@ Process& process() {
 }
 
 void installFaultHandler() {
-    static std::atomic<bool> installed{false};
-    if (!installed.exchange(true)) {
-        AddVectoredExceptionHandler(1, &faultHandler);
-    }
+    host::installFaultHandler(&faultHandler);
     reserveFaultStack();
 }
 
-void reserveFaultStack() {
-    ULONG bytes = static_cast<ULONG>(kFaultStackBytes);
-    SetThreadStackGuarantee(&bytes);
-}
+void reserveFaultStack() { host::reserveFaultStack(); }
 
 }  // namespace dal

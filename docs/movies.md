@@ -55,21 +55,47 @@ stored but not acted on.
   scan) and the frame-decoder interface that `cellAtrac` uses for the game's music and sound
   effects. Movies do not use them; they are described under [Audio](audio.md#cellatrac).
 
-FFmpeg is used as the LGPL DLLs of a pinned build, loaded at run time (no import libraries); it
+On Windows, FFmpeg is used as the LGPL DLLs of a pinned build, loaded at run time (no import
+libraries); on macOS it is Homebrew's installation (see [FFmpeg on macOS](#ffmpeg-on-macos)). It
 decodes the movies and, through the interface above, the `cellAtrac` sounds. See
 `THIRD_PARTY_NOTICES.md`. `tools/fetch-ffmpeg.ps1 [-From <zip>] [-Force]` downloads the build
 named in `cmake/ffmpeg.cmake`, checks its SHA-256, and extracts it to
 `generated/deps/ffmpeg/<asset name>/` with a `.verified-sha256` marker (exit codes: 0 success, 1
 failure, 2 usage error). Configuration fails with a hint to run the script while it is missing;
 the CMake cache variable `DAL_FFMPEG_DIR` points at another extraction. The build copies the DLLs,
-the FFmpeg licence and the notice next to the executables.
+the FFmpeg licence and the notice next to the executables. `tools/fetch-ffmpeg.sh [--from <zip>]
+[--force]` does the same from a POSIX shell, with the same pin and checks; the macOS build does not
+use that build.
+
+### FFmpeg on macOS
+
+On macOS there is no pin and no download. FFmpeg comes from Homebrew (`brew install ffmpeg`):
+
+- **Finding it.** Configuration uses `DAL_FFMPEG_DIR`, or `$(brew --prefix ffmpeg)` when that is
+  empty. The directory must hold `include/libavcodec/avcodec.h` and `lib/`; otherwise configuration
+  stops with that hint. It prints `DAL: FFmpeg: <directory>`. Nothing is checked against a hash.
+- **Loading.** The libraries are `libavutil`, `libswresample`, `libswscale` and `libavcodec`, as
+  `lib<name>.<major>.dylib` with the major version from the headers the build used. `dal_game` opens
+  them with `dlopen` by absolute path, from the `lib` directory that was compiled in, in the same
+  order and with the same checks (missing file, missing function, wrong major version) and messages
+  as for the DLLs, for example `cannot load libavcodec.<major>.dylib from <directory>: <reason>`. They
+  are loaded in place: nothing is linked, copied or put next to the executables. After a Homebrew
+  upgrade that changes a major version, build again.
+- **Licence.** Homebrew's FFmpeg is configured with GPL components (x264 and x265), unlike the
+  pinned LGPL build of the Windows distribution. This project loads it from the user's own
+  installation and never copies, bundles or redistributes it. The runtime uses only the H.264 and
+  ATRAC3plus decoders and the conversion functions.
+- **Tests.** `media_ffmpeg`, `movie_decode` and `atrac_decode` run against Homebrew's libraries. The
+  float PCM of Apple Silicon differs in rounding from the Windows build, so the two PCM hashes have
+  macOS values in `cmake/movie_decode.cmake` and `cmake/atrac_decode.cmake`; everything else in the
+  pins is shared. Another Homebrew FFmpeg version may need new hashes.
 
 ## Failure policy
 
 Media problems are never fatal:
 
-- Without usable FFmpeg DLLs the runtime logs `dal: sail: codecs unavailable: <reason>` once, and
-  each movie plays as black frames without sound for the duration of its stream. The same DLLs
+- Without usable FFmpeg DLLs (libraries on macOS) the runtime logs `dal: sail: codecs unavailable: <reason>` once, and
+  each movie plays as black frames without sound for the duration of its stream. The same libraries
   decode the game's `cellAtrac` sounds, so it also logs `dal: atrac: no decoder: <reason>` and the
   music and sound effects are silent (see [Audio](audio.md#cellatrac)).
 - A file that cannot be opened or parsed is logged (`dal: sail: <path> cannot be played: ...`);
@@ -91,7 +117,7 @@ sends every 5.333 ms. The game's sound thread, which that notify wakes, calls
 `cellSailSoundAdapterGetFrame` for the number of samples it wants (stereo float, 48 kHz), mixes
 them with its `cellAtrac` sounds, and the mixer writes the result into the port block that the next
 period plays. The runtime plays the result through the audio output
-(WASAPI with the window, none with `--no-window`; `--audio-dump FILE` writes it to a WAV file). Audio that
+(WASAPI on Windows or CoreAudio on macOS with the window, none with `--no-window`; `--audio-dump FILE` writes it to a WAV file). Audio that
 the game does not pull is still dropped once the playback clock has passed it, as before. While
 fast-forwarding, the game still pulls audio once per `cellAudio` notify (the engine stays on host
 time) while the faster clock drops the audio it has passed as stale, so the movie's sound does not
@@ -109,7 +135,7 @@ sound effects.
 | `dal: sail: movie <path>: 1280x720 29.97 fps, D decoded, N delivered, K dropped, audio S samples (U underruns), played X s of Y s` | The movie ended or was finalized |
 | `dal: sail: movie window <path>: a .. b s (W s), F flips (R/s), Z skipped draws, G GetFrame calls (Q/s)` | Flips and `GetFrame` calls during the movie, for measuring the pacing |
 | `dal: sail: movie <path> details: ...` | Debug level: decode and frame copy time per frame, audio counts |
-| `dal: sail: codecs unavailable: <reason>` | The FFmpeg DLLs could not be loaded |
+| `dal: sail: codecs unavailable: <reason>` | The FFmpeg DLLs (libraries on macOS) could not be loaded |
 
 The times in `movie start` and `movie window` are guest time, and so are the rates of the `movie
 window` line (per guest second, which is N times faster than the host clock while fast-forwarding).
@@ -142,6 +168,7 @@ It reads movies only; the ATRAC3plus files of the game's archives are handled by
   cellSail HLE driven through fake guest callbacks.
 - `media_ffmpeg`: the FFmpeg loader, the H.264 and ATRAC3plus decoders (also the raw-frame one
   behind `cellAtrac`) and the conversions.
-- `movie_decode`: `dal_moviedump` on `ch_logo.pam` with pinned hashes (`cmake/movie_decode.cmake`).
+- `movie_decode`: `dal_moviedump` on `ch_logo.pam` with pinned hashes (`cmake/movie_decode.cmake`;
+  the audio hash has a separate value on macOS).
 
 See [Tests](tests.md) for when each one is registered and which use the game files.

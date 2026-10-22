@@ -1,4 +1,4 @@
-// The guest's clock: the host performance counter, run guestSpeed() times as fast while fast-forward
+// The guest's clock: the host monotonic counter, run guestSpeed() times as fast while fast-forward
 // is active. Everything the game can time itself by (systemTimeUs, the timebase) reads it.
 
 #include "core/guest_clock.h"
@@ -10,12 +10,17 @@
 
 #include "core/log.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <time.h>
+#endif
 
 namespace {
 
+#if defined(_WIN32)
 std::int64_t queryCounter() {
     LARGE_INTEGER value;
     QueryPerformanceCounter(&value);
@@ -30,6 +35,21 @@ std::int64_t counterFrequency() {
     }();
     return frequency;
 }
+#else
+// Nanoseconds, so the frequency is a constant. On Apple, CLOCK_UPTIME_RAW is the clock that does not
+// count time asleep, like QueryPerformanceCounter does not on Windows.
+std::int64_t queryCounter() {
+#if defined(__APPLE__)
+    return static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#else
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+#endif
+}
+
+std::int64_t counterFrequency() { return 1'000'000'000; }
+#endif
 
 // Initialised during static initialisation, so it is the process start for all practical purposes.
 const std::int64_t g_start_counter = queryCounter();

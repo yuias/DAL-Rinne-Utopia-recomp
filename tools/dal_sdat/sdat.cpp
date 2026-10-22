@@ -7,10 +7,7 @@
 #include <iterator>
 #include <string_view>
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <bcrypt.h>
+#include "crypto/host_crypto.h"
 
 namespace dal::sdat {
 namespace {
@@ -32,88 +29,6 @@ std::uint32_t readBe32(const std::uint8_t* p) {
 }
 
 std::uint64_t readBe64(const std::uint8_t* p) { return (std::uint64_t{readBe32(p)} << 32) | readBe32(p + 4); }
-
-// ---------------------------------------------------------------------------------------------
-// CNG
-
-struct AlgHandle {
-    explicit AlgHandle(const wchar_t* id, const wchar_t* chain_mode) {
-        if (BCryptOpenAlgorithmProvider(&handle, id, nullptr, 0) != 0) {
-            handle = nullptr;
-            return;
-        }
-        if (chain_mode != nullptr &&
-            BCryptSetProperty(handle, BCRYPT_CHAINING_MODE, reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(chain_mode)),
-                              static_cast<ULONG>((wcslen(chain_mode) + 1) * sizeof(wchar_t)), 0) != 0) {
-            BCryptCloseAlgorithmProvider(handle, 0);
-            handle = nullptr;
-        }
-    }
-    ~AlgHandle() {
-        if (handle != nullptr) {
-            BCryptCloseAlgorithmProvider(handle, 0);
-        }
-    }
-    AlgHandle(const AlgHandle&) = delete;
-    AlgHandle& operator=(const AlgHandle&) = delete;
-
-    BCRYPT_ALG_HANDLE handle = nullptr;
-};
-
-const AlgHandle& ecbAlg() {
-    static const AlgHandle alg(BCRYPT_AES_ALGORITHM, BCRYPT_CHAIN_MODE_ECB);
-    return alg;
-}
-
-const AlgHandle& cbcAlg() {
-    static const AlgHandle alg(BCRYPT_AES_ALGORITHM, BCRYPT_CHAIN_MODE_CBC);
-    return alg;
-}
-
-const AlgHandle& cmacAlg() {
-    static const AlgHandle alg(L"AES-CMAC", nullptr);
-    return alg;
-}
-
-class AesKey {
-public:
-    AesKey(const AlgHandle& alg, const Block16& key) {
-        if (alg.handle == nullptr ||
-            BCryptGenerateSymmetricKey(alg.handle, &key_, nullptr, 0, const_cast<PUCHAR>(key.data()),
-                                       static_cast<ULONG>(key.size()), 0) != 0) {
-            key_ = nullptr;
-        }
-    }
-    ~AesKey() {
-        if (key_ != nullptr) {
-            BCryptDestroyKey(key_);
-        }
-    }
-    AesKey(const AesKey&) = delete;
-    AesKey& operator=(const AesKey&) = delete;
-
-    // `iv` is null for ECB. The chaining state is kept in a copy, so the same IV can be reused.
-    bool crypt(bool encrypt, const Block16* iv, const std::uint8_t* in, std::uint8_t* out, std::size_t size) const {
-        if (key_ == nullptr || size % 16 != 0 || size > 0x7FFFFFFF) {
-            return false;
-        }
-        Block16 iv_copy{};
-        if (iv != nullptr) {
-            iv_copy = *iv;
-        }
-        ULONG done = 0;
-        PUCHAR iv_ptr = iv != nullptr ? iv_copy.data() : nullptr;
-        const ULONG iv_size = iv != nullptr ? static_cast<ULONG>(iv_copy.size()) : 0;
-        const NTSTATUS status = encrypt ? BCryptEncrypt(key_, const_cast<PUCHAR>(in), static_cast<ULONG>(size), nullptr,
-                                                        iv_ptr, iv_size, out, static_cast<ULONG>(size), &done, 0)
-                                        : BCryptDecrypt(key_, const_cast<PUCHAR>(in), static_cast<ULONG>(size), nullptr,
-                                                        iv_ptr, iv_size, out, static_cast<ULONG>(size), &done, 0);
-        return status == 0 && done == size;
-    }
-
-private:
-    BCRYPT_KEY_HANDLE key_ = nullptr;
-};
 
 // ---------------------------------------------------------------------------------------------
 // Key file parsing
@@ -209,33 +124,19 @@ bool loadKeys(const stdfs::path& path, Keys& keys, std::string& error) {
 }
 
 bool aesEcbEncrypt(const Block16& key, const Block16& in, Block16& out) {
-    return AesKey(ecbAlg(), key).crypt(true, nullptr, in.data(), out.data(), in.size());
+    return crypto::aesEcbEncrypt(key, in, out.data());
 }
 
 bool aesCbcEncrypt(const Block16& key, const Block16& iv, std::span<const std::uint8_t> in, std::uint8_t* out) {
-    return AesKey(cbcAlg(), key).crypt(true, &iv, in.data(), out, in.size());
+    return crypto::aesCbcEncrypt(key, iv, in, out);
 }
 
 bool aesCbcDecrypt(const Block16& key, const Block16& iv, std::span<const std::uint8_t> in, std::uint8_t* out) {
-    return AesKey(cbcAlg(), key).crypt(false, &iv, in.data(), out, in.size());
+    return crypto::aesCbcDecrypt(key, iv, in, out);
 }
 
 bool aesCmac(const Block16& key, std::span<const std::uint8_t> data, Block16& out) {
-    const AlgHandle& alg = cmacAlg();
-    if (alg.handle == nullptr) {
-        return false;
-    }
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    if (BCryptCreateHash(alg.handle, &hash, nullptr, 0, const_cast<PUCHAR>(key.data()), static_cast<ULONG>(key.size()),
-                         0) != 0) {
-        return false;
-    }
-    bool ok = data.size() <= 0x7FFFFFFF &&
-              (data.empty() ||
-               BCryptHashData(hash, const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()), 0) == 0) &&
-              BCryptFinishHash(hash, out.data(), static_cast<ULONG>(out.size()), 0) == 0;
-    BCryptDestroyHash(hash);
-    return ok;
+    return crypto::aesCmac(key, data, out);
 }
 
 bool decryptSdat(std::span<const std::uint8_t> file, const Keys& keys, Bytes& out, SdatInfo& info, std::string& error) {
@@ -285,7 +186,6 @@ bool decryptSdat(std::span<const std::uint8_t> file, const Keys& keys, Bytes& ou
     Block16 digest_iv;
     std::memcpy(digest_iv.data(), digest, digest_iv.size());
 
-    const AesKey block_key_cipher(ecbAlg(), data_key);
     out.clear();
     out.reserve(info.file_size);
     Bytes encrypted;
@@ -336,7 +236,7 @@ bool decryptSdat(std::span<const std::uint8_t> file, const Keys& keys, Bytes& ou
         block_id[14] = static_cast<std::uint8_t>(block >> 8);
         block_id[15] = static_cast<std::uint8_t>(block);
         Block16 block_key;
-        if (!block_key_cipher.crypt(true, nullptr, block_id.data(), block_key.data(), block_key.size())) {
+        if (!aesEcbEncrypt(data_key, block_id, block_key)) {
             error = "AES failure";
             return false;
         }

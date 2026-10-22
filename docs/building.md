@@ -1,8 +1,9 @@
 # Building
 
 The [top-level README](../README.md) shows the one build command a player needs. This page lists
-every parameter of the build script, the CMake variables behind them, and the commands for the
-test runs.
+every parameter of the build scripts (`tools/build.ps1` on Windows, `tools/build.sh` on macOS), the
+CMake variables behind them, and the commands for the test runs. The Windows instructions come
+first; [Building on macOS](#building-on-macos) has the macOS ones.
 
 ## `tools/build.ps1`
 
@@ -53,9 +54,141 @@ With `-GameDir`, after a successful build that produced `build/<preset>/bin/dal_
 The script can also be run alone: `pwsh -NoProfile -File tools/write-game-config.ps1 -BinDir <dir>
 -GameDir <dir> [-EbootElf <path>]`.
 
+## Building on macOS
+
+The prerequisites are in the [README](../README.md#macos). The build runs on Apple Silicon only
+(arm64, 16 KiB pages) and uses Homebrew's clang and Homebrew's FFmpeg and the LunarG Vulkan SDK; the
+Windows presets and scripts are unchanged and cannot be used on a Mac.
+
+### Presets and toolchain
+
+| Preset | Build type | Output |
+| --- | --- | --- |
+| `macos-debug` | `Debug` | `build/macos-debug/`, executables in `build/macos-debug/bin/` |
+| `macos-release` | `RelWithDebInfo` | `build/macos-release/`, executables in `build/macos-release/bin/` |
+
+Both are available only on a macOS host and use Ninja and `cmake/toolchains/macos-homebrew-llvm.cmake`.
+That file selects Homebrew's `clang` and `clang++` (also for the Objective-C++ files), `llvm-ar` and
+`llvm-ranlib`, and links against Homebrew's libc++ and libunwind, because the sources use C++26
+library features that the C++ library in the macOS SDK lacks. The LLVM prefix is the CMake variable
+or environment variable `DAL_LLVM_PREFIX`, else `$(brew --prefix llvm)`; configuration stops with an
+install hint when no `bin/clang++` is found there. Apple's clang is refused by the compiler check.
+The binaries refer to Homebrew's libraries by path, so they run on the Mac that built them.
+
+All targets, the generated code included, are compiled with `-mcpu=apple-m1` where the Windows
+build uses `-march=x86-64-v3`; configuration prints `DAL: arch flags: -mcpu=apple-m1`. Any other
+platform stops with `DAL: unsupported platform`. The commands behind `tools/build.sh` are:
+
+```sh
+cmake --preset macos-debug
+cmake --build --preset macos-debug
+ctest --preset macos-debug
+```
+
+`macos-release` is the build to play with. The debug build is slow enough to starve the audio
+thread while the game loads (see [Audio](audio.md#debug-builds)).
+
+### `tools/build.sh`
+
+```sh
+tools/build.sh [--preset <name>] [--clean] [--test]
+               [--generated-dir <dir>] [--game-dir <dir>] [--eboot-elf <path>] [--eboot-bin <path>]
+               [--rpcs3-crypto-dir <dir>] [--llvm-prefix <dir>]
+```
+
+It is a POSIX `sh` script that configures, builds and optionally runs CTest, with the parameters of
+`tools/build.ps1` in kebab case.
+
+| Parameter | Meaning |
+| --- | --- |
+| `--preset <name>` | The CMake preset. The default is `macos-debug` on macOS; on other systems the option is required. |
+| `--clean` | Delete `build/<preset>/` before configuring. This also deletes the `.sdat` cache and the default hdd directory `build/<preset>/hdd`. |
+| `--test` | Run CTest after the build (see [Tests](tests.md)). |
+| `--generated-dir <dir>`, `--game-dir <dir>`, `--eboot-elf <path>`, `--eboot-bin <path>`, `--rpcs3-crypto-dir <dir>` | The same as `-GeneratedDir`, `-GameDir`, `-EbootElf`, `-EbootBin` and `-Rpcs3CryptoDir` above, and they set the same CMake variables. The paths of `--eboot-elf`, `--eboot-bin` and `--rpcs3-crypto-dir` must exist. |
+| `--llvm-prefix <dir>` | The LLVM installation to use, exported as `DAL_LLVM_PREFIX`. Defaults to the `DAL_LLVM_PREFIX` environment variable, then to `$(brew --prefix llvm)`. |
+
+Relative paths are resolved against the current directory. The script prints the first line of
+`clang --version` of the LLVM it uses and, after the build, `build: N.N s`. Its exit code is the
+exit code of the command that failed, 1 for a failed check of the script itself and 2 for a usage
+error.
+
+With `--game-dir`, after a successful build that produced `build/<preset>/bin/dal_game`, the script
+runs `tools/write-game-config.sh --bin-dir <dir> --game-dir <dir> [--eboot-elf <path>]`. It follows
+the rules of [`config.json` for `dal_game`](#configjson-for-dal_game), including the choice of the
+`elf` entry, and compares directories after resolving symbolic links. It can be run alone.
+
+### Decrypting and emitting on a Mac
+
+`dal_decrypt` and `dal_sdat` are built and used exactly as described under
+[Decrypting `EBOOT.BIN`](#decrypting-ebootbin) and in [SDAT files](sdat.md); only the AES, CMAC,
+HMAC and SHA code differs, as the macOS build uses CommonCrypto where Windows uses CNG (the library
+`dal_crypto`; its tests are `crypto_core`). The pins and the keys are the same. The full sequence:
+
+```sh
+tools/build.sh --preset macos-release --eboot-bin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN
+python3 tools/ps3tool.py emit generated/inputs/EBOOT.elf --out generated/ppu
+tools/build.sh --preset macos-release --generated-dir generated/ppu --game-dir <game-dir> --eboot-bin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN
+```
+
+Run the Python tools with `python3` 3.10 or newer; the `python3` that macOS provides can be 3.9, and
+the CMake configuration (which finds its own Python) does not tell you which one your shell uses.
+The emitted tree builds without warnings under `-Werror` with the macOS flags.
+
+### Vulkan, shaderc and FFmpeg
+
+- **Loader.** `dal_game` loads the Vulkan loader at run time. When the normal search fails (it does
+  when `DYLD_FALLBACK_LIBRARY_PATH` is set), it tries `/usr/local/lib/libvulkan.1.dylib`, then
+  `libvulkan.1.dylib` in the `lib` directory of the `VULKAN_SDK` that was set when CMake configured.
+  If neither exists, the error names the missing loader and this page.
+- **Shaders.** The run-time shader compiler is `libshaderc_combined.a` with `include/shaderc/shaderc.hpp`.
+  Configuration takes them from `$VULKAN_SDK` when it is set and has them, else from `/usr/local`
+  (where the SDK's system-global install puts a copy) and prints `DAL: shaderc: libshaderc_combined.a
+  from $VULKAN_SDK/lib` or `... from /usr/local/lib`. There is one archive for every configuration.
+- **Drivers.** The SDK installs two Vulkan drivers on top of Metal, KosmicKrisp and MoltenVK.
+  `dal_game` uses KosmicKrisp when both are present; MoltenVK works too. How to choose one yourself
+  is under [Rendering](rendering.md#vulkan-on-macos).
+- **FFmpeg.** The Homebrew installation in `DAL_FFMPEG_DIR` (default `$(brew --prefix ffmpeg)`) must
+  hold `include/libavcodec/avcodec.h` and `lib/`. Configuration prints `DAL: FFmpeg: <directory>`.
+  The headers are used at build time, and the directory of the libraries and the major version
+  numbers in their file names are compiled into `dal_game`; build again after an upgrade that
+  changes a major version. Nothing is copied and nothing is pinned or checked (see
+  [Movies](movies.md#ffmpeg-on-macos)). `tools/fetch-ffmpeg.sh [--from <zip>] [--force]` is the
+  POSIX version of `tools/fetch-ffmpeg.ps1`: it fetches the pinned Windows build, which the macOS
+  build does not use.
+
+### Running and debugging on a Mac
+
+- **Event loop.** AppKit must be used from the main thread. `dal_game` therefore runs the Cocoa
+  event loop on the main thread and the boot and the supervisor on a second thread
+  (`runWithHostEventLoop` in `runtime/src/render/vk_window.h`). The window, and the code that
+  creates or destroys it, belongs to the main thread; the controller notifications of
+  GameController.framework also arrive there. With `--no-window` the main thread runs a plain
+  `CFRunLoop` and the process never connects to the window server, so unattended runs and the game
+  tests work from an SSH session. The tests `render_window`, `audio_coreaudio` and
+  `input_gamecontroller` need a logged-in session and skip themselves otherwise.
+- **Quitting.** `Cmd+Q`, the application menu's Quit and the close button end the run through the same
+  path (`dal: stop: window closed`).
+- **lldb.** The runtime reserves the 4 GiB guest address space and finds out about guest accesses
+  to uncommitted memory from `SIGSEGV` and `SIGBUS` (macOS reports some protection faults as `SIGBUS`).
+  lldb stops on each of these as `EXC_BAD_ACCESS`. To let the runtime's handler run, tell lldb to pass
+  them on without stopping:
+
+  ```text
+  (lldb) process handle SIGSEGV SIGBUS -n true -p true -s false
+  ```
+
+  A real crash then still ends the run with a `dal: stop: fatal ...` line and the call trace.
+- **Page size and guard pages.** The guest keeps 4 KiB logical pages, but the host page of an Apple
+  Silicon Mac is 16 KiB, and the host protects whole pages. A host page stays accessible while any
+  of its logical pages is committed. The 4 KiB guard page on each side of a guest thread stack, which
+  is uncommitted so that an overrun faults, therefore stays accessible when it shares its host page
+  with a live allocation, and a stray access there does not fault. Guest addresses and the other
+  behaviour of guest memory are the same as on Windows.
+
 ## CMake variables
 
-These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<value>`):
+These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<value>`, or
+`macos-release` on a Mac):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -64,9 +197,10 @@ These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<
 | `DAL_EBOOT_ELF` | empty | Set by `-EbootElf`. While it is empty and `DAL_EBOOT_BIN` is set, configuration sets it to `generated/inputs/EBOOT.elf`. |
 | `DAL_EBOOT_BIN` | empty | Set by `-EbootBin`. |
 | `DAL_RPCS3_CRYPTO_DIR` | empty | Set by `-Rpcs3CryptoDir`. |
-| `DAL_FFMPEG_DIR` | empty | An extracted FFmpeg build to use instead of `generated/deps/ffmpeg/<pinned build>` (see [Movies](movies.md)). |
-| `DAL_GAMEINPUT_DIR` | empty | An extracted `Microsoft.GameInput` package to use instead of `generated/deps/gameinput/<pinned version>` (see [Input](input.md#the-gameinput-package)). Configure needs the package from `tools/fetch-gameinput.ps1`. |
-| `DAL_PPU_WERROR` | `ON` | Add `-Werror` for generated code and the code that mirrors it (header check, semantics harness, link test). Every such target is compiled with `-O1 -march=x86-64-v3 -ffp-contract=off -fpatchable-function-entry=8 -Wall -Wextra`, whatever the preset's optimization level. |
+| `DAL_FFMPEG_DIR` | empty | An extracted FFmpeg build to use instead of `generated/deps/ffmpeg/<pinned build>` (see [Movies](movies.md)). On macOS: the Homebrew prefix of FFmpeg to use instead of `$(brew --prefix ffmpeg)`. |
+| `DAL_GAMEINPUT_DIR` | empty | Windows only. An extracted `Microsoft.GameInput` package to use instead of `generated/deps/gameinput/<pinned version>` (see [Input](input.md#the-gameinput-package)). Configure needs the package from `tools/fetch-gameinput.ps1`. |
+| `DAL_LLVM_PREFIX` | `$(brew --prefix llvm)` | macOS only. The LLVM installation whose clang is used (a CMake variable or an environment variable); set by `--llvm-prefix`. |
+| `DAL_PPU_WERROR` | `ON` | Add `-Werror` for generated code and the code that mirrors it (header check, semantics harness, link test). Every such target is compiled with `-O1 -march=x86-64-v3 -ffp-contract=off -fpatchable-function-entry=8 -Wall -Wextra`, whatever the preset's optimization level (`-mcpu=apple-m1` replaces `-march=x86-64-v3` on macOS). |
 
 No tracked file contains a game path: they are command-line arguments, CMake cache variables, a
 user-local `config.json` (`config/dal_game.example.json` shows the format with placeholders), or a
@@ -145,8 +279,12 @@ the target that writes `generated/inputs`, exists only with `-EbootBin`.
 ## What gets built
 
 The runtime core (`dal_runtime_core`: `runtime/src/core`, `lv2`, `hle`, `input`, `rsx`, `audio`
-without the WASAPI output, and the demuxer, player and ATRAC3plus file parser in `runtime/src/media`)
-does not reference generated symbols and is always built, together with its unit tests. The renderer
+without the WASAPI and CoreAudio outputs, and the demuxer, player and ATRAC3plus file parser in
+`runtime/src/media`) does not reference generated symbols and is always built, together with its
+unit tests. Next to it are the host crypto library `dal_crypto` (CNG or CommonCrypto), the shared
+device-thread code of the audio outputs `dal_audio_stream`, and the platform libraries: on Windows
+`dal_audio_wasapi`, `dal_input_gameinput` and `dal_padtool`; on macOS `dal_audio_coreaudio` and
+`dal_input_gamecontroller`. The renderer
 (`dal_render`, `runtime/src/render`) is a separate library on top of it, so the core itself needs no
 GPU. `dal_game` is built only with `-GeneratedDir`, because only `runtime/src/game_main.cpp` passes
 the generated tables to the core. It checks the executable against the SHA-256 that the generated
@@ -176,6 +314,17 @@ Generated code, the game runs (`game_boot`, `game_input`, `game_audio`) and the 
 pwsh -NoProfile -File tools/build.ps1 -Preset release -GeneratedDir generated/ppu -EbootBin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN -GameDir <game-dir> -Test
 ```
 
+On macOS the same three builds are:
+
+```sh
+tools/build.sh --preset macos-debug --clean --test
+tools/build.sh --preset macos-release --eboot-bin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN --test
+tools/build.sh --preset macos-release --generated-dir generated/ppu --eboot-bin <game-dir>/PS3_GAME/USRDIR/EBOOT.BIN --game-dir <game-dir> --test
+```
+
+`--eboot-elf <path-to-EBOOT.elf>` replaces `--eboot-bin` as on Windows. Export `DAL_GAME_DIR`
+before running CTest to include the game-file parts of `media_core` and `media_ffmpeg`.
+
 The full list of tests and the conditions under which each one is registered are in
 [Tests](tests.md).
 
@@ -186,3 +335,9 @@ The full list of tests and the conditions under which each one is registered are
   the Ghidra results it uses are committed.
 - git and a sparse checkout of the RPCS3 sources, for `ps3tool.py nidgen` only (see
   [Analysis tools](analysis-tools.md#nid-and-syscall-name-tables)).
+- On macOS, `tools/install-ghidra-cell.sh` installs the built Cell PPU language module into Ghidra,
+  as `tools/install-ghidra-cell.ps1` does on Windows, with the options `--ghidra-dir`, `--target
+  user|processors`, `--settings-dir`, `--source`, `--uninstall`, `--yes` (instead of
+  `-Confirm:$false`; without it the script asks `proceed? [y/N]`) and `--dry-run` (instead of
+  `-WhatIf`). See [The install script](ghidra-cell-language.md#the-install-script) for the checks and
+  the plan; the default settings directory on macOS is under `~/Library/ghidra`.

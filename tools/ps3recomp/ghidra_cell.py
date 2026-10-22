@@ -329,7 +329,8 @@ def build(ghidra_dir: Path, src_dir: Path, out_dir: Path, make_zip: bool = True,
     print("staged: %d stock files, %d module files -> %s"
           % (staged.stock_files, staged.module_files, _display(staged.stage_dir)))
 
-    size, elapsed = compile_module(staged.stage_dir, ghidra_dir.resolve(), out_dir, run, os_name)
+    size, elapsed = compile_module(staged.stage_dir.resolve(), ghidra_dir.resolve(), out_dir, run,
+                                  os_name)
     print("compiled: %s (%d bytes, %.1f s)" % (SLA_NAME, size, elapsed))
 
     if make_zip:

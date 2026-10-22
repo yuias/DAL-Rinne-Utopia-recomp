@@ -835,6 +835,14 @@ void testVertexConvert() {
     CHECK(!dal::indicesInRange(false, restart_u32, 3, 5, 7, false, 0xFFFFFFFF));
     CHECK(!dal::indicesInRange(false, restart_u32, 4, 5, 7, true, 0xFFFFFFFF));  // source too short
 
+    // Triangle fans as lists.
+    CHECK((dal::triangleFanToList(2, 5) == std::vector<std::uint32_t>{2, 3, 4, 2, 4, 5, 2, 5, 6}));
+    CHECK(dal::triangleFanToList(0, 2).empty() && dal::triangleFanToList(7, 0).empty());
+    const std::uint32_t fan_indices[4] = {9, 8, 7, 6};
+    CHECK((dal::triangleFanIndicesToList(fan_indices) == std::vector<std::uint32_t>{9, 8, 7, 9, 7, 6}));
+    CHECK(dal::triangleFanIndicesToList(std::span<const std::uint32_t>(fan_indices, 2)).empty());
+    CHECK(dal::triangleFanIndicesToList({}).empty());
+
     // Scaled-integer types can be widened to floats: s32k is signed, ub256 is not normalized.
     const auto s32k3 = vertexAttribFormat(dal::kVertexTypeSint16, 3);
     CHECK(s32k3 && s32k3->format == VK_FORMAT_R16G16B16A16_SSCALED);
@@ -1614,6 +1622,7 @@ void testLetterbox() {
     CHECK(sameRect(dal::letterboxRect(0xFFFFFFFFu, 0xFFFFFFFFu, 16, 9), 0, 939524096, 0xFFFFFFFFu, 2415919103u));
 }
 
+#if defined(_WIN32)
 // lParam of a key message: repeat count, scan code (bits 16..23), extended (24), previous state (30).
 std::uint64_t keyLparam(std::uint32_t scan, bool extended, bool was_down) {
     return 1u | (static_cast<std::uint64_t>(scan) << 16) | (extended ? 1u << 24 : 0u) | (was_down ? 1u << 30 : 0u);
@@ -1657,6 +1666,7 @@ void testKeyMessages() {
     CHECK(!dal::keyMessageFromWin32(kSize, 0, 0x02D00500));
     CHECK(!dal::keyMessageFromWin32(kKillFocus, 0, 0));
 }
+#endif
 
 // The presenter's overlay-facing types; no window is opened.
 void testPresenterTypes() {
@@ -1665,6 +1675,7 @@ void testPresenterTypes() {
 
     dal::PresenterOptions options;
     CHECK(!options.on_message);
+#if defined(_WIN32)
     int calls = 0;
     options.on_message = [&calls](const dal::WindowMessage& message) {
         calls++;
@@ -1676,6 +1687,23 @@ void testPresenterTypes() {
 
     const dal::WindowMessage blank;
     CHECK(blank.hwnd == nullptr && blank.message == 0 && blank.wparam == 0 && blank.lparam == 0);
+#else
+    int calls = 0;
+    options.on_message = [&calls](const dal::WindowMessage& message) {
+        calls++;
+        CHECK(message.view == nullptr && message.event == nullptr && message.kind == dal::WindowEventKind::Key);
+        CHECK(message.key && message.key->scan_code == 0x3B && message.key->down);
+        return dal::MessageRoute{.withhold_key = true};
+    };
+    dal::WindowMessage key_message;
+    key_message.kind = dal::WindowEventKind::Key;
+    key_message.key = dal::KeyMessage{0x3B, true, false};
+    const dal::MessageRoute route = options.on_message(key_message);
+    CHECK(calls == 1 && route.withhold_key && !route.handled && route.result == 0);
+
+    const dal::WindowMessage blank;
+    CHECK(blank.view == nullptr && blank.event == nullptr && blank.kind == dal::WindowEventKind::Other && !blank.key);
+#endif
 
     const dal::Presenter::Target empty;
     CHECK(empty.view == VK_NULL_HANDLE && empty.format == VK_FORMAT_UNDEFINED);
@@ -1711,7 +1739,9 @@ int main() {
     const bool layer = dal::vkValidationLayerAvailable();
     std::printf("validation layer: %s\n", layer ? "installed" : "not installed");
     testLetterbox();
+#if defined(_WIN32)
     testKeyMessages();
+#endif
     testPresenterTypes();
     testPresentModeChoice();
     testShaderCompiler();
@@ -1731,8 +1761,10 @@ int main() {
     }
 
     const std::uint32_t api = ctx->deviceProperties().apiVersion;
-    std::printf("device: %s (Vulkan %u.%u.%u), D24S8 %s, validation %s\n", ctx->deviceName().data(),
-                VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), VK_API_VERSION_PATCH(api),
+    std::printf("device: %s (Vulkan %u.%u.%u), driver %s %s, triangle fans %s, D24S8 %s, validation %s\n",
+                ctx->deviceName().data(), VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api),
+                VK_API_VERSION_PATCH(api), std::string(ctx->driverName()).c_str(),
+                std::string(ctx->driverInfo()).c_str(), ctx->triangleFans() ? "yes" : "no",
                 ctx->hasD24S8() ? "supported" : "unsupported (D32S8 fallback)",
                 ctx->validationEnabled() ? "active" : "inactive");
     CHECK(layer == ctx->validationEnabled());

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -32,6 +33,7 @@
 #include "core/guest_clock.h"
 #include "core/guest_memory.h"
 #include "core/host_functions.h"
+#include "core/host_memory.h"
 #include "core/json_read.h"
 #include "core/log.h"
 #include "core/param_sfo.h"
@@ -67,9 +69,22 @@
 #include "rsx_synthetic.h"
 #include "zlib.h"
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+extern char** environ;
+#endif
 
 namespace {
 
@@ -85,6 +100,14 @@ int g_failed;
             std::fprintf(stderr, "check failed (line %d): %s\n", __LINE__, #cond); \
         }                                                                          \
     } while (0)
+
+unsigned long processId() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
+}
 
 std::optional<std::uint32_t> g_thread_id;
 
@@ -183,10 +206,10 @@ dal::GuestMemory* newMemory() {
     return memory;
 }
 
-DWORD queryState(const dal::GuestMemory& memory, std::uint64_t guest_addr) {
-    MEMORY_BASIC_INFORMATION info{};
-    VirtualQuery(memory.base() + guest_addr, &info, sizeof info);
-    return info.State;
+using dal::host::PageState;
+
+PageState queryState(const dal::GuestMemory& memory, std::uint64_t guest_addr) {
+    return dal::host::queryPage(memory.base() + guest_addr);
 }
 
 void testGuestMemoryRoundTrip() {
@@ -194,10 +217,11 @@ void testGuestMemoryRoundTrip() {
     std::uint8_t* base = memory->base();
 
     CHECK(base != nullptr);
-    CHECK(queryState(*memory, 0x10000) == MEM_RESERVE);
+    CHECK(queryState(*memory, 0x10000) == PageState::Reserved);
     CHECK(memory->commit(0x10001, 0x10));  // rounds out to the whole page
-    CHECK(queryState(*memory, 0x10000) == MEM_COMMIT);
-    CHECK(queryState(*memory, 0x11000) == MEM_RESERVE);
+    CHECK(queryState(*memory, 0x10000) == PageState::Committed);
+    // The next page of the host's own size is still reserved (the host page may be larger than 4 KiB).
+    CHECK(queryState(*memory, 0x10000 + dal::host::pageSize()) == PageState::Reserved);
     CHECK(dalRead32(base, 0x10100) == 0);  // zero-filled
 
     dalWrite32(base, 0x10100, 0x11223344u);
@@ -209,7 +233,7 @@ void testGuestMemoryRoundTrip() {
     CHECK(memory->commit(0x10000, 0x1000));
     CHECK(dalRead32(base, 0x10100) == 0x11223344u);
     memory->decommit(0x10000, 0x1000);
-    CHECK(queryState(*memory, 0x10000) == MEM_RESERVE);
+    CHECK(queryState(*memory, 0x10000) == PageState::Reserved);
     CHECK(memory->commit(0x10000, 0x1000));
     CHECK(dalRead32(base, 0x10100) == 0);
 
@@ -217,6 +241,39 @@ void testGuestMemoryRoundTrip() {
     CHECK(memory->containsHost(base + kGuestSpace + kDalGuestGuardSize - 1));
     CHECK(!memory->containsHost(base + kGuestSpace + kDalGuestGuardSize));
     CHECK(!memory->containsHost(base - 1));
+}
+
+// Two 4 KiB logical pages can share one host page (16 KiB on Apple Silicon). Decommitting one must
+// not discard the other, and recommitting it must read zero even though the host page was kept.
+void testLogicalPagesSharingAHostPage() {
+    std::unique_ptr<dal::GuestMemory> memory(newMemory());
+    std::uint8_t* base = memory->base();
+
+    CHECK(memory->commit(0x10000, 0x2000));
+    dalWrite32(base, 0x10010, 0xAAAAAAAAu);
+    dalWrite32(base, 0x11010, 0xBBBBBBBBu);
+
+    memory->decommit(0x10000, 0x1000);
+    CHECK(!memory->isCommitted(0x10000, 4));
+    CHECK(memory->isCommitted(0x11000, 4));
+    CHECK(dalRead32(base, 0x11010) == 0xBBBBBBBBu);
+
+    CHECK(memory->commit(0x10000, 0x1000));
+    CHECK(dalRead32(base, 0x10010) == 0);
+    CHECK(dalRead32(base, 0x11010) == 0xBBBBBBBBu);
+
+    // Committing an already committed page keeps its contents, even in a shared host page.
+    dalWrite32(base, 0x10010, 0xCCCCCCCCu);
+    CHECK(memory->commit(0x10000, 0x2000));
+    CHECK(dalRead32(base, 0x10010) == 0xCCCCCCCCu);
+    CHECK(dalRead32(base, 0x11010) == 0xBBBBBBBBu);
+
+    // Once both are decommitted the host page goes too, and both read zero afterwards.
+    memory->decommit(0x10000, 0x2000);
+    CHECK(queryState(*memory, 0x10000) == PageState::Reserved);
+    CHECK(memory->commit(0x10000, 0x2000));
+    CHECK(dalRead32(base, 0x10010) == 0);
+    CHECK(dalRead32(base, 0x11010) == 0);
 }
 
 void testIsCommittedAndRangeNames() {
@@ -272,11 +329,14 @@ void testTopOfAddressSpace() {
 
     // An 8-byte access at 0xFFFFFFFC spills into the guard tail. The tail belongs to the same
     // reservation and stays inaccessible, so it faults instead of touching foreign memory.
+    CHECK(dal::host::queryPage(base + kGuestSpace) == PageState::Reserved);
+    CHECK(dal::host::queryPage(base + kGuestSpace + kDalGuestGuardSize - 1) == PageState::Reserved);
+#ifdef _WIN32
     MEMORY_BASIC_INFORMATION tail{};
     VirtualQuery(base + kGuestSpace, &tail, sizeof tail);
     CHECK(tail.AllocationBase == base);
-    CHECK(tail.State == MEM_RESERVE);
     CHECK(tail.RegionSize >= static_cast<SIZE_T>(kDalGuestGuardSize));
+#endif
 }
 
 void testAllocatorFirstFit() {
@@ -289,7 +349,7 @@ void testAllocatorFirstFit() {
     CHECK(a == 0x10000);
     CHECK(b == 0x20000);  // 0x10001 rounds up to two 64 KiB granules
     CHECK(c == 0x80000);  // alignment leaves 0x40000..0x80000 free
-    CHECK(queryState(*memory, a) == MEM_COMMIT);
+    CHECK(queryState(*memory, a) == PageState::Committed);
 
     // First fit takes the hole before the end of the region.
     const std::uint32_t d = alloc.allocate(0x10000, 0);
@@ -298,7 +358,7 @@ void testAllocatorFirstFit() {
     CHECK(alloc.free(b) == 0x20000);
     CHECK(alloc.free(b) == 0);        // already freed
     CHECK(alloc.free(0x10010) == 0);  // not an allocation start
-    CHECK(queryState(*memory, b) == MEM_RESERVE);
+    CHECK(queryState(*memory, b) == PageState::Reserved);
     CHECK(alloc.allocate(0x20000, 0) == b);  // reuse of the freed hole
     CHECK(dalRead32(memory->base(), b) == 0);
 
@@ -342,14 +402,22 @@ void testStackGuards() {
 
     const std::uint32_t a = stack.allocate(0x10000, 0x1000);
     CHECK(a == 0xD0001000);
-    CHECK(queryState(*memory, a - 0x1000) == MEM_RESERVE);  // guard below
-    CHECK(queryState(*memory, a) == MEM_COMMIT);
-    CHECK(queryState(*memory, a + 0xF000) == MEM_COMMIT);
-    CHECK(queryState(*memory, a + 0x10000) == MEM_RESERVE);  // guard above
+    CHECK(!memory->isCommitted(a - 0x1000, 1));  // guard below
+    CHECK(queryState(*memory, a) == PageState::Committed);
+    CHECK(queryState(*memory, a + 0xF000) == PageState::Committed);
+    CHECK(!memory->isCommitted(a + 0x10000, 1));  // guard above
+    if (dal::host::pageSize() == 0x1000) {
+        // With larger host pages a guard shares its host page with the allocation and stays accessible.
+        CHECK(queryState(*memory, a - 0x1000) == PageState::Reserved);
+        CHECK(queryState(*memory, a + 0x10000) == PageState::Reserved);
+    }
 
     const std::uint32_t b = stack.allocate(0x1000, 0x1000);
     CHECK(b == 0xD0013000);  // the upper guard of a, then the lower guard of b
-    CHECK(queryState(*memory, b - 0x1000) == MEM_RESERVE);
+    CHECK(!memory->isCommitted(b - 0x1000, 1));
+    if (dal::host::pageSize() == 0x1000) {
+        CHECK(queryState(*memory, b - 0x1000) == PageState::Reserved);
+    }
     CHECK(stack.allocate(0xE0000000u - 0xD0000000u, 0x1000) == 0);
     CHECK(stack.free(a) == 0x10000);
     CHECK(stack.allocate(0x2000, 0x1000) == a);
@@ -417,7 +485,7 @@ std::vector<std::uint8_t> syntheticElf(std::uint16_t machine) {
 std::filesystem::path writeTempFile(const char* name, const std::vector<std::uint8_t>& bytes) {
     const std::filesystem::path path =
             std::filesystem::temp_directory_path() /
-            (std::string("dal_runtime_test_") + std::to_string(GetCurrentProcessId()) + name);
+            (std::string("dal_runtime_test_") + std::to_string(processId()) + name);
     std::ofstream out(path, std::ios::binary);
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return path;
@@ -1134,7 +1202,7 @@ void testFileSystem() {
         return std::string(std::istreambuf_iterator<char>(in), {});
     };
 
-    const stdfs::path root = stdfs::temp_directory_path() / ("dal_vfs_test_" + std::to_string(GetCurrentProcessId()));
+    const stdfs::path root = stdfs::temp_directory_path() / ("dal_vfs_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     const stdfs::path game = root / "game";
@@ -2076,7 +2144,7 @@ void testCellGame() {
     const std::uint32_t name = scratch, size = scratch + 0x100, info = scratch + 0x200, usrdir = scratch + 0x300,
                         init = scratch + 0x400;
 
-    const stdfs::path root = stdfs::temp_directory_path() / ("dal_game_test_" + std::to_string(GetCurrentProcessId()));
+    const stdfs::path root = stdfs::temp_directory_path() / ("dal_game_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     const stdfs::path game = root / "game";
@@ -2199,7 +2267,7 @@ void testCellFs() {
                         arg = scratch + 0x3200;
 
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_cellfs_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_cellfs_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     const stdfs::path game = root / "game";
@@ -2431,7 +2499,7 @@ void testVfsConfig() {
     dal::resetLogOnce();
 
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_vfs_config_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_vfs_config_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     auto hostFile = [](const stdfs::path& path, std::string_view data) {
@@ -2809,7 +2877,7 @@ void testSceNpAndTrophy() {
     trp.insert(trp.end(), config.begin(), config.end());
 
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_trophy_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_trophy_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     const stdfs::path game = root / "game";
@@ -4425,7 +4493,7 @@ void testCellSaveData() {
                         fixed_list = scratch + 0x7400, focus_dir = scratch + 0x7500;
 
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_savedata_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_savedata_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     stdfs::create_directories(root / "game", ec);
@@ -4865,7 +4933,7 @@ void testCellPngDec() {
     g_png_feed.staging = staging;
 
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_pngdec_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_pngdec_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     stdfs::create_directories(root / "game", ec);
@@ -5720,7 +5788,7 @@ void testRsxArgCensus() {
     // Collector: feed the register writes of one draw.
     namespace stdfs = std::filesystem;
     const stdfs::path root =
-            stdfs::temp_directory_path() / ("dal_rsx_census_test_" + std::to_string(GetCurrentProcessId()));
+            stdfs::temp_directory_path() / ("dal_rsx_census_test_" + std::to_string(processId()));
     std::error_code ec;
     stdfs::remove_all(root, ec);
     dal::RsxArgCensus census(
@@ -7179,7 +7247,7 @@ void testRsxCapture() {
 
     // The file survives a trip through the disk.
     const std::filesystem::path dir =
-            std::filesystem::temp_directory_path() / ("dal_rsx_capture_test_" + std::to_string(GetCurrentProcessId()));
+            std::filesystem::temp_directory_path() / ("dal_rsx_capture_test_" + std::to_string(processId()));
     const std::filesystem::path path = dir / "nested" / "frame.dalcap";
     CHECK(dal::writeCaptureFile(path, capture_file, error));
     dal::RsxCaptureReader from_disk;
@@ -9000,20 +9068,17 @@ void testGuestLockFifo() {
 
 void testTimebase() {
     auto ctx = std::make_unique<DalPpuContext>();
-    LARGE_INTEGER frequency, t0, t1;
-    QueryPerformanceFrequency(&frequency);
-
     const std::uint64_t first = dalMftb(ctx.get());
-    QueryPerformanceCounter(&t0);
+    const auto t0 = std::chrono::steady_clock::now();
     const std::uint64_t tb0 = dalMftb(ctx.get());
-    Sleep(100);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const std::uint64_t tb1 = dalMftb(ctx.get());
-    QueryPerformanceCounter(&t1);
+    const auto t1 = std::chrono::steady_clock::now();
 
     CHECK(tb0 >= first);
     CHECK(tb1 > tb0);
-    // The rate is measured against the host clock over the same interval, so Sleep jitter cancels.
-    const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / frequency.QuadPart;
+    // The rate is measured against the host clock over the same interval, so sleep jitter cancels.
+    const double seconds = std::chrono::duration<double>(t1 - t0).count();
     const double rate = static_cast<double>(tb1 - tb0) / seconds;
     const bool rate_ok = rate > 79800000.0 * 0.95 && rate < 79800000.0 * 1.05;
     CHECK(rate_ok);
@@ -9021,7 +9086,7 @@ void testTimebase() {
     CHECK(dal::kTimebaseFrequency == 79800000);
 
     const std::uint64_t us0 = dal::systemTimeUs();
-    Sleep(20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     CHECK(dal::systemTimeUs() >= us0 + 15000);
 }
 
@@ -9081,20 +9146,18 @@ void testGuestClock() {
     dal::setFastForwardHeld(false);
     CHECK(dal::guestSpeed() == 1);
 
-    // (c) Guest time against the host clock, with the interval measured by QueryPerformanceCounter so
-    // Sleep jitter cancels.
+    // (c) Guest time against the host clock, with the interval measured by the steady clock so
+    // sleep jitter cancels.
     auto ctx = std::make_unique<DalPpuContext>();
-    LARGE_INTEGER frequency, t0, t1;
-    QueryPerformanceFrequency(&frequency);
     dal::setFastForwardToggled(true);
     const std::uint64_t us0 = dal::systemTimeUs();
     const std::uint64_t tb0 = dalMftb(ctx.get());
-    QueryPerformanceCounter(&t0);
-    Sleep(100);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const std::uint64_t us1 = dal::systemTimeUs();
     const std::uint64_t tb1 = dalMftb(ctx.get());
-    QueryPerformanceCounter(&t1);
-    const double seconds = static_cast<double>(t1.QuadPart - t0.QuadPart) / frequency.QuadPart;
+    const auto t1 = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(t1 - t0).count();
     const std::uint64_t elapsed_us = us1 - us0;
     CHECK(elapsed_us >= 350000 && elapsed_us <= 700000);
     const double time_ratio = static_cast<double>(elapsed_us) / 1e6 / seconds;
@@ -9127,7 +9190,7 @@ void testGuestClock() {
             switcher_monotonic = switcher_monotonic && now_us >= last_us;
             last_us = now_us;
         }
-        if (i % 20 == 0) Sleep(1);
+        if (i % 20 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     dal::setLogSink({});
     stop = true;
@@ -9222,16 +9285,18 @@ void testReservationAndDcbz() {
 }
 
 struct ChildResult {
-    DWORD exit_code = 0xFFFFFFFF;
+    std::uint32_t exit_code = 0xFFFFFFFF;
     std::string output;
 };
 
+#ifdef _WIN32
 // Runs this executable again with `arg`, capturing stdout and stderr together.
-ChildResult runChild(const wchar_t* arg) {
+ChildResult runChild(const char* arg) {
     ChildResult result;
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring command = std::wstring(L"\"") + exe + L"\" " + arg;
+    const std::string narrow_arg = arg;
+    std::wstring command = std::wstring(L"\"") + exe + L"\" " + std::wstring(narrow_arg.begin(), narrow_arg.end());
 
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE read_end = nullptr;
@@ -9259,12 +9324,87 @@ ChildResult runChild(const wchar_t* arg) {
         result.output.append(buffer, got);
     }
     WaitForSingleObject(pi.hProcess, 30000);
-    GetExitCodeProcess(pi.hProcess, &result.exit_code);
+    DWORD exit_code = 0xFFFFFFFF;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    result.exit_code = exit_code;
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(read_end);
     return result;
 }
+#else
+std::string selfPath() {
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // fails and reports the needed size
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) {
+        return {};
+    }
+    path.resize(std::strlen(path.c_str()));
+    return path;
+#else
+    return std::filesystem::read_symlink("/proc/self/exe").string();
+#endif
+}
+
+// Runs this executable again with `arg`, capturing stdout and stderr together. The exit code is
+// 0xFFFFFFFF when the child ends on a signal or cannot be started.
+ChildResult runChild(const char* arg) {
+    ChildResult result;
+    const std::string exe = selfPath();
+    int fds[2];
+    if (exe.empty() || pipe(fds) != 0) {
+        return result;
+    }
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 1);
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 2);
+    std::string exe_arg = exe;
+    std::string mode_arg = arg;
+    char* const argv[] = {exe_arg.data(), mode_arg.data(), nullptr};
+    pid_t pid = 0;
+    const int spawned = posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(fds[1]);
+    if (spawned != 0) {
+        close(fds[0]);
+        return result;
+    }
+
+    // A child that never ends is killed after 30 s, like the wait on Windows but without leaking it.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    char buffer[4096];
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0) {
+            kill(pid, SIGKILL);
+            break;
+        }
+        pollfd pfd{fds[0], POLLIN, 0};
+        const int ready = poll(&pfd, 1, static_cast<int>(left.count()));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) continue;  // timeout is handled by the deadline check above
+        const ssize_t got = read(fds[0], buffer, sizeof buffer);
+        if (got <= 0) break;
+        result.output.append(buffer, static_cast<std::size_t>(got));
+    }
+    close(fds[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    if (WIFEXITED(status)) {
+        result.exit_code = static_cast<std::uint32_t>(WEXITSTATUS(status));
+    }
+    return result;
+}
+#endif
 
 void echoChild(const char* name, const ChildResult& result) {
     std::printf("--- %s: exit code %lu\n", name, static_cast<unsigned long>(result.exit_code));
@@ -9278,7 +9418,7 @@ bool contains(const ChildResult& result, std::string_view needle) {
 }
 
 void testFaultChild() {
-    const ChildResult r = runChild(L"--fault-child");
+    const ChildResult r = runChild("--fault-child");
     echoChild("fault child", r);
     CHECK(r.exit_code == 3);
     CHECK(contains(r, "dal: stop: fatal guest fault: write to guest address 0x00200000"));
@@ -9291,14 +9431,14 @@ void testFaultChild() {
 }
 
 void testOverflowChild() {
-    const ChildResult r = runChild(L"--overflow-child");
+    const ChildResult r = runChild("--overflow-child");
     echoChild("overflow child", r);
     CHECK(r.exit_code == 3);
     CHECK(contains(r, "dal: stop: fatal guest fault: host stack overflow"));
 }
 
 void testStopChild() {
-    const ChildResult r = runChild(L"--stop-child");
+    const ChildResult r = runChild("--stop-child");
     echoChild("stop child", r);
     CHECK(r.exit_code == 5);
     CHECK(contains(r, "dal: stop: watchdog 5 s"));
@@ -9307,7 +9447,7 @@ void testStopChild() {
 }
 
 void testStrictDispatchChild() {
-    const ChildResult r = runChild(L"--strict-dispatch-child");
+    const ChildResult r = runChild("--strict-dispatch-child");
     echoChild("strict dispatch child", r);
     CHECK(r.exit_code == 3);
     CHECK(contains(r, "dal: stop: fatal unknown target: target 0x00010204 from 0x00010300"));
@@ -9315,7 +9455,7 @@ void testStrictDispatchChild() {
 }
 
 void testUnsortedTableChild() {
-    const ChildResult r = runChild(L"--unsorted-table-child");
+    const ChildResult r = runChild("--unsorted-table-child");
     echoChild("unsorted table child", r);
     CHECK(r.exit_code == 3);
     CHECK(contains(r,
@@ -9458,6 +9598,7 @@ int main(int argc, char** argv) {
     testLogVisibleLevel();
     testLogOnce();
     testGuestMemoryRoundTrip();
+    testLogicalPagesSharingAHostPage();
     testIsCommittedAndRangeNames();
     testTopOfAddressSpace();
     testAllocatorFirstFit();

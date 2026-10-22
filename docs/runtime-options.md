@@ -16,6 +16,10 @@ dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sd
          [--config FILE | --no-config] [-h|--help]
 ```
 
+`--audio` takes `none` or the system's device output: `wasapi` on Windows, `coreaudio` on macOS. The
+usage text of `dal_game` shows the one of the system it runs on; the block above shows the Windows
+one.
+
 A value is given as `--name value` or `--name=value`. Flags take no value; `--flag=false` switches a
 flag off (see [precedence](#precedence)). Arguments are read as UTF-8, so paths with characters
 outside the ANSI code page work. When an option is repeated, the last one wins, except
@@ -40,11 +44,11 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 
 | Option | Meaning |
 | --- | --- |
-| `--no-window` | Run without a window, for unattended runs and tests. By default `dal_game` shows the frames in a window (which implies `--render vulkan`), and closing it stops the run with exit code 0. An explicit `--render none` also turns the window off. Without the window GameInput is never loaded, so these runs need no gamepad or GameInput runtime. |
-| `--pad none\|neutral\|keyboard\|gamepad\|keyboard+gamepad` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad, `gamepad` the connected gamepads, and `keyboard+gamepad` both at once. With `gamepad`, port 0 is connected only while a gamepad is in use; otherwise it is always connected. Default: `keyboard+gamepad` with the window; `keyboard` with `--no-window` and `--pad-script`; otherwise `neutral`. `keyboard` without the window or `--pad-script` is a usage error, and so are `gamepad` and `keyboard+gamepad` with `--no-window`: unattended runs never load GameInput. See [Input](runtime.md#input) and [Gamepads](input.md#gamepads). |
+| `--no-window` | Run without a window, for unattended runs and tests. By default `dal_game` shows the frames in a window (which implies `--render vulkan`), and closing it stops the run with exit code 0 (on macOS `Cmd+Q` does the same). An explicit `--render none` also turns the window off. Without the window no gamepad backend is loaded (GameInput on Windows, GameController.framework on macOS), so these runs need no gamepad or GameInput runtime. On macOS the process also never connects to the window server, so such a run works over SSH. |
+| `--pad none\|neutral\|keyboard\|gamepad\|keyboard+gamepad` | Input source for port 0. `neutral` connects a standard pad that never changes, `none` connects no pad, `keyboard` makes the keyboard the pad, `gamepad` the connected gamepads, and `keyboard+gamepad` both at once. With `gamepad`, port 0 is connected only while a gamepad is in use; otherwise it is always connected. Default: `keyboard+gamepad` with the window; `keyboard` with `--no-window` and `--pad-script`; otherwise `neutral`. `keyboard` without the window or `--pad-script` is a usage error, and so are `gamepad` and `keyboard+gamepad` with `--no-window`: unattended runs never load a gamepad backend. See [Input](runtime.md#input) and [Gamepads](input.md#gamepads). |
 | `--pad-script FILE` | Press pad buttons at given times, for runs without a person at the keyboard. The file is read and checked at start-up; an error is a usage error that names the line. It needs `--pad keyboard` or `keyboard+gamepad` (the default with the window) and cannot be combined with `none`, `neutral` or `gamepad`. See [Pad script](runtime.md#pad-script). |
-| `--pad-probe` | Diagnostic for gamepads: logs every game controller that GameInput reports, every change of their readings and what the process knows about Steam, as `dal: pad: probe ...` lines. Needs the window (a usage error with `--no-window`) and is independent of `--pad`; it never changes the pad. See [`--pad-probe`](input.md#--pad-probe). |
-| `--audio none\|wasapi` | Where the game's sound goes. `wasapi` plays it through the default Windows audio device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: `wasapi` with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. See [Audio](audio.md#options). |
+| `--pad-probe` | Diagnostic for gamepads: logs every game controller that GameInput (Windows) or GameController.framework (macOS) reports, every change of their readings and what the process knows about Steam, as `dal: pad: probe ...` lines. Needs the window (a usage error with `--no-window`) and is independent of `--pad`; it never changes the pad. See [`--pad-probe`](input.md#--pad-probe). |
+| `--audio none\|wasapi` (Windows), `--audio none\|coreaudio` (macOS) | Where the game's sound goes. `wasapi` plays it through the default Windows audio device and `coreaudio` through the default macOS output device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: the system's device output with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. The other system's name is a usage error (`--audio needs none or coreaudio` on macOS). See [Audio](audio.md#options). |
 | `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. Its header is updated every second, so a run stopped by `--seconds` or by closing the window leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see [`dal_audiotool`](audio.md#dal_audiotool)). |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
 
@@ -74,8 +78,11 @@ reported once and counted, and the run goes on.
 
 The log says which Vulkan device was chosen and how long the device and renderer took to start. If
 no device meets the requirements (Vulkan 1.3 with dynamic rendering, synchronization2 and shader
-demote-to-helper-invocation; a window also needs the Win32 surface and swapchain extensions), or
-the window cannot be created, the RSX thread logs the reason and the game goes on without rendering.
+demote-to-helper-invocation; a window also needs the platform's surface extension, Win32 or Metal,
+and the swapchain extension), or the window cannot be created, the RSX thread logs the reason and the
+game goes on without rendering. On macOS the Vulkan driver (KosmicKrisp or MoltenVK) is chosen with
+the loader's environment variables, not with an option; see
+[Vulkan on macOS](rendering.md#vulkan-on-macos).
 
 ### Diagnostics
 
@@ -103,17 +110,19 @@ These three have no key in the configuration file.
 ## Configuration file
 
 Every option above can also be set in a JSON file, so that `dal_game.exe` starts without arguments
-(double-click, or a shortcut with "Start in" set to the `bin` folder).
+(double-click, or a shortcut with "Start in" set to the `bin` folder). On macOS the executable is
+`dal_game`, which starts without arguments from a terminal in the `bin` folder.
 
 ### Lookup
 
 1. `config.json` in the working directory, if it exists.
-2. Otherwise `config.json` in the directory of `dal_game.exe`.
+2. Otherwise `config.json` in the directory of `dal_game.exe` (`dal_game` on macOS).
 
 Only one file is read; they are not merged. A missing file is not an error. `--config FILE` reads
 `FILE` instead (the last `--config` counts), and then a missing or unreadable file is an error.
-`--no-config` reads none. `tools/build.ps1 -GameDir <game-dir>` writes `build/<preset>/bin/config.json`
-when there is none (see [Building](building.md#toolsbuildps1)); `/config.json` at the repository root is
+`--no-config` reads none. `tools/build.ps1 -GameDir <game-dir>` (Windows) or `tools/build.sh --game-dir <game-dir>` (macOS)
+writes `build/<preset>/bin/config.json` when there is none (see
+[Building](building.md#toolsbuildps1) and [Building on macOS](building.md#toolsbuildsh)); `/config.json` at the repository root is
 git-ignored, for a file of your own.
 
 The log tells which file was read, as `dal: config: <file>`.
@@ -151,7 +160,8 @@ the exit codes are the same.
 }
 ```
 
-Here `hdd_dir` is `saves` next to the file.
+Here `hdd_dir` is `saves` next to the file. On macOS the `audio` value is `coreaudio` (or leave the key
+out for the default); `wasapi` is a usage error there.
 
 ### Precedence
 
@@ -214,7 +224,7 @@ exits:
 
 | Code | Meaning | Stop line |
 | --- | --- | --- |
-| 0 | The guest called `sys_process_exit` or `_sys_process_exit`, the window was closed, or `--load-only` finished loading | `dal: stop: process exit status N`, `dal: stop: window closed` |
+| 0 | The guest called `sys_process_exit` or `_sys_process_exit`, the window was closed (on macOS also by `Cmd+Q`), or `--load-only` finished loading | `dal: stop: process exit status N`, `dal: stop: window closed` |
 | 2 | Usage error: bad option, neither `--game-dir` nor `--vfs-config`, game directory missing, log file or audio dump file not writable, configuration file missing (`--config`) or invalid | `error: ...` (usage text; none for a configuration file error) |
 | 3 | Fatal error: unhandled instruction, trap, guest fault (access outside the committed guest memory), unknown dispatch target with `--strict`, guest address space cannot be reserved; also the stops the game itself asks for (`cellGameContentErrorDialog`, a failed trophy registration) | `dal: stop: fatal <kind>: ...`, or a `dal: stop: ...` line naming the call |
 | 4 | Load error: file missing, not a PPU executable, SHA-256 different from the one in the generated code, invalid VFS configuration, or no executable can be located | `error: ...` |
@@ -223,8 +233,8 @@ exits:
 | 7 | All guest threads ended without a process exit | `dal: stop: no guest threads left` |
 
 A fatal stop also prints the registers and the call trace (the most recent function entries) of
-the faulting guest thread. The runtime never calls `abort`: the CRT and Windows error dialogs are
-disabled, so a run always ends with an exit code, also when it is started from a script.
+the faulting guest thread. The runtime never calls `abort`: on Windows the CRT and Windows error
+dialogs are disabled, so a run always ends with an exit code, also when it is started from a script.
 
 ## Examples by purpose
 

@@ -96,9 +96,54 @@ function(dal_runtime_add_cli11)
   message(STATUS "DAL: CLI11 ${cli11_version}")
 endfunction()
 
+# Host crypto (AES, AES-CMAC, HMAC-SHA1, SHA-256) on the OS's own library: CNG on Windows,
+# CommonCrypto (part of libSystem, nothing to link) on macOS. Independent of the runtime core.
+# Call after enable_testing().
+function(dal_crypto_add)
+  if(WIN32)
+    set(crypto_provider runtime/src/crypto/host_crypto_bcrypt.cpp)
+  elseif(APPLE)
+    set(crypto_provider runtime/src/crypto/host_crypto_commoncrypto.cpp)
+  else()
+    message(FATAL_ERROR "DAL: no host crypto provider for this platform")
+  endif()
+  add_library(dal_crypto STATIC ${crypto_provider})
+  target_compile_options(dal_crypto PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  target_include_directories(dal_crypto PUBLIC ${CMAKE_SOURCE_DIR}/runtime/src)
+  if(WIN32)
+    target_link_libraries(dal_crypto PRIVATE bcrypt)
+  endif()
+
+  add_executable(dal_crypto_tests runtime/tests/crypto_test.cpp)
+  target_compile_options(dal_crypto_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  target_link_libraries(dal_crypto_tests PRIVATE dal_crypto)
+
+  add_test(NAME crypto_core COMMAND dal_crypto_tests)
+  set_tests_properties(crypto_core PROPERTIES
+    PASS_REGULAR_EXPRESSION "crypto tests: [0-9]+ passed, 0 failed")
+endfunction()
+
 # Runtime core: everything that does not reference generated symbols, so it builds and its tests
 # run without a generated tree. Call after enable_testing().
 function(dal_runtime_add_core)
+  dal_crypto_add()
+  if(WIN32)
+    set(host_memory_provider runtime/src/core/host_memory_win32.cpp)
+  elseif(APPLE)
+    set(host_memory_provider runtime/src/core/host_memory_posix.cpp)
+  else()
+    message(FATAL_ERROR "DAL: no host memory provider for this platform")
+  endif()
+  if(WIN32)
+    set(host_file_provider runtime/src/core/host_file_win32.cpp)
+  else()
+    set(host_file_provider runtime/src/core/host_file_posix.cpp)
+  endif()
+  if(WIN32)
+    set(timer_resolution_provider runtime/src/core/timer_resolution.cpp)
+  else()
+    set(timer_resolution_provider runtime/src/core/timer_resolution_posix.cpp)
+  endif()
   dal_runtime_add_spdlog()
   dal_runtime_add_libpng()
   dal_runtime_add_yyjson()
@@ -116,13 +161,15 @@ function(dal_runtime_add_core)
     runtime/src/core/fatal.cpp
     runtime/src/core/guest_clock.cpp
     runtime/src/core/guest_memory.cpp
+    ${host_file_provider}
+    ${host_memory_provider}
     runtime/src/core/json_read.cpp
     runtime/src/core/log.cpp
     runtime/src/core/override_handlers.cpp
     runtime/src/core/overrides.cpp
     runtime/src/core/param_sfo.cpp
     runtime/src/core/threads.cpp
-    runtime/src/core/timer_resolution.cpp
+    ${timer_resolution_provider}
     runtime/src/hle/cell_atrac.cpp
     runtime/src/hle/cell_atrac_stream.cpp
     runtime/src/hle/cell_audio.cpp
@@ -150,6 +197,7 @@ function(dal_runtime_add_core)
     runtime/src/input/gamepad_probe.cpp
     runtime/src/input/gamepad_select.cpp
     runtime/src/input/keyboard_pad.cpp
+    runtime/src/input/mac_key_codes.cpp
     runtime/src/input/pad_buttons.cpp
     runtime/src/input/pad_script.cpp
     runtime/src/lv2/sys_event.cpp
@@ -175,13 +223,16 @@ function(dal_runtime_add_core)
     runtime/src/rsx/rsx_texture_cache.cpp
     runtime/src/rsx/rsx_thread.cpp
     runtime/src/rsx/rsx_unimplemented.cpp)
-  target_compile_options(dal_runtime_core PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_runtime_core PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_runtime_core PUBLIC
     ${CMAKE_SOURCE_DIR}/runtime/src
     ${CMAKE_SOURCE_DIR}/runtime/include)
-  target_link_libraries(dal_runtime_core PUBLIC bcrypt)
-  # timeBeginPeriod (core/timer_resolution.cpp).
-  target_link_libraries(dal_runtime_core PRIVATE winmm)
+  # PRIVATE: only core/elf_loader.cpp hashes the executable.
+  target_link_libraries(dal_runtime_core PRIVATE dal_crypto)
+  if(WIN32)
+    # timeBeginPeriod (core/timer_resolution.cpp).
+    target_link_libraries(dal_runtime_core PRIVATE winmm)
+  endif()
   # PRIVATE: spdlog types stay out of core/log.h, so consumers never compile against its headers.
   target_link_libraries(dal_runtime_core PRIVATE spdlog::spdlog)
   # PRIVATE as well: the PNG codec stays inside cell_png_dec.cpp.
@@ -190,7 +241,7 @@ function(dal_runtime_add_core)
   target_link_libraries(dal_runtime_core PRIVATE yyjson)
 
   add_executable(dal_runtime_tests runtime/tests/runtime_core_test.cpp)
-  target_compile_options(dal_runtime_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_runtime_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   # The tests build their PNG inputs with libpng's writer and test the json_read.h helpers.
   target_link_libraries(dal_runtime_tests PRIVATE dal_runtime_core png_static yyjson)
 
@@ -200,7 +251,7 @@ function(dal_runtime_add_core)
 
   # The movie pipeline's core needs no FFmpeg, so its tests link the core library only.
   add_executable(dal_media_core_tests runtime/tests/media_core_test.cpp)
-  target_compile_options(dal_media_core_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_media_core_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_media_core_tests PRIVATE dal_runtime_core)
 
   add_test(NAME media_core COMMAND dal_media_core_tests)
@@ -211,12 +262,12 @@ function(dal_runtime_add_core)
   add_library(dal_game_options STATIC
     runtime/src/app/config_file.cpp
     runtime/src/app/game_options.cpp)
-  target_compile_options(dal_game_options PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_game_options PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_game_options PUBLIC dal_runtime_core)
   target_link_libraries(dal_game_options PRIVATE CLI11 yyjson)
 
   add_executable(dal_game_options_tests runtime/tests/game_options_test.cpp)
-  target_compile_options(dal_game_options_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_game_options_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_compile_definitions(dal_game_options_tests PRIVATE DAL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(dal_game_options_tests PRIVATE dal_game_options)
 
@@ -231,16 +282,16 @@ endfunction()
 # tool runs, so nothing here (or in any test) contains key material.
 function(dal_sdat_add_tool)
   add_library(dal_sdat_lib STATIC tools/dal_sdat/sdat.cpp tools/dal_sdat/sdat_lz.cpp)
-  target_compile_options(dal_sdat_lib PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat_lib PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_include_directories(dal_sdat_lib PUBLIC ${CMAKE_SOURCE_DIR}/tools/dal_sdat)
-  target_link_libraries(dal_sdat_lib PUBLIC bcrypt)
+  target_link_libraries(dal_sdat_lib PRIVATE dal_crypto)
 
   add_executable(dal_sdat tools/dal_sdat/main.cpp)
-  target_compile_options(dal_sdat PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_sdat PRIVATE dal_sdat_lib)
 
   add_executable(dal_sdat_tests tools/dal_sdat/sdat_test.cpp)
-  target_compile_options(dal_sdat_tests PRIVATE -march=x86-64-v3 -Wall -Wextra)
+  target_compile_options(dal_sdat_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
   target_link_libraries(dal_sdat_tests PRIVATE dal_sdat_lib)
   add_test(NAME sdat_tests COMMAND dal_sdat_tests)
   set_tests_properties(sdat_tests PROPERTIES PASS_REGULAR_EXPRESSION "sdat tests: [0-9]+ passed, 0 failed")

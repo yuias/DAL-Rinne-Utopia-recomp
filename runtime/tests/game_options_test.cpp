@@ -138,7 +138,7 @@ void testDerivedValues() {
             CHECK(result->game_dir == std::filesystem::path("g"));
             CHECK(result->window && result->render_vulkan);
             CHECK(result->pad == "keyboard+gamepad");
-            CHECK(result->audio == "wasapi");
+            CHECK(result->audio == dal::kHostAudioOutput);
             CHECK(result->seconds == 0 && result->dump_frames_every == 1 && result->fast_forward == 1);
             CHECK(!result->log_level && result->dialog_answer.empty() && result->warnings.empty());
         }
@@ -266,7 +266,8 @@ void testValidationMessages() {
                            "error: --dialog-answer needs yes, no or ok\n"));
     CHECK(expectUsageError({"--game-dir", "g", "--pad", "bogus"},
                            "error: --pad needs none, neutral, keyboard, gamepad or keyboard+gamepad\n"));
-    CHECK(expectUsageError({"--game-dir", "g", "--audio", "bogus"}, "error: --audio needs none or wasapi\n"));
+    CHECK(expectUsageError({"--game-dir", "g", "--audio", "bogus"},
+                           "error: --audio needs none or " + std::string(dal::kHostAudioOutput) + "\n"));
     CHECK(expectUsageError({"--game-dir", "g", "--render", "bogus"}, "error: --render needs none or vulkan\n"));
 
     CHECK(expectUsageError({"--game-dir", "g", "--seconds=-1"}, "error: --seconds needs a non-negative integer\n"));

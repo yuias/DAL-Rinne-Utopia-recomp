@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include <volk.h>
 
@@ -65,5 +66,12 @@ bool indexRange(bool is_u16, std::span<const std::uint8_t> src, std::uint32_t co
 // restart_index.
 bool indicesInRange(bool is_u16, std::span<const std::uint8_t> src, std::uint32_t count, std::uint32_t min_index,
                     std::uint32_t max_index, bool restart, std::uint32_t restart_index);
+
+// A triangle fan of `count` vertices starting at vertex `first` as triangle-list indices: first,
+// first + i, first + i + 1 for i = 1..count - 2. Empty below three vertices.
+std::vector<std::uint32_t> triangleFanToList(std::uint32_t first, std::uint32_t count);
+
+// The same for a fan given as indices (the first one is the hub). Empty below three indices.
+std::vector<std::uint32_t> triangleFanIndicesToList(std::span<const std::uint32_t> fan);
 
 }  // namespace dal

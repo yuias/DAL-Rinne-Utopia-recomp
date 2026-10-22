@@ -12,18 +12,16 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 #include "core/guest_memory.h"
+#include "core/host_file.h"
 #include "core/log.h"
 #include "dal/ppu_context.h"
 #include "lv2/cell_error.h"
 #include "lv2/sys_sync.h"
 #include "lv2/vfs.h"
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
 
 namespace dal {
 namespace {
@@ -64,17 +62,12 @@ struct FsObject {
     FsObject() = default;
     FsObject(const FsObject&) = delete;
     FsObject& operator=(const FsObject&) = delete;
-    ~FsObject() {
-        if (file != INVALID_HANDLE_VALUE) {
-            CloseHandle(file);
-        }
-    }
 
     bool is_dir = false;
     VfsDevice device = VfsDevice::None;
     VfsDeviceInfo info = {512, true};
     bool read_only = false;
-    HANDLE file = INVALID_HANDLE_VALUE;
+    host::File file;
     std::int32_t flags = 0;
     std::vector<DirEntry> entries;
     std::size_t pos = 0;
@@ -184,45 +177,37 @@ std::uint32_t notFoundOrNotDir(const stdfs::path& host) {
     return kCellEnoent;
 }
 
-std::uint32_t mapWinError(DWORD error, const stdfs::path& host) {
-    switch (error) {
-        case ERROR_FILE_NOT_FOUND:
-        case ERROR_PATH_NOT_FOUND: return notFoundOrNotDir(host);
-        case ERROR_INVALID_NAME: return kCellEnoent;
-        case ERROR_DIRECTORY: return kCellEnotdir;
-        case ERROR_ACCESS_DENIED: return kCellEacces;
-        case ERROR_FILE_EXISTS:
-        case ERROR_ALREADY_EXISTS: return kCellEexist;
-        case ERROR_SHARING_VIOLATION:
-        case ERROR_LOCK_VIOLATION: return kCellEbusy;
-        case ERROR_NEGATIVE_SEEK:
-        case ERROR_INVALID_PARAMETER: return kCellEinval;
-        default:
-            logOnce(std::format("fs-win-error-{}", error), "dal: fs: unmapped host error {}", error);
+std::uint32_t mapHostError(const host::FileFailure& failure, const stdfs::path& host) {
+    switch (failure.kind) {
+        case host::FileError::NotFound: return notFoundOrNotDir(host);
+        case host::FileError::InvalidName: return kCellEnoent;
+        case host::FileError::NotDirectory: return kCellEnotdir;
+        case host::FileError::AccessDenied: return kCellEacces;
+        case host::FileError::Exists: return kCellEexist;
+        case host::FileError::Busy: return kCellEbusy;
+        case host::FileError::InvalidArgument: return kCellEinval;
+        case host::FileError::Other:
+#if defined(_WIN32)
+            logOnce(std::format("fs-win-error-{}", failure.native), "dal: fs: unmapped host error {}", failure.native);
+#else
+            logOnce(std::format("fs-errno-{}", failure.native), "dal: fs: unmapped host error {}", failure.native);
+#endif
             return kCellEio;
     }
+    return kCellEio;
 }
 
-std::int64_t toUnixTime(const FILETIME& ft) {
-    ULARGE_INTEGER value;
-    value.LowPart = ft.dwLowDateTime;
-    value.HighPart = ft.dwHighDateTime;
-    constexpr std::int64_t kEpochDiffSeconds = 11644473600;  // 1601 -> 1970
-    return static_cast<std::int64_t>(value.QuadPart / 10000000ull) - kEpochDiffSeconds;
-}
-
-FsStat makeStat(bool is_dir, bool read_only, const VfsDeviceInfo& info, std::uint64_t size, const FILETIME& atime,
-                const FILETIME& mtime, const FILETIME& ctime) {
+FsStat makeStat(bool is_dir, bool read_only, const VfsDeviceInfo& info, const host::PathInfo& host_info) {
     FsStat out;
     out.mode = is_dir ? (kSIfDir | 0777) : (kSIfReg | 0666);
     if (read_only) {
         out.mode &= ~0222;
     }
     out.uid = out.gid = info.no_uid_gid ? -1 : 0;
-    out.atime = toUnixTime(atime);
-    out.mtime = toUnixTime(mtime);
-    out.ctime = toUnixTime(ctime);
-    out.size = is_dir ? info.block_size : size;
+    out.atime = host_info.times.atime;
+    out.mtime = host_info.times.mtime;
+    out.ctime = host_info.times.ctime;
+    out.size = is_dir ? info.block_size : host_info.size;
     out.blksize = info.block_size;
     return out;
 }
@@ -266,39 +251,39 @@ std::uint32_t openFile(std::string_view path, std::int32_t flags, std::uint32_t&
         }
     }
 
-    DWORD access = GENERIC_READ;
-    DWORD disposition = OPEN_EXISTING;
+    bool want_read = true;
+    bool want_write = false;
+    host::OpenMode mode = host::OpenMode::OpenExisting;
     if (!no_write) {
         const bool create = (flags & kOCreat) != 0;
         const bool trunc = (flags & kOTrunc) != 0;
         if (access_mode == kOWronly) {
-            access = GENERIC_WRITE;
+            want_read = false;
+            want_write = true;
         } else if (access_mode != 0) {
-            access = GENERIC_READ | GENERIC_WRITE;
+            want_write = true;
         }
         if (trunc) {
-            access |= GENERIC_WRITE;
+            want_write = true;
         }
         if (create && (flags & kOExcl) != 0) {
-            disposition = CREATE_NEW;
+            mode = host::OpenMode::CreateNew;
         } else if (create && trunc) {
-            disposition = CREATE_ALWAYS;
+            mode = host::OpenMode::CreateAlways;
         } else if (create) {
-            disposition = OPEN_ALWAYS;
+            mode = host::OpenMode::OpenAlways;
         } else if (trunc) {
-            disposition = TRUNCATE_EXISTING;
+            mode = host::OpenMode::TruncateExisting;
         }
     }
 
-    // Sharing everything lets the guest unlink or reopen a file it still holds open.
-    const HANDLE handle = CreateFileW(res.host.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                      nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return mapWinError(GetLastError(), res.host);
+    auto file = host::File::open(res.host, want_read, want_write, mode);
+    if (!file) {
+        return mapHostError(file.error(), res.host);
     }
 
     auto object = std::make_shared<FsObject>();
-    object->file = handle;
+    object->file = std::move(*file);
     object->flags = flags;
     object->device = res.device;
     object->info = res.info;
@@ -355,34 +340,23 @@ std::uint32_t openDirectory(std::string_view path, std::uint32_t& fd) {
     return fd != 0 ? kCellOk : kCellEmfile;
 }
 
-bool setPos(HANDLE file, std::int64_t offset, DWORD method, std::uint64_t* result) {
-    LARGE_INTEGER distance;
-    distance.QuadPart = offset;
-    LARGE_INTEGER position;
-    if (!SetFilePointerEx(file, distance, &position, method)) {
-        return false;
-    }
-    if (result != nullptr) {
-        *result = static_cast<std::uint64_t>(position.QuadPart);
-    }
-    return true;
-}
+constexpr int kSeekSet = 0;
+constexpr int kSeekCur = 1;
+constexpr int kSeekEnd = 2;
 
 // Reads or writes `size` bytes at the current position; returns the byte count and sets `code` on
 // a host error.
-std::uint64_t transfer(HANDLE file, bool write, std::uint8_t* data, std::uint64_t size, std::uint32_t& code) {
+std::uint64_t transfer(host::File& file, bool write, std::uint8_t* data, std::uint64_t size, std::uint32_t& code) {
     std::uint64_t total = 0;
     while (total < size) {
-        const DWORD chunk = static_cast<DWORD>(std::min<std::uint64_t>(size - total, 0x40000000));
-        DWORD done = 0;
-        const BOOL ok = write ? WriteFile(file, data + total, chunk, &done, nullptr)
-                              : ReadFile(file, data + total, chunk, &done, nullptr);
-        if (!ok) {
-            code = mapWinError(GetLastError(), {});
+        const std::uint64_t chunk = std::min(size - total, host::kMaxTransferBytes);
+        const auto done = write ? file.write(data + total, chunk) : file.read(data + total, chunk);
+        if (!done) {
+            code = mapHostError(done.error(), {});
             break;
         }
-        total += done;
-        if (done < chunk) {
+        total += *done;
+        if (*done < chunk) {
             break;
         }
     }
@@ -391,23 +365,24 @@ std::uint64_t transfer(HANDLE file, bool write, std::uint8_t* data, std::uint64_
 
 // Like transfer() at an absolute offset, leaving the file position where it was (the console's
 // cellFsReadWithOffset/cellFsWriteWithOffset do not move it either).
-std::uint64_t transferAt(HANDLE file, bool write, std::uint64_t offset, std::uint8_t* data, std::uint64_t size,
+std::uint64_t transferAt(host::File& file, bool write, std::uint64_t offset, std::uint8_t* data, std::uint64_t size,
                          std::uint32_t& code) {
-    std::uint64_t saved = 0;
-    if (!setPos(file, 0, FILE_CURRENT, &saved)) {
-        code = mapWinError(GetLastError(), {});
+    const auto saved = file.seek(0, kSeekCur);
+    if (!saved) {
+        code = mapHostError(saved.error(), {});
         return 0;
     }
     std::uint64_t total = 0;
     if (offset > static_cast<std::uint64_t>(INT64_MAX)) {
         // Beyond any file: a read hits the end, a write cannot be placed.
         code = write ? kCellEinval : kCellOk;
-    } else if (!setPos(file, static_cast<std::int64_t>(offset), FILE_BEGIN, nullptr)) {
-        code = mapWinError(GetLastError(), {});
+    } else if (const auto moved = file.seek(static_cast<std::int64_t>(offset), kSeekSet); !moved) {
+        code = mapHostError(moved.error(), {});
     } else {
         total = transfer(file, write, data, size, code);
     }
-    setPos(file, static_cast<std::int64_t>(saved), FILE_BEGIN, nullptr);
+    // Best effort: the transfer's result is already decided, and a failed restore has no error to report.
+    std::ignore = file.seek(static_cast<std::int64_t>(*saved), kSeekSet);
     return total;
 }
 
@@ -433,16 +408,14 @@ std::uint32_t openSdata(std::string_view path, std::uint32_t& fd) {
         logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path), "dal: fs: sdata open not supported: {}", path);
         return kCellEnoent;
     }
-    const HANDLE handle =
-            CreateFileW(cached->c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
+    auto file = host::File::open(*cached, true, false, host::OpenMode::OpenExisting);
+    if (!file) {
         logOnce(LogLevel::Warn, std::format("fs-sdata:{}", path),
                 "dal: fs: no readable decrypted copy of sdata file {}", path);
         return kCellEnoent;
     }
     auto object = std::make_shared<FsObject>();
-    object->file = handle;
+    object->file = std::move(*file);
     object->device = res.device;
     object->info = res.info;
     object->read_only = true;
@@ -492,17 +465,14 @@ std::uint32_t fsStatPath(std::string_view guest_path, FsStat& out) {
     if (res.status != VfsStatus::Ok) {
         return vfsError(res.status);
     }
-    WIN32_FILE_ATTRIBUTE_DATA data;
-    if (!GetFileAttributesExW(res.host.c_str(), GetFileExInfoStandard, &data)) {
-        return mapWinError(GetLastError(), res.host);
+    const auto info = host::statPath(res.host);
+    if (!info) {
+        return mapHostError(info.error(), res.host);
     }
-    const bool is_dir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    if (res.dir_only && !is_dir) {
+    if (res.dir_only && !info->is_dir) {
         return kCellEnotdir;
     }
-    const std::uint64_t size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-    out = makeStat(is_dir, res.read_only, res.info, size, data.ftLastAccessTime, data.ftLastWriteTime,
-                   data.ftCreationTime);
+    out = makeStat(info->is_dir, res.read_only, res.info, *info);
     return kCellOk;
 }
 
@@ -511,13 +481,11 @@ std::uint32_t fsStatFd(std::uint32_t fd, FsStat& out) {
     if (object == nullptr) {
         return kCellEbadf;
     }
-    BY_HANDLE_FILE_INFORMATION info;
-    if (!GetFileInformationByHandle(object->file, &info)) {
+    const auto info = object->file.info();
+    if (!info) {
         return kCellEio;
     }
-    const std::uint64_t size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
-    out = makeStat(false, object->read_only, object->info, size, info.ftLastAccessTime, info.ftLastWriteTime,
-                   info.ftCreationTime);
+    out = makeStat(false, object->read_only, object->info, *info);
     return kCellOk;
 }
 
@@ -607,8 +575,8 @@ std::uint32_t fsMkdirGuest(std::uint8_t* base, std::uint32_t path_addr) {
             code = kCellEexist;
         } else if (res.protected_parent) {
             code = kCellEacces;
-        } else if (!CreateDirectoryW(res.host.c_str(), nullptr)) {
-            code = mapWinError(GetLastError(), res.host);
+        } else if (const auto created = host::createDirectory(res.host); !created) {
+            code = mapHostError(created.error(), res.host);
         }
     }
     logPathOp("mkdir", path, code);
@@ -632,8 +600,8 @@ std::uint32_t fsUnlinkGuest(std::uint8_t* base, std::uint32_t path_addr) {
             code = kCellEisdir;
         } else if (res.read_only) {
             code = kCellErofs;
-        } else if (!DeleteFileW(res.host.c_str())) {
-            code = mapWinError(GetLastError(), res.host);
+        } else if (const auto removed = host::removeFile(res.host); !removed) {
+            code = mapHostError(removed.error(), res.host);
         }
     }
     logPathOp("unlink", path, code);
@@ -776,7 +744,8 @@ void sysFsWrite(DalPpuContext* ctx, std::uint8_t* base) {
     }
 
     if ((file->flags & kOAppend) != 0) {
-        setPos(file->file, 0, FILE_END, nullptr);
+        // A failed seek leaves the position as it was; the write below reports any I/O error.
+        std::ignore = file->file.seek(0, kSeekEnd);
     }
     std::uint32_t code = kCellOk;
     const std::uint64_t total = transfer(file->file, true, base + buf, nbytes, code);
@@ -897,13 +866,13 @@ void sysFsLseek(DalPpuContext* ctx, std::uint8_t* base) {
         setResultCode(ctx, kCellEfault);
         return;
     }
-    // FILE_BEGIN, FILE_CURRENT and FILE_END have the same values as SEEK_SET, SEEK_CUR and SEEK_END.
-    std::uint64_t result = 0;
-    if (!setPos(file->file, offset, whence, &result)) {
-        setResultCode(ctx, mapWinError(GetLastError(), {}));
+    // The guest's whence values 0, 1 and 2 are the host's.
+    const auto result = file->file.seek(offset, static_cast<int>(whence));
+    if (!result) {
+        setResultCode(ctx, mapHostError(result.error(), {}));
         return;
     }
-    dalWrite64(base, pos, result);
+    dalWrite64(base, pos, *result);
     setResultCode(ctx, kCellOk);
 }
 

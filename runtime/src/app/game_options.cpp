@@ -53,17 +53,19 @@ constexpr std::array<OptionSpec, 27> kOptionSpecs{{
         {"no-window", OptionKind::Flag},
 }};
 
-constexpr std::string_view kUsage =
+// A string built once because the --audio choices name the host's output.
+const std::string kUsage = std::format(
         "usage: dal_game [--game-dir DIR] [--vfs-config FILE] (at least one) [--elf PATH]\n"
         "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
         "                [--log-level trace|debug|info|warn|error]\n"
         "                [--quiet-hle] [--load-only] [--png-dump DIR]\n"
         "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
-        "                [--pad-script FILE] [--pad-probe] [--audio none|wasapi] [--audio-dump FILE]\n"
+        "                [--pad-script FILE] [--pad-probe] [--audio none|{}] [--audio-dump FILE]\n"
         "                [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]\n"
         "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
         "                [--fast-forward N] [--vk-validation] [--no-window]\n"
-        "                [--config FILE | --no-config] [-h|--help]\n";
+        "                [--config FILE | --no-config] [-h|--help]\n",
+        kHostAudioOutput);
 
 // The raw value of one option as CLI11 delivers it; the checks run afterwards, in table order.
 struct Slot {
@@ -267,7 +269,9 @@ std::expected<GameOptions, OptionsExit> validate(const std::vector<Slot>& slots,
     }
     o.pad_probe = slot("pad-probe").flag;
     if (const Slot& s = slot("audio"); s.given()) {
-        if (s.text != "none" && s.text != "wasapi") return usageError(std::format("{} needs none or wasapi", label(s)));
+        if (s.text != "none" && s.text != kHostAudioOutput) {
+            return usageError(std::format("{} needs none or {}", label(s), kHostAudioOutput));
+        }
         o.audio = s.text;
     }
     o.audio_dump = pathFromUtf8(slot("audio-dump").text);
@@ -326,7 +330,7 @@ std::expected<GameOptions, OptionsExit> validate(const std::vector<Slot>& slots,
         return usageError("--pad-script needs --pad keyboard or keyboard+gamepad");
     }
     // A window means somebody is listening; unattended runs must not need a sound device.
-    if (o.audio.empty()) o.audio = o.window ? "wasapi" : "none";
+    if (o.audio.empty()) o.audio = o.window ? std::string(kHostAudioOutput) : "none";
     if (!o.audio_dump.empty()) {
         // The engine creates the file again on its own thread; creating it here makes a bad path a
         // usage error instead of a warning in the middle of a run.

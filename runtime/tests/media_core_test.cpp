@@ -2005,17 +2005,29 @@ const GameFile kGameFiles[] = {
         {"end06.pam", 79860, 78813, 299, 2},
 };
 
-void testPamfGameFiles() {
+// DAL_GAME_DIR, or empty when unset.
+std::string gameDirFromEnv() {
+#if defined(_WIN32)
     // _dupenv_s: the CRT marks getenv as deprecated.
     char* dir = nullptr;
     std::size_t dir_len = 0;
-    if (_dupenv_s(&dir, &dir_len, "DAL_GAME_DIR") != 0 || dir == nullptr || *dir == '\0') {
-        std::free(dir);
+    std::string result;
+    if (_dupenv_s(&dir, &dir_len, "DAL_GAME_DIR") == 0 && dir != nullptr) result = dir;
+    std::free(dir);
+    return result;
+#else
+    const char* dir = std::getenv("DAL_GAME_DIR");
+    return dir != nullptr ? dir : "";
+#endif
+}
+
+void testPamfGameFiles() {
+    const std::string dir = gameDirFromEnv();
+    if (dir.empty()) {
         std::printf("pamf game files: skipped (DAL_GAME_DIR is not set)\n");
         return;
     }
     const std::filesystem::path movie_dir = std::filesystem::path(dir) / "PS3_GAME" / "USRDIR" / "Movie";
-    std::free(dir);
 
     for (const GameFile& file : kGameFiles) {
         const std::filesystem::path path = movie_dir / file.name;

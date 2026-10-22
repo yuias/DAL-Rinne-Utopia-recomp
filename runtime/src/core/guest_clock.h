@@ -20,10 +20,10 @@ struct GuestClockSegment {
     GuestClockSegment rebased(std::uint64_t host, std::uint32_t new_speed) const;
 };
 
-// Host performance-counter ticks since process start, advancing guestSpeed() times as fast as the
+// Host monotonic counter ticks since process start, advancing guestSpeed() times as fast as the
 // host clock. Monotonic and continuous across speed changes. Lock-free; any thread.
 std::uint64_t guestClockTicks();
-std::uint64_t guestClockFrequency();  // ticks per second (the host counter frequency)
+std::uint64_t guestClockFrequency();  // ticks per second (the host counter frequency: the performance counter on Windows, 1e9 elsewhere)
 
 // Guest seconds per host second: 1, or FastForwardState::speed while fast-forward is active. Any thread.
 std::uint32_t guestSpeed();

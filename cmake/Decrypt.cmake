@@ -12,7 +12,7 @@ set(DAL_INPUTS_DIR "${CMAKE_SOURCE_DIR}/generated/inputs")
 # that produces generated/inputs/EBOOT.elf. Call after dal_runtime_add_core() (for zlibstatic) and
 # enable_testing().
 function(dal_decrypt_add)
-  set(decrypt_options -march=x86-64-v3 -Wall -Wextra)
+  set(decrypt_options ${DAL_ARCH_FLAGS} -Wall -Wextra)
 
   add_library(dal_decrypt_lib STATIC
     tools/dal_decrypt/cli.cpp
@@ -22,7 +22,7 @@ function(dal_decrypt_add)
     tools/dal_decrypt/self.cpp)
   target_compile_options(dal_decrypt_lib PRIVATE ${decrypt_options})
   target_include_directories(dal_decrypt_lib PUBLIC tools/dal_decrypt)
-  target_link_libraries(dal_decrypt_lib PUBLIC bcrypt zlibstatic)
+  target_link_libraries(dal_decrypt_lib PUBLIC zlibstatic PRIVATE dal_crypto)
 
   add_executable(dal_decrypt tools/dal_decrypt/main.cpp)
   target_compile_options(dal_decrypt PRIVATE ${decrypt_options})

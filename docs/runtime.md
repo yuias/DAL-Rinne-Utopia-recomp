@@ -60,7 +60,12 @@ the game runs; these lines are the progress markers that `game_boot` checks.
 The guest space is one reservation of 4 GiB plus a guard area, big-endian, accessed only through
 the `dalRead*` and `dalWrite*` helpers. Pages are committed on demand by the allocators below. An
 access to an uncommitted page raises a fault that the runtime turns into a fatal stop with the
-guest address and the access kind.
+guest address and the access kind. The operating system calls sit behind `runtime/src/core/host_memory.h`:
+on Windows the space is reserved and committed with `VirtualAlloc` and faults arrive through a
+vectored exception handler; on macOS it is `mmap` and `mprotect` with a `SIGSEGV` and `SIGBUS` handler
+that runs on an alternate stack. The guest keeps 4 KiB logical pages, but the host page of an Apple
+Silicon Mac is 16 KiB, so a host page stays accessible while any of its logical pages is committed
+(see "Page size and guard pages" under [Running and debugging on a Mac](building.md#running-and-debugging-on-a-mac)).
 
 | Range | Use |
 | --- | --- |
@@ -69,7 +74,7 @@ guest address and the access kind.
 | `0x20000000..0x30000000` | User memory with 1 MiB pages (`sys_memory_allocate` with flags 0x400 or 0). |
 | `0x30000000..0x40000000` | User memory with 64 KiB pages (`sys_memory_allocate` with flags 0x200). |
 | `0xC0000000..0xCF900000` | RSX local memory (video memory), committed when the game initializes GCM. |
-| `0xD0000000..0xE0000000` | Thread stacks, 4 KiB pages, with an uncommitted 4 KiB guard page on each side of every stack. |
+| `0xD0000000..0xE0000000` | Thread stacks, 4 KiB pages, with an uncommitted 4 KiB guard page on each side of every stack (on macOS a guard that shares a 16 KiB host page with a live allocation stays accessible). |
 
 The top 64 KiB, `0xFFFF0000..0xFFFFFFFF`, are never committed: they hold the entry keys of host
 functions, the function descriptors that the HLE layer hands to guest code (for example a callback
@@ -79,7 +84,8 @@ dispatcher resolves the key to the host handler.
 The primary stack size from the executable's process parameters is clamped as RPCS3 does (the
 game's 0x8000 becomes 0x10000). The argument block (`argv`, `envp`, strings) sits at the top of
 the stack. `sys_memory_get_user_memory_size` reports a 0xD500000 container. The timebase runs at
-79.8 MHz, scaled from the host performance counter.
+79.8 MHz, scaled from the host monotonic counter (`QueryPerformanceCounter` on Windows,
+`CLOCK_UPTIME_RAW` on macOS).
 
 ## Dispatch
 
@@ -102,7 +108,8 @@ generated override table against the dispatch table (a wrong table is a fatal st
 
 ## Threads
 
-Each guest thread is a host thread (16 MiB host stack) with its own context. All guest code runs
+Each guest thread is a host thread (16 MiB host stack; `_beginthreadex` on Windows, a detached
+pthread with a 64 KiB host guard region on macOS) with its own context. All guest code runs
 under one global guest lock, a FIFO ticket lock, so guest threads never run in parallel. A thread
 gives up the lock only in `dalYield` (called from loop hooks, when another thread is waiting), in
 a blocking wait and when it exits. Blocking system calls (mutex, condition variable, event flag,
@@ -124,11 +131,13 @@ logs `dal: thread: ... not queued within 5 ms; creator continues` at info level.
 priority behaviour: no priority-ordered hand-off, no wake order by priority, no preemption, and no
 rescheduling when a priority changes.
 
-`dal_game` holds a 1 ms system timer resolution for the whole run (`timeBeginPeriod`,
-`runtime/src/core/timer_resolution.*`). Timed waits (`sys_timer_usleep`, lock and queue time-outs)
+On Windows, `dal_game` holds a 1 ms system timer resolution for the whole run (`timeBeginPeriod`,
+`runtime/src/core/timer_resolution.cpp`). Timed waits (`sys_timer_usleep`, lock and queue time-outs)
 are host condition variable waits, and Windows rounds them to its timer tick (15.6 ms by default),
 so a 1 ms guest sleep would take 15 ms. The game's decode loops poll with 1 ms sleeps. The request
-ends with the process; a refusal is logged as a warning and the default tick stays.
+ends with the process; a refusal is logged as a warning and the default tick stays. macOS has no
+coarse tick to raise, so `timer_resolution_posix.cpp` holds nothing and the request counts as granted
+(see [Audio](audio.md#engine-and-block-clock)).
 
 The RSX thread and the audio engine are host threads that take the same guest lock. The RSX thread
 therefore pumps the command buffer in slices of 128 words and leaves the lock once a hold has lasted
@@ -163,7 +172,7 @@ name; struct layouts and error codes are restated from its headers.
 | Event flag | `sys_event_flag_create` (82), `_destroy` (83), `_wait` (85), `_set` (87), `_clear` (118), `_cancel` (132), `_get` (139) |
 | Event queue and port | `sys_event_queue_create` (128), `_destroy` (129), `_receive` (130), `_drain` (133); `sys_event_port_create` (134), `_destroy` (135), `_connect_local` (136), `_disconnect` (137), `_send` (138). A queue created with a non-zero IPC key can be found by that key (the host looks it up and sends to it; the `cellAudio` notify uses this); a second live queue with the same key fails with `CELL_EEXIST`, key 0 makes a local queue, and destroying the queue forgets the key. IPC ports (`sys_event_port_connect_ipc`) are not supported. |
 | SPU | `sys_spu_initialize` (169), `sys_spu_thread_write_ls` (181), `_read_ls` (182), `_write_spu_mb` (190), `_connect_event` (191), `_disconnect_event` (192), `sys_spu_thread_group_connect_event_all_threads` (251), `_disconnect_event_all_threads` (252). Only the bookkeeping is kept; no SPU code runs. |
-| File system | `sys_fs_open` (801), `_read` (802), `_write` (803), `_close` (804), `_opendir` (805), `_readdir` (806), `_closedir` (807), `_stat` (808), `_fstat` (809), `_mkdir` (811), `_unlink` (814), `_lseek` (818); see [Virtual file system](virtual-file-system.md#virtual-file-system) |
+| File system | `sys_fs_open` (801), `_read` (802), `_write` (803), `_close` (804), `_opendir` (805), `_readdir` (806), `_closedir` (807), `_stat` (808), `_fstat` (809), `_mkdir` (811), `_unlink` (814), `_lseek` (818); host files are opened through `runtime/src/core/host_file.h` (`CreateFileW` on Windows, `open` on macOS; Windows opens with every share mode, so the guest can unlink or reopen a file it still holds open); see [Virtual file system](virtual-file-system.md#virtual-file-system) |
 | Thread | `_sys_ppu_thread_exit` (41), `sys_ppu_thread_yield` (43), `sys_ppu_thread_join` (44), `sys_ppu_thread_set_priority` (47), `sys_ppu_thread_get_priority` (48); the creation rule of `sys_ppu_thread_create` is under [Threads](#threads) |
 
 ## Implemented imports
@@ -241,8 +250,8 @@ selection, Steam, the GameInput runtime, log lines and tools) are described in [
 | Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `PadAnalog` (sticks and trigger pressure), `padStateFromButtons` and `padStateFromInput` (digital words, pressure words at 0xFF for pressed buttons or the analog trigger value, sticks, everything else as the neutral pad) and the button names used by scripts |
 | State and provider | `runtime/src/input/keyboard_pad.*` | The scan-code table, `KeyboardPadState` (the state of every host source: keyboard, script, gamepad) and the provider for port 0 (always connected, or connected only while a gamepad is in use with `--pad gamepad`; other ports empty) |
 | Script | `runtime/src/input/pad_script.*` | The script parser and the player thread |
-| Gamepad | `runtime/src/input/gamepad_*`, `gameinput_backend.*` | Backend interface, GameInput backend, mapping, selection, the gamepad thread and `--pad-probe`; see [Input](input.md#design) |
-| Window | `runtime/src/render/vk_window.*` | Key and focus messages from the window thread; turns the IME off for the window |
+| Gamepad | `runtime/src/input/gamepad_*`, `gameinput_backend.*`, `gamecontroller_backend.*` | Backend interface, GameInput backend (Windows), GameController backend (macOS), mapping, selection, the gamepad thread and `--pad-probe`; see [Input](input.md#design) |
+| Window | `runtime/src/render/vk_window.*`, `vk_window_win32.cpp`, `vk_window_macos.mm` | Key and focus messages from the window thread (on macOS, from the main thread's event loop); on Windows it turns the IME off for the window |
 | Overlay | `runtime/src/overlay/debug_overlay.*` | The `F1` toggle, the `Tab` fast-forward hold and the message hook that decides which key presses the [debug overlay](#debug-overlay) withholds from the pad |
 
 The renderer library does not depend on `input/` or on the overlay: the window reports raw scan codes
@@ -263,29 +272,32 @@ nothing joins them, because the process ends with `std::_Exit`.
 
 ### Key handling
 
-- Keys are identified by scan code (PC/AT set 1 make code from `lParam` bits 16 to 23, plus `0xE000`
-  for an extended key), not by virtual key, so the mapping is a positional cluster on any layout
-  and works while an IME is open. A zero scan code (some injected input) falls back to
-  `MapVirtualKeyW`. Only the dedicated arrow keys map; the numpad does not.
+- Keys are identified by scan code (PC/AT set 1 make code), not by virtual key, so the mapping is a
+  positional cluster on any layout and works while an IME is open. On Windows the scan code is
+  `lParam` bits 16 to 23, plus `0xE000` for an extended key, and a zero scan code (some injected
+  input) falls back to `MapVirtualKeyW`. On macOS the Cocoa window turns the key's virtual key code
+  into the scan code (see [Input](input.md#keyboard-and-the-overlay-on-macos)). Only the dedicated
+  arrow keys map; the numpad does not.
 - Key repeats are dropped, so they do not refresh a press time.
 - A press stays in the reported state for at least `KeyboardPadState::kMinPressVisible` (60 ms)
   after it started, also when the key is already up. The game reads the pad about every 33 ms and
   `cellPadGetData` reports only changes, so a shorter tap could fall between two reads.
 - Both opposite D-pad directions held cancel each other. A held direction beats the 60 ms tail of a
   released opposite one; with two tails the later press wins.
-- `WM_KILLFOCUS` releases every `Keyboard` button at once (a key-up is not delivered to a window
-  without focus). Script buttons are a separate source and stay; the gamepad thread releases its own
-  source when the process loses the foreground window. `Alt` combinations still reach the
-  default window procedure, so `Alt+F4` closes the window.
+- A loss of window focus (`WM_KILLFOCUS` on Windows, the window losing key status on macOS)
+  releases every `Keyboard` button at once (a key-up is not delivered to a window without focus).
+  Script buttons are a separate source and stay; the gamepad thread releases its own source when the
+  process loses the foreground window. On Windows, `Alt` combinations still reach the default window
+  procedure, so `Alt+F4` closes the window; on macOS `Cmd+Q` is handled by AppKit and ends the run.
 - `F1` (scan code `0x3B`) is not in the pad map: it toggles the [debug overlay](#debug-overlay) and
   never reaches the pad, with any `--pad` value. While the overlay is shown and ImGui wants the
-  keyboard (a text box is active), key presses (`WM_KEYDOWN`, `WM_SYSKEYDOWN`) are withheld from the
+  keyboard (a text box is active), key presses (`WM_KEYDOWN`, `WM_SYSKEYDOWN` on Windows) are withheld from the
   pad. Key-ups are always delivered, so a key that went down before the overlay took the keyboard is
   still released.
 - `Tab` (scan code `0x0F`) is not in the pad map either: holding it fast-forwards the game (see
   [Debug overlay](#debug-overlay)). The first key-down starts the hold, repeats are ignored, and the
   key-up ends it. It works with the overlay hidden, is withheld from the pad and from ImGui (so Tab
-  does not move between the overlay's controls), and `WM_KILLFOCUS` ends the hold too, because the
+  does not move between the overlay's controls), and a loss of window focus ends the hold too, because the
   key-up does not arrive in a window without focus.
 - The press mode that the game sets with `cellPadSetPortSetting` decides whether `cellPad` copies
   the pressure words to the game; the game under test turns it on (`dal: pad: port 0 setting 0x2`).
@@ -412,7 +424,9 @@ Design notes:
   it. `overlay_model.*` holds the numbers (no ImGui), `overlay_panels.*` the ImGui window,
   `overlay_sources.*` the connections to the runtime (audio engine and `cellAudio` counters, the
   `rsx unimplemented` snapshot, the fast-forward state and its switches, the sound switch, the capture
-  request and status, the log level) and `debug_overlay.*` the Vulkan and Win32 backends and the keys.
+  request and status, the log level) and `debug_overlay.*` the Vulkan backend and the keys. The calls into the window system sit behind
+  `overlay_platform.h`, implemented by `overlay_platform_win32.cpp` (Win32 backend) and
+  `overlay_platform_macos.mm` (`imgui_impl_osx`, reached through `imgui_osx_bridge.mm`).
   The overlay only calls thread-safe providers and never touches guest memory.
 - The ImGui backends start at the first draw after the first show, not at start-up, on the RSX thread:
   the log gets `dal: overlay: ready (imgui 1.91.9b, scale N)` (info) and the font upload costs a
@@ -423,10 +437,12 @@ Design notes:
   after start-up skips the overlay for that image and logs `dal: overlay: surface format changed,
   overlay skipped for that image` once.
 - One global ImGui context is guarded by a mutex. The window thread feeds it the mouse and key
-  messages (the Win32 backend calls `SetCapture` and `GetKeyState`, which only work on the thread that
-  owns the window); the RSX thread holds the mutex while it builds and records a frame, and never
-  across a swapchain call. `ImGui_ImplWin32_NewFrame` is not used, because its key workaround reads
-  `GetKeyState` on the calling thread. Hiding the overlay sends ImGui a focus-lost event so that held
+  messages (on Windows, the Win32 backend calls `SetCapture` and `GetKeyState`, which only work on the
+  thread that owns the window); the RSX thread holds the mutex while it builds and records a frame,
+  and never across a swapchain call. On Windows `ImGui_ImplWin32_NewFrame` is not used, because its
+  key workaround reads `GetKeyState` on the calling thread. On macOS the window passes each event to
+  `imgui_impl_osx` under the mutex instead of the backend's own event monitor, and a focus change
+  reaches ImGui as an explicit focus event. Hiding the overlay sends ImGui a focus-lost event so that held
   keys and buttons are dropped, and showing it again sends a focus-gained event: ImGui 1.91.9b keeps
   clearing its input while it believes the application has no focus.
 - The overlay window has no `imgui.ini`, no docking, no gamepad navigation and does not change the
