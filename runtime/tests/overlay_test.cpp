@@ -2,12 +2,16 @@
 // overlay tests draw into an offscreen image on the first Vulkan device. On Windows they also create a
 // hidden window, to give the Win32 backend a handle.
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -23,9 +27,11 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "overlay/debug_overlay.h"
+#include "overlay/imgui_context.h"
 #include "overlay/overlay_model.h"
 #include "overlay/overlay_panels.h"
 #include "overlay/overlay_sources.h"
+#include "overlay/overlay_stack.h"
 #include "rsx/rsx_unimplemented.h"
 
 namespace {
@@ -734,6 +740,144 @@ void testOverlayRecording(dal::VkContext& ctx) {
     CHECK(errors == 0);
 }
 
+// A PresentOverlay that logs its calls into a shared list, to check the stack's order and merging.
+class FakeOverlay final : public dal::PresentOverlay {
+public:
+    FakeOverlay(int id, std::vector<std::string>& log, bool wants, dal::PresentOverlayRequests requests = {})
+        : id_(id), log_(log), wants_(wants), requests_(std::move(requests)) {}
+
+    dal::PresentOverlayRequests onFlip(const dal::PresentFrameInfo&) override {
+        log_.push_back("flip" + std::to_string(id_));
+        return requests_;
+    }
+    bool wantsDraw() const override { return wants_; }
+    void record(VkCommandBuffer, const dal::Presenter::Target&) override {
+        log_.push_back("record" + std::to_string(id_));
+    }
+
+private:
+    int id_;
+    std::vector<std::string>& log_;
+    bool wants_;
+    dal::PresentOverlayRequests requests_;
+};
+
+void testOverlayStack() {
+    std::vector<std::string> log;
+    dal::OverlayStack empty;
+    CHECK(!empty.wantsDraw());
+    CHECK(!empty.onFlip({}).dump_display);
+    empty.record(VK_NULL_HANDLE, {});
+    empty.add(nullptr);
+    CHECK(!empty.wantsDraw());
+
+    dal::PresentOverlayRequests dump;
+    dump.dump_display = true;
+    FakeOverlay first(1, log, false);
+    FakeOverlay second(2, log, true, dump);
+    FakeOverlay third(3, log, false);
+    dal::OverlayStack stack;
+    stack.add(&first);
+    stack.add(&second);
+    stack.add(&third);
+
+    // Every child sees the flip, in insertion order, and a request from any child survives the merge.
+    const dal::PresentOverlayRequests merged = stack.onFlip({});
+    CHECK((log == std::vector<std::string>{"flip1", "flip2", "flip3"}));
+    CHECK(merged.dump_display);
+
+    // wantsDraw is true when any child wants; record runs only the children that do.
+    CHECK(stack.wantsDraw());
+    log.clear();
+    stack.record(VK_NULL_HANDLE, {});
+    CHECK((log == std::vector<std::string>{"record2"}));
+
+    std::vector<std::string> log_all;
+    FakeOverlay a(1, log_all, true);
+    FakeOverlay b(2, log_all, false);
+    FakeOverlay c(3, log_all, true);
+    dal::OverlayStack both;
+    both.add(&a);
+    both.add(&b);
+    both.add(&c);
+    both.record(VK_NULL_HANDLE, {});
+    CHECK((log_all == std::vector<std::string>{"record1", "record3"}));
+
+    std::vector<std::string> log_none;
+    FakeOverlay idle(1, log_none, false);
+    dal::OverlayStack none;
+    none.add(&idle);
+    CHECK(!none.wantsDraw());
+    none.record(VK_NULL_HANDLE, {});
+    CHECK(log_none.empty());
+    CHECK(!none.onFlip({}).dump_display);
+}
+
+void testImGuiContextScope() {
+    ImGuiContext* a = ImGui::CreateContext();
+    ImGuiContext* b = ImGui::CreateContext();
+    ImGui::SetCurrentContext(nullptr);
+
+    {
+        dal::ImGuiContextScope outer(a);
+        CHECK(ImGui::GetCurrentContext() == a);
+        {
+            // Nesting on one thread must not deadlock (recursive lock) and unwinds one level at a time.
+            dal::ImGuiContextScope inner(b);
+            CHECK(ImGui::GetCurrentContext() == b);
+            {
+                dal::ImGuiContextScope none(nullptr);
+                CHECK(ImGui::GetCurrentContext() == nullptr);
+            }
+            CHECK(ImGui::GetCurrentContext() == b);
+        }
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+
+    // A non-null previous context comes back as well.
+    ImGui::SetCurrentContext(b);
+    {
+        dal::ImGuiContextScope scope(a);
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    CHECK(ImGui::GetCurrentContext() == b);
+    ImGui::SetCurrentContext(nullptr);
+
+    // While one thread holds a scope, another thread's scope blocks until it ends.
+    // The thread does not use CHECK, whose counters are not atomic.
+    std::atomic<bool> second_entered{false};
+    std::atomic<ImGuiContext*> second_context{nullptr};
+    std::thread other;
+    {
+        dal::ImGuiContextScope held(a);
+        other = std::thread([&] {
+            dal::ImGuiContextScope scope(b);
+            second_context.store(ImGui::GetCurrentContext());
+            second_entered.store(true);
+        });
+        // Several short waits (50 ms in total) are enough for a missing lock to show as an early entry.
+        for (int i = 0; i < 5; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(!second_entered.load());
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!second_entered.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!second_entered.load()) {
+        // Joining a thread that is still blocked would hang the test run.
+        std::fprintf(stderr, "check failed (line %d): second thread never entered its scope\n", __LINE__);
+        std::_Exit(1);
+    }
+    other.join();
+    CHECK(second_context.load() == b);
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+
+    ImGui::DestroyContext(a);
+    ImGui::DestroyContext(b);
+}
+
 }  // namespace
 
 int main() {
@@ -743,6 +887,8 @@ int main() {
     testRefresh();
     testPanels();
     testRuntimeSources();
+    testOverlayStack();
+    testImGuiContextScope();
 
     dal::VkContextOptions options;
     options.validation = true;
