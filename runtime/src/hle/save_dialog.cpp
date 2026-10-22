@@ -170,7 +170,11 @@ private:
         const OpenScope scope(board_, send_end);
         content->id = g_next_content_id.fetch_add(1);
         const std::shared_ptr<const SaveDialogContent> shown = content;
-        logInfo("dal: savedata: dialog opened: {} of {} rows", kindName(kind), rows);
+        if (kind == DialogKind::List) {
+            logInfo("dal: savedata: dialog opened: list of {} rows", rows);
+        } else {
+            logInfo("dal: savedata: dialog opened: {}", kindName(kind));
+        }
 
         DialogInput input(dialogButtons());
         SaveDialogModel model(kind, rows, initial_row, SaveDialogModel::Clock::now());

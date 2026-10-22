@@ -301,7 +301,8 @@ wait. The overlay that draws it is described in [Overlays](rendering.md#overlays
   lock again), steps the model and publishes a new snapshot. When the dialog closes it clears the board, releases
   the pad and queues `CELL_SYSUTIL_DRAWING_END` (`0x0122`). The game's callback handles neither event; they are
   sent to match RPCS3. Sequential dialogs (list, confirmation, list again) each get their own pair. The driver
-  logs `dal: savedata: dialog opened: <kind> of N rows` and `dal: savedata: dialog closed: <kind> -> <answer>`.
+  logs `dal: savedata: dialog opened: list of N rows` (or `confirmation`, `message`) and
+  `dal: savedata: dialog closed: <kind> -> <answer>`.
 - **While a dialog is open.** A savedata call from another thread returns `CELL_SAVEDATA_ERROR_BUSY` and
   `cellMsgDialogOpen2` returns `CELL_SYSUTIL_ERROR_BUSY`. If `DRAWING_BEGIN` is refused because another system
   dialog holds it, a confirmation ends the call with `CELL_SAVEDATA_ERROR_INTERNAL` (an error message is just not
