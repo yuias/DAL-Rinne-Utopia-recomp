@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -43,6 +44,8 @@
 #include "dal/ppu_context.h"
 #include "dal/ppu_override.h"
 #include "hle/hle.h"
+#include "hle/save_dialog.h"
+#include "hle/save_dialog_text.h"
 #include "input/keyboard_pad.h"
 #include "input/pad_buttons.h"
 #include "input/pad_script.h"
@@ -4851,6 +4854,330 @@ void testCellSaveData() {
     CHECK(ctx->gpr[1] == 0x500000);
 
     stdfs::remove_all(root, ec);
+    dal::resetCellSaveData();
+    dal::resetHostFunctions();
+    dal::setLogSink({});
+    dal::resetCensus();
+    dal::resetLogOnce();
+}
+
+// A save dialog driver that records every request and returns queued answers. With nothing queued a list
+// answers back and a message answers No.
+struct ScriptedSaveDialog final : dal::SaveDialogDriver {
+    struct ListCall {
+        dal::SaveListKind kind = dal::SaveListKind::Save;
+        std::vector<std::string> titles, infos;
+        std::vector<bool> has_icon, is_new;
+        std::int32_t initial_row = 0;
+        std::optional<std::int32_t> auto_row;
+    };
+    std::vector<ListCall> lists;
+    std::vector<std::string> messages;
+    std::vector<dal::DialogKind> message_kinds;
+    std::deque<std::optional<std::int32_t>> list_answers;
+    std::deque<dal::SaveMessageResult> message_answers;
+    dal::SaveDialogDriverKind driver_kind = dal::SaveDialogDriverKind::Interactive;
+
+    void reset() {
+        lists.clear();
+        messages.clear();
+        message_kinds.clear();
+        list_answers.clear();
+        message_answers.clear();
+    }
+    dal::SaveDialogDriverKind kind() const override { return driver_kind; }
+    std::optional<std::int32_t> showList(const dal::SaveListRequest& request) override {
+        ListCall call;
+        call.kind = request.content->list_kind;
+        call.initial_row = request.initial_row;
+        call.auto_row = request.auto_row;
+        for (const dal::SaveDialogRow& row : request.content->rows) {
+            call.titles.push_back(row.title);
+            call.infos.push_back(row.info);
+            call.has_icon.push_back(row.icon_png != nullptr);
+            call.is_new.push_back(row.new_data);
+        }
+        lists.push_back(std::move(call));
+        if (list_answers.empty()) return std::nullopt;
+        const auto answer = list_answers.front();
+        list_answers.pop_front();
+        return answer;
+    }
+    dal::SaveMessageResult showMessage(std::shared_ptr<dal::SaveDialogContent> content) override {
+        messages.push_back(content->message);
+        message_kinds.push_back(content->kind);
+        if (message_answers.empty()) return dal::SaveMessageResult::No;
+        const auto answer = message_answers.front();
+        message_answers.pop_front();
+        return answer;
+    }
+};
+
+// ListSave2/ListLoad2 through the save dialog driver: the rows, where the list opens, the confirmation loop and
+// what the Auto and Cancel drivers make of it.
+void testCellSaveDataDialog() {
+    namespace stdfs = std::filesystem;
+    using dal::DialogKind;
+    using dal::SaveListKind;
+    using dal::SaveMessageResult;
+    std::vector<std::string> lines;
+    dal::setLogSink([&](std::string_view line) { lines.emplace_back(line); });
+    dal::resetCensus();
+    dal::resetLogOnce();
+    dal::resetHostFunctions();
+    dal::resetCellSaveData();
+    dal::resetSaveDialog();
+    dal::Process& p = dal::process();
+    CHECK(p.memory.reserve());
+    std::uint8_t* base = p.memory.base();
+    const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+    CHECK(scratch != 0);
+    const std::uint32_t dir_addr = scratch, set_buf = scratch + 0x100, buf = scratch + 0x1000,
+                        set_param = scratch + 0x4000, data = scratch + 0x6000, set_list = scratch + 0x7100,
+                        prefix = scratch + 0x7200, new_data = scratch + 0x7300, new_dir = scratch + 0x7340,
+                        fixed_list = scratch + 0x7400, focus_dir = scratch + 0x7500, icon_struct = scratch + 0x7800,
+                        icon_title = scratch + 0x7840, icon_bytes = scratch + 0x7900, missing_dir = scratch + 0x7a00;
+
+    const stdfs::path root = stdfs::temp_directory_path() / ("dal_savedata_dialog_test_" + std::to_string(processId()));
+    std::error_code ec;
+    stdfs::remove_all(root, ec);
+    stdfs::create_directories(root / "game", ec);
+    dal::configureVfs(root / "game", root / "hdd");
+    const stdfs::path saves = root / "hdd" / "dev_hdd0" / "home" / "00000001" / "savedata";
+
+    enum Import : std::uint32_t { AutoSave, ListLoad, ListSave, ImportCount };
+    const DalImportInfo imports[] = {
+            {0x00800000, 0x8b7ed64b, "cellSysutil", "cellSaveDataAutoSave2"},
+            {0x00800010, 0x1dfbfdd6, "cellSysutil", "cellSaveDataListLoad2"},
+            {0x00800020, 0x2de0d663, "cellSysutil", "cellSaveDataListSave2"},
+    };
+    dal::installImports(imports, ImportCount);
+    auto ctx = std::make_unique<DalPpuContext>();
+    ctx->gpr[1] = 0x500000;
+    CHECK(p.memory.commit(0x4f0000, 0x10000));
+    auto call = [&](Import which, std::initializer_list<std::uint64_t> args) {
+        int reg = 3;
+        for (const std::uint64_t arg : args) ctx->gpr[reg++] = arg;
+        dalHleCall(ctx.get(), base, which);
+        return static_cast<std::uint32_t>(ctx->gpr[3]);
+    };
+    auto put = [&](std::uint32_t addr, std::string_view text) {
+        std::memcpy(base + addr, text.data(), text.size());
+        base[addr + text.size()] = 0;
+    };
+    auto logged = [&](std::string_view needle) {
+        for (const std::string& line : lines) {
+            if (line.find(needle) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    const std::uint32_t stat_cb = dal::registerHostFunction("saveStatCallback", saveStatCallback);
+    const std::uint32_t file_cb = dal::registerHostFunction("saveFileCallback", saveFileCallback);
+    const std::uint32_t list_cb = dal::registerHostFunction("saveListCallback", saveListCallback);
+    constexpr std::uint32_t kErrInternal = 0x8002b403;
+
+    dalWrite32(base, set_buf, 4);
+    dalWrite32(base, set_buf + 4, 8);
+    dalWrite32(base, set_buf + 32, 0x2000);
+    dalWrite32(base, set_buf + 36, buf);
+
+    // Three saves whose subtitles sort as SAVE0003 "A-sub", SAVE0002 "B-sub", SAVE0001 "M-sub"; SAVE0002 has an
+    // icon, SAVE0001 is the newest and SAVE0003 the oldest.
+    put(data, "hello");
+    put(data + 0x200, "PNGBYTES");
+    put(set_param + 0, "Title");
+    put(set_param + 256, "Detail");
+    const auto now = stdfs::file_time_type::clock::now();
+    auto makeSave = [&](const char* name, const char* subtitle, bool icon, int age_hours) {
+        put(dir_addr, name);
+        put(set_param + 128, subtitle);
+        g_save = SaveScript{};
+        g_save.set_param = set_param;
+        g_save.file_ops = {{1, 1, 0, 5, 5, data, "DATA.BIN"}};
+        if (icon) g_save.file_ops.push_back({1, 2, 0, 8, 8, data + 0x200, ""});
+        const std::uint32_t result = call(AutoSave, {0, dir_addr, 0, set_buf, stat_cb, file_cb, 0, 0});
+        stdfs::last_write_time(saves / name, now - std::chrono::hours(age_hours), ec);
+        return result;
+    };
+    CHECK(makeSave("SAVE0001", "M-sub", false, 0) == 0);
+    CHECK(makeSave("SAVE0002", "B-sub", true, 2) == 0);
+    CHECK(makeSave("SAVE0003", "A-sub", false, 5) == 0);
+
+    put(prefix, "SAVE");
+    dalWrite32(base, set_list, 1);  // sort by subtitle
+    dalWrite32(base, set_list + 4, 1);
+    dalWrite32(base, set_list + 8, prefix);
+    put(fixed_list, "SAVE0001");
+    put(fixed_list + 48, "SAVE0002");
+    put(fixed_list + 96, "SAVE0003");
+    put(new_dir, "SAVE0009");
+    put(missing_dir, "SAVE0008");
+    put(icon_title, "Fresh start");
+    put(icon_bytes, "NEWICON");
+    dalWrite32(base, icon_struct, icon_title);
+    dalWrite32(base, icon_struct + 4, 7);
+    dalWrite32(base, icon_struct + 8, icon_bytes);
+    dalWrite32(base, new_data + 4, new_dir);
+
+    auto script = std::make_unique<ScriptedSaveDialog>();
+    ScriptedSaveDialog& dlg = *script;
+    dal::setSaveDialogDriver(std::move(script));
+    bool scripted = true;  // `dlg` dies when another driver is installed
+    // `new_pos` 2 means no newData structure. OK_LAST from funcStat ends a call after the choice without writing
+    // anything.
+    auto setup = [&](std::uint32_t focus, std::uint32_t new_pos, std::uint32_t icon) {
+        g_save = SaveScript{};
+        g_save.focus = focus;
+        g_save.focus_dir = focus_dir;
+        g_save.fixed_num = 3;
+        g_save.fixed_list = fixed_list;
+        g_save.new_data = new_pos == 2 ? 0 : new_data;
+        g_save.stat_result = 1;
+        dalWrite32(base, new_data, new_pos);
+        dalWrite32(base, new_data + 8, icon);
+        if (scripted) dlg.reset();
+        lines.clear();
+    };
+    auto run = [&](Import which) { return call(which, {0, set_list, set_buf, list_cb, stat_cb, file_cb, 0, 0}); };
+
+    // TAIL, NEWDATA focus: the new-data row comes last and the list opens on it.
+    setup(5, 1, 0);
+    dlg.list_answers = {3};
+    dlg.message_answers = {SaveMessageResult::Yes};
+    CHECK(run(ListSave) == 0);
+    CHECK(dlg.lists.size() == 1 && dlg.lists[0].kind == SaveListKind::Save && dlg.lists[0].initial_row == 3 &&
+          dlg.lists[0].auto_row == 3);
+    CHECK((dlg.lists[0].titles ==
+           std::vector<std::string>{"A-sub", "B-sub", "M-sub", std::string(dal::kNewDataTitle)}));
+    CHECK((dlg.lists[0].has_icon == std::vector<bool>{false, true, false, false}));
+    CHECK((dlg.lists[0].is_new == std::vector<bool>{false, false, false, true}));
+    CHECK(dlg.lists[0].infos[3] == dal::kNewDataLine && dlg.lists[0].infos[0].find("KB") != std::string::npos);
+    CHECK(dlg.messages.size() == 1 && dlg.messages[0] == dal::kConfirmSaveNew &&
+          dlg.message_kinds[0] == DialogKind::YesNo);
+    CHECK(g_save.list_calls == 1 && g_save.stat_dir == "SAVE0009" && g_save.stat_is_new == 1);
+    CHECK(logged("ListSave2: new save 'SAVE0009' chosen"));
+
+    // HEAD: the new-data row comes first; entry focus 0 opens on row 1, NEWDATA on row 0, TAIL on the last entry.
+    setup(1, 0, 0);  // LISTHEAD
+    CHECK(run(ListSave) == 1);
+    CHECK(dlg.lists.size() == 1 && dlg.lists[0].initial_row == 1 && dlg.lists[0].auto_row == 1 &&
+          dlg.lists[0].titles.size() == 4 && dlg.lists[0].titles[0] == dal::kNewDataTitle &&
+          dlg.lists[0].titles[1] == "A-sub");
+    CHECK(g_save.stat_calls == 0 && dlg.messages.empty() && logged("ListSave2: save list cancelled") &&
+          !logged("without a save list dialog"));
+    setup(5, 0, 0);
+    CHECK(run(ListSave) == 1 && dlg.lists[0].initial_row == 0 && dlg.lists[0].auto_row == 0);
+    setup(2, 0, 0);  // LISTTAIL
+    CHECK(run(ListSave) == 1 && dlg.lists[0].initial_row == 3 && dlg.lists[0].auto_row == 3);
+
+    // The game's newData title and icon buffer; a null title keeps the default.
+    setup(5, 0, icon_struct);
+    CHECK(run(ListSave) == 1 && dlg.lists[0].titles[0] == "Fresh start" && dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct, 0);
+    setup(5, 0, icon_struct);
+    CHECK(run(ListSave) == 1 && dlg.lists[0].titles[0] == dal::kNewDataTitle && dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct + 4, 225281);  // beyond the icon buffer limit: no icon
+    setup(5, 0, icon_struct);
+    CHECK(run(ListSave) == 1 && !dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct + 4, 0);  // no bytes
+    setup(5, 0, icon_struct);
+    CHECK(run(ListSave) == 1 && !dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct + 4, 7);
+    dalWrite32(base, icon_struct + 8, 0xdeadbeef);  // a buffer outside guest memory: no icon
+    setup(5, 0, icon_struct);
+    CHECK(run(ListSave) == 1 && !dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct + 8, icon_bytes);
+    setup(5, 0, 0xdeadbeef);  // an icon structure outside guest memory (an uninitialised field): no icon
+    CHECK(run(ListSave) == 1 && dlg.lists[0].titles[0] == dal::kNewDataTitle && !dlg.lists[0].has_icon[0]);
+    dalWrite32(base, icon_struct, icon_title);
+
+    // List -> row 2, No, list again on row 2 -> row 1, Yes: row 1's save is used and funcList ran once.
+    setup(1, 2, 0);
+    dlg.list_answers = {2, 1};
+    dlg.message_answers = {SaveMessageResult::No, SaveMessageResult::Yes};
+    CHECK(run(ListLoad) == 0);
+    CHECK(dlg.lists.size() == 2 && dlg.lists[0].kind == SaveListKind::Load && dlg.lists[0].initial_row == 0 &&
+          dlg.lists[0].auto_row == 0 && dlg.lists[1].initial_row == 2);
+    CHECK(dlg.messages.size() == 2 && dlg.messages[0].starts_with(dal::kConfirmLoad) &&
+          dlg.messages[0].find("M-sub") != std::string::npos && dlg.messages[1].find("B-sub") != std::string::npos);
+    CHECK(g_save.list_calls == 1 && g_save.stat_dir == "SAVE0002" && g_save.stat_is_new == 0);
+    CHECK(logged("ListLoad2: entry 'SAVE0002' chosen of 3"));
+
+    // ListSave2 asks the overwrite question for an entry.
+    setup(1, 2, 0);
+    dlg.list_answers = {0};
+    dlg.message_answers = {SaveMessageResult::Yes};
+    CHECK(run(ListSave) == 0 && dlg.messages[0].starts_with(dal::kConfirmOverwrite) && g_save.stat_dir == "SAVE0003");
+
+    // A confirmation that cannot be shown is INTERNAL; back from the list is CELL_CANCEL.
+    setup(1, 2, 0);
+    dlg.list_answers = {1};
+    dlg.message_answers = {SaveMessageResult::Failed};
+    CHECK(run(ListSave) == kErrInternal && g_save.stat_calls == 0);
+    CHECK(logged("ListSave2: the confirmation could not be shown"));
+    setup(1, 2, 0);
+    CHECK(run(ListSave) == 1 && g_save.stat_calls == 0);
+
+    // A row outside the list cancels.
+    setup(1, 2, 0);
+    dlg.list_answers = {3};
+    CHECK(run(ListLoad) == 1 && dlg.messages.empty() && logged("the dialog returned row 3 of 3"));
+
+    // ListLoad2 shows the "create new data" question on its new-data row; the Auto row is the focused entry.
+    setup(5, 0, 0);
+    dlg.list_answers = {0};
+    dlg.message_answers = {SaveMessageResult::Yes};
+    CHECK(run(ListLoad) == 0 && dlg.messages.size() == 1 && dlg.messages[0] == dal::kConfirmLoadNew &&
+          g_save.stat_dir == "SAVE0009" && dlg.lists[0].initial_row == 0 && dlg.lists[0].auto_row == 1);
+
+    // DIRNAME focus on a name that is not listed opens on row 0; the Auto row is the newest entry.
+    setup(0, 2, 0);
+    g_save.focus_dir = missing_dir;
+    CHECK(run(ListLoad) == 1 && dlg.lists.size() == 1 && dlg.lists[0].initial_row == 0 &&
+          dlg.lists[0].titles.size() == 3 && g_save.stat_calls == 0);
+    CHECK(dlg.lists[0].auto_row == 2);  // SAVE0001 "M-sub" is the newest
+    setup(0, 2, 0);
+    put(focus_dir, "SAVE0002");
+    CHECK(run(ListLoad) == 1 && dlg.lists[0].initial_row == 1 && dlg.lists[0].auto_row == 1);
+
+    // An empty list has no Auto row.
+    setup(1, 2, 0);
+    g_save.fixed_num = 0;
+    CHECK(run(ListLoad) == 1 && dlg.lists.size() == 1 && dlg.lists[0].titles.empty() && dlg.lists[0].initial_row == 0 &&
+          !dlg.lists[0].auto_row);
+
+    // The Auto driver keeps the headless choice and the log lines without showing anything.
+    dal::setSaveDialogDriver(nullptr);
+    scripted = false;
+    setup(5, 0, 0xdeadbeef);  // also with a garbage icon pointer
+    CHECK(run(ListSave) == 0 && g_save.stat_dir == "SAVE0009" && g_save.stat_is_new == 1);
+    CHECK(logged("dal: savedata: ListSave2: new save 'SAVE0009' chosen") && !logged("save list cancelled"));
+    setup(1, 2, 0);
+    CHECK(run(ListLoad) == 0 && g_save.stat_dir == "SAVE0003");
+    CHECK(logged("dal: savedata: ListLoad2: entry 'SAVE0003' chosen of 3"));
+    setup(0, 2, 0);
+    g_save.focus_dir = missing_dir;
+    CHECK(run(ListLoad) == 0 && g_save.stat_dir == "SAVE0001");  // no focused entry: the newest
+    CHECK(logged("dal: savedata: ListLoad2: entry 'SAVE0001' chosen of 3"));
+    setup(1, 2, 0);
+    g_save.fixed_num = 0;
+    CHECK(run(ListSave) == 1 && g_save.stat_calls == 0);  // nothing to choose
+    CHECK(logged("dal: savedata: ListSave2: no entry to choose without a save list dialog, cancelling"));
+    setup(1, 2, 0);
+    CHECK(run(ListSave) == 0 && g_save.stat_dir == "SAVE0003");  // the focused entry, as before
+    for (const std::string& line : lines) CHECK(line.find("dialog (") == std::string::npos);
+
+    // The Cancel driver answers back and says so.
+    dal::setSaveDialogDriver(dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Cancel));
+    setup(1, 2, 0);
+    CHECK(run(ListLoad) == 1 && g_save.stat_calls == 0);
+    CHECK(logged("dal: savedata: dialog (cancel): list of 3 rows -> back") &&
+          logged("dal: savedata: ListLoad2: save list cancelled") && !logged("without a save list dialog"));
+
+    CHECK(ctx->gpr[1] == 0x500000);
+    stdfs::remove_all(root, ec);
+    dal::resetSaveDialog();
     dal::resetCellSaveData();
     dal::resetHostFunctions();
     dal::setLogSink({});
@@ -9761,6 +10088,7 @@ int main(int argc, char** argv) {
     testPadScriptPlay();
     testCellMsgDialog();
     testCellSaveData();
+    testCellSaveDataDialog();
     testCellPngDec();
     testFifoParser();
     testRsxArgCensus();
