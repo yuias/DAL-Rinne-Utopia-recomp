@@ -7,6 +7,7 @@ options for unattended and diagnostic runs.
 ```sh
 dal_game [--game-dir DIR] [--vfs-config FILE] [--elf PATH] [--hdd-dir DIR] [--sdata-cache DIR]
          [--seconds N] [--strict] [--log FILE] [--log-level LEVEL] [--quiet-hle] [--dialog-answer yes|no|ok]
+         [--save-dialog auto|cancel|window] [--ui-font FILE]
          [--pad none|neutral|keyboard|gamepad|keyboard+gamepad] [--pad-script FILE] [--pad-probe]
          [--audio none|wasapi] [--audio-dump FILE]
          [--load-only] [--png-dump DIR]
@@ -51,6 +52,8 @@ thread the way RPCS3 does and calls the entry function through the generated cod
 | `--audio none\|wasapi` (Windows), `--audio none\|coreaudio` (macOS) | Where the game's sound goes. `wasapi` plays it through the default Windows audio device and `coreaudio` through the default macOS output device; `none` plays nothing, but the game's mixer and the audio clock run the same. Default: the system's device output with the window, `none` with `--no-window`, so unattended runs and tests need no sound device. The other system's name is a usage error (`--audio needs none or coreaudio` on macOS). See [Audio](audio.md#options). |
 | `--audio-dump FILE` | Write the mixed sound to `FILE` as a WAV file (48 kHz, stereo, 32-bit float), with either output. A file that cannot be created is a usage error. Its header is updated every second, so a run stopped by `--seconds` or by closing the window leaves a usable file. `dal_audiotool wavstat FILE` prints its levels per second (see [`dal_audiotool`](audio.md#dal_audiotool)). |
 | `--dialog-answer yes\|no\|ok` | What an auto-answered Yes/No message dialog replies (default `yes`; `ok` is the same as `yes`). OK dialogs always answer OK. |
+| `--save-dialog auto\|cancel\|window` | Who answers the save data dialogs of `cellSaveDataListSave2` and `cellSaveDataListLoad2`. `window` draws the save list, the confirmation and the error message over the game and lets the player answer with the pad; `auto` answers by itself, as unattended runs always did; `cancel` backs out of every list, answers No to every confirmation and OK to every message. Default: `window` with the window and a pad that reads host input (`keyboard`, `gamepad` or `keyboard+gamepad`) and no `--pad-script`; otherwise `auto`. `window` without the window, or with `--pad none` or `neutral`, is a usage error (`--save-dialog window needs the window and --pad keyboard, gamepad or keyboard+gamepad`); it is allowed together with `--pad-script`. |
+| `--ui-font FILE` | The TrueType font the save data dialog uses, for Japanese text. Default: none; the dialog then looks for a font next to the executable. |
 
 ### Rendering
 
@@ -135,8 +138,8 @@ replaced by `_` (`--game-dir` is `game_dir`). `null` is not a value; remove the 
 
 | Kind | Keys | JSON value |
 | --- | --- | --- |
-| Path | `game_dir`, `vfs_config`, `elf`, `log`, `hdd_dir`, `sdata_cache`, `png_dump`, `pad_script`, `audio_dump`, `rsx_census`, `dump_frames`, `shader_cache` | A non-empty string. A relative path is relative to the directory of the file, not to the working directory. |
-| String | `log_level`, `dialog_answer`, `pad`, `audio`, `render` | A string with one of the values of the option. |
+| Path | `game_dir`, `vfs_config`, `elf`, `log`, `hdd_dir`, `sdata_cache`, `png_dump`, `ui_font`, `pad_script`, `audio_dump`, `rsx_census`, `dump_frames`, `shader_cache` | A non-empty string. A relative path is relative to the directory of the file, not to the working directory. |
+| String | `log_level`, `dialog_answer`, `save_dialog`, `pad`, `audio`, `render` | A string with one of the values of the option. |
 | Unsigned integer | `seconds`, `dump_frames_every`, `fast_forward` | A non-negative integer, with the range of the option (`dump_frames_every` must be positive; `fast_forward` is 1 or from 2 to 8). |
 | Flag | `strict`, `quiet_hle`, `load_only`, `pad_probe`, `vk_validation`, `no_window` | `true` or `false`. |
 | Frame list | `rsx_capture` | An array of positive integers (`[300, 600]`), or a string in the command-line form (`"300,600"`). |

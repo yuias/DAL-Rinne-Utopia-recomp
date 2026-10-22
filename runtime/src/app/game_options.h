@@ -34,7 +34,7 @@ struct OptionSpec {
     OptionKind kind;
 };
 
-// The 27 options in usage-text order; the single source for the CLI11 registration and the file
+// The 29 options in usage-text order; the single source for the CLI11 registration and the file
 // schema. Excludes --config, --no-config and --help, which have no file key.
 std::span<const OptionSpec> gameOptionSpecs();
 std::string configKeyFor(std::string_view option_name);  // "game-dir" -> "game_dir"
@@ -45,6 +45,8 @@ struct GameOptions {
             audio_dump, dump_frames, shader_cache;  // empty: not given
     std::optional<LogLevel> log_level;              // nullopt: keep the default
     std::string dialog_answer;                      // empty: keep the default
+    std::string save_dialog;                        // settled: auto|cancel|window
+    std::filesystem::path ui_font;                  // empty: not given
     std::string pad;                                // settled: none|neutral|keyboard|gamepad|keyboard+gamepad
     std::string audio;                              // settled: none|kHostAudioOutput
     std::vector<PadScriptEvent> pad_script_events;  // loaded from pad_script
