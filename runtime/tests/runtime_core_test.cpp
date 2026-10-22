@@ -3474,6 +3474,119 @@ void testCellPad() {
     dal::resetLogOnce();
 }
 
+void testCellPadIntercept() {
+    using dal::PadButton;
+    dal::setLogSink([](std::string_view) {});
+    dal::resetCensus();
+    dal::resetLogOnce();
+    dal::resetCellPad();
+    dal::Process& p = dal::process();
+    CHECK(p.memory.reserve());
+    std::uint8_t* base = p.memory.base();
+    const std::uint32_t scratch = p.main.allocate(0x10000, 0x10000);
+    CHECK(scratch != 0);
+    const std::uint32_t info = scratch, data = scratch + 0x200;
+
+    enum Import : std::uint32_t { Init, End, SetPortSetting, GetData, GetInfo2, SetActDirect, ImportCount };
+    const DalImportInfo imports[] = {
+            {0x00800000, 0x1cf98800, "sys_io", "cellPadInit"},
+            {0x00800010, 0x4d9b75d5, "sys_io", "cellPadEnd"},
+            {0x00800020, 0x578e3c98, "sys_io", "cellPadSetPortSetting"},
+            {0x00800030, 0x8b72cda1, "sys_io", "cellPadGetData"},
+            {0x00800040, 0xa703a51d, "sys_io", "cellPadGetInfo2"},
+            {0x00800050, 0xf65544ee, "sys_io", "cellPadSetActDirect"},
+    };
+    dal::installImports(imports, ImportCount);
+    auto ctx = std::make_unique<DalPpuContext>();
+    auto call = [&](Import which, std::uint64_t a = 0, std::uint64_t b = 0) {
+        ctx->gpr[3] = a;
+        ctx->gpr[4] = b;
+        dalHleCall(ctx.get(), base, which);
+        return static_cast<std::uint32_t>(ctx->gpr[3]);
+    };
+    const auto len = [&] { return static_cast<std::int32_t>(dalRead32(base, data)); };
+    const auto word = [&](std::uint32_t i) { return dalRead16(base, data + 4 + 2 * i); };
+    const auto fill = [&] { std::memset(base + data, 0xAA, 0x100); };
+    const auto set = [](ScriptedPad& pad, dal::PadButtons buttons) { pad.state = dal::padStateFromButtons(buttons); };
+    const auto circle = dal::padButtonBit(PadButton::Circle);
+    const auto cross = dal::padButtonBit(PadButton::Cross);
+    const auto up = dal::padButtonBit(PadButton::Up);
+
+    // Enter/back mapping.
+    CHECK(dal::enterButtonAssign() == dal::EnterButtonAssign::Circle);
+    CHECK(dal::dialogButtons().enter == PadButton::Circle && dal::dialogButtons().back == PadButton::Cross);
+    dal::setEnterButtonAssign(dal::EnterButtonAssign::Cross);
+    CHECK(dal::dialogButtons().enter == PadButton::Cross && dal::dialogButtons().back == PadButton::Circle);
+    dal::setEnterButtonAssign(dal::EnterButtonAssign::Circle);
+    CHECK(dal::dialogButtons().enter == PadButton::Circle && dal::dialogButtons().back == PadButton::Cross);
+
+    auto host = std::make_unique<ScriptedPad>();
+    ScriptedPad* pad = host.get();
+    dal::setPadProvider(std::move(host));
+    CHECK(call(Init, 4) == 0);
+    CHECK(!dal::padIntercepted());
+    CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 8) == 0);
+    set(*pad, circle);
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(3) == 0x20);
+
+    // Intercepted: no change is reported even when a button changes; the game's view stays as it was.
+    dal::setPadIntercepted(true);
+    CHECK(dal::padIntercepted());
+    CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 8) == 1);
+    set(*pad, circle | cross);
+    fill();
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+    CHECK(call(GetData, 1, data) == 0x80121107);  // the connection checks still come first
+
+    // pollHostPad reads the provider and leaves what the game was told alone.
+    const dal::PadPortState host_state = dal::pollHostPad(0);
+    CHECK(host_state.connected && host_state.button[dal::kPadButtonDigital2] == 0x60);
+    CHECK(!dal::pollHostPad(1).connected);
+
+    // Released with circle still held: one change to neutral, then nothing.
+    dal::setPadIntercepted(false);
+    CHECK(!dal::padIntercepted());
+    CHECK(call(GetInfo2, info) == 0 && dalRead32(base, info + 8) == 0);
+    set(*pad, circle);
+    fill();
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(2) == 0 && word(3) == 0);
+    CHECK(word(4) == 0x80 && word(7) == 0x80);
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+
+    // Once the watched buttons are up the real state is reported. A d-pad press is not watched.
+    set(*pad, up);
+    fill();
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(2) == 0x10 && word(3) == 0);
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+    set(*pad, circle);
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(3) == 0x20);  // the phase has ended
+
+    // pollHostPad does not change what the next GetData reports.
+    set(*pad, cross);
+    (void)dal::pollHostPad(0);
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(3) == 0x40);
+
+    // Intercepting twice and a full cycle without a held button ends the phase on the first call.
+    dal::setPadIntercepted(true);
+    dal::setPadIntercepted(true);
+    set(*pad, 0);
+    dal::setPadIntercepted(false);
+    CHECK(call(GetData, 0, data) == 0 && len() == 8 && word(3) == 0);  // buffer cleared: reported again
+    CHECK(call(GetData, 0, data) == 0 && len() == 0);
+
+    // resetCellPad clears the interception.
+    dal::setPadIntercepted(true);
+    dal::resetCellPad();
+    CHECK(!dal::padIntercepted());
+
+    p.main.free(scratch);
+    dal::setLogSink({});
+    dal::resetCensus();
+    dal::resetLogOnce();
+}
+
 bool samePadState(const dal::PadPortState& a, const dal::PadPortState& b) {
     return a.connected == b.connected && a.device_capability == b.device_capability && a.device_type == b.device_type &&
            a.button == b.button;
@@ -9633,6 +9746,7 @@ int main(int argc, char** argv) {
     testCellSysutil();
     testVideoAndAudioOut();
     testCellPad();
+    testCellPadIntercept();
     testPadButtons();
     testKeyboardPadScanCodes();
     testKeyboardPadState();
