@@ -19,8 +19,9 @@
 //    the "new data" slot when the game supplied one; without a choice the call returns CELL_CANCEL, as
 //    RPCS3 does without a save dialog. It answers every confirmation with Yes, silently.
 //  - Error dialogs (errDialog of the Auto functions; ListSave2/ListLoad2 always ask for one): the
-//    text is logged and the error code is returned, with RPCS3's NOREPEAT bookkeeping. No dialog
-//    object is created, so the game sees no DRAWING_BEGIN/END events for it.
+//    English text is logged, an OK message with the Japanese text is shown through the driver, and
+//    CBRESULT is returned whatever the player does, with RPCS3's NOREPEAT bookkeeping. The Auto
+//    driver answers OK without showing anything, so the game sees no DRAWING_BEGIN/END events for it.
 //  - cellSaveDataDelete2 only opens a selection UI in RPCS3, so it returns CELL_CANCEL.
 //
 // Deviations from RPCS3:
@@ -459,9 +460,11 @@ std::int32_t runCallback(OpState& s, std::uint32_t func, std::uint32_t get, std:
     return read32s(s, s.result + kResultResult);
 }
 
-// RPCS3 `display_callback_result_error_message`, minus the blocking dialog (see the header).
+// RPCS3 `display_callback_result_error_message`. The log text is English; the dialog shows the Japanese text
+// of saveErrorText(), or the game's own message for ERR_INVALID.
 std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::uint32_t err_dialog) {
     std::string msg;
+    std::string invalid_msg;  // empty when the game's pointer is null
     switch (result) {
         case kCbErrNoSpace:
             msg = std::format("not enough space ({} KB needed)", read32s(s, s.result + kResultErrNeedSizeKb));
@@ -471,7 +474,8 @@ std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::ui
         case kCbErrNoData: msg = "there is no save data"; break;
         case kCbErrInvalid: {
             const std::uint32_t text = dalRead32(s.base, s.result + kResultInvalidMsg);
-            msg = text != 0 ? getText(s.base, text, 256) : std::string("invalid");
+            if (text != 0) invalid_msg = getText(s.base, text, 256);
+            msg = text != 0 ? invalid_msg : std::string("invalid");
             break;
         }
         default:
@@ -482,8 +486,23 @@ std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::ui
     if (err_dialog == kErrDialogNoRepeat) g_last_error_dialog = result;
     if (err_dialog == kErrDialogNone || (err_dialog == kErrDialogNoRepeat && repeat)) {
         logInfo("dal: savedata: callback result {}: {} (no dialog requested)", result, msg);
+        return kErrorCbResult;
+    }
+
+    SaveDialogDriver& driver = saveDialogDriver();
+    if (driver.interactive()) {
+        logWarn("dal: savedata: error dialog: {}", msg);
     } else {
         logWarn("dal: savedata: error dialog (headless, not shown): {}", msg);
+    }
+    // The result is ignored, as in RPCS3: the game sees CBRESULT whether or not the player read the message.
+    const std::optional<std::string> text =
+            saveErrorText(result, read32s(s, s.result + kResultErrNeedSizeKb), invalid_msg);
+    if (text) {
+        auto content = std::make_shared<SaveDialogContent>();
+        content->kind = DialogKind::Ok;
+        content->message = *text;
+        driver.showMessage(std::move(content));
     }
     return kErrorCbResult;
 }

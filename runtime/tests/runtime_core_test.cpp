@@ -5147,6 +5147,64 @@ void testCellSaveDataDialog() {
     CHECK(run(ListLoad) == 1 && dlg.lists.size() == 1 && dlg.lists[0].titles.empty() && dlg.lists[0].initial_row == 0 &&
           !dlg.lists[0].auto_row);
 
+    // Error dialogs: one OK message per error with the Japanese text; the result is ignored.
+    constexpr std::uint32_t kErrCbResult = 0x8002b401, kErrParam = 0x8002b404;
+    auto autoSave = [&](std::uint32_t err_dialog) {
+        return call(AutoSave, {0, dir_addr, err_dialog, set_buf, stat_cb, file_cb, 0, 0x1234});
+    };
+    auto errorSetup = [&](std::int32_t stat_result) {
+        g_save = SaveScript{};
+        g_save.stat_result = stat_result;
+        dlg.reset();
+        lines.clear();
+    };
+    put(dir_addr, "SAVE0001");
+    dal::resetCellSaveData();
+    dlg.driver_kind = dal::SaveDialogDriverKind::Auto;
+    errorSetup(-4);
+    dlg.message_answers = {SaveMessageResult::Failed};
+    CHECK(autoSave(1) == kErrCbResult);
+    CHECK(dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorNoData && dlg.message_kinds[0] == DialogKind::Ok);
+    CHECK(logged("dal: savedata: error dialog (headless, not shown): there is no save data"));
+    dlg.driver_kind = dal::SaveDialogDriverKind::Interactive;
+    errorSetup(-4);
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 &&
+          logged("dal: savedata: error dialog: there is no save data") && !logged("headless"));
+    dlg.driver_kind = dal::SaveDialogDriverKind::Cancel;
+    errorSetup(-4);
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 && logged("error dialog (headless, not shown)"));
+    dlg.driver_kind = dal::SaveDialogDriverKind::Interactive;
+    errorSetup(-2);
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorFailure);
+    errorSetup(-3);
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorBroken);
+    errorSetup(-4);
+    CHECK(autoSave(0) == kErrCbResult && dlg.messages.empty() && logged("no dialog requested") &&
+          !logged("error dialog"));
+    errorSetup(9);  // a result without a dialog is a parameter error
+    CHECK(autoSave(1) == kErrParam && dlg.messages.empty());
+    errorSetup(-5);  // the game's message pointer is null: the dialog opens with an empty text
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0].empty());
+    errorSetup(-1);
+    CHECK(autoSave(1) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0].starts_with(dal::kErrorNoSpace) &&
+          dlg.messages[0].find("KB") != std::string::npos);
+
+    // ListSave2 and ListLoad2 always ask for the error dialog.
+    errorSetup(0);
+    g_save.list_result = -4;
+    CHECK(run(ListSave) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorNoData);
+    errorSetup(0);
+    g_save.list_result = -3;
+    CHECK(run(ListLoad) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorBroken);
+
+    // NOREPEAT shows the same error once; a different error shows again.
+    dal::resetCellSaveData();
+    errorSetup(-4);
+    CHECK(autoSave(2) == kErrCbResult && autoSave(2) == kErrCbResult && dlg.messages.size() == 1);
+    errorSetup(-3);
+    CHECK(autoSave(2) == kErrCbResult && dlg.messages.size() == 1 && dlg.messages[0] == dal::kErrorBroken);
+    dal::resetCellSaveData();
+
     // The Auto driver keeps the headless choice and the log lines without showing anything.
     dal::setSaveDialogDriver(nullptr);
     scripted = false;
