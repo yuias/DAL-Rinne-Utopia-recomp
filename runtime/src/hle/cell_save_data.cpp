@@ -22,6 +22,11 @@
 //    English text is logged, an OK message with the Japanese text is shown through the driver, and
 //    CBRESULT is returned whatever the player does, with RPCS3's NOREPEAT bookkeeping. The Auto
 //    driver answers OK without showing anything, so the game sees no DRAWING_BEGIN/END events for it.
+//  - While the game's own cellMsgDialogOpen2 dialog is open, an interactive driver shows no confirmation
+//    and no error message, as in RPCS3 (its message dialog open returns BUSY): the confirmation fails with
+//    INTERNAL, the error message is dropped, and the save list still opens. On a first boot the game's
+//    loading dialog is open around AutoLoad2, so its "no data" error message is not shown. The Auto driver
+//    ignores the game's dialog and keeps answering Yes/OK.
 //  - cellSaveDataDelete2 only opens a selection UI in RPCS3, so it returns CELL_CANCEL.
 //
 // Deviations from RPCS3:

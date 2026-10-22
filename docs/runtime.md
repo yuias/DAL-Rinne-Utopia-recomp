@@ -190,7 +190,7 @@ serves any import without one. Behaviour follows the RPCS3 function of the same 
 | `cellSysmodule` | `cellSysmoduleLoadModule`, `cellSysmoduleUnloadModule`: every module id succeeds, because the HLE functions are always available |
 | `cellSpurs` | `cellSpursInitializeWithAttribute2` and its attribute helper, `cellSpursGetSpuThreadGroupId`, `cellSpursFinalize`: a SPURS instance can be created and queried, but no SPU thread, workload or helper thread exists |
 | `cellGcmSys` | 26 imports: initialization (`_cellGcmInitBody`), configuration, IO mapping (`cellGcmMapMainMemory`, `cellGcmAddressToOffset`, `cellGcmUnmapEaIoAddress`), display buffers, flip mode and flip status, the vblank, flip and user handlers, tiles and zcull, the control register and the default command buffer callback; see [Fake RSX](rendering.md#fake-rsx) |
-| `cellSysutil` | the callback pump (`cellSysutilRegisterCallback`, `_UnregisterCallback`, `_CheckCallback`), BGM playback status, `cellVideoOutConfigure`, `_GetState`, `_GetResolutionAvailability`, `cellAudioOutGetState`, the message dialog (`cellMsgDialogOpen2`, `_Close`, progress bar reset and increment) and save data (`cellSaveDataAutoLoad2`, `AutoSave2`, `ListLoad2`, `ListSave2`, `Delete2`) |
+| `cellSysutil` | the callback pump (`cellSysutilRegisterCallback`, `_UnregisterCallback`, `_CheckCallback`), BGM playback status, `cellVideoOutConfigure`, `_GetState`, `_GetResolutionAvailability`, `cellAudioOutGetState`, the message dialog (`cellMsgDialogOpen2`, `_Close`, progress bar reset and increment) and save data (`cellSaveDataAutoLoad2`, `AutoSave2`, `ListLoad2`, `ListSave2`, `Delete2`); the list functions can show a save list to the player (see [Save data dialog](#save-data-dialog)) |
 | `cellGame` | `cellGameDataCheck`, `cellGameCreateGameData`, `cellGameContentPermit`, `cellGameContentErrorDialog` |
 | `sys_fs` | `cellFsOpen`, `cellFsSdataOpen`, `cellFsReadWithOffset`, `cellFsWriteWithOffset`, `cellFsClose`, `cellFsFstat`, `cellFsStat`, `cellFsMkdir`, `cellFsUnlink` |
 | `sys_io` | `cellPadInit`, `cellPadEnd`, `cellPadSetPortSetting`, `cellPadGetData`, `cellPadGetInfo2`, `cellPadSetActDirect` |
@@ -218,7 +218,8 @@ interface, so each module follows a documented policy that never blocks on a per
   are logged and their error code is returned, without a dialog object. A save list is never
   shown; the entry is the one the game's list callback highlights, with RPCS3's fallbacks, and
   without a choice the call returns `CELL_CANCEL`. `cellSaveDataDelete2` returns `CELL_CANCEL`.
-  Secure files are stored in plain text.
+  Secure files are stored in plain text. With a window the player answers the dialogs instead of this
+  policy; see [Save data dialog](#save-data-dialog).
 - **Trophies**: no trophy pack is installed from the network and no notification is shown. The
   pack is read for its trophy list, and the unlock state is kept as a text file in the trophy
   directory under `/dev_hdd0/home/00000001`. The registration status callbacks run inside
@@ -234,6 +235,101 @@ interface, so each module follows a documented policy that never blocks on a per
   (`runtime/src/hle/hle.h`): none, neutral, or the host pad state that the keyboard, a pad script and
   gamepads write. Runs with `--no-window` never load a gamepad backend.
 
+## Save data dialog
+
+`cellSaveDataListSave2` and `cellSaveDataListLoad2` show a list of saves that the player picks from with the pad.
+With a window the runtime draws the list over the final presented image with the game dimmed behind it, then a Yes/No
+confirmation for the picked row, and an OK message for an error result of a callback; all text is Japanese. Runs
+without a window, with a pad script, replays and the unit tests keep the [Auto policy](#headless-policy) and never
+wait. The overlay that draws it is described in [Overlays](rendering.md#overlays); this section covers the runtime side.
+
+| Part | File | Role |
+| --- | --- | --- |
+| Model | `runtime/src/hle/save_dialog_model.*` | `DialogInput` (edges and auto-repeat), `SaveDialogModel` (selection, scrolling, fades, result). Pure and driven by an injected clock, so it needs no window and no pad provider |
+| Text | `runtime/src/hle/save_dialog_text.*` | Every Japanese string in one header, and the formatting of sizes, dates, confirmations and error texts |
+| Driver and board | `runtime/src/hle/save_dialog.*` | `SaveDialogDriver` (Auto, Cancel and Interactive), `SaveDialogBoard` (the latest snapshot, read by the overlay) and `saveDialogOpen()` |
+| Handlers | `runtime/src/hle/cell_save_data.cpp` | Builds the rows and the confirmations and calls the driver |
+| Message dialog | `runtime/src/hle/cell_msg_dialog.cpp` | `msgDialogOpen()` for the driver; `cellMsgDialogOpen2` answers BUSY while a save dialog is open |
+
+- **`--save-dialog`.** `window` uses the interactive driver; `auto` and `cancel` use the Auto and Cancel policies,
+  which answer at once. The Auto policy logs nothing, so a run without a window keeps the `dal: savedata:` and
+  `dal: msgdialog:` lines it had before the dialog existed; the Cancel policy logs one
+  `dal: savedata: dialog (cancel): ...` line per call. Without the option the dialog is `window` when the run has a
+  window, a pad that reads host input and no `--pad-script`, otherwise `auto`; `window` without the window or a host
+  pad is a usage error. The start-up line `dal: savedata dialog: window|auto|cancel` says which (see
+  [`dal_game` options](runtime-options.md#window-input-and-sound)). The debug overlay does not change the setting.
+- **The list.** The game's list callback (`funcList`) runs first, as before. The rows are its saves in the sort order
+  the game asked for, with the new-data row last for `iconPosition` TAIL and first otherwise. A row shows the subtitle (or the
+  title when there is none), the date and size and the first lines of the detail text, with the save's
+  `ICON0.PNG`; the new-data row uses the icon and title the game passed, or a placeholder and `新しいデータ`. The
+  list opens on the row the callback focuses (`CELL_SAVEDATA_FOCUSPOS_*`), and `funcList` is not called again when
+  the player comes back to the list. Four rows are visible, with a scrollbar for more; the d-pad or a stick moves one
+  row and L1/R1 ten. Without a window the Auto policy takes the place of the player: it picks the entry the
+  callback focuses, with the fallbacks described under [Headless policy](#headless-policy), and answers every
+  confirmation with Yes.
+- **Picking.** The enter button on a row asks `このデータに上書きしますか？` (save) or `このデータをロードしますか？`
+  (load) with the save's title, subtitle, date, size and detail, or `新しいデータにセーブしますか？` for the new-data
+  row of a save list. はい continues with that save; いいえ returns to the list on the same row. The back button on the
+  list returns `CELL_CANCEL`, and so does an empty list (it shows `セーブデータがありません`).
+- **Error messages.** An error result of a callback with error dialogs requested shows an OK message with the
+  Japanese text (`空き容量が足りません。` followed by `必要な空き容量：N KB`, `セーブまたはロードに失敗しました。`,
+  `セーブデータが壊れています。`, `セーブデータが見つかりません。`, or the text the game gave for
+  `CELL_SAVEDATA_ERR_INVALID`), after the English text has been logged as before
+  (`dal: savedata: error dialog: ...` with a window). `cellSaveDataAutoLoad2` and `AutoSave2` show no list and no
+  confirmation, only this message when the game asks for error dialogs. The call still returns
+  `CELL_SAVEDATA_ERROR_CBRESULT` whatever the player does. The game's own `cellMsgDialogOpen2` dialogs have no
+  overlay and keep the auto-answer of `--dialog-answer`.
+- **The game's message dialog.** RPCS3 refuses a savedata confirmation while a `cellMsgDialogOpen2` dialog is open
+  (its open call returns `CELL_SYSUTIL_ERROR_BUSY`, and the confirmation then ends the call with
+  `CELL_SAVEDATA_ERROR_INTERNAL`) and ignores an error message in that case; its save list is a separate overlay
+  and still opens. The interactive driver does the same. A confirmation or a message is not shown while the game's
+  message dialog is open: the driver logs `dal: savedata: confirmation not shown, the game's message dialog is open`
+  (`message not shown, ...` for an error message), touches neither the pad nor the board and queues no
+  `DRAWING_BEGIN`. A confirmation then ends the call with `CELL_SAVEDATA_ERROR_INTERNAL` and
+  `dal: savedata: <op>: the confirmation could not be shown`; an error message is just not shown. A list opens
+  anyway, without `DRAWING_BEGIN` and `DRAWING_END`, because the game's dialog holds them. The first boot with an
+  empty hdd directory shows the case: the game's loading thread opens its own message dialog (type `0x85`, no
+  buttons) and then calls `cellSaveDataAutoLoad2` with error dialogs requested, and the callback reports that
+  there is no data. A window run therefore logs `dal: savedata: message not shown, the game's message dialog is
+  open`, shows nothing, and the call returns `CELL_SAVEDATA_ERROR_CBRESULT`, as in RPCS3. The Auto policy does not
+  look at the game's dialog and keeps answering Yes and OK as before; this differs from RPCS3.
+- **Waiting.** The interactive driver runs on the guest thread that called, with the guest lock held. It queues
+  `CELL_SYSUTIL_DRAWING_BEGIN` (`0x0121`), takes over the pad (see [Input](input.md#system-dialogs)), publishes
+  the dialog on the board and then waits in 5 ms steps with `blockingWait`: every step gives up the guest lock so
+  the rest of the game keeps running, and the timeout keeps the thread out of the supervisor's "waits
+  indefinitely" verdict while the player reads. After each step it polls the host pad (`pollHostPad`, under the
+  lock again), steps the model and publishes a new snapshot. When the dialog closes it clears the board, releases
+  the pad and queues `CELL_SYSUTIL_DRAWING_END` (`0x0122`). The game's callback handles neither event; they are
+  sent to match RPCS3. Sequential dialogs (list, confirmation, list again) each get their own pair. The driver
+  logs `dal: savedata: dialog opened: <kind> of N rows` and `dal: savedata: dialog closed: <kind> -> <answer>`.
+- **While a dialog is open.** A savedata call from another thread returns `CELL_SAVEDATA_ERROR_BUSY` and
+  `cellMsgDialogOpen2` returns `CELL_SYSUTIL_ERROR_BUSY`. If `DRAWING_BEGIN` is refused because another system
+  dialog holds it, a confirmation ends the call with `CELL_SAVEDATA_ERROR_INTERNAL` (an error message is just not
+  shown) and a list opens anyway, without sending the matching END.
+- **No drawer.** If no overlay can draw (the window has no overlay, or its set-up failed, also after the dialog
+  opened), the driver warns once and answers as the Cancel policy: back for a list, No for a confirmation, OK for a
+  message. A dialog that nobody can draw never hangs the game.
+- **Flips.** While a dialog waits, the picture keeps being presented as long as the game flips. If the waiting
+  thread is the one that drives the flips, none comes; the renderer then presents the last image again with the
+  overlays every 33 ms after 100 ms without a flip, so the dialog stays visible (see [Overlays](rendering.md#overlays)).
+
+Deviations from RPCS3 and limits:
+
+- The enter button is circle and the back button is cross, as on a Japanese console. This is fixed for now:
+  `setEnterButtonAssign` in `runtime/src/input/pad_buttons.*` is the only place that would take a setting, and
+  no option or menu calls it.
+- The confirmation for the new-data row of a load list asks `新しいデータを作成しますか？` where RPCS3 shows its
+  save text, and the HEAD focus off-by-one of RPCS3 is not copied.
+- The list sends `DRAWING_BEGIN` and `DRAWING_END` when it can; RPCS3's list sends none.
+- Not done: sounds, the clock in the list header, the animated `ICON1.PAM`, the user name, an OPTIONS menu,
+  keyboard or mouse control of the dialog (the keyboard works only through the pad mapping), a delete list
+  (`cellSaveDataDelete2` still returns `CELL_CANCEL`) and glyphs outside the Basic Multilingual Plane (they show
+  ImGui's fallback glyph).
+- The dialog is drawn on the swapchain image only, so it is never part of `--dump-frames` files, requested dumps,
+  `readDisplay` or captures; checking it in a window needs a person or the log lines above.
+- The tests cover the model, the text, the drivers (including the timed wait and the game's message dialog), the pad
+  interception and the overlay recorded over an offscreen image (see [Tests](tests.md)).
+
 ## Input
 
 `cellPad` asks a `PadProvider` for the state of a port on every `cellPadGetData` call and reports
@@ -243,16 +339,19 @@ port 0 that never changes), `keyboard`, `gamepad` or `keyboard+gamepad`. The las
 gamepad thread; `setPadBackend` accepts only `none` and `neutral`. The option defaults are in
 [`dal_game` options](runtime-options.md#window-input-and-sound) and the key table in the
 [README](../README.md#keyboard); the script format is [below](#pad-script). Gamepads (mapping,
-selection, Steam, the GameInput runtime, log lines and tools) are described in [Input](input.md).
+selection, Steam, the GameInput runtime, log lines and tools) are described in [Input](input.md). While the
+[save data dialog](#save-data-dialog) is open it takes the pad from the game (see
+[System dialogs](input.md#system-dialogs)).
 
 | Part | File | Role |
 | --- | --- | --- |
-| Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `PadAnalog` (sticks and trigger pressure), `padStateFromButtons` and `padStateFromInput` (digital words, pressure words at 0xFF for pressed buttons or the analog trigger value, sticks, everything else as the neutral pad) and the button names used by scripts |
+| Buttons | `runtime/src/input/pad_buttons.*` | The 16 buttons as a bit mask, `PadAnalog` (sticks and trigger pressure), `padStateFromButtons` and `padStateFromInput` (digital words, pressure words at 0xFF for pressed buttons or the analog trigger value, sticks, everything else as the neutral pad) and the button names used by scripts, and `dialogButtons()`, the enter and back buttons of system dialogs (circle and cross, see [System dialogs](input.md#system-dialogs)) |
 | State and provider | `runtime/src/input/keyboard_pad.*` | The scan-code table, `KeyboardPadState` (the state of every host source: keyboard, script, gamepad) and the provider for port 0 (always connected, or connected only while a gamepad is in use with `--pad gamepad`; other ports empty) |
 | Script | `runtime/src/input/pad_script.*` | The script parser and the player thread |
 | Gamepad | `runtime/src/input/gamepad_*`, `gameinput_backend.*`, `gamecontroller_backend.*` | Backend interface, GameInput backend (Windows), GameController backend (macOS), mapping, selection, the gamepad thread and `--pad-probe`; see [Input](input.md#design) |
 | Window | `runtime/src/render/vk_window.*`, `vk_window_win32.cpp`, `vk_window_macos.mm` | Key and focus messages from the window thread (on macOS, from the main thread's event loop); on Windows it turns the IME off for the window |
 | Overlay | `runtime/src/overlay/debug_overlay.*` | The `F1` toggle, the `Tab` fast-forward hold and the message hook that decides which key presses the [debug overlay](#debug-overlay) withholds from the pad |
+| Dialog interception | `runtime/src/hle/cell_pad.cpp` | `setPadIntercepted`, `padIntercepted` and `pollHostPad`, used by the [save data dialog](#save-data-dialog) |
 
 The renderer library does not depend on `input/` or on the overlay: the window reports raw scan codes
 and, through `PresenterOptions::on_message`, raw window messages through callbacks, and `game_main.cpp`
@@ -415,7 +514,9 @@ is written once.
 The overlay is drawn on the swapchain image after the letterboxed blit, so it is never part of
 `--dump-frames` files, requested dumps, `readDisplay` or captures (see
 [Rendering](rendering.md#rendering)). It redraws only when the game flips: during a stall without
-flips (a load, for example) it freezes and takes no input. Without the window (`--no-window`,
+flips (a load, for example) it freezes and takes no input, except while a
+[save data dialog](#save-data-dialog) is open: the renderer then presents the last image again with the overlays
+(see [Overlays](rendering.md#overlays)) and the visible overlays are drawn again. Without the window (`--no-window`,
 `--render none`) there is no overlay, and `F1` and `Tab` do nothing.
 
 Design notes:
@@ -436,12 +537,15 @@ Design notes:
   fast-forwards. A change of the swapchain's surface format
   after start-up skips the overlay for that image and logs `dal: overlay: surface format changed,
   overlay skipped for that image` once.
-- One global ImGui context is guarded by a mutex. The window thread feeds it the mouse and key
+- The overlay has an ImGui context of its own. ImGui keeps its current context in one process global, so every use
+  of any overlay's context (this one and the save dialog's) takes the shared lock `imguiMutex()` in
+  `runtime/src/overlay/imgui_context.h` and makes its context current for the scope (`ImGuiContextScope`). The window
+  thread feeds the context the mouse and key
   messages (on Windows, the Win32 backend calls `SetCapture` and `GetKeyState`, which only work on the
-  thread that owns the window); the RSX thread holds the mutex while it builds and records a frame,
+  thread that owns the window); the RSX thread holds the lock while it builds and records a frame,
   and never across a swapchain call. On Windows `ImGui_ImplWin32_NewFrame` is not used, because its
   key workaround reads `GetKeyState` on the calling thread. On macOS the window passes each event to
-  `imgui_impl_osx` under the mutex instead of the backend's own event monitor, and a focus change
+  `imgui_impl_osx` under the lock instead of the backend's own event monitor, and a focus change
   reaches ImGui as an explicit focus event. Hiding the overlay sends ImGui a focus-lost event so that held
   keys and buttons are dropped, and showing it again sends a focus-gained event: ImGui 1.91.9b keeps
   clearing its input while it believes the application has no focus.
