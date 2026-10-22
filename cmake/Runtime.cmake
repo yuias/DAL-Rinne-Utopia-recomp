@@ -189,6 +189,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/cell_sysutil.cpp
     runtime/src/hle/hle.cpp
     runtime/src/hle/sail_service.cpp
+    runtime/src/hle/save_dialog_model.cpp
     runtime/src/hle/sce_np.cpp
     runtime/src/hle/sce_np_trophy.cpp
     runtime/src/hle/sys_prx_for_user.cpp
@@ -248,6 +249,14 @@ function(dal_runtime_add_core)
   add_test(NAME runtime_core COMMAND dal_runtime_tests)
   set_tests_properties(runtime_core PROPERTIES
     PASS_REGULAR_EXPRESSION "runtime core tests: [0-9]+ passed, 0 failed")
+
+  add_executable(dal_save_dialog_tests runtime/tests/save_dialog_test.cpp)
+  target_compile_options(dal_save_dialog_tests PRIVATE ${DAL_ARCH_FLAGS} -Wall -Wextra)
+  target_link_libraries(dal_save_dialog_tests PRIVATE dal_runtime_core)
+
+  add_test(NAME save_dialog COMMAND dal_save_dialog_tests)
+  set_tests_properties(save_dialog PROPERTIES
+    PASS_REGULAR_EXPRESSION "save dialog tests: [0-9]+ passed, 0 failed")
 
   # The movie pipeline's core needs no FFmpeg, so its tests link the core library only.
   add_executable(dal_media_core_tests runtime/tests/media_core_test.cpp)
