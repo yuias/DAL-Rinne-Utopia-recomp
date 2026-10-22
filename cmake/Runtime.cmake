@@ -189,6 +189,7 @@ function(dal_runtime_add_core)
     runtime/src/hle/cell_sysutil.cpp
     runtime/src/hle/hle.cpp
     runtime/src/hle/sail_service.cpp
+    runtime/src/hle/save_dialog.cpp
     runtime/src/hle/save_dialog_model.cpp
     runtime/src/hle/save_dialog_text.cpp
     runtime/src/hle/sce_np.cpp

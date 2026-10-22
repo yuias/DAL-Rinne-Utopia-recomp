@@ -2,13 +2,19 @@
 // window or game data is involved.
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "core/log.h"
+#include "hle/save_dialog.h"
 #include "hle/save_dialog_model.h"
 #include "hle/save_dialog_text.h"
 #include "input/pad_buttons.h"
@@ -395,6 +401,144 @@ void testSaveErrorText() {
     CHECK(!dal::saveErrorText(0, 0, "ignored").has_value());
 }
 
+std::shared_ptr<dal::SaveDialogContent> contentWithRows(int rows, DialogKind kind = DialogKind::List) {
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->kind = kind;
+    content->rows.resize(static_cast<std::size_t>(rows));
+    return content;
+}
+
+dal::SaveListRequest listRequest(int rows, std::int32_t initial_row, std::optional<std::int32_t> auto_row) {
+    dal::SaveListRequest request;
+    request.content = contentWithRows(rows);
+    request.initial_row = initial_row;
+    request.auto_row = auto_row;
+    return request;
+}
+
+// Collects the log lines written while it is alive.
+class LogCapture {
+public:
+    LogCapture() {
+        dal::setLogSink([this](std::string_view line) { lines.emplace_back(line); });
+    }
+    ~LogCapture() { dal::setLogSink({}); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+
+    std::vector<std::string> lines;
+};
+
+bool anyLineContains(const LogCapture& log, std::string_view text) {
+    for (const auto& line : log.lines) {
+        if (line.find(text) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void testAutoDriver() {
+    LogCapture log;
+    auto driver = dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Auto);
+    CHECK(driver->kind() == dal::SaveDialogDriverKind::Auto);
+    CHECK(!driver->interactive());
+
+    // The headless choice is passed through; initial_row plays no part.
+    CHECK(driver->showList(listRequest(3, 0, 1)) == std::optional<std::int32_t>(1));
+    CHECK(driver->showList(listRequest(3, 2, 0)) == std::optional<std::int32_t>(0));
+    CHECK(driver->showList(listRequest(3, 1, 2)) == std::optional<std::int32_t>(2));
+    CHECK(!driver->showList(listRequest(3, 1, std::nullopt)).has_value());
+    CHECK(!driver->showList(listRequest(3, 1, 3)).has_value());
+    CHECK(!driver->showList(listRequest(3, 1, -1)).has_value());
+    CHECK(!driver->showList(listRequest(0, 0, 0)).has_value());
+    dal::SaveListRequest no_content;
+    no_content.auto_row = 0;
+    CHECK(!driver->showList(no_content).has_value());
+
+    CHECK(driver->showMessage(contentWithRows(0, DialogKind::YesNo)) == dal::SaveMessageResult::Yes);
+    CHECK(driver->showMessage(contentWithRows(0, DialogKind::Ok)) == dal::SaveMessageResult::Ok);
+
+    // Existing headless logs must not change.
+    CHECK(log.lines.empty());
+}
+
+void testCancelDriver() {
+    LogCapture log;
+    auto driver = dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Cancel);
+    CHECK(driver->kind() == dal::SaveDialogDriverKind::Cancel);
+    CHECK(!driver->interactive());
+    CHECK(!driver->showList(listRequest(3, 1, 1)).has_value());
+    CHECK(log.lines.size() == 1 &&
+          log.lines[0].find("dal: savedata: dialog (cancel): list of 3 rows -> back") != std::string::npos);
+    CHECK(!driver->showList(listRequest(0, 0, std::nullopt)).has_value());
+    CHECK(anyLineContains(log, "dialog (cancel): list of 0 rows -> back"));
+    CHECK(driver->showMessage(contentWithRows(0, DialogKind::YesNo)) == dal::SaveMessageResult::No);
+    CHECK(anyLineContains(log, "dal: savedata: dialog (cancel): confirmation -> no"));
+    CHECK(driver->showMessage(contentWithRows(0, DialogKind::Ok)) == dal::SaveMessageResult::Ok);
+    CHECK(anyLineContains(log, "dal: savedata: dialog (cancel): message -> ok"));
+    CHECK(log.lines.size() == 4);
+}
+
+void testBoard() {
+    dal::SaveDialogBoard board;
+    CHECK(board.read().content == nullptr);
+    CHECK(board.drawer() == dal::SaveDialogDrawer::None);
+
+    auto content = contentWithRows(2);
+    dal::SaveDialogSnapshot snapshot;
+    snapshot.content = content;
+    snapshot.selected_row = 1;
+    snapshot.first_visible_row = 1;
+    snapshot.opacity = 0.5f;
+    board.publish(snapshot);
+    const auto first = board.read();
+    CHECK(first.content == content);
+    CHECK(first.selected_row == 1);
+    CHECK(first.first_visible_row == 1);
+    CHECK(first.opacity == 0.5f);
+
+    board.publish(snapshot);
+    const auto second = board.read();
+    CHECK(second.serial > first.serial);
+
+    board.clear();
+    const auto cleared = board.read();
+    CHECK(cleared.content == nullptr);
+    CHECK(cleared.serial > second.serial);
+
+    board.setDrawer(dal::SaveDialogDrawer::Ready);
+    CHECK(board.drawer() == dal::SaveDialogDrawer::Ready);
+    board.setDrawer(dal::SaveDialogDrawer::Failed);
+    CHECK(board.drawer() == dal::SaveDialogDrawer::Failed);
+    board.clear();
+    CHECK(board.drawer() == dal::SaveDialogDrawer::Failed);
+}
+
+void testDriverRegistry() {
+    LogCapture log;
+    dal::resetSaveDialog();
+    CHECK(dal::saveDialogDriver().kind() == dal::SaveDialogDriverKind::Auto);
+    CHECK(dal::saveDialogDriver().showMessage(contentWithRows(0, DialogKind::YesNo)) == dal::SaveMessageResult::Yes);
+    CHECK(!dal::saveDialogOpen());
+
+    dal::setSaveDialogDriver(dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Cancel));
+    CHECK(dal::saveDialogDriver().kind() == dal::SaveDialogDriverKind::Cancel);
+    CHECK(dal::saveDialogDriver().showMessage(contentWithRows(0, DialogKind::YesNo)) == dal::SaveMessageResult::No);
+    dal::setSaveDialogDriver(nullptr);
+    CHECK(dal::saveDialogDriver().kind() == dal::SaveDialogDriverKind::Auto);
+    CHECK(dal::saveDialogDriver().showMessage(contentWithRows(0, DialogKind::YesNo)) == dal::SaveMessageResult::Yes);
+
+    // resetSaveDialog empties the board and the drawer too.
+    dal::saveDialogBoard().setDrawer(dal::SaveDialogDrawer::Ready);
+    dal::SaveDialogSnapshot snapshot;
+    snapshot.content = contentWithRows(1);
+    dal::saveDialogBoard().publish(snapshot);
+    dal::setSaveDialogDriver(dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Cancel));
+    dal::resetSaveDialog();
+    CHECK(dal::saveDialogDriver().kind() == dal::SaveDialogDriverKind::Auto);
+    CHECK(dal::saveDialogBoard().read().content == nullptr);
+    CHECK(dal::saveDialogBoard().drawer() == dal::SaveDialogDrawer::None);
+}
+
 }  // namespace
 
 int main() {
@@ -421,6 +565,10 @@ int main() {
     testFormatSaveDate();
     testSaveConfirmText();
     testSaveErrorText();
+    testAutoDriver();
+    testCancelDriver();
+    testBoard();
+    testDriverRegistry();
     std::printf("save dialog tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed != 0 ? 1 : 0;
 }
