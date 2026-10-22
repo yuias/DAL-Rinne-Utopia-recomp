@@ -97,6 +97,9 @@ bool setDialogAnswer(std::string_view answer);
 // Delay before a dialog with buttons answers itself (default 200 ms).
 void setDialogAnswerDelay(std::chrono::milliseconds delay);
 
+// True while a dialog opened by cellMsgDialogOpen2 is open (until it is answered or closed). Guest lock.
+bool msgDialogOpen();
+
 // Forgets the open dialog and restores the answer and delay defaults. Intended for tests.
 void resetCellMsgDialog();
 

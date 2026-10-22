@@ -16,8 +16,9 @@
 // callback runs there).
 //
 // Deviations from RPCS3: cellMsgDialogOpen2 never blocks, a dialog has no overlay, and a failed
-// DRAWING_BEGIN leaves no dialog behind. The progress bars keep no value; only their index is
-// validated.
+// DRAWING_BEGIN leaves no dialog behind. Open2 also answers BUSY while a save data dialog is open
+// (the save dialog holds the screen and the pad). The progress bars keep no value; only their index
+// is validated.
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +34,7 @@
 #include "core/log.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "hle/save_dialog.h"
 #include "lv2/cell_error.h"
 
 namespace dal {
@@ -165,7 +167,7 @@ void open2(DalPpuContext* ctx, std::uint8_t* base) {
         return;
     }
 
-    if (g_dialog.open) {
+    if (g_dialog.open || saveDialogOpen()) {
         ctx->gpr[3] = kSysutilErrorBusy;
         return;
     }
@@ -258,6 +260,8 @@ bool setDialogAnswer(std::string_view answer) {
 }
 
 void setDialogAnswerDelay(std::chrono::milliseconds delay) { g_answer_delay = delay; }
+
+bool msgDialogOpen() { return g_dialog.open; }
 
 void resetCellMsgDialog() {
     g_dialog = {};

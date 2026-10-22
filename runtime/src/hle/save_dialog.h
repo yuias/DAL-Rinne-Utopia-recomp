@@ -1,7 +1,10 @@
 // Save data dialogs as seen by cellSaveData: what is shown (content), what the overlay draws (snapshot on the board)
 // and who answers (the driver). The Auto and Cancel drivers answer at once and never wait, so runs without a window,
 // replays and tests never block. The Auto driver also logs nothing and never touches the pad, the board or the
-// DRAWING_BEGIN/END events, so a headless run keeps exactly the output it had before the dialogs existed.
+// DRAWING_BEGIN/END events, so a headless run keeps exactly the output it had before the dialogs existed. The
+// interactive driver holds DRAWING_BEGIN, takes over the pad and waits for the player in timed waits that give up the
+// guest lock; it answers as Cancel when no overlay can draw the dialog, and refuses messages while the game's own
+// message dialog is open.
 
 #pragma once
 
@@ -88,6 +91,8 @@ public:
 
 enum class SaveDialogPolicy : std::uint8_t { Auto, Cancel };
 std::unique_ptr<SaveDialogDriver> makeAutoSaveDialogDriver(SaveDialogPolicy policy);
+// Shows dialogs on `board` and waits for the player. Without a drawer on the board it answers as Cancel.
+std::unique_ptr<SaveDialogDriver> makeInteractiveSaveDialogDriver(SaveDialogBoard& board);
 // null: Auto. Before the guest runs or under the guest lock.
 void setSaveDialogDriver(std::unique_ptr<SaveDialogDriver> driver);
 SaveDialogDriver& saveDialogDriver();
