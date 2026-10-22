@@ -51,7 +51,8 @@ function(dal_overlay_add)
     runtime/src/overlay/debug_overlay.cpp
     runtime/src/overlay/overlay_model.cpp
     runtime/src/overlay/overlay_panels.cpp
-    runtime/src/overlay/overlay_sources.cpp)
+    runtime/src/overlay/overlay_sources.cpp
+    runtime/src/overlay/ui_font.cpp)
   if(WIN32)
     target_sources(dal_overlay PRIVATE runtime/src/overlay/overlay_platform_win32.cpp)
   elseif(APPLE)

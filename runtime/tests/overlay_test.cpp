@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -24,6 +25,8 @@
 #include <windows.h>
 #endif
 
+#include "core/fatal.h"
+#include "hle/save_dialog_text.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "overlay/debug_overlay.h"
@@ -32,6 +35,7 @@
 #include "overlay/overlay_panels.h"
 #include "overlay/overlay_sources.h"
 #include "overlay/overlay_stack.h"
+#include "overlay/ui_font.h"
 #include "rsx/rsx_unimplemented.h"
 
 namespace {
@@ -969,6 +973,110 @@ void testImGuiContextScope() {
     ImGui::DestroyContext(b);
 }
 
+std::filesystem::path testExecutablePath() {
+#if defined(_WIN32)
+    return dal::executableDirectory() / "dal_overlay_tests.exe";
+#else
+    return dal::executableDirectory() / "dal_overlay_tests";
+#endif
+}
+
+void testUiFontCandidates() {
+    namespace fs = std::filesystem;
+    const auto c = dal::uiFontCandidates("custom.ttf", "elf", "exe");
+    CHECK(c.size() == 3);
+    if (c.size() == 3) {
+        CHECK(c[0] == fs::path("custom.ttf"));
+        CHECK(c[1] == fs::path("elf") / "SCE-PS3-SR-R-JPN.TTF");
+        CHECK(c[2] == fs::path("exe") / "fonts" / "BIZUDPGothic-Regular.ttf");
+    }
+    const auto no_explicit = dal::uiFontCandidates({}, "elf", "exe");
+    CHECK(no_explicit.size() == 2);
+    if (no_explicit.size() == 2) CHECK(no_explicit[0] == fs::path("elf") / "SCE-PS3-SR-R-JPN.TTF");
+    CHECK(dal::uiFontCandidates({}, {}, {}).empty());
+}
+
+void testLoadUiFont() {
+    namespace fs = std::filesystem;
+    const fs::path exe_dir = dal::executableDirectory();
+    const fs::path missing = exe_dir / "no-such-font.ttf";
+    const fs::path not_a_font = testExecutablePath();  // an executable is readable but not a font
+    const fs::path bundled = exe_dir / "fonts" / "BIZUDPGothic-Regular.ttf";
+
+    const std::vector<fs::path> junk = {missing, not_a_font};
+    CHECK(!dal::loadUiFont(junk).has_value());
+
+    std::error_code ec;
+    fs::path arial;
+#if defined(_WIN32)
+    wchar_t windir[MAX_PATH];
+    const UINT windir_len = GetWindowsDirectoryW(windir, MAX_PATH);
+    if (windir_len > 0) arial = fs::path(windir) / "Fonts" / "arial.ttf";
+    if (!arial.empty() && fs::exists(arial, ec)) {
+        const std::vector<fs::path> latin_only = {arial};
+        CHECK(!dal::loadUiFont(latin_only).has_value());
+    } else {
+        std::printf("overlay tests: ui font: arial.ttf check skipped (not found)\n");
+    }
+#else
+    std::printf("overlay tests: ui font: arial.ttf check skipped (Windows only)\n");
+#endif
+
+    if (fs::exists(bundled, ec)) {
+        const std::vector<fs::path> list = {missing, not_a_font, arial, bundled};
+        const auto font = dal::loadUiFont(list);
+        CHECK(font.has_value());
+        if (font) {
+            CHECK(font->path == bundled);
+            CHECK(font->bytes.size() > 1000);
+        }
+    } else {
+        std::printf("overlay tests: ui font: BIZ UDPGothic check skipped (%s not found)\n", bundled.string().c_str());
+    }
+}
+
+void testDialogCodePoints() {
+    dal::SaveDialogContent content;
+    content.kind = dal::DialogKind::List;
+    dal::SaveDialogRow row;
+    row.title = "\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88 \xE9\x9B\xA3";  // "テスト 難"
+    row.info = "2026/10/18  12:34   5 KB";
+    content.rows.push_back(row);
+    content.message = "line1\nline2";
+    const auto points = dal::dialogCodePoints(content);
+
+    bool ascii = true;
+    for (ImWchar c = 0x20; c <= 0x7E; ++c) ascii = ascii && points.count(c) == 1;
+    CHECK(ascii);
+    CHECK(points.count(0x30BB) == 1);  // セ
+    CHECK(points.count(0x96E3) == 1);  // 難, only in the row title
+    CHECK(points.count(0x30C6) == 1);  // テ
+    CHECK(points.count('\n') == 0);
+
+    // Every code point of a constant, including one that is not in the content.
+    ImFontGlyphRangesBuilder probe;
+    probe.AddText(dal::kConfirmOverwrite.data(), dal::kConfirmOverwrite.data() + dal::kConfirmOverwrite.size());
+    ImVector<ImWchar> expected;
+    probe.BuildRanges(&expected);
+    bool all = expected.Size > 1;
+    for (int i = 0; i + 1 < expected.Size && expected[i] != 0; i += 2) {
+        for (ImWchar c = expected[i]; c <= expected[i + 1]; ++c) all = all && points.count(c) == 1;
+    }
+    CHECK(all);
+}
+
+void testGlyphRanges() {
+    const ImVector<ImWchar> ranges = dal::glyphRanges({'A', 'B', 'C', 0x30BB});
+    CHECK(ranges.Size == 5);
+    if (ranges.Size == 5) {
+        CHECK(ranges[0] == 'A');
+        CHECK(ranges[1] == 'C');
+        CHECK(ranges[2] == 0x30BB);
+        CHECK(ranges[3] == 0x30BB);
+        CHECK(ranges[4] == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -980,6 +1088,10 @@ int main() {
     testRuntimeSources();
     testOverlayStack();
     testImGuiContextScope();
+    testUiFontCandidates();
+    testLoadUiFont();
+    testDialogCodePoints();
+    testGlyphRanges();
 
     dal::VkContextOptions options;
     options.validation = true;
