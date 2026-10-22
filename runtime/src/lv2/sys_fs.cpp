@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 #include "core/guest_memory.h"
@@ -380,7 +381,8 @@ std::uint64_t transferAt(host::File& file, bool write, std::uint64_t offset, std
     } else {
         total = transfer(file, write, data, size, code);
     }
-    file.seek(static_cast<std::int64_t>(*saved), kSeekSet);
+    // Best effort: the transfer's result is already decided, and a failed restore has no error to report.
+    std::ignore = file.seek(static_cast<std::int64_t>(*saved), kSeekSet);
     return total;
 }
 
@@ -742,7 +744,8 @@ void sysFsWrite(DalPpuContext* ctx, std::uint8_t* base) {
     }
 
     if ((file->flags & kOAppend) != 0) {
-        file->file.seek(0, kSeekEnd);
+        // A failed seek leaves the position as it was; the write below reports any I/O error.
+        std::ignore = file->file.seek(0, kSeekEnd);
     }
     std::uint32_t code = kCellOk;
     const std::uint64_t total = transfer(file->file, true, base + buf, nbytes, code);
