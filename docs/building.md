@@ -197,6 +197,8 @@ These can also be passed to `cmake` directly (`cmake --preset release -D<name>=<
 | `DAL_EBOOT_ELF` | empty | Set by `-EbootElf`. While it is empty and `DAL_EBOOT_BIN` is set, configuration sets it to `generated/inputs/EBOOT.elf`. |
 | `DAL_EBOOT_BIN` | empty | Set by `-EbootBin`. |
 | `DAL_RPCS3_CRYPTO_DIR` | empty | Set by `-Rpcs3CryptoDir`. |
+| `DAL_UI_FONT_FILE` | empty | A local `BIZUDPGothic-Regular.ttf` to use as the save dialog's fallback font instead of the download (see [Fallback UI font](#fallback-ui-font)). |
+| `DAL_UI_FONT_URL_BASE` | the pinned raw GitHub URL | URL prefix the fallback font and its licence are downloaded from. Change it only to test the failure path. |
 | `DAL_FFMPEG_DIR` | empty | An extracted FFmpeg build to use instead of `generated/deps/ffmpeg/<pinned build>` (see [Movies](movies.md)). On macOS: the Homebrew prefix of FFmpeg to use instead of `$(brew --prefix ffmpeg)`. |
 | `DAL_GAMEINPUT_DIR` | empty | Windows only. An extracted `Microsoft.GameInput` package to use instead of `generated/deps/gameinput/<pinned version>` (see [Input](input.md#the-gameinput-package)). Configure needs the package from `tools/fetch-gameinput.ps1`. |
 | `DAL_LLVM_PREFIX` | `$(brew --prefix llvm)` | macOS only. The LLVM installation whose clang is used (a CMake variable or an environment variable); set by `--llvm-prefix`. |
@@ -289,6 +291,33 @@ device-thread code of the audio outputs `dal_audio_stream`, and the platform lib
 GPU. `dal_game` is built only with `-GeneratedDir`, because only `runtime/src/game_main.cpp` passes
 the generated tables to the core. It checks the executable against the SHA-256 that the generated
 code was emitted from.
+
+## Fallback UI font
+
+The save data dialog (see [Save data dialog](runtime.md#save-data-dialog)) draws Japanese text and needs a font that
+has it. At run time it takes the first usable font of: the `--ui-font` file, `SCE-PS3-SR-R-JPN.TTF` in the directory of
+the ELF (the firmware's Japanese system font, if you put a copy there; the build does not extract it), then the fallback described here. The fallback is BIZ UDPGothic Regular (SIL Open Font
+License 1.1, <https://github.com/googlefonts/morisawa-biz-ud-gothic>). Configuration downloads
+`fonts/ttf/BIZUDPGothic-Regular.ttf` and `OFL.txt` from commit `18934af56b9c003ca58c54bffbf226848cb11032`
+into `generated/deps/fonts/<commit>/` and checks their SHA-256 (the pins are in `cmake/ui_font.cmake`):
+
+| File | SHA-256 |
+| --- | --- |
+| `BIZUDPGothic-Regular.ttf` | `258d7156c165f2ff774b6efee637c22c3b950de0d8a10e501137061bc8085d01` |
+| `OFL.txt` | `e753d7155d53c747d037a445e584c8ecfca6dd79846db610417e282a736b28bc` |
+
+The ALL target `dal_ui_fonts` copies the font to `build/<preset>/bin/fonts/` and the licence to
+`build/<preset>/bin/licenses/biz-udgothic/OFL.txt`, so the font sits next to `dal_game` where the dialog looks for it.
+Unlike the keys, the font is optional: a failed download, or a file whose hash differs from the pin, prints one
+`DAL: warning:` line, configuration goes on and `dal_ui_fonts` is not created. A font is copied only together with
+its licence text. Without any font the dialog uses ImGui's default font, which has no Japanese glyphs, so they show
+as `?`; the log then says so (`dal: overlay: no UI font with Japanese glyphs found`). `tools/build.ps1` and
+`tools/build.sh` need no parameter for this: configuration does the download on Windows and on macOS.
+
+To build offline, put `BIZUDPGothic-Regular.ttf` and `OFL.txt` with the pinned hashes into
+`generated/deps/fonts/<commit>/` before configuring, or set `DAL_UI_FONT_FILE` to a local
+`BIZUDPGothic-Regular.ttf`. A file given that way is used even if its hash differs from the pin (configuration
+prints a line); its licence text is still taken from the pinned `OFL.txt` when that can be had.
 
 ## Test builds
 

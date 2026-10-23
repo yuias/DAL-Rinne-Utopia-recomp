@@ -10,14 +10,23 @@
 // core/param_sfo) next to the files. Files are collected in memory and committed through a
 // ".working_<dir>" directory and a ".backup_<dir>" swap, as RPCS3 does.
 //
-// Headless policy (RPCS3 opens dialogs and waits for the user; nothing here can):
+// Dialogs (RPCS3 opens them and waits for the user). The SaveDialogDriver (hle/save_dialog.h) decides:
+//  - The save list of ListSave2/ListLoad2 and the Yes/No confirmation after a pick go through the
+//    driver. A No returns to the list on the picked row; back from the list returns CELL_CANCEL; a
+//    confirmation the driver cannot show returns CELL_SAVEDATA_ERROR_INTERNAL. The Auto driver (no
+//    window, pad script, tests) keeps the old headless choice: the entry the list would highlight
+//    (funcList's focus position); ListLoad2 falls back to the newest entry; ListSave2 falls back to
+//    the "new data" slot when the game supplied one; without a choice the call returns CELL_CANCEL, as
+//    RPCS3 does without a save dialog. It answers every confirmation with Yes, silently.
 //  - Error dialogs (errDialog of the Auto functions; ListSave2/ListLoad2 always ask for one): the
-//    text is logged and the error code is returned, with RPCS3's NOREPEAT bookkeeping. No dialog
-//    object is created, so the game sees no DRAWING_BEGIN/END events for it.
-//  - The save list of ListSave2/ListLoad2 is never shown. The entry is chosen as the list would
-//    highlight it (funcList's focus position); ListLoad2 falls back to the newest entry; ListSave2
-//    falls back to the "new data" slot when the game supplied one; without a choice the call
-//    returns CELL_CANCEL, as RPCS3 does without a save dialog. Confirmation prompts count as YES.
+//    English text is logged, an OK message with the Japanese text is shown through the driver, and
+//    CBRESULT is returned whatever the player does, with RPCS3's NOREPEAT bookkeeping. The Auto
+//    driver answers OK without showing anything, so the game sees no DRAWING_BEGIN/END events for it.
+//  - While the game's own cellMsgDialogOpen2 dialog is open, an interactive driver shows no confirmation
+//    and no error message, as in RPCS3 (its message dialog open returns BUSY): the confirmation fails with
+//    INTERNAL, the error message is dropped, and the save list still opens. On a first boot the game's
+//    loading dialog is open around AutoLoad2, so its "no data" error message is not shown. The Auto driver
+//    ignores the game's dialog and keeps answering Yes/OK.
 //  - cellSaveDataDelete2 only opens a selection UI in RPCS3, so it returns CELL_CANCEL.
 //
 // Deviations from RPCS3:
@@ -38,11 +47,13 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -57,6 +68,8 @@
 #include "core/param_sfo.h"
 #include "dal/ppu_context.h"
 #include "hle/hle.h"
+#include "hle/save_dialog.h"
+#include "hle/save_dialog_text.h"
 #include "lv2/cell_error.h"
 #include "lv2/vfs.h"
 
@@ -70,9 +83,11 @@ constexpr char kModule[] = "cellSysutil";
 // CELL_SAVEDATA_ERROR_*
 constexpr std::uint32_t kErrorCbResult = 0x8002b401;
 constexpr std::uint32_t kErrorAccess = 0x8002b402;
+constexpr std::uint32_t kErrorInternal = 0x8002b403;
 constexpr std::uint32_t kErrorParam = 0x8002b404;
-constexpr std::uint32_t kErrorBroken = 0x8002b406;
-constexpr std::uint32_t kErrorFailure = 0x8002b407;
+// Not kErrorBroken/kErrorFailure: save_dialog_text.h has dialog texts of those names.
+constexpr std::uint32_t kErrBroken = 0x8002b406;
+constexpr std::uint32_t kErrFailure = 0x8002b407;
 constexpr std::uint32_t kErrorBusy = 0x8002b408;
 constexpr std::uint32_t kCancel = 1;  // CELL_CANCEL
 
@@ -161,6 +176,12 @@ constexpr std::uint32_t kListSetFixedList = 12;
 constexpr std::uint32_t kListSetNewData = 16;
 constexpr std::uint32_t kNewDataIconPosition = 0;
 constexpr std::uint32_t kNewDataDirName = 4;
+constexpr std::uint32_t kNewDataIcon = 8;
+// CellSaveDataNewDataIcon
+constexpr std::uint32_t kIconBufTitle = 0;
+constexpr std::uint32_t kIconBufSize = 4;
+constexpr std::uint32_t kIconBuf = 8;
+constexpr std::uint32_t kIconBufMaxSize = 225280;  // CELL_SAVEDATA_ICONBUF_SIZE
 constexpr std::uint32_t kDirListDirName = 0;
 constexpr std::uint32_t kDirListListParam = 32;
 // CellSaveDataStatGet
@@ -336,6 +357,7 @@ struct SaveEntry {
     std::string details;
     std::uint64_t size = 0;
     Times times;
+    std::shared_ptr<const std::vector<std::uint8_t>> icon0;  // ICON0.PNG; null when missing or empty
     bool is_new = false;
 };
 
@@ -392,6 +414,38 @@ std::optional<SaveEntry> loadEntry(const stdfs::path& root, const std::string& e
     return entry;
 }
 
+// The entry's modification time as local calendar time, which is what the console's list shows.
+std::tm localTime(std::int64_t unix_seconds) {
+    std::tm out{};
+    const auto seconds = static_cast<std::time_t>(unix_seconds);
+#ifdef _WIN32
+    const bool ok = localtime_s(&out, &seconds) == 0;
+#else
+    const bool ok = localtime_r(&seconds, &out) != nullptr;
+#endif
+    if (!ok) {
+        out = {};
+        out.tm_year = 70;
+        out.tm_mday = 1;
+    }
+    return out;
+}
+
+// Confirmation text of a listed entry: the question and the info block (title, subtitle, date, size, detail).
+std::string entryConfirmText(std::string_view question, const SaveEntry& entry) {
+    return saveConfirmText(question, entry.title, entry.subtitle, formatSaveDate(localTime(entry.times.mtime)),
+                           formatSaveSize(entry.size), entry.details);
+}
+
+SaveDialogRow entryRow(const SaveEntry& entry) {
+    SaveDialogRow row;
+    row.title = entry.subtitle.empty() ? entry.title : entry.subtitle;
+    row.info = saveRowInfo(localTime(entry.times.mtime), entry.size);
+    row.detail = entry.details;
+    row.icon_png = entry.icon0;
+    return row;
+}
+
 // Everything one savedata_op call works with.
 struct OpState {
     DalPpuContext* ctx = nullptr;
@@ -411,9 +465,11 @@ std::int32_t runCallback(OpState& s, std::uint32_t func, std::uint32_t get, std:
     return read32s(s, s.result + kResultResult);
 }
 
-// RPCS3 `display_callback_result_error_message`, minus the blocking dialog (see the header).
+// RPCS3 `display_callback_result_error_message`. The log text is English; the dialog shows the Japanese text
+// of saveErrorText(), or the game's own message for ERR_INVALID.
 std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::uint32_t err_dialog) {
     std::string msg;
+    std::string invalid_msg;  // empty when the game's pointer is null
     switch (result) {
         case kCbErrNoSpace:
             msg = std::format("not enough space ({} KB needed)", read32s(s, s.result + kResultErrNeedSizeKb));
@@ -423,7 +479,8 @@ std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::ui
         case kCbErrNoData: msg = "there is no save data"; break;
         case kCbErrInvalid: {
             const std::uint32_t text = dalRead32(s.base, s.result + kResultInvalidMsg);
-            msg = text != 0 ? getText(s.base, text, 256) : std::string("invalid");
+            if (text != 0) invalid_msg = getText(s.base, text, 256);
+            msg = text != 0 ? invalid_msg : std::string("invalid");
             break;
         }
         default:
@@ -434,8 +491,23 @@ std::uint32_t reportCallbackError(const OpState& s, std::int32_t result, std::ui
     if (err_dialog == kErrDialogNoRepeat) g_last_error_dialog = result;
     if (err_dialog == kErrDialogNone || (err_dialog == kErrDialogNoRepeat && repeat)) {
         logInfo("dal: savedata: callback result {}: {} (no dialog requested)", result, msg);
+        return kErrorCbResult;
+    }
+
+    SaveDialogDriver& driver = saveDialogDriver();
+    if (driver.interactive()) {
+        logWarn("dal: savedata: error dialog: {}", msg);
     } else {
         logWarn("dal: savedata: error dialog (headless, not shown): {}", msg);
+    }
+    // The result is ignored, as in RPCS3: the game sees CBRESULT whether or not the player read the message.
+    const std::optional<std::string> text =
+            saveErrorText(result, read32s(s, s.result + kResultErrNeedSizeKb), invalid_msg);
+    if (text) {
+        auto content = std::make_shared<SaveDialogContent>();
+        content->kind = DialogKind::Ok;
+        content->message = *text;
+        driver.showMessage(std::move(content));
     }
     return kErrorCbResult;
 }
@@ -597,10 +669,18 @@ ListResult runListStep(OpState& s, Op op, std::uint32_t err_dialog, std::uint32_
         selected_list.insert(name);
     }
     std::erase_if(entries, [&](const SaveEntry& e) { return !selected_list.contains(e.dir_name); });
+    // Icons only for the saves that stay listed: each can be up to an icon buffer in size.
+    for (SaveEntry& entry : entries) {
+        if (auto icon = readFile(root / entry.escaped / "ICON0.PNG"); icon && !icon->empty()) {
+            entry.icon0 = std::make_shared<const std::vector<std::uint8_t>>(std::move(*icon));
+        }
+    }
 
     const std::uint32_t new_data = dalRead32(base, s.list_set + kListSetNewData);
     std::string new_dir;
     std::uint32_t new_icon_pos = 0;
+    std::string new_title;
+    std::shared_ptr<const std::vector<std::uint8_t>> new_icon;
     if (new_data != 0) {
         new_icon_pos = dalRead32(base, new_data + kNewDataIconPosition);
         if (new_icon_pos > kIconPosTail) return fail(paramError(43, std::format("(iconPosition={:#x})", new_icon_pos)));
@@ -613,6 +693,21 @@ ListResult runListStep(OpState& s, Op op, std::uint32_t err_dialog, std::uint32_
                 if (!new_dir.empty()) return fail(paramError(46));
                 break;
             default: break;
+        }
+        // The icon only decorates the dialog, so a pointer outside committed guest memory (an
+        // uninitialised field) means "no icon" instead of an error.
+        const GuestMemory& memory = process().memory;
+        const std::uint32_t icon = dalRead32(base, new_data + kNewDataIcon);
+        if (icon != 0 && memory.isCommitted(icon, kIconBuf + 4)) {
+            const std::uint32_t title_addr = dalRead32(base, icon + kIconBufTitle);
+            if (title_addr != 0 && memory.isCommitted(title_addr, 1)) new_title = getText(base, title_addr, kTitleSize);
+            const std::uint32_t icon_size = dalRead32(base, icon + kIconBufSize);
+            const std::uint32_t icon_addr = dalRead32(base, icon + kIconBuf);
+            if (icon_addr != 0 && icon_size > 0 && icon_size <= kIconBufMaxSize &&
+                memory.isCommitted(icon_addr, icon_size)) {
+                new_icon = std::make_shared<const std::vector<std::uint8_t>>(base + icon_addr,
+                                                                             base + icon_addr + icon_size);
+            }
         }
     }
 
@@ -668,7 +763,7 @@ ListResult runListStep(OpState& s, Op op, std::uint32_t err_dialog, std::uint32_
         default: return fail(paramError(34, std::format("(focusPosition={:#x})", focus_pos)));
     }
 
-    // Headless choice (see the header).
+    // The Auto driver's answer: the headless choice (see the header).
     std::int32_t selected = -2;
     const bool can_make_new = op == Op::ListSave && new_data != 0;
     if (can_make_new && focus_pos == kFocusNewData) {
@@ -686,19 +781,89 @@ ListResult runListStep(OpState& s, Op op, std::uint32_t err_dialog, std::uint32_
     } else if (can_make_new) {
         selected = -1;
     }
-    if (selected == -2) {
-        logInfo("dal: savedata: {}: no entry to choose without a save list dialog, cancelling", opName(op));
-        return fail(kCancel);
+
+    // Rows in the entries' sorted order, with the new-data row first for HEAD and last for TAIL.
+    const bool has_new_row = new_data != 0;
+    const bool new_first = has_new_row && new_icon_pos != kIconPosTail;
+    const std::int32_t first_entry_row = new_first ? 1 : 0;
+    const std::int32_t new_row = !has_new_row ? -1 : (new_first ? 0 : count);
+    std::vector<SaveDialogRow> rows;
+    for (const SaveEntry& entry : entries) rows.push_back(entryRow(entry));
+    if (has_new_row) {
+        SaveDialogRow row;
+        row.title = new_title.empty() ? std::string(kNewDataTitle) : new_title;
+        row.info = std::string(kNewDataLine);
+        row.icon_png = new_icon;
+        row.new_data = true;
+        rows.insert(rows.begin() + (new_first ? 0 : count), std::move(row));
+    }
+
+    std::int32_t initial_row = 0;
+    if (focus_pos == kFocusNewData) {
+        initial_row = new_row;
+    } else if (focused >= 0) {
+        initial_row = focused + first_entry_row;
+    }
+    std::optional<std::int32_t> auto_row;
+    if (selected == -1) {
+        auto_row = new_row;
+    } else if (selected >= 0) {
+        auto_row = selected + first_entry_row;
+    }
+
+    bool chose_new = false;
+    const SaveEntry* chosen = nullptr;
+    SaveDialogDriver& driver = saveDialogDriver();
+    const bool saving = op == Op::ListSave;
+    for (;;) {
+        auto list = std::make_shared<SaveDialogContent>();
+        list->kind = DialogKind::List;
+        list->list_kind = saving ? SaveListKind::Save : SaveListKind::Load;
+        list->rows = rows;
+        const std::optional<std::int32_t> row = driver.showList({std::move(list), initial_row, auto_row});
+        if (!row) {
+            if (driver.kind() == SaveDialogDriverKind::Auto) {
+                logInfo("dal: savedata: {}: no entry to choose without a save list dialog, cancelling", opName(op));
+            } else {
+                logInfo("dal: savedata: {}: save list cancelled", opName(op));
+            }
+            return fail(kCancel);
+        }
+        if (*row < 0 || *row >= static_cast<std::int32_t>(rows.size())) {
+            logError("dal: savedata: {}: the dialog returned row {} of {}, cancelling", opName(op), *row, rows.size());
+            return fail(kCancel);
+        }
+        initial_row = *row;
+
+        const bool is_new = *row == new_row;
+        const SaveEntry* entry = is_new ? nullptr : &entries[static_cast<std::size_t>(*row - first_entry_row)];
+        auto confirm = std::make_shared<SaveDialogContent>();
+        confirm->kind = DialogKind::YesNo;
+        confirm->list_kind = saving ? SaveListKind::Save : SaveListKind::Load;
+        if (is_new) {
+            confirm->message = std::string(saving ? kConfirmSaveNew : kConfirmLoadNew);
+        } else {
+            confirm->message = entryConfirmText(saving ? kConfirmOverwrite : kConfirmLoad, *entry);
+        }
+        const SaveMessageResult answer = driver.showMessage(std::move(confirm));
+        if (answer == SaveMessageResult::Failed) {
+            logWarn("dal: savedata: {}: the confirmation could not be shown", opName(op));
+            return fail(kErrorInternal);
+        }
+        if (answer == SaveMessageResult::Yes) {
+            chose_new = is_new;
+            chosen = entry;
+            break;
+        }
     }
 
     if (dir_num != 0) clearBuf();  // funcStat gets a clean buffer
-    if (selected == -1) {
+    if (chose_new) {
         logInfo("dal: savedata: {}: new save '{}' chosen", opName(op), new_dir);
         return {false, kCellOk, new_dir};
     }
-    const std::string& chosen = entries[static_cast<std::size_t>(selected)].dir_name;
-    logInfo("dal: savedata: {}: entry '{}' chosen of {}", opName(op), chosen, count);
-    return {false, kCellOk, chosen};
+    logInfo("dal: savedata: {}: entry '{}' chosen of {}", opName(op), chosen->dir_name, count);
+    return {false, kCellOk, chosen->dir_name};
 }
 
 // In-memory copy of a save's files while the callbacks run.
@@ -770,7 +935,7 @@ std::uint32_t savedataOp(OpState& s, Op op, std::uint32_t err_dialog, std::uint3
     }
     if (!isValidDirName(save.dir_name)) {
         logError("dal: savedata: invalid save directory name '{}'", save.dir_name);
-        return kErrorBroken;
+        return kErrBroken;
     }
     save.escaped = save.dir_name;
     const stdfs::path dir_path = root / save.escaped;
@@ -1003,7 +1168,7 @@ std::uint32_t savedataOp(OpState& s, Op op, std::uint32_t err_dialog, std::uint3
                 if (file == files.end() || file->second.size() <= file_offset) {
                     logError("dal: savedata: cannot read '{}' (size {}, offset {})", path,
                              file == files.end() ? -1 : static_cast<std::int64_t>(file->second.size()), file_offset);
-                    savedata_result = kErrorFailure;
+                    savedata_result = kErrFailure;
                     break;
                 }
                 const std::size_t n = std::min<std::size_t>(file_size, file->second.size() - file_offset);
@@ -1025,7 +1190,7 @@ std::uint32_t savedataOp(OpState& s, Op op, std::uint32_t err_dialog, std::uint3
             case kFileOpDelete:
                 if (files.erase(path) == 0) {
                     logError("dal: savedata: cannot delete '{}'", path);
-                    savedata_result = kErrorFailure;
+                    savedata_result = kErrFailure;
                     break;
                 }
                 sfo.ints.erase("*" + path);
@@ -1071,7 +1236,7 @@ void runOp(DalPpuContext* ctx, std::uint8_t* base, Op op, std::uint32_t version,
         g_scratch = process().main.allocate(kScratchUsed, 16);
         if (g_scratch == 0) {
             logError("dal: savedata: cannot allocate the callback structures");
-            ctx->gpr[3] = kErrorFailure;
+            ctx->gpr[3] = kErrFailure;
             return;
         }
     }

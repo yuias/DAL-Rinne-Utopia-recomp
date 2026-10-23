@@ -97,6 +97,9 @@ bool setDialogAnswer(std::string_view answer);
 // Delay before a dialog with buttons answers itself (default 200 ms).
 void setDialogAnswerDelay(std::chrono::milliseconds delay);
 
+// True while a dialog opened by cellMsgDialogOpen2 is open (until it is answered or closed). Guest lock.
+bool msgDialogOpen();
+
 // Forgets the open dialog and restores the answer and delay defaults. Intended for tests.
 void resetCellMsgDialog();
 
@@ -162,7 +165,17 @@ void setPadProvider(std::unique_ptr<PadProvider> provider);
 // standard pad that never changes). Returns false for any other name.
 bool setPadBackend(std::string_view name);
 
-// Forgets the init state and restores the default provider. Intended for tests.
+// A system dialog has the pad: cellPadGetData reports no change, cellPadGetInfo2 sets
+// CELL_PAD_INFO_INTERCEPTED. Ending it starts the release phase (one change to a neutral pad, then no
+// change until START, SELECT, cross, circle, triangle and square are up on every connected port).
+// Guest lock.
+void setPadIntercepted(bool intercepted);
+bool padIntercepted();
+
+// The provider's state of `port` without change detection; leaves what the game was told alone. Guest lock.
+PadPortState pollHostPad(std::uint32_t port);
+
+// Forgets the init state and the interception and restores the default provider. Intended for tests.
 void resetCellPad();
 
 // Handlers of the cellPngDec imports: Create, Destroy, ExtOpen, ExtReadHeader, ExtSetParameter,

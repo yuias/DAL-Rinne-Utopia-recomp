@@ -115,7 +115,7 @@ const std::string kRequired =
 
 void testGameOptionSpecs() {
     const std::span<const dal::OptionSpec> specs = dal::gameOptionSpecs();
-    CHECK(specs.size() == 27);
+    CHECK(specs.size() == 29);
     CHECK(specs.front().name == "game-dir" && specs.back().name == "no-window");
     CHECK(dal::configKeyFor("game-dir") == "game_dir");
     CHECK(dal::configKeyFor("dump-frames-every") == "dump_frames_every");
@@ -1005,6 +1005,125 @@ void testConfigFileFailures() {
     CHECK(expectUsageError({"--game-dir"}, "error: --game-dir: 1 required TEXT missing\n"));
 }
 
+// The dialog mode is settled from the window, the pad and the pad script; --ui-font is a plain path.
+void testSaveDialogOptions() {
+    const TempDir dir("dal_game_options_dialog");
+    const std::string script = dir.write("pad.txt", "0.1 tap cross\n");
+
+    // Defaults: the window with a host pad shows the dialog, everything unattended answers by itself.
+    for (const char* pad : {"keyboard", "gamepad", "keyboard+gamepad"}) {
+        const auto result = parse({"--game-dir", "g", "--pad", pad});
+        CHECK(result.has_value() && result->save_dialog == "window");
+    }
+    {
+        const auto result = parse({"--game-dir", "g"});
+        CHECK(result.has_value() && result->pad == "keyboard+gamepad" && result->save_dialog == "window");
+        CHECK(result.has_value() && result->ui_font.empty());
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--no-window"});
+        CHECK(result.has_value() && result->save_dialog == "auto");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--pad", "neutral"});
+        CHECK(result.has_value() && result->window && result->save_dialog == "auto");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--pad", "none"});
+        CHECK(result.has_value() && result->save_dialog == "auto");
+    }
+    {
+        // A script makes the window run unattended.
+        const auto result = parse({"--game-dir", "g", "--pad-script", script});
+        CHECK(result.has_value() && result->window && result->save_dialog == "auto");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--no-window", "--pad-script", script});
+        CHECK(result.has_value() && result->save_dialog == "auto");
+    }
+
+    // Explicit values.
+    {
+        const auto result = parse({"--game-dir", "g", "--save-dialog", "cancel"});
+        CHECK(result.has_value() && result->save_dialog == "cancel");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--no-window", "--save-dialog=cancel"});
+        CHECK(result.has_value() && result->save_dialog == "cancel");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--save-dialog", "auto"});
+        CHECK(result.has_value() && result->save_dialog == "auto");
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--save-dialog", "window"});
+        CHECK(result.has_value() && result->save_dialog == "window");
+    }
+    {
+        // Allowed together with a script: the player can take over a scripted window run.
+        const auto result = parse({"--game-dir", "g", "--pad-script", script, "--save-dialog", "window"});
+        CHECK(result.has_value() && result->save_dialog == "window");
+    }
+    {
+        // The last one wins, as for every option.
+        const auto result = parse({"--game-dir", "g", "--save-dialog", "cancel", "--save-dialog", "auto"});
+        CHECK(result.has_value() && result->save_dialog == "auto");
+    }
+
+    const std::string needs = " window needs the window and --pad keyboard, gamepad or keyboard+gamepad\n";
+    CHECK(expectUsageError({"--game-dir", "g", "--save-dialog", "bogus"},
+                           "error: --save-dialog needs auto, cancel or window\n"));
+    CHECK(expectUsageError({"--game-dir", "g", "--save-dialog", "Window"},
+                           "error: --save-dialog needs auto, cancel or window\n"));
+    CHECK(expectUsageError({"--game-dir", "g", "--no-window", "--save-dialog", "window"},
+                           "error: --save-dialog" + needs));
+    CHECK(expectUsageError({"--game-dir", "g", "--render", "none", "--save-dialog", "window"},
+                           "error: --save-dialog" + needs));
+    CHECK(expectUsageError({"--game-dir", "g", "--pad", "none", "--save-dialog", "window"},
+                           "error: --save-dialog" + needs));
+    CHECK(expectUsageError({"--game-dir", "g", "--pad", "neutral", "--save-dialog", "window"},
+                           "error: --save-dialog" + needs));
+
+    // --ui-font from the command line stays as given.
+    {
+        const auto result = parse({"--game-dir", "g", "--ui-font", "fonts/x.ttf"});
+        CHECK(result.has_value() && result->ui_font == std::filesystem::path("fonts/x.ttf"));
+    }
+    {
+        const auto result = parse({"--game-dir", "g", "--ui-font=-odd.ttf"});
+        CHECK(result.has_value() && result->ui_font == std::filesystem::path("-odd.ttf"));
+    }
+
+    // The same keys in a config file; a relative ui_font is relative to the file.
+    const ScopedCwd cwd(dir.path());
+    const std::string file = utf8Of(std::filesystem::absolute("config.json"));
+    dir.write("config.json", R"({"game_dir": "g", "save_dialog": "cancel", "ui_font": "fonts/x.ttf"})");
+    {
+        const auto result = parse({});
+        CHECK(result.has_value());
+        if (result) {
+            CHECK(result->save_dialog == "cancel");
+            CHECK(normal(result->ui_font) == normal(std::filesystem::current_path() / "fonts" / "x.ttf"));
+        }
+    }
+    {
+        // The command line beats the file.
+        const auto result = parse({"--save-dialog", "auto", "--ui-font", "cli.ttf"});
+        CHECK(result.has_value() && result->save_dialog == "auto" &&
+              result->ui_font == std::filesystem::path("cli.ttf"));
+    }
+    dir.write("config.json", R"({"game_dir": "g", "save_dialog": "window", "no_window": true})");
+    // The message names the file already, so no note follows.
+    CHECK(expectUsageError({}, "error: " + file + ": save_dialog" + needs));
+    dir.write("config.json", R"({"game_dir": "g", "save_dialog": "bogus"})");
+    CHECK(expectUsageError({}, "error: " + file + ": save_dialog needs auto, cancel or window\n"));
+    dir.write("config.json", R"({"game_dir": "g", "pad": "none"})");
+    CHECK(expectUsageError({"--save-dialog", "window"},
+                           "error: --save-dialog" + needs + "note: settings were also read from " + file + "\n"));
+    dir.write("config.json", R"({"game_dir": "g", "save_dialog": 1})");
+    CHECK(expectConfigFailure(parse({}), "error: " + file + ": \"save_dialog\": expected a string, got number\n"));
+}
+
 void testConfigUnknownKeyWarning() {
     const TempDir dir("dal_game_options_cfg");
     dir.write("config.json", R"({"game_dir": "g", "future_option": 1, "config": "x.json"})");
@@ -1077,6 +1196,7 @@ int main() {
     testConfigValueErrors();
     testConfigConflictNote();
     testConfigFileFailures();
+    testSaveDialogOptions();
     testConfigUnknownKeyWarning();
     testApplyGameOptionsConfigLog();
     std::printf("game options tests: %d passed, %d failed\n", g_passed, g_failed);

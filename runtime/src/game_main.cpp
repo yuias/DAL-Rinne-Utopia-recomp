@@ -45,6 +45,7 @@
 #include "dal/ppu_context.h"
 #include "hle/cell_audio_ports.h"
 #include "hle/hle.h"
+#include "hle/save_dialog.h"
 #if defined(_WIN32)
 #include "input/gameinput_backend.h"
 #elif defined(__APPLE__)
@@ -60,6 +61,9 @@
 #include "media/movie_decoder.h"
 #include "overlay/debug_overlay.h"
 #include "overlay/overlay_sources.h"
+#include "overlay/overlay_stack.h"
+#include "overlay/save_dialog_overlay.h"
+#include "overlay/ui_font.h"
 #include "render/vk_context.h"
 #include "render/vk_renderer.h"
 #include "render/vk_window.h"
@@ -74,22 +78,28 @@ bool padUsesGamepad(std::string_view pad) { return pad == "gamepad" || pad == "k
 // counters are published for the census, which reads them from another one.
 class VulkanExecutor final : public dal::RsxExecutor {
 public:
-    // `presenter` and `overlay` may be null (no window).
+    // `presenter`, `overlay` and `save_overlay` may be null (no window).
     VulkanExecutor(std::unique_ptr<dal::VkContext> context, std::unique_ptr<dal::Presenter> presenter,
-                   std::unique_ptr<dal::DebugOverlay> overlay, const dal::RenderOptions& options)
+                   std::unique_ptr<dal::DebugOverlay> overlay, std::unique_ptr<dal::SaveDialogOverlay> save_overlay,
+                   const dal::RenderOptions& options)
         : context_(std::move(context)),
           presenter_(std::move(presenter)),
           overlay_(std::move(overlay)),
+          save_overlay_(std::move(save_overlay)),
           renderer_(std::make_unique<dal::RsxRenderer>(*context_, options)) {
         renderer_->setPresenter(presenter_.get());
-        renderer_->setPresentOverlay(overlay_.get());
+        // The save dialog is drawn first, so the debug overlay stays on top of it.
+        overlays_.add(save_overlay_.get());
+        overlays_.add(overlay_.get());
+        renderer_->setPresentOverlay(overlay_ || save_overlay_ ? &overlays_ : nullptr);
     }
 
     ~VulkanExecutor() override {
         // The renderer and the swapchain go before the device they were created from. The presenter's
-        // destructor joins the window thread, which calls into the overlay, so the overlay outlives it.
+        // destructor joins the window thread, which calls into the overlays, so the overlays outlive it.
         renderer_.reset();
         presenter_.reset();
+        save_overlay_.reset();
         overlay_.reset();
         context_.reset();
     }
@@ -129,12 +139,17 @@ public:
         return counts;
     }
 
+    // RSX thread, no FIFO work: keeps an open save dialog on screen while the game does not flip.
+    void idle() override { renderer_->presentIdle(); }
+
     std::uint64_t flushOutput(std::chrono::milliseconds timeout) override { return renderer_->flushDumps(timeout); }
 
 private:
     std::unique_ptr<dal::VkContext> context_;
     std::unique_ptr<dal::Presenter> presenter_;
     std::unique_ptr<dal::DebugOverlay> overlay_;
+    std::unique_ptr<dal::SaveDialogOverlay> save_overlay_;
+    dal::OverlayStack overlays_;
     std::unique_ptr<dal::RsxRenderer> renderer_;
     std::atomic<std::uint64_t> draws_{0}, skipped_{0}, clears_{0}, flips_{0};
     std::atomic<bool> failed_{false};
@@ -143,6 +158,7 @@ private:
 // Runs on the RSX thread; a null result makes the consumer continue without rendering.
 std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const dal::GameOptions& opt,
                                                        const std::shared_ptr<dal::KeyboardPadState>& keyboard,
+                                                       const std::vector<std::filesystem::path>& ui_font_candidates,
                                                        std::string& error) {
     const auto start = std::chrono::steady_clock::now();
     dal::VkContextOptions context_options;
@@ -169,9 +185,12 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const dal::GameOptions& o
     // Declared before the presenter so that on every return path the presenter (and its window thread, which
     // calls into the overlay) is destroyed first. Only created with a window.
     std::unique_ptr<dal::DebugOverlay> overlay;
+    std::unique_ptr<dal::SaveDialogOverlay> save_overlay;
     std::unique_ptr<dal::Presenter> presenter;
     if (opt.window) {
         overlay = std::make_unique<dal::DebugOverlay>(*context, dal::makeRuntimeOverlaySources());
+        save_overlay = std::make_unique<dal::SaveDialogOverlay>(
+                *context, dal::saveDialogBoard(), dal::SaveDialogOverlayOptions{.font_candidates = ui_font_candidates});
         dal::PresenterOptions presenter_options;
         presenter_options.on_message = [overlay = overlay.get()](const dal::WindowMessage& message) {
             return overlay->onWindowMessage(message);
@@ -199,7 +218,7 @@ std::unique_ptr<dal::RsxExecutor> createVulkanExecutor(const dal::GameOptions& o
         overlay->attachWindow(presenter->nativeWindowHandle());
     }
     auto executor = std::make_unique<VulkanExecutor>(std::move(context), std::move(presenter), std::move(overlay),
-                                                     render_options);
+                                                     std::move(save_overlay), render_options);
     if (!executor->valid()) {
         error = executor->error();
         return nullptr;
@@ -331,6 +350,21 @@ void applyBuildDirDefaults(dal::VfsLayout& layout) {
             std::erase_if(layout.mounts, [&](const dal::VfsMount& m) { return m.name == mount.name; });
             layout.mounts.push_back(std::move(mount));
         }
+    }
+}
+
+// --save-dialog, settled by parseGameOptions: window only with a window and a pad that reads host input. The mode
+// is installed before boot so that the first cellSaveData call already sees it.
+void installSaveDialogDriver(const dal::GameOptions& opt) {
+    if (opt.save_dialog == "window") {
+        dal::setSaveDialogDriver(dal::makeInteractiveSaveDialogDriver(dal::saveDialogBoard()));
+        dal::logInfo("dal: savedata dialog: window");
+    } else if (opt.save_dialog == "cancel") {
+        dal::setSaveDialogDriver(dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Cancel));
+        dal::logInfo("dal: savedata dialog: cancel");
+    } else {
+        dal::setSaveDialogDriver(dal::makeAutoSaveDialogDriver(dal::SaveDialogPolicy::Auto));
+        dal::logInfo("dal: savedata dialog: auto");
     }
 }
 
@@ -514,11 +548,17 @@ int main(int argc, char** argv) {
     }
 
     configureAudio(opt);
+    installSaveDialogDriver(opt);
+
+    std::vector<std::filesystem::path> ui_font_candidates =
+            dal::uiFontCandidates(opt.ui_font, elf_path.parent_path(), dal::executableDirectory());
 
     // The device is created on the RSX thread when it starts, so it belongs to that thread.
     if (opt.render_vulkan) {
         dal::setRsxExecutorFactory(
-                [opt, keyboard](std::string& error) { return createVulkanExecutor(opt, keyboard, error); });
+                [opt, keyboard, ui_font_candidates = std::move(ui_font_candidates)](std::string& error) {
+                    return createVulkanExecutor(opt, keyboard, ui_font_candidates, error);
+                });
     }
 
     // RPCS3 passes this VFS path as argv[0] (`Emu/System.cpp` `Emulator::Load`, "Fake arg").

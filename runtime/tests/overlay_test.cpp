@@ -2,12 +2,20 @@
 // overlay tests draw into an offscreen image on the first Vulkan device. On Windows they also create a
 // hidden window, to give the Win32 backend a handle.
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -20,12 +28,20 @@
 #include <windows.h>
 #endif
 
+#include "core/fatal.h"
+#include "hle/save_dialog_text.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "overlay/debug_overlay.h"
+#include "overlay/imgui_context.h"
 #include "overlay/overlay_model.h"
 #include "overlay/overlay_panels.h"
 #include "overlay/overlay_sources.h"
+#include "overlay/overlay_stack.h"
+#include "overlay/save_dialog_overlay.h"
+#include "overlay/ui_font.h"
+#include "render/frame_dump.h"
+#include "render/vk_renderer.h"
 #include "rsx/rsx_unimplemented.h"
 
 namespace {
@@ -527,9 +543,9 @@ public:
 
     bool ok() const { return ok_; }
 
-    // One submit that follows the renderer's present path: clear to black (the blit), the barriers around
+    // One submit that follows the renderer's present path: clear to `clear` (the blit), the barriers around
     // the overlay, then a copy into the host buffer instead of the present.
-    bool drawOnce(dal::DebugOverlay& overlay, const dal::RendererStats& stats) {
+    bool drawOnce(dal::PresentOverlay& overlay, const dal::RendererStats& stats, VkClearColorValue clear = {}) {
         dal::Presenter::Target target;
         target.image = image_;
         target.view = view_;
@@ -545,9 +561,8 @@ public:
 
         imageBarrier(cmd_, image_, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT,
                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkClearColorValue black{};
         const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cmd_, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        vkCmdClearColorImage(cmd_, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
 
         dal::PresentFrameInfo info;
         info.stats = &stats;
@@ -591,6 +606,23 @@ public:
         vkResetFences(ctx_.device(), 1, &fence_);
         vmaInvalidateAllocation(ctx_.allocator(), buffer_alloc_, 0, VK_WHOLE_SIZE);
         return done;
+    }
+
+    // The pixel's channels in memory order (B, G, R, A); the target is B8G8R8A8.
+    struct Pixel {
+        std::uint8_t b, g, r, a;
+        int minChannel() const { return std::min({b, g, r}); }
+        int maxChannel() const { return std::max({b, g, r}); }
+    };
+    Pixel pixel(std::uint32_t x, std::uint32_t y) const {
+        const std::uint8_t* p = pixels_ + (static_cast<std::size_t>(y) * kTargetWidth + x) * 4;
+        return {p[0], p[1], p[2], p[3]};
+    }
+
+    // Writes the readback as an RGB PNG.
+    bool savePng(const std::filesystem::path& path, std::string& error) const {
+        const std::span<const std::uint8_t> bgra(pixels_, static_cast<std::size_t>(kTargetWidth) * kTargetHeight * 4);
+        return dal::writePngRgb(path, dal::rgbFromBgra(bgra, kTargetWidth, kTargetHeight), error);
     }
 
     // True when any pixel of the rectangle (inclusive) has a non-zero colour channel.
@@ -683,7 +715,10 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
         CHECK(target.drawOnce(overlay, stats));
         stats.flips = 3;
         CHECK(target.drawOnce(overlay, stats));
-        CHECK(ImGui::GetIO().WantCaptureMouse);
+        {
+            dal::ImGuiContextScope scope(overlay.imguiContext());
+            CHECK(ImGui::GetIO().WantCaptureMouse);
+        }
 
         // Hiding and showing again must leave ImGui focused, or it would drop all input.
         overlay.onWindowMessage(keyMessage(kKeyDown, dal::kOverlayToggleScanCode));
@@ -695,7 +730,10 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
         overlay.onWindowMessage(move);
         stats.flips = 4;
         CHECK(target.drawOnce(overlay, stats));
-        CHECK(ImGui::GetIO().WantCaptureMouse);
+        {
+            dal::ImGuiContextScope scope(overlay.imguiContext());
+            CHECK(ImGui::GetIO().WantCaptureMouse);
+        }
 
         // A click goes through the window procedure like in the game. The button-up makes the handler call
         // ReleaseCapture, which sends WM_CAPTURECHANGED to the same window procedure before the handler returns.
@@ -716,6 +754,493 @@ void testWin32Input(dal::VkContext& ctx, OffscreenTarget& target) {
 }
 #endif
 
+// Destroying an overlay while its own context is current must leave no freed context current afterwards.
+void testShutdownInsideScope(dal::VkContext& ctx, OffscreenTarget& target) {
+    auto overlay = std::make_unique<dal::DebugOverlay>(ctx, makeFakeSources());
+    overlay->attachWindow(nullptr);
+    overlay->setVisible(true);
+    dal::RendererStats stats;
+    stats.flips = 1;
+    CHECK(target.drawOnce(*overlay, stats));
+    CHECK(overlay->imguiContext() != nullptr);
+    {
+        dal::ImGuiContextScope scope(overlay->imguiContext());
+        overlay.reset();
+        CHECK(ImGui::GetCurrentContext() == nullptr);
+    }
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+}
+
+// Starting, drawing and stopping an overlay must not switch the context another user of ImGui has current, and
+// the window thread's calls into the overlay wait for whoever holds the ImGui lock.
+void testDebugOverlayKeepsCurrentContext(dal::VkContext& ctx, OffscreenTarget& target) {
+    ImGuiContext* other = ImGui::CreateContext();
+    ImGui::SetCurrentContext(other);
+    {
+        dal::DebugOverlay overlay(ctx, makeFakeSources());
+        overlay.attachWindow(nullptr);
+        overlay.setVisible(true);
+        dal::RendererStats stats;
+        stats.flips = 1;
+        CHECK(target.drawOnce(overlay, stats));
+        CHECK(!overlay.failed());
+        CHECK(overlay.imguiContext() != nullptr && overlay.imguiContext() != other);
+        CHECK(ImGui::GetCurrentContext() == other);
+        stats.flips = 2;
+        CHECK(target.drawOnce(overlay, stats));
+        CHECK(ImGui::GetCurrentContext() == other);
+
+        // setVisible changes the flag at once but feeds the focus event to ImGui only under the lock.
+        // The thread does not use CHECK, whose counters are not atomic.
+        std::atomic<bool> done{false};
+        std::thread window_thread;
+        {
+            dal::ImGuiContextScope held(other);
+            window_thread = std::thread([&] {
+                overlay.setVisible(false);
+                done.store(true);
+            });
+            for (int i = 0; i < 5; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(!done.load());
+            CHECK(ImGui::GetCurrentContext() == other);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!done.load()) {
+            // Joining a thread that is still blocked would hang the test run.
+            std::fprintf(stderr, "check failed (line %d): setVisible never returned\n", __LINE__);
+            std::_Exit(1);
+        }
+        window_thread.join();
+        CHECK(!overlay.visible());
+        CHECK(ImGui::GetCurrentContext() == other);
+    }
+    CHECK(ImGui::GetCurrentContext() == other);
+    ImGui::SetCurrentContext(nullptr);
+    ImGui::DestroyContext(other);
+}
+
+std::shared_ptr<const dal::SaveDialogContent> messageContent(std::uint64_t id, dal::DialogKind kind,
+                                                             std::string message) {
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->id = id;
+    content->kind = kind;
+    content->message = std::move(message);
+    return content;
+}
+
+void publishDialog(dal::SaveDialogBoard& board, std::shared_ptr<const dal::SaveDialogContent> content, float opacity) {
+    dal::SaveDialogSnapshot snapshot;
+    snapshot.content = std::move(content);
+    snapshot.opacity = opacity;
+    board.publish(std::move(snapshot));
+}
+
+// True when a pixel of the rectangle (inclusive) is lighter than the dimmed white background (at most 38).
+bool anyBright(const OffscreenTarget& target, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) {
+    for (std::uint32_t y = y0; y <= y1; ++y) {
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            if (target.pixel(x, y).minChannel() > 120) return true;
+        }
+    }
+    return false;
+}
+
+// True when a pixel of the rectangle (inclusive) is lighter than the dim in any channel; unlike anyBright this also
+// finds the saturated colours of the button symbols.
+bool anyAboveDim(const OffscreenTarget& target, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1,
+                 std::uint32_t y1) {
+    for (std::uint32_t y = y0; y <= y1; ++y) {
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            if (target.pixel(x, y).maxChannel() > 130) return true;
+        }
+    }
+    return false;
+}
+
+std::uint32_t crc32(const std::uint8_t* data, std::size_t size) {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < t.size(); ++i) {
+            std::uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit) c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void appendBigEndian(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<std::uint8_t>(value >> shift));
+}
+
+void appendPngChunk(std::vector<std::uint8_t>& out, const char (&type)[5], const std::vector<std::uint8_t>& data) {
+    appendBigEndian(out, static_cast<std::uint32_t>(data.size()));
+    std::vector<std::uint8_t> body(type, type + 4);
+    body.insert(body.end(), data.begin(), data.end());
+    out.insert(out.end(), body.begin(), body.end());
+    appendBigEndian(out, crc32(body.data(), body.size()));
+}
+
+using PngPixelFn = std::array<std::uint8_t, 3> (*)(std::uint32_t x, std::uint32_t y);
+
+// An 8-bit RGB PNG whose zlib stream holds stored blocks, so the test needs no compressor.
+std::shared_ptr<const std::vector<std::uint8_t>> makePng(std::uint32_t width, std::uint32_t height, PngPixelFn pixel) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        raw.push_back(0);  // filter: none
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const std::array<std::uint8_t, 3> rgb = pixel(x, y);
+            raw.insert(raw.end(), rgb.begin(), rgb.end());
+        }
+    }
+    std::vector<std::uint8_t> zlib = {0x78, 0x01};
+    for (std::size_t pos = 0; pos < raw.size() || pos == 0;) {
+        const std::size_t length = std::min<std::size_t>(65535, raw.size() - pos);
+        const bool last = pos + length >= raw.size();
+        zlib.push_back(last ? 1 : 0);
+        zlib.push_back(static_cast<std::uint8_t>(length));
+        zlib.push_back(static_cast<std::uint8_t>(length >> 8));
+        zlib.push_back(static_cast<std::uint8_t>(~length));
+        zlib.push_back(static_cast<std::uint8_t>((~length) >> 8));
+        zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos),
+                    raw.begin() + static_cast<std::ptrdiff_t>(pos + length));
+        pos += length;
+        if (last) break;
+    }
+    std::uint32_t a = 1;
+    std::uint32_t b = 0;
+    for (const std::uint8_t byte : raw) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    appendBigEndian(zlib, (b << 16) | a);
+
+    std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<std::uint8_t> header;
+    appendBigEndian(header, width);
+    appendBigEndian(header, height);
+    header.insert(header.end(), {8, 2, 0, 0, 0});  // 8 bit, RGB, deflate, no filter variants, no interlace
+    appendPngChunk(png, "IHDR", header);
+    appendPngChunk(png, "IDAT", zlib);
+    appendPngChunk(png, "IEND", {});
+    return std::make_shared<const std::vector<std::uint8_t>>(std::move(png));
+}
+
+constexpr std::uint32_t kIconPngWidth = 320;
+constexpr std::uint32_t kIconPngHeight = 176;
+
+std::shared_ptr<const std::vector<std::uint8_t>> redIconPng() {
+    return makePng(kIconPngWidth, kIconPngHeight,
+                   [](std::uint32_t, std::uint32_t) { return std::array<std::uint8_t, 3>{255, 0, 0}; });
+}
+
+// A diagonal colour ramp with a lighter frame, for looking at the render.
+std::shared_ptr<const std::vector<std::uint8_t>> gradientIconPng() {
+    return makePng(kIconPngWidth, kIconPngHeight, [](std::uint32_t x, std::uint32_t y) {
+        if (x < 4 || y < 4 || x >= kIconPngWidth - 4 || y >= kIconPngHeight - 4) {
+            return std::array<std::uint8_t, 3>{235, 235, 235};
+        }
+        return std::array<std::uint8_t, 3>{
+                static_cast<std::uint8_t>(x * 255 / kIconPngWidth), static_cast<std::uint8_t>(y * 255 / kIconPngHeight),
+                static_cast<std::uint8_t>(255 - (x + y) * 255 / (kIconPngWidth + kIconPngHeight))};
+    });
+}
+
+// `icon` goes to every row except each third one, which keeps its placeholder.
+std::shared_ptr<dal::SaveDialogContent> listContent(std::uint64_t id, int row_count,
+                                                    std::shared_ptr<const std::vector<std::uint8_t>> icon = nullptr) {
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->id = id;
+    content->kind = dal::DialogKind::List;
+    content->list_kind = dal::SaveListKind::Save;
+    for (int i = 0; i < row_count; ++i) {
+        dal::SaveDialogRow row;
+        row.new_data = i == 0;
+        if (i % 3 != 2) row.icon_png = icon;
+        row.title =
+                row.new_data
+                        ? "\xE6\x96\xB0\xE3\x81\x97\xE3\x81\x84\xE3\x83\x87\xE3\x83\xBC\xE3\x82\xBF"  // 新しいデータ
+                        : "Stage " + std::to_string(i) + " \xE3\x82\xBB\xE3\x83\xBC\xE3\x83\x96";     // セーブ
+        row.info = row.new_data
+                           ? "\xE6\x96\xB0\xE3\x81\x97\xE3\x81\x84\xE3\x83\x87\xE3\x83\xBC\xE3\x82\xBF\xE3\x82\x92"
+                             "\xE4\xBD\x9C\xE6\x88\x90\xE3\x81\x97\xE3\x81\xBE\xE3\x81\x99"  // 新しいデータを作成します
+                           : "2026/10/" + std::to_string(10 + i) + " 21:" + std::to_string(30 + i) + "   " +
+                                     std::to_string(120 + i * 7) + " KB";
+        // Three detail lines like the game's, and one row with a fourth that the row cuts with "...".
+        if (!row.new_data && i % 2 == 1) {
+            row.detail =
+                    "走り出す運命\nルドガー　Ｌｖ　" + std::to_string(i) + "\nプレイ時間　0：0" + std::to_string(i);
+        } else if (i == 2) {
+            row.detail = "Chapter 2\nAfter the harbour\nThe long road to the capital\nA fourth line is cut";
+        }
+        content->rows.push_back(std::move(row));
+    }
+    return content;
+}
+
+// Set DAL_OVERLAY_TEST_LIST_PNG to a file path to keep the render of a 7-row list for looking at.
+void saveListRenderIfRequested(const OffscreenTarget& target) {
+#if defined(_WIN32)
+    // getenv is deprecated in the MSVC runtime.
+    char path_buffer[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableA("DAL_OVERLAY_TEST_LIST_PNG", path_buffer, sizeof(path_buffer));
+    if (length == 0 || length >= sizeof(path_buffer)) return;
+    const char* path = path_buffer;
+#else
+    const char* path = std::getenv("DAL_OVERLAY_TEST_LIST_PNG");
+    if (path == nullptr || *path == '\0') return;
+#endif
+    std::string error;
+    const bool saved = target.savePng(path, error);
+    std::printf("overlay tests: list render %s %s\n", saved ? "saved to" : "not saved:", saved ? path : error.c_str());
+}
+
+void testSaveListLayout(dal::SaveDialogBoard& board, dal::SaveDialogOverlay& overlay, OffscreenTarget& target,
+                        const dal::RendererStats& stats) {
+    constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    // Seven rows of which four show, the second one selected: the dim, the heading, the focus border and the scrollbar
+    // thumb.
+    dal::SaveDialogSnapshot snapshot;
+    snapshot.content = listContent(10, 7, gradientIconPng());
+    snapshot.selected_row = 1;
+    snapshot.first_visible_row = 0;
+    snapshot.opacity = 1.0f;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(!overlay.failed());
+    CHECK(target.pixel(4, 700).maxChannel() <= 115);
+    CHECK(target.pixel(4, 700).minChannel() > 50);
+    const OffscreenTarget::Pixel focus = target.pixel(210, 112 + 130 + 65);
+    CHECK(focus.b >= focus.r + 60);
+    CHECK(anyBright(target, 64, 36, 200, 72));
+    const OffscreenTarget::Pixel thumb = target.pixel(1085, 114);
+    const OffscreenTarget::Pixel track = target.pixel(1085, 620);
+    CHECK(thumb.minChannel() > track.minChannel());
+    CHECK(track.minChannel() > 102);                 // the track is lighter than the plain dim
+    CHECK(anyAboveDim(target, 184, 662, 200, 678));  // the enter symbol
+    CHECK(anyAboveDim(target, 64, 662, 80, 678));    // the back symbol
+    saveListRenderIfRequested(target);
+
+    // Scrolled to the end: the thumb is at the bottom of the track.
+    snapshot.selected_row = 6;
+    snapshot.first_visible_row = 3;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(1085, 114).minChannel() == track.minChannel());
+    CHECK(target.pixel(1085, 628).minChannel() > track.minChannel());
+
+    // Three rows fit: no scrollbar.
+    snapshot.content = listContent(11, 3);
+    snapshot.selected_row = 0;
+    snapshot.first_visible_row = 0;
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(1085, 114).maxChannel() <= 115);
+    CHECK(target.pixel(1085, 300).maxChannel() <= 115);
+
+    // An empty list shows only the back item.
+    snapshot.content = listContent(12, 0);
+    board.publish(snapshot);
+    CHECK(target.drawOnce(overlay, stats, kWhite));
+    CHECK(target.pixel(4, 700).maxChannel() <= 115);
+    CHECK(!anyAboveDim(target, 184, 662, 200, 678));
+    CHECK(anyAboveDim(target, 64, 662, 80, 678));
+    CHECK(anyBright(target, 400, 350, 880, 390));  // the "no data" line in the middle of the list box
+}
+
+bool isRed(const OffscreenTarget::Pixel& pixel) { return pixel.r > 200 && pixel.g < 60 && pixel.b < 60; }
+
+// The icon cells of rows 0 and 1 of a list that shows its first page (canvas == target pixels).
+constexpr std::uint32_t kIconCellX = 220;
+constexpr std::uint32_t kIconCellWidth = 160;
+constexpr std::uint32_t kIconCellHeight = 88;
+std::uint32_t iconCellY(std::uint32_t row) { return 112 + 130 * row + 8; }
+
+void testSaveDialogIcons(dal::VkContext& ctx, OffscreenTarget& target) {
+    constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
+    constexpr std::size_t kFrames = dal::RsxRenderer::kFramesInFlight;
+    dal::RendererStats stats;
+    stats.flips = 1;
+
+    dal::SaveDialogBoard board;
+    dal::SaveDialogOverlayOptions options;
+    options.font_candidates.push_back(dal::executableDirectory() / "fonts" / "BIZUDPGothic-Regular.ttf");
+    dal::SaveDialogOverlay overlay(ctx, board, options);
+
+    const auto publish = [&](std::shared_ptr<dal::SaveDialogContent> content, int selected, int first) {
+        dal::SaveDialogSnapshot snapshot;
+        snapshot.content = std::move(content);
+        snapshot.selected_row = selected;
+        snapshot.first_visible_row = first;
+        snapshot.opacity = 1.0f;
+        board.publish(std::move(snapshot));
+    };
+    const auto draw = [&] {
+        const bool drawn = target.drawOnce(overlay, stats, kWhite);
+        CHECK(drawn);
+        CHECK(!overlay.failed());
+    };
+
+    // A red icon shows within two records, a bad PNG leaves the placeholder, and a row without an icon too.
+    auto content = std::make_shared<dal::SaveDialogContent>();
+    content->id = 30;
+    content->kind = dal::DialogKind::List;
+    content->rows.resize(3);
+    content->rows[0].icon_png = redIconPng();
+    content->rows[1].icon_png =
+            std::make_shared<const std::vector<std::uint8_t>>(std::vector<std::uint8_t>{1, 2, 3, 4});
+    publish(content, 2, 0);
+    draw();
+    draw();
+    const std::uint32_t red_x = kIconCellX + kIconCellWidth / 2;
+    CHECK(isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    CHECK(isRed(target.pixel(kIconCellX + 2, iconCellY(0) + 2)));  // the 160x88 cell is filled by the 320x176 image
+    CHECK(isRed(target.pixel(kIconCellX + kIconCellWidth - 3, iconCellY(0) + kIconCellHeight - 3)));
+    CHECK(overlay.iconTextureCount() == 1);
+    // The placeholder: its fill lifts the dim (102 over white) a little and its border more.
+    for (const std::uint32_t row : {1u, 2u}) {
+        const OffscreenTarget::Pixel inside = target.pixel(red_x, iconCellY(row) + kIconCellHeight / 2);
+        CHECK(!isRed(inside) && inside.minChannel() >= 105 && inside.maxChannel() <= 125);
+        CHECK(target.pixel(kIconCellX, iconCellY(row) + kIconCellHeight / 2).minChannel() > 135);
+    }
+    // A failed row is not decoded again, whatever the number of records.
+    for (int i = 0; i < 3; ++i) draw();
+    CHECK(overlay.iconTextureCount() == 1);
+
+    // 40 rows scrolled through, in single steps and in jumps over the whole window: never more than 32 textures,
+    // counting the ones that wait for their frames.
+    content = std::make_shared<dal::SaveDialogContent>();
+    content->id = 31;
+    content->kind = dal::DialogKind::List;
+    const auto red = redIconPng();
+    content->rows.resize(40);
+    for (dal::SaveDialogRow& row : content->rows) row.icon_png = red;
+    std::size_t most = 0;
+    const auto scroll_to = [&](int first) {
+        publish(content, first, first);
+        draw();
+        most = std::max(most, overlay.iconTextureCount());
+    };
+    for (int first = 0; first <= 36; ++first) scroll_to(first);
+    for (const int first : {0, 15, 30, 36, 21, 6, 0, 18, 36, 0}) scroll_to(first);
+    CHECK(most > 0 && most <= 32);
+
+    // At rest the window [first - 5, first + 10) holds its icons; the visible page draws red.
+    for (int i = 0; i < 10; ++i) scroll_to(20);
+    CHECK(overlay.iconTextureCount() == 15);
+    for (std::uint32_t row = 0; row < 4; ++row) {
+        CHECK(isRed(target.pixel(red_x, iconCellY(row) + kIconCellHeight / 2)));
+    }
+
+    // New content: the old textures go once the frames that may use them are done, and not before.
+    auto next = std::make_shared<dal::SaveDialogContent>();
+    next->id = 32;
+    next->kind = dal::DialogKind::List;
+    next->rows.resize(2);
+    publish(next, 0, 0);
+    draw();
+    CHECK(overlay.iconTextureCount() == 15);
+    CHECK(!isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    for (std::size_t i = 0; i < kFrames; ++i) draw();
+    CHECK(overlay.iconTextureCount() == 15);
+    draw();
+    CHECK(overlay.iconTextureCount() == 0);
+
+    // The same row numbers again after a release: the new dialog decodes its own icons.
+    next->id = 33;
+    next->rows[0].icon_png = red;
+    publish(next, 0, 0);
+    draw();
+    CHECK(isRed(target.pixel(red_x, iconCellY(0) + kIconCellHeight / 2)));
+    CHECK(overlay.iconTextureCount() == 1);
+}
+
+void testSaveDialogOverlay(dal::VkContext& ctx, OffscreenTarget& target) {
+    constexpr VkClearColorValue kWhite = {{1.0f, 1.0f, 1.0f, 1.0f}};
+    dal::RendererStats stats;
+    stats.flips = 1;
+
+    dal::SaveDialogBoard board;
+    CHECK(board.drawer() == dal::SaveDialogDrawer::None);
+    // The bundled font when the build copied it, otherwise ImGui's default font; the checks do not depend on which.
+    dal::SaveDialogOverlayOptions options;
+    options.font_candidates.push_back(dal::executableDirectory() / "fonts" / "BIZUDPGothic-Regular.ttf");
+    {
+        dal::SaveDialogOverlay overlay(ctx, board, options);
+        CHECK(board.drawer() == dal::SaveDialogDrawer::Ready);
+        CHECK(!overlay.wantsDraw() && !overlay.wantsIdlePresent());
+        publishDialog(board, messageContent(1, dal::DialogKind::YesNo, "line one\n\nline two"), 1.0f);
+        CHECK(overlay.wantsDraw() && overlay.wantsIdlePresent());
+        board.clear();
+        CHECK(!overlay.wantsDraw() && !overlay.wantsIdlePresent());
+        CHECK(overlay.atlasBuildCount() == 0);
+
+        publishDialog(board, messageContent(1, dal::DialogKind::YesNo, "line one\n\nline two"), 1.0f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(!overlay.failed());
+        CHECK(board.drawer() == dal::SaveDialogDrawer::Ready);
+        CHECK(overlay.atlasBuildCount() == 1);
+        // The dim is alpha 0.85 over white, and the rule below the text is white at alpha 0.6 over that.
+        CHECK(target.pixel(4, 700).maxChannel() <= 50);
+        CHECK(target.pixel(640, 400).minChannel() > 140);
+        CHECK(anyBright(target, 560, 290, 720, 330));  // the first message line
+
+        // The same content again builds nothing.
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(overlay.atlasBuildCount() == 1);
+
+        // A Japanese message that the dialog constants do not cover needs one more build, once.
+        const std::string rare = "\xE9\xAC\xB1\xE9\xAC\xB1";  // "鬱鬱"
+        publishDialog(board, messageContent(2, dal::DialogKind::Ok, rare), 1.0f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(overlay.atlasBuildCount() == 2);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(overlay.atlasBuildCount() == 2);
+        CHECK(target.pixel(4, 700).maxChannel() <= 50);
+        CHECK(target.pixel(640, 400).minChannel() > 140);
+
+        // New content with glyphs the atlas already has builds nothing.
+        publishDialog(board, messageContent(3, dal::DialogKind::YesNo, "line"), 1.0f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(overlay.atlasBuildCount() == 2);
+
+        testSaveListLayout(board, overlay, target, stats);
+
+        // Fully faded out: nothing is drawn.
+        publishDialog(board, messageContent(5, dal::DialogKind::YesNo, "line"), 0.0f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(target.pixel(4, 700).minChannel() >= 250);
+        CHECK(target.pixel(640, 400).minChannel() >= 250);
+
+        // Half way: the dim is half as strong.
+        publishDialog(board, messageContent(5, dal::DialogKind::YesNo, "line"), 0.5f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(target.pixel(4, 700).maxChannel() > 100 && target.pixel(4, 700).maxChannel() < 160);
+        CHECK(!overlay.failed());
+    }
+    // The overlay is gone: a waiting dialog must not expect a drawer.
+    CHECK(board.drawer() == dal::SaveDialogDrawer::None);
+
+    // No usable font: the default font stands in and the dialog still draws.
+    {
+        dal::SaveDialogOverlay overlay(ctx, board, {});
+        publishDialog(board, messageContent(1, dal::DialogKind::Ok, "line one"), 1.0f);
+        CHECK(target.drawOnce(overlay, stats, kWhite));
+        CHECK(!overlay.failed());
+        CHECK(overlay.atlasBuildCount() == 1);
+        CHECK(target.pixel(4, 700).maxChannel() <= 50);
+        CHECK(target.pixel(640, 400).minChannel() > 140);
+        CHECK(anyBright(target, 560, 340, 720, 380));
+    }
+}
+
 void testOverlayRecording(dal::VkContext& ctx) {
     OffscreenTarget target(ctx);
     CHECK(target.ok());
@@ -728,10 +1253,271 @@ void testOverlayRecording(dal::VkContext& ctx) {
 #if defined(_WIN32)
     testWin32Input(ctx, target);
 #endif
+    testShutdownInsideScope(ctx, target);
+    testDebugOverlayKeepsCurrentContext(ctx, target);
+    testSaveDialogOverlay(ctx, target);
+    testSaveDialogIcons(ctx, target);
 
     const std::uint32_t errors = ctx.validationErrorCount() - errors_before;
     std::printf("overlay tests: validation %s, %u error(s)\n", ctx.validationEnabled() ? "active" : "inactive", errors);
     CHECK(errors == 0);
+}
+
+// A PresentOverlay that logs its calls into a shared list, to check the stack's order and merging.
+class FakeOverlay final : public dal::PresentOverlay {
+public:
+    FakeOverlay(int id, std::vector<std::string>& log, bool wants, dal::PresentOverlayRequests requests = {})
+        : id_(id), log_(log), wants_(wants), requests_(std::move(requests)) {}
+
+    dal::PresentOverlayRequests onFlip(const dal::PresentFrameInfo&) override {
+        log_.push_back("flip" + std::to_string(id_));
+        return requests_;
+    }
+    bool wantsDraw() const override { return wants_; }
+    bool wantsIdlePresent() const override { return wants_idle_; }
+    void setWantsIdlePresent(bool wants) { wants_idle_ = wants; }
+    void record(VkCommandBuffer, const dal::Presenter::Target&) override {
+        log_.push_back("record" + std::to_string(id_));
+    }
+
+private:
+    int id_;
+    std::vector<std::string>& log_;
+    bool wants_;
+    bool wants_idle_ = false;
+    dal::PresentOverlayRequests requests_;
+};
+
+void testOverlayStack() {
+    std::vector<std::string> log;
+    dal::OverlayStack empty;
+    CHECK(!empty.wantsDraw());
+    CHECK(!empty.onFlip({}).dump_display);
+    empty.record(VK_NULL_HANDLE, {});
+    empty.add(nullptr);
+    CHECK(!empty.wantsDraw());
+
+    dal::PresentOverlayRequests dump;
+    dump.dump_display = true;
+    FakeOverlay first(1, log, false);
+    FakeOverlay second(2, log, true, dump);
+    FakeOverlay third(3, log, false);
+    dal::OverlayStack stack;
+    stack.add(&first);
+    stack.add(&second);
+    stack.add(&third);
+
+    // Every child sees the flip, in insertion order, and a request from any child survives the merge.
+    const dal::PresentOverlayRequests merged = stack.onFlip({});
+    CHECK((log == std::vector<std::string>{"flip1", "flip2", "flip3"}));
+    CHECK(merged.dump_display);
+
+    // wantsDraw is true when any child wants; record runs only the children that do.
+    CHECK(stack.wantsDraw());
+    log.clear();
+    stack.record(VK_NULL_HANDLE, {});
+    CHECK((log == std::vector<std::string>{"record2"}));
+
+    std::vector<std::string> log_all;
+    FakeOverlay a(1, log_all, true);
+    FakeOverlay b(2, log_all, false);
+    FakeOverlay c(3, log_all, true);
+    dal::OverlayStack both;
+    both.add(&a);
+    both.add(&b);
+    both.add(&c);
+    both.record(VK_NULL_HANDLE, {});
+    CHECK((log_all == std::vector<std::string>{"record1", "record3"}));
+
+    std::vector<std::string> log_none;
+    FakeOverlay idle(1, log_none, false);
+    dal::OverlayStack none;
+    none.add(&idle);
+    CHECK(!none.wantsDraw());
+    none.record(VK_NULL_HANDLE, {});
+    CHECK(log_none.empty());
+    CHECK(!none.onFlip({}).dump_display);
+
+    // wantsIdlePresent is independent of wantsDraw and true when any child wants it.
+    CHECK(!empty.wantsIdlePresent());
+    CHECK(!none.wantsIdlePresent());
+    CHECK(!stack.wantsIdlePresent());
+    third.setWantsIdlePresent(true);
+    CHECK(stack.wantsIdlePresent());
+    third.setWantsIdlePresent(false);
+    first.setWantsIdlePresent(true);
+    CHECK(stack.wantsIdlePresent());
+    first.setWantsIdlePresent(false);
+    CHECK(!stack.wantsIdlePresent());
+}
+
+void testImGuiContextScope() {
+    ImGuiContext* a = ImGui::CreateContext();
+    ImGuiContext* b = ImGui::CreateContext();
+    ImGui::SetCurrentContext(nullptr);
+
+    {
+        dal::ImGuiContextScope outer(a);
+        CHECK(ImGui::GetCurrentContext() == a);
+        {
+            // Nesting on one thread must not deadlock (recursive lock) and unwinds one level at a time.
+            dal::ImGuiContextScope inner(b);
+            CHECK(ImGui::GetCurrentContext() == b);
+            {
+                dal::ImGuiContextScope none(nullptr);
+                CHECK(ImGui::GetCurrentContext() == nullptr);
+            }
+            CHECK(ImGui::GetCurrentContext() == b);
+        }
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+
+    // A non-null previous context comes back as well.
+    ImGui::SetCurrentContext(b);
+    {
+        dal::ImGuiContextScope scope(a);
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    CHECK(ImGui::GetCurrentContext() == b);
+    ImGui::SetCurrentContext(nullptr);
+
+    // While one thread holds a scope, another thread's scope blocks until it ends.
+    // The thread does not use CHECK, whose counters are not atomic.
+    std::atomic<bool> second_entered{false};
+    std::atomic<ImGuiContext*> second_context{nullptr};
+    std::thread other;
+    {
+        dal::ImGuiContextScope held(a);
+        other = std::thread([&] {
+            dal::ImGuiContextScope scope(b);
+            second_context.store(ImGui::GetCurrentContext());
+            second_entered.store(true);
+        });
+        // Several short waits (50 ms in total) are enough for a missing lock to show as an early entry.
+        for (int i = 0; i < 5; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(!second_entered.load());
+        CHECK(ImGui::GetCurrentContext() == a);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!second_entered.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!second_entered.load()) {
+        // Joining a thread that is still blocked would hang the test run.
+        std::fprintf(stderr, "check failed (line %d): second thread never entered its scope\n", __LINE__);
+        std::_Exit(1);
+    }
+    other.join();
+    CHECK(second_context.load() == b);
+    CHECK(ImGui::GetCurrentContext() == nullptr);
+
+    ImGui::DestroyContext(a);
+    ImGui::DestroyContext(b);
+}
+
+std::filesystem::path testExecutablePath() {
+#if defined(_WIN32)
+    return dal::executableDirectory() / "dal_overlay_tests.exe";
+#else
+    return dal::executableDirectory() / "dal_overlay_tests";
+#endif
+}
+
+void testUiFontCandidates() {
+    namespace fs = std::filesystem;
+    const auto c = dal::uiFontCandidates("custom.ttf", "elf", "exe");
+    CHECK(c.size() == 3);
+    if (c.size() == 3) {
+        CHECK(c[0] == fs::path("custom.ttf"));
+        CHECK(c[1] == fs::path("elf") / "SCE-PS3-SR-R-JPN.TTF");
+        CHECK(c[2] == fs::path("exe") / "fonts" / "BIZUDPGothic-Regular.ttf");
+    }
+    const auto no_explicit = dal::uiFontCandidates({}, "elf", "exe");
+    CHECK(no_explicit.size() == 2);
+    if (no_explicit.size() == 2) CHECK(no_explicit[0] == fs::path("elf") / "SCE-PS3-SR-R-JPN.TTF");
+    CHECK(dal::uiFontCandidates({}, {}, {}).empty());
+}
+
+void testLoadUiFont() {
+    namespace fs = std::filesystem;
+    const fs::path exe_dir = dal::executableDirectory();
+    const fs::path missing = exe_dir / "no-such-font.ttf";
+    const fs::path not_a_font = testExecutablePath();  // an executable is readable but not a font
+    const fs::path bundled = exe_dir / "fonts" / "BIZUDPGothic-Regular.ttf";
+
+    const std::vector<fs::path> junk = {missing, not_a_font};
+    CHECK(!dal::loadUiFont(junk).has_value());
+
+    std::error_code ec;
+    fs::path arial;
+#if defined(_WIN32)
+    wchar_t windir[MAX_PATH];
+    const UINT windir_len = GetWindowsDirectoryW(windir, MAX_PATH);
+    if (windir_len > 0) arial = fs::path(windir) / "Fonts" / "arial.ttf";
+    if (!arial.empty() && fs::exists(arial, ec)) {
+        const std::vector<fs::path> latin_only = {arial};
+        CHECK(!dal::loadUiFont(latin_only).has_value());
+    } else {
+        std::printf("overlay tests: ui font: arial.ttf check skipped (not found)\n");
+    }
+#else
+    std::printf("overlay tests: ui font: arial.ttf check skipped (Windows only)\n");
+#endif
+
+    if (fs::exists(bundled, ec)) {
+        const std::vector<fs::path> list = {missing, not_a_font, arial, bundled};
+        const auto font = dal::loadUiFont(list);
+        CHECK(font.has_value());
+        if (font) {
+            CHECK(font->path == bundled);
+            CHECK(font->bytes.size() > 1000);
+        }
+    } else {
+        std::printf("overlay tests: ui font: BIZ UDPGothic check skipped (%s not found)\n", bundled.string().c_str());
+    }
+}
+
+void testDialogCodePoints() {
+    dal::SaveDialogContent content;
+    content.kind = dal::DialogKind::List;
+    dal::SaveDialogRow row;
+    row.title = "\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88 \xE9\x9B\xA3";  // "テスト 難"
+    row.info = "2026/10/18  12:34   5 KB";
+    content.rows.push_back(row);
+    content.message = "line1\nline2";
+    const auto points = dal::dialogCodePoints(content);
+
+    bool ascii = true;
+    for (ImWchar c = 0x20; c <= 0x7E; ++c) ascii = ascii && points.count(c) == 1;
+    CHECK(ascii);
+    CHECK(points.count(0x30BB) == 1);  // セ
+    CHECK(points.count(0x96E3) == 1);  // 難, only in the row title
+    CHECK(points.count(0x30C6) == 1);  // テ
+    CHECK(points.count('\n') == 0);
+
+    // Every code point of a constant, including one that is not in the content.
+    ImFontGlyphRangesBuilder probe;
+    probe.AddText(dal::kConfirmOverwrite.data(), dal::kConfirmOverwrite.data() + dal::kConfirmOverwrite.size());
+    ImVector<ImWchar> expected;
+    probe.BuildRanges(&expected);
+    bool all = expected.Size > 1;
+    for (int i = 0; i + 1 < expected.Size && expected[i] != 0; i += 2) {
+        for (ImWchar c = expected[i]; c <= expected[i + 1]; ++c) all = all && points.count(c) == 1;
+    }
+    CHECK(all);
+}
+
+void testGlyphRanges() {
+    const ImVector<ImWchar> ranges = dal::glyphRanges({'A', 'B', 'C', 0x30BB});
+    CHECK(ranges.Size == 5);
+    if (ranges.Size == 5) {
+        CHECK(ranges[0] == 'A');
+        CHECK(ranges[1] == 'C');
+        CHECK(ranges[2] == 0x30BB);
+        CHECK(ranges[3] == 0x30BB);
+        CHECK(ranges[4] == 0);
+    }
 }
 
 }  // namespace
@@ -743,6 +1529,12 @@ int main() {
     testRefresh();
     testPanels();
     testRuntimeSources();
+    testOverlayStack();
+    testImGuiContextScope();
+    testUiFontCandidates();
+    testLoadUiFont();
+    testDialogCodePoints();
+    testGlyphRanges();
 
     dal::VkContextOptions options;
     options.validation = true;

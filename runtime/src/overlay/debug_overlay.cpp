@@ -7,6 +7,7 @@
 #include "core/log.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
+#include "overlay/imgui_context.h"
 #include "overlay/overlay_panels.h"
 #include "overlay/overlay_platform.h"
 #include "render/vk_renderer.h"
@@ -22,8 +23,8 @@ constexpr float kFirstDeltaTime = 1.0f / 60.0f;
 // Only the font atlas needs a descriptor; the rest is room for textures a later panel may register.
 constexpr std::uint32_t kDescriptorCount = 4;
 
-// The backend reports failures through a plain function pointer without user data. One overlay exists
-// at a time, so a global is enough.
+// The backend reports failures through a plain function pointer without user data, so the capture is a file
+// level global. Each overlay file keeps its own; one DebugOverlay exists at a time.
 std::atomic<VkResult> g_first_vk_error{VK_SUCCESS};
 
 void recordVkResult(VkResult result) {
@@ -48,7 +49,10 @@ void DebugOverlay::setVisible(bool visible) {
     if (visible_.exchange(visible) == visible || !initialized_.load(std::memory_order_acquire)) return;
     // ImGui keeps the focus state of the last focus event. Hiding drops held keys and mouse buttons;
     // showing has to restore the focus, or ImGui would clear its input every frame.
-    std::lock_guard lock(mutex_);
+    // initialized_ is re-checked under the lock: shutdown() may have destroyed the context since the test above.
+    std::lock_guard lock(imguiMutex());
+    if (!initialized_.load(std::memory_order_relaxed)) return;
+    ImGuiContextScope scope(imgui_);
     ImGui::GetIO().AddFocusEvent(visible);
 }
 
@@ -76,9 +80,10 @@ MessageRoute DebugOverlay::onWindowMessage(const WindowMessage& message) {
 
     // The platform backend may need the thread that owns the window, so the input is fed from here and not
     // queued to the renderer's thread.
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(imguiMutex());
     // shutdown() may have run while this waited for the mutex.
     if (!initialized_.load(std::memory_order_acquire)) return route;
+    ImGuiContextScope scope(imgui_);
     overlay_platform::forwardMessage(message, route);
     // Key-ups always reach the pad, so a key that went down before the overlay took the focus is released.
     if (overlay_platform::isKeyDown(message)) route.withhold_key = ImGui::GetIO().WantCaptureKeyboard;
@@ -102,23 +107,29 @@ void DebugOverlay::fail(const char* what) {
     shutdown();
 }
 
+// Callers must not hold an ImGuiContextScope of their own: shutdownBackend() hops to the main thread on macOS,
+// and a scope held across it would deadlock with the main thread's event dispatch.
 void DebugOverlay::shutdown() {
     bool platform_backend = false;
     {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lock(imguiMutex());
         initialized_.store(false, std::memory_order_release);
-        if (imgui_ != nullptr) ImGui::SetCurrentContext(imgui_);
         platform_backend = platform_backend_;
         platform_backend_ = false;
     }
     // Not under the mutex: the macOS backend stops on the main thread, which may be inside onWindowMessage
     // waiting for the mutex. It cannot touch the context any more, as initialized_ is clear.
-    if (platform_backend) overlay_platform::shutdownBackend();
+    if (platform_backend) overlay_platform::shutdownBackend(imgui_);
 
-    std::lock_guard lock(mutex_);
-    if (vulkan_backend_) ImGui_ImplVulkan_Shutdown();
+    if (vulkan_backend_ && imgui_ != nullptr) {
+        ImGuiContextScope scope(imgui_);
+        ImGui_ImplVulkan_Shutdown();
+    }
     vulkan_backend_ = false;
     if (imgui_ != nullptr) {
+        // Outside any scope of ours: DestroyContext clears the current context itself when it is the destroyed
+        // one, and a scope would restore that freed pointer afterwards.
+        std::lock_guard lock(imguiMutex());
         ImGui::DestroyContext(imgui_);
         imgui_ = nullptr;
     }
@@ -128,35 +139,49 @@ void DebugOverlay::shutdown() {
     }
 }
 
+// Neither the caller nor this function holds an ImGuiContextScope across initBackend() or windowScale(): both
+// hop to the main thread on macOS, which takes imguiMutex() while it dispatches window events. Failures leave
+// every scope before fail(), because shutdown() takes its own.
 bool DebugOverlay::initialize(const Presenter::Target& target) {
     void* native_window = native_window_.load(std::memory_order_acquire);
     color_format_ = target.format;
     g_first_vk_error.store(VK_SUCCESS);
 
-    // Nothing here is shared with the window thread yet: it forwards messages only once initialized_ is set.
-    IMGUI_CHECKVERSION();
-    imgui_ = ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.LogFilename = nullptr;
-    // The window class keeps the arrow cursor; the backend must not change it.
-    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    ImGui::StyleColorsDark();
-
     const float scale = overlay_platform::windowScale(native_window);
     scale_ = scale;
-    ImFontConfig font_config;
-    font_config.SizePixels = std::round(kBaseFontSize * scale);
-    io.Fonts->AddFontDefault(&font_config);
-    if (overlay_platform::usesPointCoordinates()) {
-        // Layout stays in points; the atlas is rasterised at the framebuffer's pixel density.
-        io.FontGlobalScale = 1.0f / scale;
-    } else {
-        ImGui::GetStyle().ScaleAllSizes(scale);
+
+    // Nothing here is shared with the window thread yet: it forwards messages only once initialized_ is set.
+    // CreateContext makes the new context current, which would switch another overlay's context under it, so
+    // the previous one is put back before the scope takes over.
+    {
+        std::lock_guard lock(imguiMutex());
+        IMGUI_CHECKVERSION();
+        ImGuiContext* previous = ImGui::GetCurrentContext();
+        imgui_ = ImGui::CreateContext();
+        ImGui::SetCurrentContext(previous);
+    }
+    {
+        ImGuiContextScope scope(imgui_);
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.LogFilename = nullptr;
+        // The window class keeps the arrow cursor; the backend must not change it.
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+        ImGui::StyleColorsDark();
+
+        ImFontConfig font_config;
+        font_config.SizePixels = std::round(kBaseFontSize * scale);
+        io.Fonts->AddFontDefault(&font_config);
+        if (overlay_platform::usesPointCoordinates()) {
+            // Layout stays in points; the atlas is rasterised at the framebuffer's pixel density.
+            io.FontGlobalScale = 1.0f / scale;
+        } else {
+            ImGui::GetStyle().ScaleAllSizes(scale);
+        }
     }
 
     if (native_window != nullptr) {
-        if (!overlay_platform::initBackend(native_window)) {
+        if (!overlay_platform::initBackend(native_window, imgui_)) {
             fail("window backend");
             return false;
         }
@@ -196,21 +221,24 @@ bool DebugOverlay::initialize(const Presenter::Target& target) {
     init.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     init.PipelineRenderingCreateInfo.pColorAttachmentFormats = &color_format_;
     init.CheckVkResultFn = &recordVkResult;
-    if (!ImGui_ImplVulkan_Init(&init)) {
-        fail("Vulkan backend");
-        return false;
-    }
-    vulkan_backend_ = true;
 
-    // One queue submit and a wait: the one-time hitch when the overlay first shows.
-    if (!ImGui_ImplVulkan_CreateFontsTexture() || g_first_vk_error.load() != VK_SUCCESS) {
-        fail("font upload");
-        return false;
-    }
-
+    const char* failed_step = nullptr;
     {
-        std::lock_guard lock(mutex_);
-        initialized_.store(true, std::memory_order_release);
+        ImGuiContextScope scope(imgui_);
+        if (!ImGui_ImplVulkan_Init(&init)) {
+            failed_step = "Vulkan backend";
+        } else {
+            vulkan_backend_ = true;
+            // One queue submit and a wait: the one-time hitch when the overlay first shows.
+            if (!ImGui_ImplVulkan_CreateFontsTexture() || g_first_vk_error.load() != VK_SUCCESS) {
+                failed_step = "font upload";
+            }
+        }
+        if (failed_step == nullptr) initialized_.store(true, std::memory_order_release);
+    }
+    if (failed_step != nullptr) {
+        fail(failed_step);
+        return false;
     }
     logInfo("dal: overlay: ready (imgui {}, scale {})", IMGUI_VERSION, scale);
     return true;
@@ -228,7 +256,7 @@ void DebugOverlay::record(VkCommandBuffer cmd, const Presenter::Target& target) 
     const auto now = FrameStatsHistory::Clock::now();
     state_.refresh(sources_, now);
 
-    std::lock_guard lock(mutex_);
+    ImGuiContextScope scope(imgui_);
     ImGuiIO& io = ImGui::GetIO();
     if (overlay_platform::usesPointCoordinates()) {
         io.DisplaySize = ImVec2(static_cast<float>(target.width) / scale_, static_cast<float>(target.height) / scale_);

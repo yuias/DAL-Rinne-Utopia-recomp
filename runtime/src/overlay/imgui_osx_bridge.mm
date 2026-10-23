@@ -26,7 +26,7 @@ bool dalImGuiOsxInit(void* ns_view) {
 
     ImGui_ImplOSX_Data* bd = ImGui_ImplOSX_GetBackendData();
     // Application activation changes reach ImGui as focus events through the window instead, under the
-    // overlay's mutex. The observer object stays so that the backend's shutdown can remove it again.
+    // ImGui mutex (imguiMutex()). The observer object stays so that the backend's shutdown can remove it again.
     [[NSNotificationCenter defaultCenter] removeObserver:bd->Observer];
     // Events reach ImGui through dalImGuiOsxHandleEvent. The local monitor would feed them on the main
     // thread unlocked, and also while the overlay is hidden.

@@ -2,11 +2,11 @@
 
 The pad on port 0 of the game's `cellPad` comes from the keyboard, from a gamepad, from both
 together, or from a pad script. This page covers gamepads: what a player needs, how the code is
-organised, how pads are selected, the log lines, the diagnostic option `--pad-probe` and the tool
-`dal_padtool`. The sections about GameInput, Steam and `dal_padtool` describe Windows;
-[Gamepads on macOS](#gamepads-on-macos) describes the macOS backend. The keyboard, the pad script
-and the `PadProvider` seam are in [Input](runtime.md#input) in the runtime internals, and the option
-defaults are in [`dal_game` options](runtime-options.md#window-input-and-sound).
+organised, how pads are selected, how a system dialog takes the pad from the game, the log lines, the
+diagnostic option `--pad-probe` and the tool `dal_padtool`. The sections about GameInput, Steam and
+`dal_padtool` describe Windows; [Gamepads on macOS](#gamepads-on-macos) describes the macOS backend. The
+keyboard, the pad script and the `PadProvider` seam are in [Input](runtime.md#input) in the runtime internals,
+and the option defaults are in [`dal_game` options](runtime-options.md#window-input-and-sound).
 
 ## Gamepads
 
@@ -207,6 +207,38 @@ media keys, the Japanese `Eisu` and `Kana` keys) are not used.
   of the backend's own event monitor. `F1` and `Tab` work as on Windows. Typed text for the overlay's
   filter field is the key's characters, without an input method or the clipboard.
 
+## System dialogs
+
+The save data list dialog (see [Save data dialog](runtime.md#save-data-dialog)) is operated with the same pad that
+plays the game, so it takes the pad for as long as it is open.
+
+- **Interception.** `setPadIntercepted(true)` in `runtime/src/hle/cell_pad.cpp` makes `cellPadGetData` write a length
+  of 0 (no change) and leave the data and the game's last reported state alone, and `cellPadGetInfo2` set bit `0x1` of
+  `system_info` (`CELL_PAD_INFO_INTERCEPTED`), as the firmware does while a system dialog has the pad. The dialog reads
+  the pad itself with `pollHostPad`, which returns the provider's state without change detection and without touching
+  what the game was told.
+- **Release phase.** When the dialog closes, `setPadIntercepted(false)` starts a release phase: the game sees one
+  change to a neutral pad (all buttons up, sticks centred), then no change, until no START, SELECT, cross, circle,
+  triangle or square is held on any connected port. The press that closed the dialog therefore does not also act in
+  the game's menu. After that the next `cellPadGetData` reports the real state as a change. `resetCellPad` clears
+  both flags.
+- **Enter and back.** Circle is enter and cross is back, as on a Japanese console. The assignment is fixed for now: it
+  is `dialogButtons()` in `runtime/src/input/pad_buttons.*`, set by `setEnterButtonAssign` (default circle), and the
+  model and the legend both read it, but no option or menu changes it. With the mappings above that is the B and A
+  buttons of an Xbox pad (the same buttons on a pad that GameController.framework reports on macOS) and the `X` and
+  `Z` keys.
+- **Dialog input.** Up and down come from the d-pad and from the vertical axis of either stick (below 30 is up, above 225
+  is down, of 0 to 255); they repeat after 500 ms and then every 200 ms. L1 and R1 move ten rows, enter and back act
+  once per press. Every input counts as held when the dialog opens, so a button still down from the game acts only
+  after it was released and pressed again; other buttons do nothing, and input is ignored during the 150 ms fade-in
+  and fade-out. The dialog reads the pad provider only: the mouse and the other keys do nothing, and `F1` still
+  shows the debug overlay, drawn above the dialog.
+- **When it is used.** The dialog needs the window and a pad that reads host input (`keyboard`, `gamepad` or
+  `keyboard+gamepad`); with `--no-window` or with `--pad none` or `neutral` it is answered automatically, and
+  `--save-dialog window` with one of those is a usage error. With a `--pad-script` the default is the automatic
+  answer too, and `--save-dialog window` makes the dialog wait for the script's presses (see `--save-dialog` in
+  [`dal_game` options](runtime-options.md#window-input-and-sound)).
+
 ## Design
 
 ### Where the code lives
@@ -221,7 +253,7 @@ media keys, the Japanese `Eisu` and `Kana` keys) are not used.
 | Selection | `runtime/src/input/gamepad_select.*` | `dal_runtime_core` | Recognising Steam's virtual pad and the rule that picks the pads in use |
 | Hub | `runtime/src/input/gamepad_hub.*` | `dal_runtime_core` | The gamepad thread: devices, selection, readings, focus gate and rumble, written to the shared state |
 | Probe and formatters | `runtime/src/input/gamepad_probe.*` | `dal_runtime_core` | `--pad-probe`, and the text formats that the log and `dal_padtool` share |
-| Shared state | `runtime/src/input/keyboard_pad.*`, `pad_buttons.*` | `dal_runtime_core` | The `Gamepad` input source, the analog snapshot, the connection flag and the stored vibration |
+| Shared state | `runtime/src/input/keyboard_pad.*`, `pad_buttons.*` | `dal_runtime_core` | The `Gamepad` input source, the analog snapshot, the connection flag and the stored vibration; `pad_buttons.*` also holds `dialogButtons()`, the enter and back buttons of system dialogs |
 | Targets | `cmake/Input.cmake`, `cmake/gameinput.cmake`, `tools/fetch-gameinput.ps1` | | The package check, `dal_input_gameinput`, `dal_padtool` and `input_gameinput` (Windows), `dal_input_gamecontroller` and `input_gamecontroller` (macOS), `input_core`, and the pinned package |
 
 Mapping, selection, the hub and the probe are core code behind `GamepadBackend`, so `input_core`
@@ -250,6 +282,9 @@ block, never call GameInput and never take a lock that another thread holds. The
 `KeyboardPadState` is therefore lock-free like the keyboard and script sources: atomic button masks
 and press times, the sticks and trigger pressure packed into one atomic, the connection flag, and the
 latest vibration as one atomic that the gamepad thread forwards. `poll` only reads them.
+
+The save data dialog reads the pad the same way: the waiting guest thread calls `pollHostPad` after each timed wait,
+with the guest lock held again, never from the RSX thread.
 
 The gamepad thread (`startGamepadHub`) is a detached host thread that owns its `shared_ptr`s;
 nothing joins it, because the process ends with `std::_Exit`. It:

@@ -583,3 +583,17 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## BIZ UDPGothic
+
+The save dialog draws its text with BIZ UDPGothic Regular, <https://github.com/googlefonts/morisawa-biz-ud-gothic>,
+unless a font is given with `--ui-font` or placed next to the ELF. The font is not committed: configuration
+downloads it into `generated/deps/fonts/<commit>/` and checks its SHA-256 (the pins are in `cmake/ui_font.cmake`),
+and the build copies it to `bin/fonts/` with its licence text in `bin/licenses/biz-udgothic/OFL.txt`.
+
+| | |
+| --- | --- |
+| Commit | `18934af56b9c003ca58c54bffbf226848cb11032` |
+| `fonts/ttf/BIZUDPGothic-Regular.ttf` | SHA-256 `258d7156c165f2ff774b6efee637c22c3b950de0d8a10e501137061bc8085d01` |
+| `OFL.txt` | SHA-256 `e753d7155d53c747d037a445e584c8ecfca6dd79846db610417e282a736b28bc` |
+| Licence | SIL Open Font License, Version 1.1, Copyright 2022 The BIZ UDGothic Project Authors (<https://github.com/googlefonts/morisawa-biz-ud-mincho>). The licence text ships with the font as `OFL.txt` and must accompany any redistributed copy of the font |

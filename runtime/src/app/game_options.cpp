@@ -23,7 +23,7 @@
 namespace dal {
 namespace {
 
-constexpr std::array<OptionSpec, 27> kOptionSpecs{{
+constexpr std::array<OptionSpec, 29> kOptionSpecs{{
         {"game-dir", OptionKind::Path},
         {"vfs-config", OptionKind::Path},
         {"elf", OptionKind::Path},
@@ -37,6 +37,8 @@ constexpr std::array<OptionSpec, 27> kOptionSpecs{{
         {"load-only", OptionKind::Flag},
         {"png-dump", OptionKind::Path},
         {"dialog-answer", OptionKind::String},
+        {"save-dialog", OptionKind::String},
+        {"ui-font", OptionKind::Path},
         {"pad", OptionKind::String},
         {"pad-script", OptionKind::Path},
         {"pad-probe", OptionKind::Flag},
@@ -59,7 +61,8 @@ const std::string kUsage = std::format(
         "                [--seconds N] [--strict] [--log FILE] [--hdd-dir DIR] [--sdata-cache DIR]\n"
         "                [--log-level trace|debug|info|warn|error]\n"
         "                [--quiet-hle] [--load-only] [--png-dump DIR]\n"
-        "                [--dialog-answer yes|no|ok] [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
+        "                [--dialog-answer yes|no|ok] [--save-dialog auto|cancel|window] [--ui-font FILE]\n"
+        "                [--pad none|neutral|keyboard|gamepad|keyboard+gamepad]\n"
         "                [--pad-script FILE] [--pad-probe] [--audio none|{}] [--audio-dump FILE]\n"
         "                [--render none|vulkan] [--rsx-capture N[,M...]] [--rsx-census FILE]\n"
         "                [--dump-frames DIR] [--dump-frames-every K] [--shader-cache DIR]\n"
@@ -254,6 +257,13 @@ std::expected<GameOptions, OptionsExit> validate(const std::vector<Slot>& slots,
         }
         o.dialog_answer = s.text;
     }
+    if (const Slot& s = slot("save-dialog"); s.given()) {
+        if (s.text != "auto" && s.text != "cancel" && s.text != "window") {
+            return usageError(std::format("{} needs auto, cancel or window", label(s)));
+        }
+        o.save_dialog = s.text;
+    }
+    o.ui_font = pathFromUtf8(slot("ui-font").text);
     if (const Slot& s = slot("pad"); s.given()) {
         if (s.text != "none" && s.text != "neutral" && s.text != "keyboard" && s.text != "gamepad" &&
             s.text != "keyboard+gamepad") {
@@ -329,6 +339,15 @@ std::expected<GameOptions, OptionsExit> validate(const std::vector<Slot>& slots,
     if (!o.pad_script.empty() && !padUsesKeyboard(o.pad)) {
         return usageError("--pad-script needs --pad keyboard or keyboard+gamepad");
     }
+    // The dialog needs a window to draw in and a pad that reads host input to answer it. A pad script keeps
+    // the unattended answer unless the dialog is asked for.
+    const bool host_pad = o.pad != "none" && o.pad != "neutral";
+    const bool dialog_possible = o.window && host_pad;
+    if (o.save_dialog == "window" && !dialog_possible) {
+        return usageError(std::format("{} window needs the window and --pad keyboard, gamepad or keyboard+gamepad",
+                                      label(slot("save-dialog"))));
+    }
+    if (o.save_dialog.empty()) o.save_dialog = dialog_possible && o.pad_script.empty() ? "window" : "auto";
     // A window means somebody is listening; unattended runs must not need a sound device.
     if (o.audio.empty()) o.audio = o.window ? std::string(kHostAudioOutput) : "none";
     if (!o.audio_dump.empty()) {

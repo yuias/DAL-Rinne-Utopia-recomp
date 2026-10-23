@@ -82,7 +82,8 @@ code is in `runtime/src/rsx` (the frame builder) and `runtime/src/render` (the r
   The [debug overlay](runtime.md#debug-overlay) is drawn on the swapchain image after that blit, in a
   separate pass before the image is presented. It is not drawn into the render target, so it never
   appears in `--dump-frames` files, requested PNG dumps, the display readback or captures, and it only
-  redraws when a flip completes (while fast-forwarding, when a flip is presented).
+  redraws when a flip completes (while fast-forwarding, when a flip is presented), or when a save data dialog
+  is open and the renderer presents the last image again (see [Overlays](#overlays)).
 - **`rsx unimplemented` census.** The decoders, the frame builder and the renderer count what they
   meet but cannot handle yet (surface, depth and texture formats, texture layouts, vertex types,
   primitives, vertex and fragment opcodes, blend modes, other state and unknown methods) under
@@ -261,6 +262,87 @@ is made on the GPU instead.
   copy onto the surface itself as `state guest copy onto its own render target`. Any other CPU read of a
   render target still sees the stale bytes. An inline blit into a copy destination is seen only at the next
   epoch, as for any texture.
+
+### Overlays
+
+With a window the renderer's one `PresentOverlay` slot holds an `OverlayStack`
+(`runtime/src/overlay/overlay_stack.h`): the save data dialog overlay and, drawn after it so that it stays on top,
+the [debug overlay](runtime.md#debug-overlay). The stack gives every child every flip (`onFlip`) and keeps a
+request that any of them sets (today only `dump_display`; a field added to `PresentOverlayRequests` must be added
+to the merge), calls `record` for the children whose `wantsDraw()` is true, and wants an idle present when any child
+does. Each child has its own ImGui context. Dear ImGui keeps its current context in one process global, so all use
+of any context happens under the shared recursive lock `imguiMutex()` (`ImGuiContextScope` in
+`runtime/src/overlay/imgui_context.h` takes it and makes the context current), and the two overlays never share
+windows, focus or input. The lock sits between the guest lock and the leaf locks such as the board's mutex: an
+overlay reads the runtime state it shows, which may take the guest lock, before it opens a scope. The calls that
+start and stop a platform backend (`overlay_platform::initBackend` and `shutdownBackend`) take the context they act
+on and are made without the lock held, because on macOS they run on the main thread, which takes the lock while it
+dispatches window events.
+
+**Save data dialog overlay** (`runtime/src/overlay/save_dialog_overlay.*`). It draws the latest snapshot of the
+`SaveDialogBoard` that the waiting guest thread publishes (see [Save data dialog](runtime.md#save-data-dialog)),
+with the foreground draw list and no ImGui windows, on the swapchain image after the letterboxed blit, like the debug
+overlay. It uses only the Vulkan backend of ImGui (no Win32 or Cocoa backend), with the display size in pixels on
+every platform, and takes no window input; the pad drives the dialog. It is created with the window and sets the
+board's drawer to ready, but initialises its context, descriptor pool and backend lazily on the first `record` of a
+dialog (`dal: savedata dialog: overlay ready`). If the surface format of a later image differs from the one it
+was set up for, it logs once that the dialog is skipped for that image.
+
+- *Layout.* A canvas of 1280x720 is mapped onto the 16:9 image area of the target (`scale` is that area's height
+  over 720), and the dim covers the whole target, including the bars beside the image. A list has the heading
+  (`セーブ` or `ロード`) at the top left, a rule, a box of four rows of 130 px, a rule and a legend with the back and
+  the enter symbol. A row has the icon in a 160x88 cell, the title, the date and size, and up to three lines of
+  detail text; text that does not fit is cut with `...`. The selected row has a frame with a glow that pulses about
+  once per 1.2 s, and a scrollbar shows when there are more than four rows. The symbols are drawn as shapes, a circle
+  and a cross, in the order that `dialogButtons()` gives (see [System dialogs](input.md#system-dialogs)); an empty
+  list shows its text in the middle of the box and only the back item. A confirmation or an error message is
+  centred text between two rules with the buttons below (`はい` and `いいえ`, or `OK`), on a darker dim. Every alpha is
+  multiplied by the snapshot's opacity, which the model fades over 150 ms when the dialog opens and closes.
+- *Fonts.* The text is Japanese. At run time the first usable font of this list is used: the `--ui-font` file,
+  `SCE-PS3-SR-R-JPN.TTF` in the directory of the ELF (a firmware font that you put there), then
+  `fonts/BIZUDPGothic-Regular.ttf` next to `dal_game` (see [Fallback UI font](building.md#fallback-ui-font)). A
+  candidate counts only if it can be read, stb_truetype parses it and it has a glyph for `セ`; the check is made before
+  the font reaches ImGui, whose font loader asserts on a font it cannot parse. A candidate that exists but fails the
+  check is skipped with a warning, and the log names the font used (`dal: overlay: UI font <path>`). Without a usable
+  font the dialog uses ImGui's built-in font and Japanese text shows as `?`.
+- *Atlas.* ImGui 1.91.9b has no dynamic glyph loading, so the atlas bakes a fixed set of code points at three sizes
+  (32, 22 and 17 px times `scale`). The set holds printable ASCII, every string of the dialog text and every string of
+  the dialog being shown (titles and details come from the game's save files). It is rebuilt, and the font texture
+  uploaded again, when a dialog needs a glyph that is not baked or the image area changes height; a rebuild waits for
+  the queue, so a dialog with new glyphs costs one hitch when it opens, during the fade-in. Baked sets are only added
+  to, up to 8000 code points, and glyphs outside the Basic Multilingual Plane are not baked.
+- *Icons.* `ICON0.PNG` of the rows from 5 rows above the first visible row to 10 rows after it is decoded with
+  libpng (`decodePngRgba8`, at most four per frame) and uploaded as a texture, at most 32 at once. A row without an icon
+  or whose icon cannot be decoded keeps the placeholder, and is not decoded again. A texture that leaves the window or
+  belongs to an older dialog is released after the frames in flight have finished.
+- *Failure.* A set-up error (the Vulkan backend, the descriptor pool, the font atlas) is logged once
+  (`dal: savedata dialog: overlay <step> failed, the dialog is answered without being shown`), switches the overlay
+  off for the rest of the run and tells the board that nothing can draw, so a dialog that is open or opens later is
+  answered as cancelled instead of waiting. Destroying the overlay does the same.
+
+The debug overlay and the dialog overlay are drawn on the swapchain image only, so neither is in `--dump-frames`
+files, requested dumps, `readDisplay` or captures. The automated tests therefore check the dialog through log lines
+and, for the overlay itself, through an offscreen image (see [Tests](tests.md)).
+
+**Idle present.** The game normally keeps flipping while a dialog is open, but if the thread that drives the flips
+is the one that waits for the player, or a stall (a load) stops them, the dialog would freeze or never appear. When the
+RSX consumer loop finds a pass without FIFO work and no vblank due it calls `RsxExecutor::idle()`, which `dal_game`
+forwards to `RsxRenderer::presentIdle()`. `presentIdle` re-presents the last displayed image, black when the last flip
+was black, with the overlays, and only when:
+
+- a presenter and an overlay are set, the overlay `wantsIdlePresent()` (the dialog is shown), at least one flip has
+  been presented and the renderer is valid;
+- no real flip happened for 100 ms (`kIdleStallThreshold`, above the 33 ms interval of a 30 fps game, so idle presents
+  never interleave with the game's own flips) and the last idle present is at least 33 ms ago
+  (`kIdlePresentInterval`, about 30 per second), tested by `RsxRenderer::idlePresentDue`;
+- no frame is open, that is no draw or clear has been recorded since the last flip (the game is then mid-frame and its
+  next flip presents); this logs once, `dal: render: idle present skipped, a frame is open; an overlay shows only when
+  the game flips`.
+
+The last condition is a known limit: a stall in the middle of a frame leaves the dialog on its last frame. An idle
+present is not a flip: it does not call `onFlip`, does not count in the flip statistics, makes no readback and no
+dump, and leaves `readDisplay` reading the last real flip. Only the dialog overlay asks for idle presents; a visible
+debug overlay is drawn again by them, but on its own it still redraws only when the game flips.
 
 ### Capture and replay
 
